@@ -1926,6 +1926,19 @@ void rmw_fleetqox_cpp_stop_service_graph_renewal_thread()
   stop_service_graph_renewal_thread();
 }
 
+// stop_service_request_repair_worker() already existed and is safe to call
+// more than once (join() only runs while joinable()), but until now it was
+// only ever invoked from ServiceRequestRepairShutdownGuard's destructor --
+// i.e. not until this translation unit's static-destruction phase during
+// exit(), which is later than rmw_context_fini/rmw_shutdown and leaves the
+// same "still-running background thread vs. exit()-time teardown elsewhere"
+// window that caused the remote_graph_lease_monitor_loop crash. Call it
+// explicitly here too so it stops in lockstep with the other worker threads.
+void rmw_fleetqox_cpp_stop_service_request_repair_worker()
+{
+  stop_service_request_repair_worker();
+}
+
 bool rmw_fleetqox_cpp_handle_service_frame(const char * encoded_frame, size_t size)
 {
   if (encoded_frame == nullptr || size == 0) {
