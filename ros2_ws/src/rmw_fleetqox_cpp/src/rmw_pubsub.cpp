@@ -5918,14 +5918,29 @@ private:
         [](const CandidateRequest & left, const CandidateRequest & right) {
           return left.assembly_key < right.assembly_key;
         });
+      if (fragment_nack_sweep_window_start_ns_ == 0 ||
+        now_ns - fragment_nack_sweep_window_start_ns_ >= interval_ns)
+      {
+        // Refill the fleet-wide repair-index budget at most once per
+        // fragment_nack_interval_ms_ window, instead of on every call to
+        // this function. Without this, a receive loop that invokes this
+        // sweep many times within one window (one call per received
+        // datagram) grants a fresh kFleetFragmentRepairIndexesPerSweep
+        // budget each time, so the cumulative index count over the window
+        // scales with call frequency rather than staying bounded.
+        fragment_nack_sweep_window_budget_ = kFleetFragmentRepairIndexesPerSweep;
+        fragment_nack_sweep_window_start_ns_ = now_ns;
+      }
       const size_t eligible_assemblies = candidates.size();
       const size_t fleet_fair_share = std::max<size_t>(
         1,
-        kFleetFragmentRepairIndexesPerSweep / eligible_assemblies);
+        fragment_nack_sweep_window_budget_ / eligible_assemblies);
       const size_t request_index_limit = std::min(
         static_cast<size_t>(fragment_nack_max_indexes_per_request_),
         fleet_fair_share);
-      size_t remaining_index_budget = kFleetFragmentRepairIndexesPerSweep;
+      const size_t window_budget_at_call_start =
+        fragment_nack_sweep_window_budget_;
+      size_t remaining_index_budget = window_budget_at_call_start;
       const size_t start_index =
         fragment_nack_sweep_cursor_ % eligible_assemblies;
       size_t visited = 0;
@@ -5959,8 +5974,9 @@ private:
           std::move(candidate.missing),
           assembly.source});
       }
+      fragment_nack_sweep_window_budget_ = remaining_index_budget;
       const size_t sweep_indexes_requested =
-        kFleetFragmentRepairIndexesPerSweep - remaining_index_budget;
+        window_budget_at_call_start - remaining_index_budget;
       size_t previous_max = fragment_nack_max_sweep_indexes_requested_.load(
         std::memory_order_relaxed);
       while (previous_max < sweep_indexes_requested &&
@@ -6602,6 +6618,8 @@ private:
   std::unordered_map<std::string, FragmentAssembly> fragment_assemblies_;
   std::unordered_map<std::string, std::int64_t> completed_fragment_assemblies_;
   size_t fragment_nack_sweep_cursor_{0};
+  size_t fragment_nack_sweep_window_budget_{kFleetFragmentRepairIndexesPerSweep};
+  std::int64_t fragment_nack_sweep_window_start_ns_{0};
   std::mutex fragment_history_mutex_;
   std::unordered_map<std::string, FragmentRepairHistory> fragment_history_;
   std::mutex fragment_send_queue_mutex_;
@@ -6671,8 +6689,20 @@ private:
 
 LoopbackSocketTransport & socket_transport()
 {
-  static LoopbackSocketTransport transport;
-  return transport;
+  // Deliberately heap-allocated and never destroyed (classic "leak on
+  // purpose" singleton). A plain function-local static is destroyed by the
+  // C++ runtime during process exit in an order that is not coordinated
+  // across shared libraries: rclcpp's global Context (in librclcpp.so) can
+  // outlive this singleton and, on its own later teardown, call back into
+  // rmw_context_fini() -> shutdown_pubsub_runtime() -> socket_transport(),
+  // touching an already-destructed object (observed as a heap-use-after-free
+  // on SharedMemoryTransport::Impl::running under AddressSanitizer, and as
+  // the "assertion failed: e != ESRCH || !robust" glibc abort in the
+  // corrupted-heap case without ASan). Leaking this process-lifetime
+  // singleton avoids the cross-library static destruction order entirely;
+  // explicit teardown still happens exactly once via ::shutdown().
+  static LoopbackSocketTransport * transport = new LoopbackSocketTransport();
+  return *transport;
 }
 
 void record_fragment_repair_observation(const std::string & encoded_frame)
@@ -12359,11 +12389,14 @@ const char * rmw_fleetqox_cpp_socket_init_error()
   return socket_transport().init_error().c_str();
 }
 
+extern "C" void rmw_fleetqox_cpp_stop_remote_graph_lease_monitor_thread();
+
 void rmw_fleetqox_cpp_shutdown_pubsub_runtime()
 {
   stop_pubsub_graph_renewal_thread();
   stop_reliable_retransmit_thread();
   stop_qos_deadline_monitor_thread();
+  rmw_fleetqox_cpp_stop_remote_graph_lease_monitor_thread();
   socket_transport().shutdown();
 }
 

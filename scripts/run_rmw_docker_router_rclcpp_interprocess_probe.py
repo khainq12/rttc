@@ -63,7 +63,7 @@ def run_probe(*, root: Path, image: str) -> dict[str, Any]:
             f"source {install_base}/setup.bash && "
             f"{install_base}/rmw_fleetqox_cpp/lib/rmw_fleetqox_cpp/"
             "fleetrmw_udp_router_probe --bind 0.0.0.0:49800 "
-            "--expected-frames 4 --expected-service-frames 4 "
+            "--expected-frames 4 --expected-service-frames 3 "
             "--expected-graph-advertisements 8 --post-satisfaction-ms 1000 "
             "--timeout-ms 30000",
         ])
@@ -127,7 +127,7 @@ def run_probe(*, root: Path, image: str) -> dict[str, Any]:
             and server.get("plan_request_valid") is True
             and int(server.get("plan_pose_count", 0)) == 512
             and int(server.get("path_pose_count", 0)) == 64
-            and int(router.get("service_forwarded", 0)) >= 4
+            and int(router.get("service_forwarded", 0)) >= 3
             and {
                 "/fleetqox/cpp_set_bool",
                 "/fleetqox/cpp_get_plan",

@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -143,6 +144,10 @@ std::map<RemoteGraphKey, RemoteGraphEndpoint> g_remote_graph_endpoints;
 std::map<std::string, LocalServiceGraphEndpoint> g_local_service_endpoints;
 std::map<RemoteGraphKey, RemoteServiceGraphEndpoint> g_remote_service_endpoints;
 std::atomic<bool> g_remote_graph_lease_monitor_started{false};
+std::atomic<bool> g_remote_graph_lease_monitor_running{false};
+std::thread g_remote_graph_lease_monitor_thread;
+std::mutex g_remote_graph_lease_monitor_lifecycle_mutex;
+std::once_flag g_remote_graph_lease_monitor_atexit_once;
 
 bool identifier_matches(const char * identifier)
 {
@@ -541,19 +546,52 @@ bool purge_expired_remote_graph_locked(SteadyClock::time_point now)
 void remote_graph_lease_monitor_loop()
 {
   constexpr auto kPollInterval = std::chrono::milliseconds(20);
-  while (true) {
+  while (g_remote_graph_lease_monitor_running.load(std::memory_order_acquire)) {
     std::this_thread::sleep_for(kPollInterval);
+    if (!g_remote_graph_lease_monitor_running.load(std::memory_order_acquire)) {
+      break;
+    }
     std::lock_guard<std::mutex> lock(g_graph_mutex);
     purge_expired_remote_graph_locked(SteadyClock::now());
   }
 }
 
+// Joins the detached-in-spirit but now-joinable monitor thread. Registered
+// with std::atexit (see ensure_remote_graph_lease_monitor) as a safety net,
+// mirroring stop_pubsub_graph_renewal_thread/stop_reliable_retransmit_thread/
+// stop_qos_deadline_monitor_thread in rmw_pubsub.cpp: without an explicit
+// stop+join before process exit, this thread used to keep running (it was
+// std::thread(...).detach()-ed with an unconditional `while (true)`) and
+// could still be mutating g_remote_graph_endpoints/g_nodes via g_graph_mutex
+// at the exact moment libc's exit() path runs this translation unit's global
+// destructors on the main thread, corrupting the heap (observed as
+// "double free or corruption (out)" during short-lived `ros2 lifecycle get`
+// CLI processes).
+void stop_remote_graph_lease_monitor_thread()
+{
+  std::lock_guard<std::mutex> lifecycle_lock(g_remote_graph_lease_monitor_lifecycle_mutex);
+  g_remote_graph_lease_monitor_running.store(false, std::memory_order_release);
+  if (g_remote_graph_lease_monitor_thread.joinable()) {
+    g_remote_graph_lease_monitor_thread.join();
+  }
+  g_remote_graph_lease_monitor_started.store(false, std::memory_order_release);
+}
+
 void ensure_remote_graph_lease_monitor()
 {
-  bool expected = false;
-  if (g_remote_graph_lease_monitor_started.compare_exchange_strong(expected, true)) {
-    std::thread(remote_graph_lease_monitor_loop).detach();
+  std::lock_guard<std::mutex> lifecycle_lock(g_remote_graph_lease_monitor_lifecycle_mutex);
+  if (g_remote_graph_lease_monitor_started.load(std::memory_order_acquire)) {
+    return;
   }
+  if (g_remote_graph_lease_monitor_thread.joinable()) {
+    g_remote_graph_lease_monitor_thread.join();
+  }
+  g_remote_graph_lease_monitor_running.store(true, std::memory_order_release);
+  g_remote_graph_lease_monitor_started.store(true, std::memory_order_release);
+  g_remote_graph_lease_monitor_thread = std::thread(remote_graph_lease_monitor_loop);
+  std::call_once(g_remote_graph_lease_monitor_atexit_once, []() {
+    std::atexit(stop_remote_graph_lease_monitor_thread);
+  });
 }
 
 std::vector<TopicEndpointSnapshot> endpoint_snapshot(
@@ -906,6 +944,11 @@ std::vector<TopicRecord> service_snapshot_by_node(
 }
 
 }  // namespace
+
+extern "C" void rmw_fleetqox_cpp_stop_remote_graph_lease_monitor_thread()
+{
+  stop_remote_graph_lease_monitor_thread();
+}
 
 std::vector<std::string> rmw_fleetqox_cpp_graph_matched_subscription_endpoint_ids(
   std::size_t domain_id,
