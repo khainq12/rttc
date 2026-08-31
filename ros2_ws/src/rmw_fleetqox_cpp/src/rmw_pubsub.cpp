@@ -12390,6 +12390,7 @@ const char * rmw_fleetqox_cpp_socket_init_error()
 }
 
 extern "C" void rmw_fleetqox_cpp_stop_remote_graph_lease_monitor_thread();
+extern "C" void rmw_fleetqox_cpp_stop_service_graph_renewal_thread();
 
 void rmw_fleetqox_cpp_shutdown_pubsub_runtime()
 {
@@ -12397,6 +12398,7 @@ void rmw_fleetqox_cpp_shutdown_pubsub_runtime()
   stop_reliable_retransmit_thread();
   stop_qos_deadline_monitor_thread();
   rmw_fleetqox_cpp_stop_remote_graph_lease_monitor_thread();
+  rmw_fleetqox_cpp_stop_service_graph_renewal_thread();
   socket_transport().shutdown();
 }
 

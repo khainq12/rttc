@@ -282,6 +282,10 @@ std::vector<FleetQoxServiceData *> g_service_bus_endpoints;
 std::vector<rmw_service_t *> g_service_handles;
 std::vector<rmw_client_t *> g_client_handles;
 std::atomic<bool> g_service_graph_renewal_started{false};
+std::atomic<bool> g_service_graph_renewal_running{false};
+std::thread g_service_graph_renewal_thread;
+std::mutex g_service_graph_renewal_lifecycle_mutex;
+std::once_flag g_service_graph_renewal_atexit_once;
 std::atomic<std::uint64_t> g_next_service_endpoint_id{1};
 std::atomic<std::uint64_t> g_next_client_endpoint_id{1};
 std::atomic<std::uint64_t> g_service_expired_frames_dropped{0};
@@ -1690,13 +1694,33 @@ void send_service_graph_advertisement(const FleetQoxServiceData * data, const ch
 void service_graph_renewal_loop()
 {
   constexpr auto kRenewInterval = std::chrono::milliseconds(500);
-  while (true) {
+  while (g_service_graph_renewal_running.load(std::memory_order_acquire)) {
     std::this_thread::sleep_for(kRenewInterval);
+    if (!g_service_graph_renewal_running.load(std::memory_order_acquire)) {
+      break;
+    }
     std::lock_guard<std::mutex> lock(g_service_graph_mutex);
     for (const FleetQoxServiceData * data : g_service_graph_endpoints) {
       send_service_graph_advertisement(data, "add");
     }
   }
+}
+
+// Same unstopped-detached-thread-vs-exit()-time-static-destruction hazard as
+// remote_graph_lease_monitor_loop in rmw_graph.cpp (see
+// rmw_fleetqox_cpp_stop_remote_graph_lease_monitor_thread): this thread is
+// started by every process that creates a service endpoint, including
+// short-lived CLI processes (e.g. `ros2 lifecycle get/set`), so it must be
+// stopped and joined before such a process's exit() runs its global
+// destructors.
+void stop_service_graph_renewal_thread()
+{
+  std::lock_guard<std::mutex> lifecycle_lock(g_service_graph_renewal_lifecycle_mutex);
+  g_service_graph_renewal_running.store(false, std::memory_order_release);
+  if (g_service_graph_renewal_thread.joinable()) {
+    g_service_graph_renewal_thread.join();
+  }
+  g_service_graph_renewal_started.store(false, std::memory_order_release);
 }
 
 void ensure_service_graph_renewal_thread()
@@ -1707,11 +1731,19 @@ void ensure_service_graph_renewal_thread()
   {
     return;
   }
-  bool expected = false;
-  if (!g_service_graph_renewal_started.compare_exchange_strong(expected, true)) {
+  std::lock_guard<std::mutex> lifecycle_lock(g_service_graph_renewal_lifecycle_mutex);
+  if (g_service_graph_renewal_started.load(std::memory_order_acquire)) {
     return;
   }
-  std::thread(service_graph_renewal_loop).detach();
+  if (g_service_graph_renewal_thread.joinable()) {
+    g_service_graph_renewal_thread.join();
+  }
+  g_service_graph_renewal_running.store(true, std::memory_order_release);
+  g_service_graph_renewal_started.store(true, std::memory_order_release);
+  g_service_graph_renewal_thread = std::thread(service_graph_renewal_loop);
+  std::call_once(g_service_graph_renewal_atexit_once, []() {
+    std::atexit(stop_service_graph_renewal_thread);
+  });
 }
 
 void add_service_graph_renewal_endpoint(FleetQoxServiceData * data)
@@ -1888,6 +1920,11 @@ bool liveliness_unknown(rmw_qos_liveliness_policy_t value)
 
 extern "C"
 {
+
+void rmw_fleetqox_cpp_stop_service_graph_renewal_thread()
+{
+  stop_service_graph_renewal_thread();
+}
 
 bool rmw_fleetqox_cpp_handle_service_frame(const char * encoded_frame, size_t size)
 {
