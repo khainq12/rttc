@@ -943,12 +943,23 @@ def run_probe(
             # robots join backup_5g only after the single feedback actuation
             # (all sends but the first).
             robot_count * total_source_frames - protected_count
-            if qoe_feedback else (robot_count * 2 if qoe_migration else robot_count * 3)
+            if qoe_feedback else
+            # epoch-1-protected robots (protected_count) touch backup_5g only
+            # during the single-send epoch-1 window; epoch-1-unprotected
+            # robots (robot_count - protected_count) become epoch-2-protected
+            # and stay on backup_5g for every send.
+            protected_count + (robot_count - protected_count) * total_source_frames
+            if qoe_migration else robot_count * 3
         )
         router_expected_primary_frames = (
             protected_count * total_source_frames
             if qoe_feedback else
-            robot_count * 2
+            # epoch-1-protected robots touch primary_wifi every send;
+            # epoch-1-unprotected robots only touch it once they become
+            # epoch-2-protected, i.e. every send after the two actuations
+            # (total_source_frames - 2 sends).
+            protected_count * total_source_frames
+            + (robot_count - protected_count) * (total_source_frames - 2)
             if qoe_migration else
             (robot_count + protected_count * 2 if epoch_transition else protected_count * 3)
         )
@@ -1017,6 +1028,13 @@ def run_probe(
             backup_router_command += (
                 f" --post-satisfaction-ms 4000 --timeout-ms {router_timeout_ms}"
             )
+        elif feedback_enabled:
+            # The base command hardcodes an 18s timeout, which the
+            # qoe_migration schedule (6 sends x 3000ms + container startup
+            # overhead) can run right up against, causing the router to give
+            # up and exit before forwarding the final data frames.
+            primary_router_command += f" --timeout-ms {router_timeout_ms}"
+            backup_router_command += f" --timeout-ms {router_timeout_ms}"
         start_router(
             root=root,
             image=image,
@@ -1455,6 +1473,11 @@ def run_probe(
             else:
                 expected_redundant_frames = (
                     (total_source_frames - 1) if qoe_feedback and len(selected_paths) > 1 else
+                    # epoch-2-protected robots (final selected_paths redundant)
+                    # stay redundant for every send after both actuations;
+                    # epoch-1-only-protected robots are redundant for exactly
+                    # the single send that lands between the two actuations.
+                    (total_source_frames - 2) if qoe_migration and len(selected_paths) > 1 else
                     1 if qoe_migration else
                     3 if len(selected_paths) > 1 else
                     (1 if epoch_transition else 0)
@@ -1463,7 +1486,9 @@ def run_probe(
                     (1 + (total_source_frames - 1) * 2)
                     if qoe_feedback and len(selected_paths) > 1 else
                     total_source_frames if qoe_feedback else
-                    4 if qoe_migration else
+                    (2 * total_source_frames - 2)
+                    if qoe_migration and len(selected_paths) > 1 else
+                    (total_source_frames + 1) if qoe_migration else
                     6 if epoch_transition and len(selected_paths) > 1 else
                     4 if epoch_transition else
                     6 if len(selected_paths) > 1 else 3
