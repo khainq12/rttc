@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -59,6 +60,15 @@ def run_probe(*, root: Path, image: str, topic: str) -> dict[str, Any]:
 
     try:
         run(["docker", "network", "create", network])
+        subnet_result = run(
+            ["docker", "network", "inspect", "-f", "{{(index .IPAM.Config 0).Subnet}}", network]
+        )
+        subnet = ipaddress.ip_network(subnet_result.stdout.strip(), strict=False)
+        primary_router_ip = str(subnet.network_address + 10)
+        backup_router_ip = str(subnet.network_address + 11)
+        subscriber_ip = str(subnet.network_address + 12)
+        publisher_ip = str(subnet.network_address + 13)
+        graph_peers = f"{subscriber_ip}:48392,{publisher_ip}:48393"
         docker_shell(
             root,
             image,
@@ -75,12 +85,14 @@ def run_probe(*, root: Path, image: str, topic: str) -> dict[str, Any]:
             image=image,
             name=primary_router_name,
             network=network,
+            ip_address=primary_router_ip,
             command=(
                 f"source /opt/ros/jazzy/setup.bash && source {install_base}/setup.bash && "
                 f"{router_binary} --bind 0.0.0.0:48390 "
+                f"--graph-peers {graph_peers} "
                 "--expected-frames 3 --expected-ack-nack-frames 2 "
                 "--expected-route-advertisements 1 --expected-graph-advertisements 2 "
-                "--drop-source-sequences 2 --timeout-ms 10000"
+                "--drop-source-sequences 2 --timeout-ms 12000"
             ),
         )
         start_container(
@@ -88,11 +100,18 @@ def run_probe(*, root: Path, image: str, topic: str) -> dict[str, Any]:
             image=image,
             name=backup_router_name,
             network=network,
+            ip_address=backup_router_ip,
             command=(
                 f"source /opt/ros/jazzy/setup.bash && source {install_base}/setup.bash && "
                 f"{router_binary} --bind 0.0.0.0:48391 "
+                f"--graph-peers {graph_peers} "
+                # post_satisfaction_ms defaults to 0, which makes the router
+                # exit the instant --expected-frames is reached; add a small
+                # dwell so its socket reliably stays open long enough to
+                # relay the post-recovery payload published just after.
                 "--expected-frames 2 --expected-route-advertisements 1 "
-                "--expected-graph-advertisements 2 --timeout-ms 10000"
+                "--expected-graph-advertisements 2 --post-satisfaction-ms 1500 "
+                "--timeout-ms 12000"
             ),
         )
         time.sleep(0.6)
@@ -101,20 +120,33 @@ def run_probe(*, root: Path, image: str, topic: str) -> dict[str, Any]:
             image=image,
             name=subscriber_name,
             network=network,
+            ip_address=subscriber_ip,
             command=(
                 f"source /opt/ros/jazzy/setup.bash && source {install_base}/setup.bash && "
                 "export RMW_IMPLEMENTATION=rmw_fleetqox_cpp && "
                 "FLEETQOX_RMW_BIND=0.0.0.0:48392 "
-                f"FLEETQOX_RMW_PEERS={primary_router_name}:48390,{backup_router_name}:48391 "
-                f"{endpoint_binary} --mode subscriber --topic {topic} --timeout-ms 9000 "
-                f"--post-recovery-payload {POST_RECOVERY_PAYLOAD}"
+                f"FLEETQOX_RMW_PEERS={primary_router_ip}:48390,{backup_router_ip}:48391 "
+                f"{endpoint_binary} --mode subscriber --topic {topic} --timeout-ms 11000 "
+                f"--post-recovery-payload {POST_RECOVERY_PAYLOAD} "
+                # Without this, the subscriber's read loop exits the instant
+                # the main "one,two,three" sequence is complete (see
+                # run_subscriber() in reliable_interprocess_probe.cpp),
+                # regardless of whether the post-recovery payload has
+                # arrived yet -- so it must be given time to wait for it.
+                "--post-payload-wait-ms 2000"
             ),
         )
         time.sleep(0.8)
+        # See run_rmw_docker_router_reliability_probe.py for why
+        # --pre-publish-wait-ms is needed: any graph advertisement sent
+        # before the publisher's own socket is bound is lost (UDP has no
+        # receiver queue), so this must delay the first publish() rather
+        # than the orchestrator sleeping earlier.
         publisher = run(
             [
                 "docker", "run", "--rm",
                 "--network", network,
+                "--ip", publisher_ip,
                 "-v", f"{root}:/work",
                 "-w", "/work",
                 image,
@@ -122,10 +154,11 @@ def run_probe(*, root: Path, image: str, topic: str) -> dict[str, Any]:
                 (
                     f"source /opt/ros/jazzy/setup.bash && source {install_base}/setup.bash && "
                     "export RMW_IMPLEMENTATION=rmw_fleetqox_cpp && "
-                    "FLEETQOX_RMW_BIND=0.0.0.0:0 "
+                    "FLEETQOX_RMW_BIND=0.0.0.0:48393 "
                     "FLEETQOX_RMW_PEER_POLICY=adaptive_score "
-                    f"FLEETQOX_RMW_PEERS={primary_router_name}:48390,{backup_router_name}:48391 "
+                    f"FLEETQOX_RMW_PEERS={primary_router_ip}:48390,{backup_router_ip}:48391 "
                     f"{endpoint_binary} --mode publisher --topic {topic} "
+                    "--pre-publish-wait-ms 800 "
                     "--hold-ms 6500 --min-retransmissions 1 --min-ack-nack-received 2 "
                     f"--post-recovery-payload {POST_RECOVERY_PAYLOAD}"
                 ),
@@ -228,11 +261,14 @@ def docker_shell(
     ], check=check)
 
 
-def start_container(*, root: Path, image: str, name: str, network: str, command: str) -> str:
+def start_container(
+    *, root: Path, image: str, name: str, network: str, ip_address: str, command: str
+) -> str:
     result = run([
         "docker", "run", "-d",
         "--name", name,
         "--network", network,
+        "--ip", ip_address,
         "-v", f"{root}:/work",
         "-w", "/work",
         image,
