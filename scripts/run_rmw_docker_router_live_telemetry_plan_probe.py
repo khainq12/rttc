@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -85,6 +86,20 @@ def run_probe(*, root: Path, image: str, topic: str) -> dict[str, Any]:
     try:
         plan_dir.mkdir(parents=True, exist_ok=True)
         run(["docker", "network", "create", network])
+        subnet_result = run(
+            ["docker", "network", "inspect", "-f", "{{(index .IPAM.Config 0).Subnet}}", network]
+        )
+        subnet = ipaddress.ip_network(subnet_result.stdout.strip(), strict=False)
+        primary_router_ip = str(subnet.network_address + 10)
+        backup_router_ip = str(subnet.network_address + 11)
+        subscriber_ip = str(subnet.network_address + 12)
+        publisher_ip = str(subnet.network_address + 13)
+        graph_peers = f"{subscriber_ip}:48412,{publisher_ip}:48413"
+        # ack/nack forwarding targets peer_addresses (from --peers) plus any
+        # dynamically learned publisher route -- --graph-peers only affects
+        # graph advertisement relay, so the publisher's address must also be
+        # a static peer for both routers to reliably forward acks back to it.
+        static_peers = f"{publisher_ip}:48413"
         docker_shell(
             root,
             image,
@@ -114,17 +129,23 @@ def run_probe(*, root: Path, image: str, topic: str) -> dict[str, Any]:
             image=image,
             name=primary_router_name,
             network=network,
+            ip_address=primary_router_ip,
             command=(
                 f"source /opt/ros/jazzy/setup.bash && source {install_base}/setup.bash && "
                 f"{router_binary} --bind 0.0.0.0:48410 "
+                f"--graph-peers {graph_peers} --peers {static_peers} "
                 "--path-id primary_wifi "
                 f"--telemetry-file {primary_telemetry_container} "
                 "--telemetry-latency-ms 58 --telemetry-jitter-ms 22 "
                 "--telemetry-loss 0.18 --telemetry-nack-rate 0.16 "
                 "--telemetry-deadline-miss-ratio 0.24 --telemetry-capacity-bytes 200000 "
-                "--expected-frames 3 --expected-ack-nack-frames 3 "
+                # The subscriber's read loop exits as soon as the original
+                # 3-item payload set ("one,two,three") is complete, so it
+                # never acks the later redundant-plan-triggering sends --
+                # ack_nack_frames caps at ~3 regardless of data frame count.
+                "--expected-frames 6 --expected-ack-nack-frames 3 "
                 "--expected-route-advertisements 1 --expected-graph-advertisements 2 "
-                "--timeout-ms 10000"
+                "--timeout-ms 17000"
             ),
         )
         start_container(
@@ -132,17 +153,19 @@ def run_probe(*, root: Path, image: str, topic: str) -> dict[str, Any]:
             image=image,
             name=backup_router_name,
             network=network,
+            ip_address=backup_router_ip,
             command=(
                 f"source /opt/ros/jazzy/setup.bash && source {install_base}/setup.bash && "
                 f"{router_binary} --bind 0.0.0.0:48411 "
+                f"--graph-peers {graph_peers} --peers {static_peers} "
                 "--path-id backup_5g "
                 f"--telemetry-file {backup_telemetry_container} "
                 "--telemetry-latency-ms 24 --telemetry-jitter-ms 5 "
                 "--telemetry-loss 0.035 --telemetry-nack-rate 0.025 "
                 "--telemetry-deadline-miss-ratio 0.04 --telemetry-capacity-bytes 200000 "
-                "--expected-frames 2 --expected-ack-nack-frames 2 "
+                "--expected-frames 3 --expected-ack-nack-frames 3 "
                 "--expected-route-advertisements 1 --expected-graph-advertisements 2 "
-                "--timeout-ms 10000"
+                "--timeout-ms 17000"
             ),
         )
         time.sleep(0.6)
@@ -151,22 +174,29 @@ def run_probe(*, root: Path, image: str, topic: str) -> dict[str, Any]:
             image=image,
             name=subscriber_name,
             network=network,
+            ip_address=subscriber_ip,
             command=(
                 f"source /opt/ros/jazzy/setup.bash && source {install_base}/setup.bash && "
                 "export RMW_IMPLEMENTATION=rmw_fleetqox_cpp && "
                 "FLEETQOX_RMW_BIND=0.0.0.0:48412 "
-                f"FLEETQOX_RMW_PEERS={primary_router_name}:48410,{backup_router_name}:48411 "
+                f"FLEETQOX_RMW_PEERS={primary_router_ip}:48410,{backup_router_ip}:48411 "
                 f"{endpoint_binary} --mode subscriber --topic {topic} "
                 f"--subscriber-telemetry-file {subscriber_telemetry_container} "
                 "--robot-id robot_0000 --subscriber-deadline-ms 30 "
-                "--timeout-ms 9000"
+                "--timeout-ms 16000"
             ),
         )
         time.sleep(0.8)
+        # See run_rmw_docker_router_reliability_probe.py for why
+        # --pre-publish-wait-ms is needed: any graph advertisement sent
+        # before the publisher's own socket is bound is lost (UDP has no
+        # receiver queue), so this must delay the first publish() rather
+        # than the orchestrator sleeping earlier.
         publisher = run(
             [
                 "docker", "run", "--rm",
                 "--network", network,
+                "--ip", publisher_ip,
                 "-v", f"{root}:/work",
                 "-w", "/work",
                 image,
@@ -174,12 +204,21 @@ def run_probe(*, root: Path, image: str, topic: str) -> dict[str, Any]:
                 (
                     f"source /opt/ros/jazzy/setup.bash && source {install_base}/setup.bash && "
                     "export RMW_IMPLEMENTATION=rmw_fleetqox_cpp && "
-                    "FLEETQOX_RMW_BIND=0.0.0.0:0 "
+                    "FLEETQOX_RMW_BIND=0.0.0.0:48413 "
                     "FLEETQOX_RMW_PEER_POLICY=fleet_plan "
                     f"FLEETQOX_RMW_FLEET_PATH_PLAN_FILE='{plan_file_container}' "
-                    f"FLEETQOX_RMW_PEERS=primary_wifi={primary_router_name}:48410,backup_5g={backup_router_name}:48411 "
+                    f"FLEETQOX_RMW_PEERS=primary_wifi={primary_router_ip}:48410,backup_5g={backup_router_ip}:48411 "
                     f"{endpoint_binary} --mode publisher --topic {topic} "
-                    "--publish-interval-ms 500 --hold-ms 2500 "
+                    "--pre-publish-wait-ms 800 "
+                    # router telemetry (and thus the live plan's convergence
+                    # to redundant primary+backup delivery) only advances
+                    # once per data frame actually forwarded, so simply
+                    # waiting longer between/after sends never helps -- only
+                    # a later send can observe an updated plan. Publish more
+                    # messages so a later send has a chance to land after
+                    # convergence.
+                    "--payload-sequence one,two,three,four,five,six "
+                    "--publish-interval-ms 800 --hold-ms 8000 "
                     "--min-retransmissions 0 --min-ack-nack-received 3"
                 ),
             ],
@@ -394,11 +433,14 @@ def docker_shell(
     ], check=check)
 
 
-def start_container(*, root: Path, image: str, name: str, network: str, command: str) -> str:
+def start_container(
+    *, root: Path, image: str, name: str, network: str, ip_address: str, command: str
+) -> str:
     result = run([
         "docker", "run", "-d",
         "--name", name,
         "--network", network,
+        "--ip", ip_address,
         "-v", f"{root}:/work",
         "-w", "/work",
         image,
