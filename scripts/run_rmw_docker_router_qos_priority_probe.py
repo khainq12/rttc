@@ -22,9 +22,9 @@ def main() -> int:
     parser.add_argument("--image", default=DEFAULT_IMAGE)
     parser.add_argument("--bulk-topic", default=DEFAULT_BULK_TOPIC)
     parser.add_argument("--critical-topic", default=DEFAULT_CRITICAL_TOPIC)
-    parser.add_argument("--bulk-deadline-ms", type=int, default=500)
+    parser.add_argument("--bulk-deadline-ms", type=int, default=4000)
     parser.add_argument("--critical-deadline-ms", type=int, default=20)
-    parser.add_argument("--scheduler-window-ms", type=int, default=800)
+    parser.add_argument("--scheduler-window-ms", type=int, default=5000)
     parser.add_argument("--expected-order", choices=["priority", "fifo"], default="priority")
     parser.add_argument("--summary-json", default="results_rmw_socket/docker_router_qos_priority_probe_summary.json")
     parser.add_argument("--json", action="store_true")
@@ -111,12 +111,25 @@ def run_probe(
                 (
                     "source /opt/ros/jazzy/setup.bash && "
                     f"source {install_base}/setup.bash && "
+                    # The router only learns a topic's deadline QoS (used to
+                    # sort queued frames by absolute deadline) from that
+                    # publisher's graph advertisement, sent at
+                    # rmw_create_publisher() time. --pre-publish-ms delays
+                    # the actual publish() until after that advertisement
+                    # has had time to reach and be processed by the router,
+                    # so the scheduler can prioritize correctly instead of
+                    # falling back to arrival (FIFO) order. bulk_deadline_ms
+                    # defaults well above the ~200-500ms of inherent
+                    # inter-process overhead between these two sequential
+                    # publisher invocations, so that overhead can't make
+                    # bulk's *absolute* deadline (publish time + budget)
+                    # earlier than critical's and invert the priority order.
                     f"FLEETQOX_RMW_BIND=0.0.0.0:0 FLEETQOX_RMW_PEERS={router_name}:48330 "
                     f"{endpoint_binary} --mode publisher --topic {bulk_topic} --payload bulk "
-                    f"--deadline-ms {bulk_deadline_ms} && "
+                    f"--deadline-ms {bulk_deadline_ms} --pre-publish-ms 150 && "
                     f"FLEETQOX_RMW_BIND=0.0.0.0:0 FLEETQOX_RMW_PEERS={router_name}:48330 "
                     f"{endpoint_binary} --mode publisher --topic {critical_topic} --payload critical "
-                    f"--deadline-ms {critical_deadline_ms}"
+                    f"--deadline-ms {critical_deadline_ms} --pre-publish-ms 150"
                 ),
             ],
         )
