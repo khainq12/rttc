@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -557,6 +558,24 @@ def run_probe(
             "--cmake-args -DCMAKE_BUILD_TYPE=Release"
         )
         run(["docker", "network", "create", network])
+        subnet_result = run(
+            ["docker", "network", "inspect", "-f", "{{(index .IPAM.Config 0).Subnet}}", network]
+        )
+        subnet = ipaddress.ip_network(subnet_result.stdout.strip(), strict=False)
+        router_ip = str(subnet.network_address + 10)
+        mixed_subscriber_ips = [
+            str(subnet.network_address + 20 + index) for index in range(len(mixed_flows))
+        ]
+        mixed_publisher_ips = [
+            str(subnet.network_address + 20 + len(mixed_flows) + index)
+            for index in range(len(mixed_flows))
+        ]
+        mixed_publisher_ports = [48600 + index for index in range(len(mixed_flows))]
+        mixed_graph_peers = ",".join(
+            [f"{ip}:{48500 + index}" for index, ip in enumerate(mixed_subscriber_ips)]
+            + [f"{ip}:{port}" for ip, port in zip(mixed_publisher_ips, mixed_publisher_ports)]
+        )
+        graph_peers_args = f"--graph-peers {mixed_graph_peers} " if mixed_graph_peers else ""
 
         mixed_expected_frames = len(mixed_flows) * 4
         mixed_expected_ack_nack = len(mixed_flows) * 3
@@ -592,6 +611,7 @@ def run_probe(
             "docker", "run", "-d",
             "--name", router_name,
             "--network", network,
+            "--ip", router_ip,
             *router_extra_args,
             "--entrypoint", "bash",
             "-v", f"{root}:/work",
@@ -603,6 +623,7 @@ def run_probe(
             f"{netem_command}"
             f"{install_base}/rmw_fleetqox_cpp/lib/rmw_fleetqox_cpp/fleetrmw_udp_router_probe "
             "--bind 0.0.0.0:48400 "
+            f"{graph_peers_args}"
             f"--expected-frames {total_expected_data_frames} "
             "--expected-service-frames 10 "
             f"--expected-ack-nack-frames {mixed_expected_ack_nack} "
@@ -619,7 +640,7 @@ def run_probe(
             "--timeout-ms 25000",
         ])
         router_container = router.stdout.strip()
-        time.sleep(0.4)
+        time.sleep(2.0)
         netem_qdisc = (
             run(
                 ["docker", "exec", router_name, "tc", "qdisc", "show", "dev", "eth0"],
@@ -646,6 +667,7 @@ def run_probe(
                 "docker", "run", "-d",
                 "--name", name,
                 "--network", network,
+                "--ip", mixed_subscriber_ips[index],
                 "--entrypoint", "bash",
                 "-v", f"{root}:/work",
                 "-w", "/work",
@@ -656,7 +678,7 @@ def run_probe(
                     "export RMW_IMPLEMENTATION=rmw_fleetqox_cpp && "
                     f"FLEETQOX_RMW_ROBOT_ID={shlex.quote(flow['robot_id'])} "
                     f"FLEETQOX_RMW_BIND=0.0.0.0:{48500 + index} "
-                    f"FLEETQOX_RMW_PEERS={router_name}:48400 "
+                    f"FLEETQOX_RMW_PEERS={router_ip}:48400 "
                     f"{endpoint_binary} --mode subscriber "
                     f"--topic {shlex.quote(flow['topic'])} --timeout-ms 18000 "
                     f"--deadline-ms {flow['deadline_ms']} --min-ack-nack-sent 3"
@@ -664,11 +686,17 @@ def run_probe(
             ])
         if mixed_flows:
             time.sleep(0.8)
-        for name, flow in zip(mixed_publisher_names, mixed_flows):
+        # See run_rmw_docker_router_reliability_probe.py for why
+        # --pre-publish-wait-ms is needed: any graph advertisement sent
+        # before a publisher's own socket is bound is lost (UDP has no
+        # receiver queue), so this must delay each publisher's first
+        # publish() rather than the orchestrator sleeping earlier.
+        for index, (name, flow) in enumerate(zip(mixed_publisher_names, mixed_flows)):
             run([
                 "docker", "run", "-d",
                 "--name", name,
                 "--network", network,
+                "--ip", mixed_publisher_ips[index],
                 "--entrypoint", "bash",
                 "-v", f"{root}:/work",
                 "-w", "/work",
@@ -678,11 +706,12 @@ def run_probe(
                     f"source /opt/ros/jazzy/setup.bash && source {install_base}/setup.bash && "
                     "export RMW_IMPLEMENTATION=rmw_fleetqox_cpp && "
                     f"FLEETQOX_RMW_ROBOT_ID={shlex.quote(flow['robot_id'])} "
-                    "FLEETQOX_RMW_BIND=0.0.0.0:0 "
-                    f"FLEETQOX_RMW_PEERS={router_name}:48400 "
+                    f"FLEETQOX_RMW_BIND=0.0.0.0:{mixed_publisher_ports[index]} "
+                    f"FLEETQOX_RMW_PEERS={router_ip}:48400 "
                     f"{endpoint_binary} --mode publisher "
                     f"--topic {shlex.quote(flow['topic'])} --hold-ms 14000 "
                     f"--deadline-ms {flow['deadline_ms']} "
+                    "--pre-publish-wait-ms 800 "
                     "--min-ack-nack-received 3 --min-retransmissions 1"
                 ),
             ])

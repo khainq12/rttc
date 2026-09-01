@@ -10,18 +10,20 @@ from typing import Any
 try:
     from scripts.run_rmw_docker_router_rclpy_action_probe import (
         DEFAULT_ACTION,
-        DEFAULT_IMAGE,
         run_probe,
     )
 except ModuleNotFoundError:
     from run_rmw_docker_router_rclpy_action_probe import (
         DEFAULT_ACTION,
-        DEFAULT_IMAGE,
         run_probe,
     )
 
 
 SCHEMA_VERSION = "fleetrmw.rmw_router_mixed_action_control_state_probe.v1"
+# This probe requires --netem-profile support (default "roaming"), which
+# needs the `tc` binary. The base router_rclpy_action_probe's DEFAULT_IMAGE
+# (ros:jazzy-ros-base) doesn't have it, so this probe needs its own default.
+DEFAULT_IMAGE = "localhost/fleetrmw/rmw-netem:jazzy"
 
 
 def main() -> int:
