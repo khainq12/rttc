@@ -22,9 +22,9 @@ def main() -> int:
     parser.add_argument("--image", default=DEFAULT_IMAGE)
     parser.add_argument("--service", default=DEFAULT_SERVICE)
     parser.add_argument("--observer-bind", default="127.0.0.1:48280")
-    parser.add_argument("--spin-time", type=float, default=2.0)
+    parser.add_argument("--spin-time", type=float, default=3.0)
     parser.add_argument("--startup-delay", type=float, default=0.4)
-    parser.add_argument("--hold-ms", type=int, default=5500)
+    parser.add_argument("--hold-ms", type=int, default=15000)
     parser.add_argument(
         "--summary-json",
         default="results_rmw_socket/docker_ros2_service_graph_probe_summary.json",
