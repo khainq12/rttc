@@ -31,7 +31,7 @@ from scripts.fleetqox_public_quic_backend_delay_proxy import (
 SCHEMA_VERSION = "fleetrmw.docker_ngtcp2_public_async_backend.v1"
 DEFAULT_SERVER_IMAGE = "localhost/fleetrmw/ngtcp2-public-mtls:0.12.1"
 DEFAULT_BASE_IMAGE = "localhost/fleetrmw/rmw-netem:jazzy"
-DELAY_MS = 1500
+DELAY_MS = 6000
 
 
 def run(

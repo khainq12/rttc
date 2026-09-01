@@ -203,7 +203,7 @@ index d9a054c..49c60ef 100644
 +  if (fd == -1) {
 +    return std::nullopt;
 +  }
-+  timeval timeout{3, 0};
++  timeval timeout{12, 0};
 +  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 +  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 +  sockaddr_un address{};
