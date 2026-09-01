@@ -105,7 +105,9 @@ int main()
     status_error(intruder, 403);
   intruder.stop();
 
-  std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+  // Must exceed the gateway's admission epoch_ms (10000) so the fleet quota
+  // has definitely reset before the retry below.
+  std::this_thread::sleep_for(std::chrono::milliseconds(10500));
   const std::string state_1 = frame("/fleetqox/state", "state-publisher", 1);
   const bool epoch_replenishment_admitted = fleet_quota_rejected &&
     state.send(state_1) && receive_exact(&state, state_1);

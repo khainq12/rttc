@@ -87,7 +87,7 @@ def service_ok(row: dict[str, Any]) -> bool:
         }
         and admission.get("rule_count") == 3
         and admission.get("max_accepted_frames") == 3
-        and admission.get("epoch_ms") == 1000
+        and admission.get("epoch_ms") == 10000
         and admission.get("epoch_reset_count", 0) >= 1
         and transport.get("connections_created") == 5
         and transport.get("h3_sessions_negotiated") == 5
@@ -275,7 +275,7 @@ def run_probe(
                 "schema_version": "fleetrmw.quic_gateway_admission_policy.v1",
                 "default_action": "deny",
                 "max_accepted_frames": 3,
-                "epoch_ms": 1000,
+                "epoch_ms": 10000,
                 "rules": [
                     {
                         "domain_id": 42,
