@@ -110,11 +110,9 @@ import json
 import os
 import select
 import socket
-import sys
 import time
 
 
-publisher = (sys.argv[1], 49812)
 ports = (49821, 49822, 49823)
 sockets = {}
 for port in ports:
@@ -125,6 +123,25 @@ for port in ports:
     sockets[port] = sock
 with open(os.environ["FLEETQOX_PROBE_READY_FILE"], "w", encoding="utf-8") as stream:
     stream.write("ready\n")
+
+# The publisher container does not exist yet when this script starts (the
+# injector is started first so it can begin listening before any fragments
+# are sent), so its hostname is not yet resolvable via Docker's embedded
+# DNS and a direct getaddrinfo()-based sendto() to it intermittently fails
+# with "Name or service not known". The orchestrator resolves the
+# publisher's real IP via `docker inspect` once that container exists and
+# writes it to this file on the shared /work bind mount instead.
+addr_file = os.environ["FLEETQOX_PUBLISHER_ADDR_FILE"]
+publisher_ip = None
+addr_deadline = time.monotonic() + 8.0
+while time.monotonic() < addr_deadline:
+    if os.path.exists(addr_file):
+        with open(addr_file, "r", encoding="utf-8") as stream:
+            publisher_ip = stream.read().strip()
+        if publisher_ip:
+            break
+    time.sleep(0.05)
+publisher = (publisher_ip, 49812)
 
 prefix = "FLEETQOX_REPAIR_FRAGMENT_V1|"
 seen = {49821: {}, 49822: {}}
@@ -249,6 +266,7 @@ def run_probe(*, root: Path, image: str) -> dict[str, Any]:
     work_dir = root / f".tmp_fleetrmw_multireader_repair_{suffix}"
     publisher_script = work_dir / "publisher.py"
     injector_script = work_dir / "injector.py"
+    publisher_addr_path = work_dir / "publisher_addr.txt"
     ready_path = "/tmp/fleetrmw_multireader_repair_ready"
     publisher_returncode = injector_returncode = -1
     publisher_result: dict[str, Any] | None = None
@@ -278,18 +296,29 @@ def run_probe(*, root: Path, image: str) -> dict[str, Any]:
             "-lc",
             (
                 f"export FLEETQOX_PROBE_READY_FILE={ready_path} && "
-                f"python3 /work/{injector_script.relative_to(root)} "
-                f"{publisher_name}"
+                f"export FLEETQOX_PUBLISHER_ADDR_FILE="
+                f"/work/{publisher_addr_path.relative_to(root)} && "
+                f"python3 /work/{injector_script.relative_to(root)}"
             ),
         ])
         wait_for_container_path(injector_name, ready_path, timeout_s=12.0)
+        # FLEETQOX_RMW_PEERS is parsed as a literal IP:port by the RMW (it
+        # does not resolve hostnames), so the injector container's Docker
+        # network hostname can't be used directly here even though the
+        # injector's own raw socket usage of that hostname works fine
+        # (Python's socket module resolves it via getaddrinfo).
+        injector_ip = run([
+            "docker", "inspect", "-f",
+            "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+            injector_name,
+        ]).stdout.strip()
         publisher_command = (
             "source /opt/ros/jazzy/setup.bash && "
             f"source /work/{SERIALIZED_RELAY_INSTALL}/setup.bash && "
             "export RMW_IMPLEMENTATION=rmw_fleetqox_cpp && "
             "export FLEETQOX_RMW_BIND=0.0.0.0:49812 && "
-            f"export FLEETQOX_RMW_PEERS={injector_name}:49821,"
-            f"{injector_name}:49822 && "
+            f"export FLEETQOX_RMW_PEERS={injector_ip}:49821,"
+            f"{injector_ip}:49822 && "
             "export FLEETQOX_RMW_LOSS_RESILIENT_FRAGMENT_CHUNK_BYTES=1024 && "
             "export FLEETQOX_RMW_FRAGMENT_NACK_MAX_REQUESTS=1 && "
             "export FLEETQOX_RMW_FRAGMENT_NACK_MAX_INDEXES_PER_REQUEST=8 && "
@@ -317,6 +346,12 @@ def run_probe(*, root: Path, image: str) -> dict[str, Any]:
             "-lc",
             publisher_command,
         ])
+        publisher_ip = run([
+            "docker", "inspect", "-f",
+            "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+            publisher_name,
+        ]).stdout.strip()
+        publisher_addr_path.write_text(publisher_ip, encoding="utf-8")
         injector_returncode = int(
             run(["docker", "wait", injector_name]).stdout.strip()
         )
