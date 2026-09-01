@@ -1018,7 +1018,7 @@ def run_probe(
             network=network,
             command=backup_router_command,
         )
-        time.sleep(0.6)
+        time.sleep(2.0)
         primary_qdisc = qdisc(primary_name)
         backup_qdisc = qdisc(backup_name)
 
