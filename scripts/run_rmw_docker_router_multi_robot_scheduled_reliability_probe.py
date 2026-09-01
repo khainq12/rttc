@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -145,6 +146,19 @@ def run_probe(
 
     try:
         run(["docker", "network", "create", network])
+        subnet_result = run(
+            ["docker", "network", "inspect", "-f", "{{(index .IPAM.Config 0).Subnet}}", network]
+        )
+        subnet = ipaddress.ip_network(subnet_result.stdout.strip(), strict=False)
+        router_ip = str(subnet.network_address + 10)
+        subscriber_ips = [
+            str(subnet.network_address + 11 + index) for index in range(robot_count)
+        ]
+        publisher_ips = [
+            str(subnet.network_address + 11 + robot_count + index)
+            for index in range(robot_count)
+        ]
+        publisher_ports = [49000 + index for index in range(robot_count)]
         docker_shell(
             root,
             image,
@@ -162,15 +176,21 @@ def run_probe(
             f"loss {netem_config['loss_percent']:g}% "
             f"rate {netem_config['rate_mbit']:g}mbit && "
         )
+        graph_peers = ",".join(
+            [f"{ip}:{48900 + index}" for index, ip in enumerate(subscriber_ips)]
+            + [f"{ip}:{port}" for ip, port in zip(publisher_ips, publisher_ports)]
+        )
         start_container(
             root=root,
             image=image,
             name=router_name,
             network=network,
+            ip_address=router_ip,
             command=(
                 f"source /opt/ros/jazzy/setup.bash && source {install_base}/setup.bash && "
                 f"{netem_command}"
                 f"{router_binary} --bind 0.0.0.0:{router_port} "
+                f"--graph-peers {graph_peers} "
                 f"--expected-frames {expected_frames} "
                 f"--expected-ack-nack-frames {expected_ack_nack_frames} "
                 f"--expected-route-advertisements {robot_count} "
@@ -184,7 +204,7 @@ def run_probe(
             ),
             extra_args=("--cap-add", "NET_ADMIN"),
         )
-        time.sleep(0.5)
+        time.sleep(2.0)
         netem_qdisc = run(
             ["docker", "exec", router_name, "tc", "qdisc", "show", "dev", "eth0"],
             check=False,
@@ -198,12 +218,13 @@ def run_probe(
                 image=image,
                 name=subscriber_name,
                 network=network,
+                ip_address=subscriber_ips[index],
                 command=(
                     f"source /opt/ros/jazzy/setup.bash && source {install_base}/setup.bash && "
                     "export RMW_IMPLEMENTATION=rmw_fleetqox_cpp && "
                     f"FLEETQOX_RMW_ROBOT_ID={shlex.quote(robot_id)} "
                     f"FLEETQOX_RMW_BIND=0.0.0.0:{48900 + index} "
-                    f"FLEETQOX_RMW_PEERS={router_name}:{router_port} "
+                    f"FLEETQOX_RMW_PEERS={router_ip}:{router_port} "
                     f"{endpoint_binary} --mode subscriber "
                     f"--topic {shlex.quote(topic)} --timeout-ms 13000 "
                     "--min-ack-nack-sent 3"
@@ -211,24 +232,29 @@ def run_probe(
             )
         time.sleep(1.0)
 
-        for publisher_name, topic, robot_id in zip(
-            publisher_names,
-            topics,
-            robot_ids,
+        # See run_rmw_docker_router_reliability_probe.py for why
+        # --pre-publish-wait-ms is needed: any graph advertisement sent
+        # before a publisher's own socket is bound is lost (UDP has no
+        # receiver queue), so this must delay each publisher's first
+        # publish() rather than the orchestrator sleeping earlier.
+        for index, (publisher_name, topic, robot_id) in enumerate(
+            zip(publisher_names, topics, robot_ids)
         ):
             start_container(
                 root=root,
                 image=image,
                 name=publisher_name,
                 network=network,
+                ip_address=publisher_ips[index],
                 command=(
                     f"source /opt/ros/jazzy/setup.bash && source {install_base}/setup.bash && "
                     "export RMW_IMPLEMENTATION=rmw_fleetqox_cpp && "
                     f"FLEETQOX_RMW_ROBOT_ID={shlex.quote(robot_id)} "
-                    "FLEETQOX_RMW_BIND=0.0.0.0:0 "
-                    f"FLEETQOX_RMW_PEERS={router_name}:{router_port} "
+                    f"FLEETQOX_RMW_BIND=0.0.0.0:{publisher_ports[index]} "
+                    f"FLEETQOX_RMW_PEERS={router_ip}:{router_port} "
                     f"{endpoint_binary} --mode publisher "
                     f"--topic {shlex.quote(topic)} --hold-ms 9000 "
+                    "--pre-publish-wait-ms 800 "
                     "--min-ack-nack-received 3 --min-retransmissions 1"
                 ),
             )
