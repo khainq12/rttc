@@ -157,7 +157,7 @@ def run_probe(
                 expected_ack_nack_forwarded=3,
             ),
         )
-        time.sleep(0.6)
+        time.sleep(2.0)
         primary_qdisc = qdisc(primary_name)
         backup_qdisc = qdisc(backup_name)
         start_container(
