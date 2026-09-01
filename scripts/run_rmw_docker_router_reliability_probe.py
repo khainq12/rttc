@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -53,6 +54,13 @@ def run_probe(*, root: Path, image: str, topic: str) -> dict[str, Any]:
 
     try:
         run(["docker", "network", "create", network])
+        subnet_result = run(
+            ["docker", "network", "inspect", "-f", "{{(index .IPAM.Config 0).Subnet}}", network]
+        )
+        subnet = ipaddress.ip_network(subnet_result.stdout.strip(), strict=False)
+        router_ip = str(subnet.network_address + 10)
+        subscriber_ip = str(subnet.network_address + 11)
+        publisher_ip = str(subnet.network_address + 12)
         docker_shell(
             root,
             image,
@@ -69,9 +77,11 @@ def run_probe(*, root: Path, image: str, topic: str) -> dict[str, Any]:
             image=image,
             name=router_name,
             network=network,
+            ip_address=router_ip,
             command=(
                 f"source /opt/ros/jazzy/setup.bash && source {install_base}/setup.bash && "
                 f"{router_binary} --bind 0.0.0.0:48340 "
+                f"--graph-peers {subscriber_ip}:48341,{publisher_ip}:48342 "
                 "--expected-frames 4 --expected-ack-nack-frames 3 "
                 "--expected-route-advertisements 1 --expected-graph-advertisements 2 "
                 "--drop-source-sequences 2 --timeout-ms 9000"
@@ -83,18 +93,27 @@ def run_probe(*, root: Path, image: str, topic: str) -> dict[str, Any]:
             image=image,
             name=subscriber_name,
             network=network,
+            ip_address=subscriber_ip,
             command=(
                 f"source /opt/ros/jazzy/setup.bash && source {install_base}/setup.bash && "
                 "export RMW_IMPLEMENTATION=rmw_fleetqox_cpp && "
-                f"FLEETQOX_RMW_BIND=0.0.0.0:48341 FLEETQOX_RMW_PEERS={router_name}:48340 "
+                f"FLEETQOX_RMW_BIND=0.0.0.0:48341 FLEETQOX_RMW_PEERS={router_ip}:48340 "
                 f"{endpoint_binary} --mode subscriber --topic {topic} --timeout-ms 8000"
             ),
         )
         time.sleep(0.8)
+        # The subscriber re-advertises itself on the graph every ~500ms
+        # (FLEETQOX_RMW_GRAPH_RENEW_INTERVAL_MS), but any advertisement sent
+        # before the publisher's own socket is bound is lost (UDP has no
+        # receiver queue) -- so waiting longer *before* starting the
+        # publisher doesn't help. --pre-publish-wait-ms delays the first
+        # real publish() until *after* rmw_create_publisher() has bound the
+        # socket, giving the next renewal cycle a chance to actually land.
         publisher = run(
             [
                 "docker", "run", "--rm",
                 "--network", network,
+                "--ip", publisher_ip,
                 "-v", f"{root}:/work",
                 "-w", "/work",
                 image,
@@ -102,8 +121,9 @@ def run_probe(*, root: Path, image: str, topic: str) -> dict[str, Any]:
                 (
                     f"source /opt/ros/jazzy/setup.bash && source {install_base}/setup.bash && "
                     "export RMW_IMPLEMENTATION=rmw_fleetqox_cpp && "
-                    f"FLEETQOX_RMW_BIND=0.0.0.0:0 FLEETQOX_RMW_PEERS={router_name}:48340 "
-                    f"{endpoint_binary} --mode publisher --topic {topic} --hold-ms 5000"
+                    f"FLEETQOX_RMW_BIND=0.0.0.0:48342 FLEETQOX_RMW_PEERS={router_ip}:48340 "
+                    f"{endpoint_binary} --mode publisher --topic {topic} "
+                    "--pre-publish-wait-ms 800 --hold-ms 5000"
                 ),
             ],
         )
@@ -190,11 +210,14 @@ def docker_shell(
     ], check=check)
 
 
-def start_container(*, root: Path, image: str, name: str, network: str, command: str) -> str:
+def start_container(
+    *, root: Path, image: str, name: str, network: str, ip_address: str, command: str
+) -> str:
     result = run([
         "docker", "run", "-d",
         "--name", name,
         "--network", network,
+        "--ip", ip_address,
         "-v", f"{root}:/work",
         "-w", "/work",
         image,
