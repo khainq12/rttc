@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -97,6 +98,13 @@ def run_probe(
 
     try:
         run(["docker", "network", "create", network])
+        subnet_result = run(
+            ["docker", "network", "inspect", "-f", "{{(index .IPAM.Config 0).Subnet}}", network]
+        )
+        subnet = ipaddress.ip_network(subnet_result.stdout.strip(), strict=False)
+        router_ip = str(subnet.network_address + 10)
+        subscriber_ip = str(subnet.network_address + 11)
+        publisher_ip = str(subnet.network_address + 12)
         docker_shell(
             root,
             image,
@@ -127,10 +135,12 @@ def run_probe(
             image=image,
             name=router_name,
             network=network,
+            ip_address=router_ip,
             command=(
                 f"source /opt/ros/jazzy/setup.bash && source {install_base}/setup.bash && "
                 f"{netem_command}"
                 f"{router_binary} --bind 0.0.0.0:48740 "
+                f"--graph-peers {subscriber_ip}:48741,{publisher_ip}:48742 "
                 "--expected-frames 4 --expected-ack-nack-frames 3 "
                 "--expected-route-advertisements 1 --expected-graph-advertisements 2 "
                 "--drop-source-sequences 2 "
@@ -155,18 +165,25 @@ def run_probe(
             image=image,
             name=subscriber_name,
             network=network,
+            ip_address=subscriber_ip,
             command=(
                 f"source /opt/ros/jazzy/setup.bash && source {install_base}/setup.bash && "
                 "export RMW_IMPLEMENTATION=rmw_fleetqox_cpp && "
-                f"FLEETQOX_RMW_BIND=0.0.0.0:48741 FLEETQOX_RMW_PEERS={router_name}:48740 "
+                f"FLEETQOX_RMW_BIND=0.0.0.0:48741 FLEETQOX_RMW_PEERS={router_ip}:48740 "
                 f"{endpoint_binary} --mode subscriber --topic {topic} "
                 "--timeout-ms 10000 --min-ack-nack-sent 3"
             ),
         )
         time.sleep(0.8)
+        # See run_rmw_docker_router_reliability_probe.py for why
+        # --pre-publish-wait-ms is needed: the subscriber's periodic graph
+        # re-advertisement can't reach the publisher until after the
+        # publisher's own socket is bound, so this must delay the first
+        # publish() rather than the orchestrator sleeping earlier.
         publisher = run([
             "docker", "run", "--rm",
             "--network", network,
+            "--ip", publisher_ip,
             "--entrypoint", "bash",
             "-v", f"{root}:/work",
             "-w", "/work",
@@ -175,8 +192,9 @@ def run_probe(
             (
                 f"source /opt/ros/jazzy/setup.bash && source {install_base}/setup.bash && "
                 "export RMW_IMPLEMENTATION=rmw_fleetqox_cpp && "
-                f"FLEETQOX_RMW_BIND=0.0.0.0:0 FLEETQOX_RMW_PEERS={router_name}:48740 "
+                f"FLEETQOX_RMW_BIND=0.0.0.0:48742 FLEETQOX_RMW_PEERS={router_ip}:48740 "
                 f"{endpoint_binary} --mode publisher --topic {topic} "
+                "--pre-publish-wait-ms 800 "
                 "--hold-ms 7000 --min-ack-nack-received 3 --min-retransmissions 1"
             ),
         ])
@@ -305,6 +323,7 @@ def start_container(
     image: str,
     name: str,
     network: str,
+    ip_address: str,
     command: str,
     extra_args: tuple[str, ...] = (),
 ) -> str:
@@ -312,6 +331,7 @@ def start_container(
         "docker", "run", "-d",
         "--name", name,
         "--network", network,
+        "--ip", ip_address,
         *extra_args,
         "--entrypoint", "bash",
         "-v", f"{root}:/work",
