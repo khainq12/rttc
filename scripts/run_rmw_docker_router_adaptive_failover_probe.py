@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -58,6 +59,15 @@ def run_probe(*, root: Path, image: str, topic: str) -> dict[str, Any]:
 
     try:
         run(["docker", "network", "create", network])
+        subnet_result = run(
+            ["docker", "network", "inspect", "-f", "{{(index .IPAM.Config 0).Subnet}}", network]
+        )
+        subnet = ipaddress.ip_network(subnet_result.stdout.strip(), strict=False)
+        primary_router_ip = str(subnet.network_address + 10)
+        backup_router_ip = str(subnet.network_address + 11)
+        subscriber_ip = str(subnet.network_address + 12)
+        publisher_ip = str(subnet.network_address + 13)
+        graph_peers = f"{subscriber_ip}:48372,{publisher_ip}:48373"
         docker_shell(
             root,
             image,
@@ -74,9 +84,11 @@ def run_probe(*, root: Path, image: str, topic: str) -> dict[str, Any]:
             image=image,
             name=primary_router_name,
             network=network,
+            ip_address=primary_router_ip,
             command=(
                 f"source /opt/ros/jazzy/setup.bash && source {install_base}/setup.bash && "
                 f"{router_binary} --bind 0.0.0.0:48370 "
+                f"--graph-peers {graph_peers} "
                 "--expected-frames 3 --expected-ack-nack-frames 2 "
                 "--expected-route-advertisements 1 --expected-graph-advertisements 2 "
                 "--drop-source-sequences 2 --timeout-ms 9000"
@@ -87,9 +99,11 @@ def run_probe(*, root: Path, image: str, topic: str) -> dict[str, Any]:
             image=image,
             name=backup_router_name,
             network=network,
+            ip_address=backup_router_ip,
             command=(
                 f"source /opt/ros/jazzy/setup.bash && source {install_base}/setup.bash && "
                 f"{router_binary} --bind 0.0.0.0:48371 "
+                f"--graph-peers {graph_peers} "
                 "--expected-frames 1 --expected-route-advertisements 1 "
                 "--expected-graph-advertisements 2 --timeout-ms 9000"
             ),
@@ -100,19 +114,26 @@ def run_probe(*, root: Path, image: str, topic: str) -> dict[str, Any]:
             image=image,
             name=subscriber_name,
             network=network,
+            ip_address=subscriber_ip,
             command=(
                 f"source /opt/ros/jazzy/setup.bash && source {install_base}/setup.bash && "
                 "export RMW_IMPLEMENTATION=rmw_fleetqox_cpp && "
                 "FLEETQOX_RMW_BIND=0.0.0.0:48372 "
-                f"FLEETQOX_RMW_PEERS={primary_router_name}:48370,{backup_router_name}:48371 "
+                f"FLEETQOX_RMW_PEERS={primary_router_ip}:48370,{backup_router_ip}:48371 "
                 f"{endpoint_binary} --mode subscriber --topic {topic} --timeout-ms 8000"
             ),
         )
         time.sleep(0.8)
+        # See run_rmw_docker_router_reliability_probe.py for why
+        # --pre-publish-wait-ms is needed: any graph advertisement sent
+        # before the publisher's own socket is bound is lost (UDP has no
+        # receiver queue), so this must delay the first publish() rather
+        # than the orchestrator sleeping earlier.
         publisher = run(
             [
                 "docker", "run", "--rm",
                 "--network", network,
+                "--ip", publisher_ip,
                 "-v", f"{root}:/work",
                 "-w", "/work",
                 image,
@@ -120,10 +141,11 @@ def run_probe(*, root: Path, image: str, topic: str) -> dict[str, Any]:
                 (
                     f"source /opt/ros/jazzy/setup.bash && source {install_base}/setup.bash && "
                     "export RMW_IMPLEMENTATION=rmw_fleetqox_cpp && "
-                    "FLEETQOX_RMW_BIND=0.0.0.0:0 "
+                    "FLEETQOX_RMW_BIND=0.0.0.0:48373 "
                     "FLEETQOX_RMW_PEER_POLICY=adaptive_failover "
-                    f"FLEETQOX_RMW_PEERS={primary_router_name}:48370,{backup_router_name}:48371 "
+                    f"FLEETQOX_RMW_PEERS={primary_router_ip}:48370,{backup_router_ip}:48371 "
                     f"{endpoint_binary} --mode publisher --topic {topic} "
+                    "--pre-publish-wait-ms 800 "
                     "--hold-ms 5500 --min-retransmissions 1 --min-ack-nack-received 2"
                 ),
             ],
@@ -224,11 +246,14 @@ def docker_shell(
     ], check=check)
 
 
-def start_container(*, root: Path, image: str, name: str, network: str, command: str) -> str:
+def start_container(
+    *, root: Path, image: str, name: str, network: str, ip_address: str, command: str
+) -> str:
     result = run([
         "docker", "run", "-d",
         "--name", name,
         "--network", network,
+        "--ip", ip_address,
         "-v", f"{root}:/work",
         "-w", "/work",
         image,
