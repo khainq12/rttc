@@ -632,9 +632,9 @@ class LivePathPlanController:
             robot_states=effective_robot_states,
         )
         self._tick += 1
-        atomic_write_text(self.config.plan_file, plan.path_plan_env + "\n")
+        _write_live_plan_text(self.config.plan_file, plan.path_plan_env + "\n")
         if self.config.repair_plan_file is not None:
-            atomic_write_text(self.config.repair_plan_file, plan.path_plan_env + "\n")
+            _write_live_plan_text(self.config.repair_plan_file, plan.path_plan_env + "\n")
         self._last_plan = plan
         return plan
 
@@ -808,6 +808,22 @@ def atomic_write_text(path: Path, text: str) -> None:
         handle.write(text)
         tmp = Path(handle.name)
     os.replace(tmp, path)
+
+
+def _write_live_plan_text(path: Path, text: str) -> None:
+    # Unlike atomic_write_text, this rewrites the existing inode in place
+    # (open+truncate, no rename-over). A long-running reader process inside
+    # a Docker bind-mounted container can keep seeing pre-rename content
+    # indefinitely on some Docker Desktop virtiofs mounts even though a
+    # freshly opened reader (e.g. `docker exec cat`) sees the new content
+    # immediately -- renaming a new file over the path apparently doesn't
+    # invalidate that reader's cached view of the path, while an in-place
+    # write to the same inode does.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def _mean(values: Sequence[float]) -> float:

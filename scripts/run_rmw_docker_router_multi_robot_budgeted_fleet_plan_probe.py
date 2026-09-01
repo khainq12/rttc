@@ -795,7 +795,15 @@ def run_probe(
     )
     total_source_frames = (
         stopping_config.max_samples_per_robot * 2 + recovery_samples
-        if sequential_qoe_feedback else 3
+        if sequential_qoe_feedback else
+        # Protection/redundancy only becomes visible to the publisher's
+        # next plan-file read *after* the feedback controller has seen
+        # evidence (a missed/dropped sequence) from a prior send -- with
+        # only 3 sends, that evidence never arrives in time for a later
+        # send to observe the converged (redundant) plan. More sends give
+        # a real chance to land after convergence, same fix as
+        # run_rmw_docker_router_live_telemetry_plan_probe.py.
+        6 if feedback_enabled else 3
     )
     startup_budget_ms = 6000 + robot_count * 350
     subscriber_timeout_ms = max(
@@ -808,7 +816,9 @@ def run_probe(
     graph_renew_interval_ms = min(2000, max(500, 500 + max(0, robot_count - 8) * 50))
     payload_sequence = (
         [f"sample-{sequence:04d}" for sequence in range(1, total_source_frames + 1)]
-        if sequential_qoe_feedback else ["one", "two", "three"]
+        if sequential_qoe_feedback else
+        ["one", "two", "three", "four", "five", "six"] if feedback_enabled else
+        ["one", "two", "three"]
     )
     robot_ids = [f"robot_{index:04d}" for index in range(robot_count)]
     repair_candidate_topic_prefix = f"{topic_prefix.rstrip('/')}/repair-candidate"
@@ -929,11 +939,14 @@ def run_probe(
         router_expected_primary_frames = max(1, protected_count)
     else:
         router_expected_backup_frames = (
-            (robot_count - protected_count) + robot_count * 2
+            # unprotected robots stay on backup_5g the whole run; protected
+            # robots join backup_5g only after the single feedback actuation
+            # (all sends but the first).
+            robot_count * total_source_frames - protected_count
             if qoe_feedback else (robot_count * 2 if qoe_migration else robot_count * 3)
         )
         router_expected_primary_frames = (
-            protected_count * 3
+            protected_count * total_source_frames
             if qoe_feedback else
             robot_count * 2
             if qoe_migration else
@@ -1441,14 +1454,15 @@ def run_probe(
                     expected_selected_path_count += final_sequential_samples
             else:
                 expected_redundant_frames = (
-                    2 if qoe_feedback and len(selected_paths) > 1 else
+                    (total_source_frames - 1) if qoe_feedback and len(selected_paths) > 1 else
                     1 if qoe_migration else
                     3 if len(selected_paths) > 1 else
                     (1 if epoch_transition else 0)
                 )
                 expected_selected_path_count = (
-                    5 if qoe_feedback and len(selected_paths) > 1 else
-                    3 if qoe_feedback else
+                    (1 + (total_source_frames - 1) * 2)
+                    if qoe_feedback and len(selected_paths) > 1 else
+                    total_source_frames if qoe_feedback else
                     4 if qoe_migration else
                     6 if epoch_transition and len(selected_paths) > 1 else
                     4 if epoch_transition else
