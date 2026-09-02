@@ -13,7 +13,7 @@ from typing import Any
 
 
 SCHEMA_VERSION = "fleetrmw.rmw_router_multi_robot_qos_matrix.v1"
-DEFAULT_IMAGE = "ros:jazzy-ros-base"
+DEFAULT_IMAGE = "localhost/fleetrmw/rmw-netem:jazzy"
 NETEM_PROFILES: dict[str, dict[str, float]] = {
     "none": {"delay_ms": 0.0, "jitter_ms": 0.0, "rate_mbit": 0.0, "loss_percent": 0.0},
     "wifi": {"delay_ms": 25.0, "jitter_ms": 8.0, "rate_mbit": 20.0, "loss_percent": 0.0},
