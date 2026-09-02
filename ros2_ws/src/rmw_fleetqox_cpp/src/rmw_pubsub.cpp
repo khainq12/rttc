@@ -9894,7 +9894,15 @@ rmw_ret_t publish_payload(FleetQoxPublisherData * data, const std::vector<std::u
       frame.source_timestamp_ns,
       0,
       reliable,
-      !reliable || matched_subscription_ids.empty()};
+      // Not marking this acknowledged=true just because no subscriber is
+      // matched *yet*: graph advertisement relay can lag publish by a
+      // nontrivial amount (more so at higher peer counts), and marking the
+      // entry acknowledged makes it eviction-eligible on this publisher's
+      // very next send -- long before a delayed subscriber match or a
+      // NACK-triggered repair retransmission could ever use it. A truly
+      // subscriber-less reliable publisher still bounds fine via the
+      // existing history_limit eviction just below.
+      !reliable};
     retransmit_entry.expected_acknowledgments = matched_subscription_ids.size();
     retransmit_entry.pending_subscriber_ids.insert(
       matched_subscription_ids.begin(), matched_subscription_ids.end());

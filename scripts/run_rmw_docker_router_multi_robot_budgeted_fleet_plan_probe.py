@@ -1119,6 +1119,17 @@ def run_probe(
                     )
                 else:
                     epoch_args += f"--publish-interval-ms {3000 if qoe_migration else 2000} "
+            # A deferred repair-capacity robot's subscriber only ever
+            # legitimately delivers 2 of the 3 sequences (sequence 2 is
+            # permanently dropped and its repair request rejected by
+            # design), matching subscriber_min_ack_nack below -- requiring
+            # the publisher to have received 3 acks here would demand one
+            # more than a deferred robot can ever legitimately produce.
+            min_ack_nack_received = (
+                2
+                if repair_capacity_fault and robot_id in deferred_repair_robot_ids
+                else 3
+            )
             start_container(
                 root=root,
                 image=image,
@@ -1147,7 +1158,8 @@ def run_probe(
                     f"--robot-id {shlex.quote(robot_id)} "
                     f"{epoch_args}"
                     f"--payload-sequence {shlex.quote(','.join(payload_sequence))} "
-                    "--hold-ms 10000 --min-retransmissions 0 --min-ack-nack-received 3 "
+                    "--hold-ms 10000 --min-retransmissions 0 "
+                    f"--min-ack-nack-received {min_ack_nack_received} "
                     f"--deadline-ms {deadline_ms}"
                 ),
             )
