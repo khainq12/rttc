@@ -60,7 +60,7 @@ def main() -> int:
             robot_count=max(args.robot_count, 1),
             control_deadline_ms=max(args.control_deadline_ms, 1),
             state_deadline_ms=max(args.state_deadline_ms, 1),
-            scheduler_window_ms=max(args.scheduler_window_ms, 1),
+            scheduler_window_ms=max(args.scheduler_window_ms, args.robot_count * 1000),
             scheduler_admission_policy="slo_service_epoch",
             scheduler_admission_min_service_ratio=max(
                 args.scheduler_admission_min_service_ratio, 0.0

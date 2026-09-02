@@ -96,7 +96,12 @@ def run_probe(
                 f"source /opt/ros/jazzy/setup.bash && source {install_base}/setup.bash && "
                 f"{router_binary} --bind 0.0.0.0:48330 --peers 127.0.0.1:9 "
                 "--expected-frames 2 --expected-graph-advertisements 2 "
-                f"--scheduler-window-ms {scheduler_window_ms} --timeout-ms 7000"
+                f"--scheduler-window-ms {scheduler_window_ms} "
+                # Without this the router's scheduler_urgent_deadline_ms stays
+                # at its 0 default, so no frame is ever marked urgent and the
+                # "priority" scenario silently behaves exactly like FIFO.
+                f"--scheduler-urgent-deadline-ms {critical_deadline_ms} "
+                "--timeout-ms 7000"
             ),
         )
         time.sleep(0.5)

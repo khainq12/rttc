@@ -52,7 +52,7 @@ def main() -> int:
             robot_count=max(args.robot_count, 1),
             control_deadline_ms=max(args.control_deadline_ms, 1),
             state_deadline_ms=max(args.state_deadline_ms, 1),
-            scheduler_window_ms=max(args.scheduler_window_ms, 1),
+            scheduler_window_ms=max(args.scheduler_window_ms, args.robot_count * 1000),
             control_payload_bytes=max(args.control_payload_bytes, 1),
             state_payload_bytes=max(args.state_payload_bytes, 1),
             netem_profile=profile,

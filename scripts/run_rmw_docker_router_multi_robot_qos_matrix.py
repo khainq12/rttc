@@ -52,7 +52,11 @@ def main() -> int:
         robot_count=max(args.robot_count, 1),
         control_deadline_ms=max(args.control_deadline_ms, 1),
         state_deadline_ms=max(args.state_deadline_ms, 1),
-        scheduler_window_ms=max(args.scheduler_window_ms, 1),
+        # Floor scales with robot_count: starting one publisher container per
+        # robot sequentially can itself take longer than a flat 1000ms window,
+        # which forces the queue's safety-valve flush before every control
+        # frame has even arrived, breaking the priority ordering under test.
+        scheduler_window_ms=max(args.scheduler_window_ms, args.robot_count * 1000),
         scheduler_admission_policy=args.scheduler_admission_policy,
         scheduler_admission_min_service_ratio=max(
             args.scheduler_admission_min_service_ratio, 0.0
@@ -366,9 +370,11 @@ def run_scenario(
                 for flow in flows
                 if flow["kind"] == "control"
             )
+            queued_flow_count = sum(1 for flow in flows if flow["kind"] != "control")
             scheduler_args = (
                 f"--scheduler-window-ms {scheduler_window_ms} "
                 f"--scheduler-urgent-deadline-ms {urgent_deadline_ms} "
+                f"--scheduler-expected-frames {queued_flow_count} "
                 "--scheduler-topic-prefix /fleetqox/ "
             )
             if scheduler_admission_policy != "always":
@@ -418,14 +424,21 @@ def run_scenario(
             ),
             extra_args=router_extra_args,
         )
-        time.sleep(0.2)
-        netem_qdisc = (
-            run(
-                ["docker", "exec", router_name, "tc", "qdisc", "show", "dev", "eth0"],
-                check=False,
-            ).stdout.strip()
-            if netem_profile != "none" else "disabled"
-        )
+        netem_qdisc = "disabled"
+        if netem_profile != "none":
+            # A fixed 0.2s sleep raced "source setup.bash && tc qdisc
+            # replace" inside the container's startup command -- the query
+            # would often observe the pre-netem default "noqueue" qdisc.
+            # Poll until the qdisc actually shows netem (or give up).
+            netem_qdisc = ""
+            for _ in range(20):
+                netem_qdisc = run(
+                    ["docker", "exec", router_name, "tc", "qdisc", "show", "dev", "eth0"],
+                    check=False,
+                ).stdout.strip()
+                if "netem" in netem_qdisc:
+                    break
+                time.sleep(0.25)
         time.sleep(0.4)
         for index, flow in enumerate(flows):
             start_container(

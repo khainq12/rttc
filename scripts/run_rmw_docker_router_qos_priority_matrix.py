@@ -44,7 +44,12 @@ def run_matrix(*, root: Path, image: str) -> dict[str, Any]:
         },
         {
             "name": "deadline_scheduler",
-            "scheduler_window_ms": 800,
+            # 800ms was tighter than the 5000ms default that
+            # router_qos_priority_probe.py itself uses reliably elsewhere --
+            # too tight a margin for the bulk/critical containers to both
+            # start and publish before the queue's window-timeout flush
+            # fires, breaking priority ordering under test.
+            "scheduler_window_ms": 5000,
             "expected_order": "priority",
         },
     ]
