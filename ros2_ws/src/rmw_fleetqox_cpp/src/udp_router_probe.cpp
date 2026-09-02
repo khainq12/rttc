@@ -1692,6 +1692,22 @@ int main(int argc, char ** argv)
       for (const ActionRoute & route : action_route_table) {
         append_unique_peer(&graph_targets, route.address);
       }
+      // Plain pub/sub clients are never in peer_addresses/graph_peer_addresses
+      // (those are for static router-to-router/graph-peer config, and a
+      // publisher's ephemeral bind port can't be known ahead of time
+      // anyway). Without this, a subscription's graph advertisement never
+      // reaches the publisher unless it happens to also be a service/action
+      // endpoint, so the publisher's reliable-retransmit ledger never learns
+      // of a matched subscriber and treats every send as already
+      // acknowledged. route_table/publisher_route_table are already learned
+      // dynamically from route advertisements and data frames, so reuse
+      // them here the same way service/action routes are reused above.
+      for (const TopicRoute & route : route_table) {
+        append_unique_peer(&graph_targets, route.address);
+      }
+      for (const PublisherRoute & route : publisher_route_table) {
+        append_unique_peer(&graph_targets, route.address);
+      }
       for (const sockaddr_in & peer : graph_targets) {
         if (endpoints_match(peer, source_address)) {
           continue;
