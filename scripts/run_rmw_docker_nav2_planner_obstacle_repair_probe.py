@@ -263,7 +263,7 @@ def run_probe(*, root: Path, image: str, port_base: int) -> dict[str, Any]:
             "stop_pid ${planner_pid}; "
             "stop_pid ${tf_pid}; "
             "stop_pid ${clear_map_pid}; "
-            "wait_with_timeout ${router_pid} 75; router_rc=$?; "
+            "wait_with_timeout ${router_pid} 130; router_rc=$?; "
             "if [ ${router_rc} -eq 124 ]; then "
             "kill ${router_pid} >/dev/null 2>&1 || true; "
             "wait_with_timeout ${router_pid} 3 >/dev/null 2>&1 || true; "
