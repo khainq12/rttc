@@ -185,7 +185,17 @@ def run_probe(*, root: Path, image: str, port_base: int) -> dict[str, Any]:
             f"source /work/{install_base.relative_to(root)}/setup.bash; "
             f"{router_exe} --bind 127.0.0.1:{router_port} "
             f"--expected-frames 0 --expected-service-frames {expected_service_frames} "
-            "--expected-graph-advertisements 4 --timeout-ms 30000 "
+            "--expected-graph-advertisements 4 --timeout-ms 60000 "
+            # Default post-satisfaction dwell is 0ms: the router exits the
+            # instant it has seen >= expected-service-frames, counting
+            # duplicate/retried request frames the same as originals. With
+            # FLEETQOX_RMW_SERVICE_REQUEST_REPEATS raised well above the
+            # default, get_after's own request retries alone can satisfy
+            # this threshold before controller_server has even generated a
+            # response, let alone before the router relays it -- the router
+            # exits (taking the whole relay path down) mid-exchange. Give it
+            # real dwell time so a late response still gets forwarded.
+            "--post-satisfaction-ms 20000 "
             f"> /work/{tmp.relative_to(root)}/router.log 2>&1 & "
             "router_pid=$!; "
             "sleep 0.5; "
@@ -220,20 +230,38 @@ def run_probe(*, root: Path, image: str, port_base: int) -> dict[str, Any]:
             f"timeout 8 ros2 lifecycle get /planner_server "
             f"> /work/{tmp.relative_to(root)}/planner_get_after.log 2>&1; "
             "planner_get_after_rc=$?; "
+            # controller_server's local_costmap (static/obstacle/inflation
+            # layers, topic subscriptions, TF buffering) keeps its executor
+            # busy well after configure returns, so a fresh CLI client's
+            # get_state request can arrive while the server hasn't gotten
+            # back around to servicing new requests yet. The default
+            # service-request retry budget (5 retries x 100ms = ~500ms) is
+            # nowhere near enough headroom for that -- give these
+            # controller_server lifecycle queries a much longer budget
+            # (40 x 250ms = 10s) instead of raising the outer CLI timeout,
+            # which doesn't help once the retry budget itself is exhausted.
+            "FLEETQOX_RMW_SERVICE_REQUEST_REPEATS=40 "
+            "FLEETQOX_RMW_SERVICE_REQUEST_REPEAT_INTERVAL_MS=250 "
             f"FLEETQOX_RMW_BIND=127.0.0.1:{cli_port + 3} "
             f"FLEETQOX_RMW_PEERS=127.0.0.1:{router_port} "
-            f"timeout 8 ros2 lifecycle get /controller_server "
+            f"timeout 20 ros2 lifecycle get /controller_server "
             f"> /work/{tmp.relative_to(root)}/controller_get_before.log 2>&1; "
             "controller_get_before_rc=$?; "
             f"FLEETQOX_RMW_BIND=127.0.0.1:{cli_port + 4} "
             f"FLEETQOX_RMW_PEERS=127.0.0.1:{router_port} "
-            f"timeout 14 ros2 lifecycle set /controller_server configure "
+            # controller_server owns a local_costmap with several plugins
+            # (static/obstacle layers, topic subscriptions) that take
+            # meaningfully longer to settle than the planner's configure --
+            # give it more room than the planner's 14s/8s timeouts.
+            f"timeout 30 ros2 lifecycle set /controller_server configure "
             f"> /work/{tmp.relative_to(root)}/controller_configure.log 2>&1; "
             "controller_configure_rc=$?; "
-            "sleep 0.5; "
+            "sleep 2; "
+            "FLEETQOX_RMW_SERVICE_REQUEST_REPEATS=60 "
+            "FLEETQOX_RMW_SERVICE_REQUEST_REPEAT_INTERVAL_MS=200 "
             f"FLEETQOX_RMW_BIND=127.0.0.1:{cli_port + 5} "
             f"FLEETQOX_RMW_PEERS=127.0.0.1:{router_port} "
-            f"timeout 8 ros2 lifecycle get /controller_server "
+            f"timeout 20 ros2 lifecycle get /controller_server "
             f"> /work/{tmp.relative_to(root)}/controller_get_after.log 2>&1; "
             "controller_get_after_rc=$?; "
             "sleep 0.5; "
@@ -330,8 +358,11 @@ def run_probe(*, root: Path, image: str, port_base: int) -> dict[str, Any]:
             "router_log_excerpt": router_log[-4000:],
         }
     finally:
-        for path in (tmp, build_base, install_base, log_base):
-            shutil.rmtree(path, ignore_errors=True)
+        if not os.environ.get("FLEETQOX_DEBUG_KEEP_TMP"):
+            for path in (tmp, build_base, install_base, log_base):
+                shutil.rmtree(path, ignore_errors=True)
+        else:
+            print(f"kept tmp dir: {tmp}", file=sys.stderr)
 
 
 def main() -> int:

@@ -1117,12 +1117,12 @@ bool schedule_service_request_repair(
   const std::string & encoded_frame)
 {
   const int retries = parse_nonnegative_int_env(
-    "FLEETQOX_RMW_SERVICE_REQUEST_REPEATS", 5, 5);
+    "FLEETQOX_RMW_SERVICE_REQUEST_REPEATS", 5, 200);
   if (retries <= 0) {
     return true;
   }
   const int interval_ms = parse_nonnegative_int_env(
-    "FLEETQOX_RMW_SERVICE_REQUEST_REPEAT_INTERVAL_MS", 100, 100);
+    "FLEETQOX_RMW_SERVICE_REQUEST_REPEAT_INTERVAL_MS", 100, 5000);
   const size_t pending_limit = service_resource_limit(
     "FLEETQOX_RMW_SERVICE_REQUEST_REPAIR_PENDING_LIMIT", 4096);
   const size_t per_client_pending_limit = service_resource_limit(
