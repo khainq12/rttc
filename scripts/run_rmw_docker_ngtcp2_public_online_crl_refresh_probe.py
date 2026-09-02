@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -319,7 +319,7 @@ def run_iteration(
         "client_qlog_file_count": len(qlog_files),
         "netem_server": "delay 11ms 2ms",
         "netem_client": "delay 9ms 2ms",
-        "captured_at_utc": datetime.now(UTC).isoformat(timespec="seconds"),
+        "captured_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "initial_stderr": "" if ok else initial.stderr,
         "revoked_stderr": "" if ok else revoked.stderr,
         "restored_stderr": "" if ok else restored.stderr,
