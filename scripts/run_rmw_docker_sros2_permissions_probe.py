@@ -16,6 +16,9 @@ if str(ROOT) not in sys.path:
 
 from scripts.run_rmw_docker_allocation_probe import DEFAULT_IMAGE, parse_json_rows  # noqa: E402
 from scripts.run_rmw_docker_security_options_probe import parse_key_value_markers  # noqa: E402
+from scripts.run_rmw_docker_udp_peer_auth_probe import (  # noqa: E402
+    run_probe as run_udp_peer_auth_probe,
+)
 
 
 SCHEMA_VERSION = "fleetrmw.docker_sros2_permissions_probe.v1"
@@ -467,6 +470,18 @@ def run_probe(
         "fleetrmw_sros2_identity_probe || exit $?; "
         "/tmp/fq-sros2-install/rmw_fleetqox_cpp/lib/rmw_fleetqox_cpp/"
         "fleetrmw_sros2_permissions_probe || exit $?; "
+        # Scoped (not exported) to this one invocation: a denied service
+        # request/response never gets acknowledged, so the client-side
+        # reliability layer's default retry budget (5 retries) resends it
+        # several more times, and each retry is independently evaluated
+        # and counted as another "denied" decision by the subscriber side
+        # -- inflating e.g. request_subscribe_denied_delta from 1 to 3+
+        # depending on retry/timing, when this probe's own counters_ok
+        # check expects exactly one decision per logical attempt. Disabling
+        # retries here (only here) makes the per-attempt decision counters
+        # deterministic without affecting the other probes in this loop,
+        # which don't depend on retry behavior for their own assertions.
+        "FLEETQOX_RMW_SERVICE_REQUEST_REPEATS=0 "
         "/tmp/fq-sros2-install/rmw_fleetqox_cpp/lib/rmw_fleetqox_cpp/"
         "fleetrmw_sros2_service_permissions_probe || exit $?; "
         "python3 /work/scripts/sros2_action_permissions_probe.py || exit $?; "
@@ -698,6 +713,27 @@ def run_probe(
         and len(mismatched_identity_enclave_rows) == 1
         and mismatched_identity_enclave_control_ok
     )
+    # sros2_identity_probe/sros2_permissions_probe never authenticate a
+    # remote peer -- they validate the local enclave's own credentials and
+    # the permissions.xml ACL, nothing more. Real UDP peer authentication
+    # (sign/verify against the SROS2 identity CA, including CRL-based
+    # revocation) is a separate, already-implemented and already-passing
+    # mechanism exercised end-to-end by run_rmw_docker_udp_peer_auth_probe.
+    # Run it here and fold its real, computed evidence in rather than
+    # leaving these claims hardcoded to False.
+    try:
+        peer_auth_result = run_udp_peer_auth_probe(root=root, image=image)
+    except Exception as exc:  # noqa: BLE001 - report as unmet evidence, don't crash this probe
+        peer_auth_result = {"status": "failed", "error": str(exc)}
+    peer_auth_ok = peer_auth_result.get("status") == "ok"
+    peer_identity_authentication_claim = bool(
+        peer_auth_ok
+        and peer_auth_result.get("sros2_peer_identity_authentication_claim") is True
+    )
+    certificate_revocation_claim = bool(
+        peer_auth_ok
+        and peer_auth_result.get("certificate_revocation_claim") is True
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "ok" if ok else "failed",
@@ -807,7 +843,11 @@ def run_probe(
         "sros2_identity_enclave_mismatch_fail_closed_claim": (
             mismatched_identity_enclave_control_ok
         ),
-        "sros2_peer_identity_authentication_claim": False,
+        "sros2_peer_identity_authentication_claim": (
+            peer_identity_authentication_claim
+        ),
+        "certificate_revocation_claim": certificate_revocation_claim,
+        "udp_peer_auth_probe": peer_auth_result,
         "governance_uncontrolled_publish_returncode": governance_probe.get(
             "uncontrolled_publish_returncode"
         ),
@@ -888,10 +928,20 @@ def run_probe(
         ),
         "sros2_policy_enforcement_claim": False,
         "governance_xml_enforcement_claim": ok,
+        # Real (not hardcoded) peer authentication + CRL-based revocation
+        # evidence is folded in above via udp_peer_auth_probe. What remains
+        # unimplemented -- and unrelated to peer auth -- is (a) wiring
+        # governance.xml's transport-protection requirement to actually
+        # enable AEAD/peer-auth for the affected topics/domains (today it
+        # only fail-closed denies the operation) and (b) forward secrecy /
+        # session-key establishment, matching the same distinction already
+        # drawn in run_rmw_docker_stress_security_campaign.py.
         "governance_transport_security_claim": False,
         "production_security_hardening_claim": False,
         "security_policy_enforcement_gap_reason": (
-            "peer_auth_transport_revocation_hardening_not_implemented"
+            "forward_secret_key_exchange_and_transport_hardening_not_implemented"
+            if peer_identity_authentication_claim
+            else "peer_auth_transport_revocation_hardening_not_implemented"
         ),
         "probe": probe,
         "runs": rows,
