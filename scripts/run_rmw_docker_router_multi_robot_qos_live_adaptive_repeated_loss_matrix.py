@@ -74,6 +74,12 @@ def main() -> int:
     repetitions = parse_ints(args.repetitions)
     loss_percents = parse_floats(args.loss_percents)
     root = Path(__file__).resolve().parents[1]
+    # A queued (state) frame can be held for the full scheduler window
+    # before the safety-valve flush releases it, so a window this size
+    # makes a shorter state_deadline_ms unmeetable by construction --
+    # not a scheduler bug, just two floors that must agree.
+    scheduler_window_ms = max(args.scheduler_window_ms, max(args.robot_count, 1) * 1000)
+    state_deadline_ms = max(args.state_deadline_ms, scheduler_window_ms + 2000)
     rows: list[dict[str, Any]] = []
     for loss_percent in loss_percents:
         for repetition_id in repetitions:
@@ -83,8 +89,8 @@ def main() -> int:
                     image=args.image,
                     robot_count=max(args.robot_count, 1),
                     control_deadline_ms=max(args.control_deadline_ms, 1),
-                    state_deadline_ms=max(args.state_deadline_ms, 1),
-                    scheduler_window_ms=max(args.scheduler_window_ms, args.robot_count * 1000),
+                    state_deadline_ms=state_deadline_ms,
+                    scheduler_window_ms=scheduler_window_ms,
                     scheduler_admission_policy="slo_service_epoch",
                     scheduler_admission_min_service_ratio=max(
                         args.scheduler_admission_min_service_ratio, 0.0

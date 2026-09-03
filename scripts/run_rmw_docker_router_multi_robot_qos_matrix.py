@@ -46,17 +46,23 @@ def main() -> int:
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parents[1]
+    # Floor scales with robot_count: starting one publisher container per
+    # robot sequentially can itself take longer than a flat 1000ms window,
+    # which forces the queue's safety-valve flush before every control
+    # frame has even arrived, breaking the priority ordering under test.
+    scheduler_window_ms = max(args.scheduler_window_ms, max(args.robot_count, 1) * 1000)
+    # A queued (state) frame can be held for the full window before the
+    # safety-valve flush releases it, so a window this size makes a
+    # shorter state_deadline_ms unmeetable by construction -- not a
+    # scheduler bug, just two floors that must agree.
+    state_deadline_ms = max(args.state_deadline_ms, scheduler_window_ms + 2000)
     summary = run_matrix(
         root=root,
         image=args.image,
         robot_count=max(args.robot_count, 1),
         control_deadline_ms=max(args.control_deadline_ms, 1),
-        state_deadline_ms=max(args.state_deadline_ms, 1),
-        # Floor scales with robot_count: starting one publisher container per
-        # robot sequentially can itself take longer than a flat 1000ms window,
-        # which forces the queue's safety-valve flush before every control
-        # frame has even arrived, breaking the priority ordering under test.
-        scheduler_window_ms=max(args.scheduler_window_ms, args.robot_count * 1000),
+        state_deadline_ms=state_deadline_ms,
+        scheduler_window_ms=scheduler_window_ms,
         scheduler_admission_policy=args.scheduler_admission_policy,
         scheduler_admission_min_service_ratio=max(
             args.scheduler_admission_min_service_ratio, 0.0
@@ -440,6 +446,13 @@ def run_scenario(
                     break
                 time.sleep(0.25)
         time.sleep(0.4)
+        # A queued (state) flow's frame can be held for the full scheduler
+        # window plus the drain-pacing tail before the subscriber ever
+        # sees it, so a flat 12s subscriber wait can time out and mark
+        # `taken=false` on a frame that the scheduler itself delivered
+        # within its own deadline -- give it the same margin the window
+        # itself was floored to, plus room for setup overhead.
+        subscriber_timeout_ms = max(12000, scheduler_window_ms + 5000)
         for index, flow in enumerate(flows):
             start_container(
                 root=root,
@@ -455,7 +468,7 @@ def run_scenario(
                     f"--payload {shlex.quote(flow['payload'])} "
                     f"--payload-size {flow['payload_size']} "
                     f"--payload-fill {shlex.quote(flow['payload_fill'])} "
-                    "--expect-taken true --timeout-ms 12000"
+                    f"--expect-taken true --timeout-ms {subscriber_timeout_ms}"
                 ),
             )
         time.sleep(1.0)

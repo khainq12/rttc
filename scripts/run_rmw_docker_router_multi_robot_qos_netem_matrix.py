@@ -44,6 +44,12 @@ def main() -> int:
 
     profiles = parse_profiles(args.profiles)
     root = Path(__file__).resolve().parents[1]
+    # A queued (state) frame can be held for the full scheduler window
+    # before the safety-valve flush releases it, so a window this size
+    # makes a shorter state_deadline_ms unmeetable by construction --
+    # not a scheduler bug, just two floors that must agree.
+    scheduler_window_ms = max(args.scheduler_window_ms, max(args.robot_count, 1) * 1000)
+    state_deadline_ms = max(args.state_deadline_ms, scheduler_window_ms + 2000)
     rows: list[dict[str, Any]] = []
     for profile in profiles:
         result = run_matrix(
@@ -51,8 +57,8 @@ def main() -> int:
             image=args.image,
             robot_count=max(args.robot_count, 1),
             control_deadline_ms=max(args.control_deadline_ms, 1),
-            state_deadline_ms=max(args.state_deadline_ms, 1),
-            scheduler_window_ms=max(args.scheduler_window_ms, args.robot_count * 1000),
+            state_deadline_ms=state_deadline_ms,
+            scheduler_window_ms=scheduler_window_ms,
             control_payload_bytes=max(args.control_payload_bytes, 1),
             state_payload_bytes=max(args.state_payload_bytes, 1),
             netem_profile=profile,
@@ -99,7 +105,7 @@ def main() -> int:
         )
         row["adaptive_selected_policy"] = adaptive_selected_policy(
             row,
-            state_deadline_ms=max(args.state_deadline_ms, 1),
+            state_deadline_ms=state_deadline_ms,
         )
         row["adaptive_control_p95_ms"] = (
             row["deadline_control_p95_ms"]
@@ -145,7 +151,7 @@ def main() -> int:
         "robot_count": max(args.robot_count, 1),
         "flow_count": max(args.robot_count, 1) * 2,
         "control_deadline_ms": max(args.control_deadline_ms, 1),
-        "state_deadline_ms": max(args.state_deadline_ms, 1),
+        "state_deadline_ms": state_deadline_ms,
         "control_payload_bytes": max(args.control_payload_bytes, 1),
         "state_payload_bytes": max(args.state_payload_bytes, 1),
         "improved_profile_count": len(improved_rows),
