@@ -1397,12 +1397,21 @@ int main(int argc, char ** argv)
         }
         return left.order < right.order;
       });
+    // This sleep_for() blocks the single-threaded main loop for its full
+    // duration -- the router can't receive or forward anything else
+    // (including urgent control frames) while draining a paced batch.
+    // With the old 100ms cap, releasing 8 queued frames could block the
+    // loop for up to ~700ms, which was long enough for a control frame
+    // to arrive mid-drain and sit unprocessed until the loop woke back
+    // up. Capping at 10ms instead keeps per-frame spacing (still useful
+    // to avoid slamming a low-bandwidth link) without turning a queue
+    // flush into a near-second-long stall of everything else.
     const int drain_pacing_ms =
       config.scheduler_urgent_deadline_ms > 0 &&
       config.scheduler_window_ms > 0 &&
       queued_data_frames.size() > 1 ?
       std::min(
-        100,
+        10,
         std::max(1, config.scheduler_window_ms / static_cast<int>(queued_data_frames.size()))) :
       0;
     scheduler_drain_pacing_ms = std::max(scheduler_drain_pacing_ms, drain_pacing_ms);
