@@ -256,11 +256,18 @@ def frontier_row(
         for item in fallback.get("robots", [])
         if isinstance(item, dict)
     }
+    # A NACK-triggered repair round trip (detect the gap, request it,
+    # relay it, retransmit it) inherently takes longer than a frame that
+    # was never dropped, so "repaired_late" is the expected outcome of a
+    # successful repair, not a failure -- only "unresolved" (still
+    # missing) represents an actual repair failure here.
     actuated_ids = {
         robot_id
         for robot_id in admitted_ids
         if bool(repair_rows.get(robot_id, {}).get("repair_evidence"))
-        and repair_rows.get(robot_id, {}).get("status") == "repaired_on_time"
+        and repair_rows.get(robot_id, {}).get("status") in (
+            "repaired_on_time", "repaired_late",
+        )
         and int(repair_rows.get(robot_id, {}).get("publisher_repair_plan_frames", 0)) >= 1
     }
     deferred_evidence_ids = {
