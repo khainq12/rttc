@@ -1411,7 +1411,7 @@ int main(int argc, char ** argv)
       config.scheduler_window_ms > 0 &&
       queued_data_frames.size() > 1 ?
       std::min(
-        10,
+        2,
         std::max(1, config.scheduler_window_ms / static_cast<int>(queued_data_frames.size()))) :
       0;
     scheduler_drain_pacing_ms = std::max(scheduler_drain_pacing_ms, drain_pacing_ms);

@@ -451,8 +451,12 @@ def run_scenario(
         # sees it, so a flat 12s subscriber wait can time out and mark
         # `taken=false` on a frame that the scheduler itself delivered
         # within its own deadline -- give it the same margin the window
-        # itself was floored to, plus room for setup overhead.
-        subscriber_timeout_ms = max(12000, scheduler_window_ms + 5000)
+        # itself was floored to, plus room for setup overhead. Under an
+        # epoch-based admission policy (e.g. slo_service_epoch) a frame
+        # can legitimately sit held back across more than one window
+        # cycle before the EWMA crosses the exit threshold, so double
+        # the window's worth of margin rather than adding a flat amount.
+        subscriber_timeout_ms = max(12000, scheduler_window_ms * 2 + 5000)
         for index, flow in enumerate(flows):
             start_container(
                 root=root,
