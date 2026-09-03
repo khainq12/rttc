@@ -114,6 +114,26 @@ def wait_standby_waiting(container: str, timeout_s: float = 5.0) -> bool:
     return False
 
 
+def wait_postgres_init_complete(name: str, timeout_s: float = 15.0) -> bool:
+    # The official postgres image runs its CREATE DATABASE init scripts
+    # against a temporary local-only server before starting the real one;
+    # pg_isready (or any real connection attempt) made during that window
+    # can hit "FATAL: database ... does not exist" even though the server
+    # is technically "ready". Waiting for this specific log line instead
+    # guarantees fleetqox has actually been created, without generating
+    # any noisy failed-connection log entries of our own.
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        logs = run(["docker", "logs", name]).stdout
+        if "PostgreSQL init process complete; ready for start up." in logs:
+            return True
+        inspected = run(["docker", "inspect", "-f", "{{.State.Running}}", name])
+        if inspected.returncode != 0 or inspected.stdout.strip() != "true":
+            return False
+        time.sleep(0.2)
+    return False
+
+
 def start_postgres(*, network: str, name: str) -> dict[str, Any]:
     started = run([
         "docker", "run", "-d", "--name", name,
@@ -121,18 +141,7 @@ def start_postgres(*, network: str, name: str) -> dict[str, Any]:
         "-e", f"POSTGRES_PASSWORD={POSTGRES_PASSWORD}",
         "-e", "POSTGRES_DB=fleetqox", POSTGRES_IMAGE,
     ])
-    ready = False
-    if started.returncode == 0:
-        deadline = time.monotonic() + 15.0
-        while time.monotonic() < deadline:
-            checked = run([
-                "docker", "exec", name, "pg_isready", "-U", "postgres",
-                "-d", "fleetqox",
-            ])
-            if checked.returncode == 0:
-                ready = True
-                break
-            time.sleep(0.2)
+    ready = started.returncode == 0 and wait_postgres_init_complete(name)
     version = run([
         "docker", "exec", name, "psql", "-U", "postgres", "-d", "fleetqox",
         "-Atc", "SHOW server_version",
