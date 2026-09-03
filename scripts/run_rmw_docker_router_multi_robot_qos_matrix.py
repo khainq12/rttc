@@ -363,6 +363,14 @@ def run_scenario(
     ]
     router_port = 48500
     expected_frames = len(flows)
+    # The publisher container sends all flows sequentially (one process
+    # spawn + --pre-publish-ms wait + network round trip per flow), so
+    # total publish time scales with flow count. A flat 20s budget was
+    # sized for the original 8-robot (16-flow) default; at higher robot
+    # counts the router hit --timeout-ms and exited early having only
+    # received/forwarded a fraction of the flows, silently truncating
+    # the run instead of failing loudly.
+    router_timeout_ms = max(20000, expected_frames * 1000)
     netem_config = netem_config_for_profile(
         netem_profile,
         netem_loss_percent=netem_loss_percent,
@@ -426,7 +434,7 @@ def run_scenario(
                 f"--expected-graph-advertisements {expected_frames} "
                 f"{scheduler_args}"
                 f"{telemetry_args}"
-                "--post-satisfaction-ms 500 --timeout-ms 20000"
+                f"--post-satisfaction-ms 500 --timeout-ms {router_timeout_ms}"
             ),
             extra_args=router_extra_args,
         )
