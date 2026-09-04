@@ -223,6 +223,64 @@ bool is_fragment_datagram(const std::string & payload)
          payload.rfind(kRepairFragmentNackPrefix, 0) == 0;
 }
 
+// The sender embeds "^^<domain_id>^^<topic>" in the fragment_id field (the
+// text between the fragment prefix and the first '|') whenever it knows the
+// fragment carries a DataFrame -- see rmw_pubsub.cpp's fragment_id
+// construction. A relay router is a separate process with no reassembly
+// state of its own, so without this hint it can only broadcast every
+// fragment to every known peer (forward_passthrough_datagram), which
+// multiplies traffic by the fan-out size. Parsing it out lets fragments be
+// routed the same precise way as ordinary data frames.
+bool try_parse_fragment_route(
+  const std::string & payload,
+  std::uint64_t * domain_id,
+  std::string * topic)
+{
+  std::string prefix;
+  if (payload.rfind(kFragmentPrefix, 0) == 0) {
+    prefix = kFragmentPrefix;
+  } else if (payload.rfind(kRepairFragmentPrefix, 0) == 0) {
+    prefix = kRepairFragmentPrefix;
+  } else if (payload.rfind(kRepairFragmentNackPrefix, 0) == 0) {
+    prefix = kRepairFragmentNackPrefix;
+  } else {
+    return false;
+  }
+  const size_t id_end = payload.find('|', prefix.size());
+  if (id_end == std::string::npos) {
+    return false;
+  }
+  const std::string fragment_id = payload.substr(prefix.size(), id_end - prefix.size());
+  const size_t marker1 = fragment_id.find("^^");
+  if (marker1 == std::string::npos) {
+    return false;
+  }
+  const size_t domain_start = marker1 + 2;
+  const size_t marker2 = fragment_id.find("^^", domain_start);
+  if (marker2 == std::string::npos) {
+    return false;
+  }
+  const std::string domain_text = fragment_id.substr(domain_start, marker2 - domain_start);
+  if (domain_text.empty() ||
+    !std::all_of(domain_text.begin(), domain_text.end(), [](unsigned char c) {
+        return c >= '0' && c <= '9';
+      }))
+  {
+    return false;
+  }
+  const std::string topic_text = fragment_id.substr(marker2 + 2);
+  if (topic_text.empty()) {
+    return false;
+  }
+  if (domain_id != nullptr) {
+    *domain_id = std::strtoull(domain_text.c_str(), nullptr, 10);
+  }
+  if (topic != nullptr) {
+    *topic = topic_text;
+  }
+  return true;
+}
+
 bool parse_peer_endpoints(const std::string & peers, std::vector<sockaddr_in> * peer_addresses)
 {
   if (peer_addresses == nullptr) {
@@ -826,6 +884,58 @@ int forward_passthrough_datagram(
     }
   }
   return sent_count;
+}
+
+int forward_fragment_datagram(
+  int fd,
+  const std::string & payload,
+  const sockaddr_in & source_address,
+  const std::vector<sockaddr_in> & peer_addresses,
+  const std::vector<TopicRoute> & route_table,
+  const std::vector<PublisherRoute> & publisher_route_table,
+  const std::vector<ServiceRoute> & service_route_table,
+  const std::vector<ActionRoute> & action_route_table)
+{
+  std::uint64_t domain_id = 0;
+  std::string topic;
+  if (try_parse_fragment_route(payload, &domain_id, &topic)) {
+    std::vector<sockaddr_in> targets = peer_addresses;
+    for (const TopicRoute & route : route_table) {
+      if (route.domain_id == domain_id && route.topic == topic) {
+        append_unique_peer(&targets, route.address);
+      }
+    }
+    if (!targets.empty()) {
+      int sent_count = 0;
+      for (const sockaddr_in & peer : targets) {
+        if (endpoints_match(peer, source_address)) {
+          continue;
+        }
+        const auto sent = ::sendto(
+          fd,
+          payload.data(),
+          payload.size(),
+          0,
+          reinterpret_cast<const sockaddr *>(&peer),
+          sizeof(peer));
+        if (sent >= 0 && static_cast<size_t>(sent) == payload.size()) {
+          ++sent_count;
+        }
+      }
+      return sent_count;
+    }
+    // No route learned for this topic yet -- fall through to the broadcast
+    // passthrough below rather than silently dropping the fragment.
+  }
+  return forward_passthrough_datagram(
+    fd,
+    payload,
+    source_address,
+    peer_addresses,
+    route_table,
+    publisher_route_table,
+    service_route_table,
+    action_route_table);
 }
 
 void append_router_path_telemetry(
@@ -1521,7 +1631,7 @@ int main(int argc, char ** argv)
 
     const std::string encoded_frame(buffer.data(), static_cast<size_t>(size));
     if (is_fragment_datagram(encoded_frame)) {
-      forwarded += forward_passthrough_datagram(
+      forwarded += forward_fragment_datagram(
         fd,
         encoded_frame,
         source_address,

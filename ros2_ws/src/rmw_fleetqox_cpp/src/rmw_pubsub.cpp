@@ -4355,7 +4355,25 @@ private:
     if (payload.empty() || requested_chunk_bytes == 0) {
       return RMW_RET_INVALID_ARGUMENT;
     }
-    const std::string fragment_id = stable_fragment_id(payload);
+    std::string fragment_id = stable_fragment_id(payload);
+    if (is_data_frame) {
+      // Embed the frame's routing key (domain_id + topic) in the fragment
+      // id, using a separator ("^^") that can never appear in a decimal
+      // domain_id or a ROS topic name. A relay router forwarding this
+      // fragment is a *separate process* from the sender/receiver -- it
+      // has no reassembly state of its own to consult -- so without this
+      // hint it can only broadcast every fragment to every known peer,
+      // which multiplies traffic by the fan-out size and can turn a
+      // bandwidth-constrained link's fragment loss problem into an
+      // outright congestion collapse. This costs nothing on the direct
+      // peer-to-peer path (no router in between) since fragment_id is
+      // already carried opaquely through retransmission/repair there.
+      const auto data_frame_for_routing = rmw_fleetqox_cpp::decode_data_frame(payload);
+      if (data_frame_for_routing) {
+        fragment_id += "^^" + std::to_string(data_frame_for_routing->domain_id) +
+          "^^" + data_frame_for_routing->topic;
+      }
+    }
     const size_t chunk_bytes = effective_loss_resilient_fragment_chunk_bytes(
       payload, fragment_id, requested_chunk_bytes);
     if (chunk_bytes == 0) {
