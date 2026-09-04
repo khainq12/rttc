@@ -84,9 +84,9 @@ def run_probe(
     htdocs = tmp / "htdocs"
     qlogs = tmp / "qlogs"
     certs = tmp / "certs"
-    build_base = root / ".tmp_fleetrmw_quic_inprocess_build"
-    install_base = root / ".tmp_fleetrmw_quic_inprocess_install"
-    log_base = root / ".tmp_fleetrmw_quic_inprocess_log"
+    build_base = root / ".tmp_fleetrmw_quic_inprocess_v2_build"
+    install_base = root / ".tmp_fleetrmw_quic_inprocess_v2_install"
+    log_base = root / ".tmp_fleetrmw_quic_inprocess_v2_log"
     positive_probe = (
         f"/work/{install_base.relative_to(root)}/rmw_fleetqox_cpp/lib/"
         "rmw_fleetqox_cpp/fleetrmw_quic_inprocess_rmw_bidirectional_probe"

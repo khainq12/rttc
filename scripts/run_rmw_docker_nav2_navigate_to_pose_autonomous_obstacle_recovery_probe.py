@@ -110,9 +110,9 @@ def run_probe(
 ) -> dict[str, Any]:
     suffix = str(os.getpid())
     tmp = root / f".tmp_fleetrmw_nav2_same_goal_obstacle_{suffix}"
-    build_base = root / ".tmp_fleetrmw_nav2_same_goal_obstacle_build"
-    install_base = root / ".tmp_fleetrmw_nav2_same_goal_obstacle_install"
-    log_base = root / ".tmp_fleetrmw_nav2_same_goal_obstacle_log"
+    build_base = root / ".tmp_fleetrmw_nav2_same_goal_obstacle_v2_build"
+    install_base = root / ".tmp_fleetrmw_nav2_same_goal_obstacle_v2_install"
+    log_base = root / ".tmp_fleetrmw_nav2_same_goal_obstacle_v2_log"
     tmp.mkdir(parents=True, exist_ok=True)
     bt_xml = tmp / "same_goal_obstacle_recovery.xml"
     bt_xml.write_text(
@@ -142,7 +142,7 @@ def run_probe(
     expected_service_frames = 72
     router_post_satisfaction_ms = 90000
     router_exe = (
-        "/work/.tmp_fleetrmw_nav2_same_goal_obstacle_install/rmw_fleetqox_cpp/lib/"
+        "/work/.tmp_fleetrmw_nav2_same_goal_obstacle_v2_install/rmw_fleetqox_cpp/lib/"
         "rmw_fleetqox_cpp/fleetrmw_udp_router_probe"
     )
     tmp_rel = tmp.relative_to(root)

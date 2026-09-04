@@ -37,9 +37,9 @@ from scripts.run_ros2_direct_rmw_netem_probe import (
 
 SCHEMA_VERSION = "fleetrmw.router_matched_multi_topic_probe.v1"
 DEFAULT_IMAGE = "localhost/fleetrmw/rmw-netem:jazzy"
-BUILD_BASE = "/work/.tmp_fleetrmw_matched_build"
-INSTALL_BASE = "/work/.tmp_fleetrmw_matched_install"
-LOG_BASE = "/work/.tmp_fleetrmw_matched_log"
+BUILD_BASE = "/work/.tmp_fleetrmw_matched_v2_build"
+INSTALL_BASE = "/work/.tmp_fleetrmw_matched_v2_install"
+LOG_BASE = "/work/.tmp_fleetrmw_matched_v2_log"
 
 
 def main() -> int:

@@ -55,14 +55,14 @@ def run_session_probe(
     htdocs = tmp / "htdocs"
     qlogs = tmp / "qlogs"
     certs = tmp / "certs"
-    build_base = root / ".tmp_fleetrmw_quic_gateway_rmw_take_session_build"
-    install_base = root / ".tmp_fleetrmw_quic_gateway_rmw_take_session_install"
-    log_base = root / ".tmp_fleetrmw_quic_gateway_rmw_take_session_log"
+    build_base = root / ".tmp_fleetrmw_quic_gateway_rmw_take_session_v2_build"
+    install_base = root / ".tmp_fleetrmw_quic_gateway_rmw_take_session_v2_install"
+    log_base = root / ".tmp_fleetrmw_quic_gateway_rmw_take_session_v2_log"
     session_file = tmp / "gtlsclient-session.bin"
     tp_file = tmp / "gtlsclient-transport-params.bin"
     token_file = tmp / "gtlsclient-token.bin"
     probe = (
-        "/work/.tmp_fleetrmw_quic_gateway_rmw_take_session_install/rmw_fleetqox_cpp/lib/"
+        "/work/.tmp_fleetrmw_quic_gateway_rmw_take_session_v2_install/rmw_fleetqox_cpp/lib/"
         "rmw_fleetqox_cpp/fleetrmw_quic_gateway_rmw_take_probe"
     )
     try:

@@ -71,11 +71,11 @@ def run_probe(*, root: Path, image: str, port: int) -> dict[str, Any]:
     htdocs = tmp / "htdocs"
     qlogs = tmp / "qlogs"
     certs = tmp / "certs"
-    build_base = root / ".tmp_fleetrmw_quic_gateway_rmw_take_build"
-    install_base = root / ".tmp_fleetrmw_quic_gateway_rmw_take_install"
-    log_base = root / ".tmp_fleetrmw_quic_gateway_rmw_take_log"
+    build_base = root / ".tmp_fleetrmw_quic_gateway_rmw_take_v2_build"
+    install_base = root / ".tmp_fleetrmw_quic_gateway_rmw_take_v2_install"
+    log_base = root / ".tmp_fleetrmw_quic_gateway_rmw_take_v2_log"
     probe = (
-        "/work/.tmp_fleetrmw_quic_gateway_rmw_take_install/rmw_fleetqox_cpp/lib/"
+        "/work/.tmp_fleetrmw_quic_gateway_rmw_take_v2_install/rmw_fleetqox_cpp/lib/"
         "rmw_fleetqox_cpp/fleetrmw_quic_gateway_rmw_take_probe"
     )
     try:

@@ -177,11 +177,11 @@ def run_probe(
     qlogs = tmp / "qlogs"
     certs = tmp / "certs"
     server_log_path = tmp / "server.log"
-    build_base = root / ".tmp_fleetrmw_quic_netem_build"
-    install_base = root / ".tmp_fleetrmw_quic_netem_install"
-    log_base = root / ".tmp_fleetrmw_quic_netem_log"
+    build_base = root / ".tmp_fleetrmw_quic_netem_v2_build"
+    install_base = root / ".tmp_fleetrmw_quic_netem_v2_install"
+    log_base = root / ".tmp_fleetrmw_quic_netem_v2_log"
     frame_probe = (
-        "/work/.tmp_fleetrmw_quic_netem_install/rmw_fleetqox_cpp/lib/"
+        "/work/.tmp_fleetrmw_quic_netem_v2_install/rmw_fleetqox_cpp/lib/"
         "rmw_fleetqox_cpp/fleetrmw_frame_probe"
     )
     try:
@@ -203,13 +203,13 @@ def run_probe(
                 image,
                 "-lc",
                 "source /opt/ros/jazzy/setup.bash && "
-                "rm -rf /work/.tmp_fleetrmw_quic_netem_build "
-                "/work/.tmp_fleetrmw_quic_netem_install "
-                "/work/.tmp_fleetrmw_quic_netem_log && "
-                "colcon --log-base /work/.tmp_fleetrmw_quic_netem_log build "
+                "rm -rf /work/.tmp_fleetrmw_quic_netem_v2_build "
+                "/work/.tmp_fleetrmw_quic_netem_v2_install "
+                "/work/.tmp_fleetrmw_quic_netem_v2_log && "
+                "colcon --log-base /work/.tmp_fleetrmw_quic_netem_v2_log build "
                 "--base-paths ros2_ws/src --packages-select rmw_fleetqox_cpp "
-                "--build-base /work/.tmp_fleetrmw_quic_netem_build "
-                "--install-base /work/.tmp_fleetrmw_quic_netem_install "
+                "--build-base /work/.tmp_fleetrmw_quic_netem_v2_build "
+                "--install-base /work/.tmp_fleetrmw_quic_netem_v2_install "
                 "--cmake-args -DCMAKE_BUILD_TYPE=Release",
             ]
         )

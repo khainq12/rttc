@@ -755,9 +755,9 @@ def run_probe(
     backup_name = f"fleetrmw-budget-plan-backup-{suffix}"
     subscriber_names = [f"fleetrmw-budget-plan-sub-{suffix}-{i}" for i in range(robot_count)]
     publisher_names = [f"fleetrmw-budget-plan-pub-{suffix}-{i}" for i in range(robot_count)]
-    build_base = "/work/.tmp_fleetrmw_budget_plan_build"
-    install_base = "/work/.tmp_fleetrmw_budget_plan_install"
-    log_base = "/work/.tmp_fleetrmw_budget_plan_log"
+    build_base = "/work/.tmp_fleetrmw_budget_plan_v2_build"
+    install_base = "/work/.tmp_fleetrmw_budget_plan_v2_install"
+    log_base = "/work/.tmp_fleetrmw_budget_plan_v2_log"
     plan_dir = root / f".tmp_fleetrmw_budget_plan_{suffix}"
     plan_file = plan_dir / "path_plan.txt"
     plan_file_container = f"/work/{plan_file.relative_to(root)}"

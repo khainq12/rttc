@@ -101,9 +101,9 @@ def run_probe(
 ) -> dict[str, Any]:
     suffix = str(os.getpid())
     tmp = root / f".tmp_fleetrmw_nav2_recovery_tree_{suffix}"
-    build_base = root / ".tmp_fleetrmw_nav2_recovery_tree_build"
-    install_base = root / ".tmp_fleetrmw_nav2_recovery_tree_install"
-    log_base = root / ".tmp_fleetrmw_nav2_recovery_tree_log"
+    build_base = root / ".tmp_fleetrmw_nav2_recovery_tree_v2_build"
+    install_base = root / ".tmp_fleetrmw_nav2_recovery_tree_v2_install"
+    log_base = root / ".tmp_fleetrmw_nav2_recovery_tree_v2_log"
     tmp.mkdir(parents=True, exist_ok=True)
     bt_xml = tmp / "navigate_recovery_tree.xml"
     bt_xml.write_text(recovery_tree_bt_xml(spin_dist), encoding="utf-8")
@@ -127,7 +127,7 @@ def run_probe(
     cli_port = port_base + 20
     expected_service_frames = 54
     router_exe = (
-        "/work/.tmp_fleetrmw_nav2_recovery_tree_install/rmw_fleetqox_cpp/lib/"
+        "/work/.tmp_fleetrmw_nav2_recovery_tree_v2_install/rmw_fleetqox_cpp/lib/"
         "rmw_fleetqox_cpp/fleetrmw_udp_router_probe"
     )
     tmp_rel = tmp.relative_to(root)

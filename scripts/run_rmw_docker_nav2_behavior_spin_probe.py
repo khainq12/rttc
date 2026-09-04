@@ -97,9 +97,9 @@ def parse_spin_output(text: str) -> dict[str, Any]:
 def run_probe(*, root: Path, image: str, port_base: int, target_yaw: float) -> dict[str, Any]:
     suffix = str(os.getpid())
     tmp = root / f".tmp_fleetrmw_nav2_behavior_spin_{suffix}"
-    build_base = root / ".tmp_fleetrmw_nav2_behavior_spin_build"
-    install_base = root / ".tmp_fleetrmw_nav2_behavior_spin_install"
-    log_base = root / ".tmp_fleetrmw_nav2_behavior_spin_log"
+    build_base = root / ".tmp_fleetrmw_nav2_behavior_spin_v2_build"
+    install_base = root / ".tmp_fleetrmw_nav2_behavior_spin_v2_install"
+    log_base = root / ".tmp_fleetrmw_nav2_behavior_spin_v2_log"
     tmp.mkdir(parents=True, exist_ok=True)
     params = tmp / "behavior_server_params.yaml"
     params.write_text(behavior_server_params_yaml(), encoding="utf-8")
@@ -112,7 +112,7 @@ def run_probe(*, root: Path, image: str, port_base: int, target_yaw: float) -> d
     cli_port = port_base + 20
     expected_service_frames = 18
     router_exe = (
-        "/work/.tmp_fleetrmw_nav2_behavior_spin_install/rmw_fleetqox_cpp/lib/"
+        "/work/.tmp_fleetrmw_nav2_behavior_spin_v2_install/rmw_fleetqox_cpp/lib/"
         "rmw_fleetqox_cpp/fleetrmw_udp_router_probe"
     )
     tmp_rel = tmp.relative_to(root)

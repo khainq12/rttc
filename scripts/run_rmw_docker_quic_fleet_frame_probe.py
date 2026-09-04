@@ -30,13 +30,13 @@ def container_script(*, frame_size: int, port: int) -> str:
     return f"""
 set -e
 source /opt/ros/jazzy/setup.bash
-rm -rf /work/.tmp_fleetrmw_quic_frame_build /work/.tmp_fleetrmw_quic_frame_install /work/.tmp_fleetrmw_quic_frame_log
-colcon --log-base /work/.tmp_fleetrmw_quic_frame_log build --base-paths ros2_ws/src \
+rm -rf /work/.tmp_fleetrmw_quic_frame_v2_build /work/.tmp_fleetrmw_quic_frame_v2_install /work/.tmp_fleetrmw_quic_frame_v2_log
+colcon --log-base /work/.tmp_fleetrmw_quic_frame_v2_log build --base-paths ros2_ws/src \
   --packages-select rmw_fleetqox_cpp \
-  --build-base /work/.tmp_fleetrmw_quic_frame_build \
-  --install-base /work/.tmp_fleetrmw_quic_frame_install \
+  --build-base /work/.tmp_fleetrmw_quic_frame_v2_build \
+  --install-base /work/.tmp_fleetrmw_quic_frame_v2_install \
   --cmake-args -DCMAKE_BUILD_TYPE=Release >/tmp/fleetrmw_quic_frame_colcon.out 2>/tmp/fleetrmw_quic_frame_colcon.err
-source /work/.tmp_fleetrmw_quic_frame_install/setup.bash
+source /work/.tmp_fleetrmw_quic_frame_v2_install/setup.bash
 python3 - <<'PY'
 import hashlib
 import json
@@ -51,7 +51,7 @@ from fleetqox.rmw_frame import encode_data_frame
 schema_version = {SCHEMA_VERSION!r}
 frame_size = {frame_size}
 port = {port}
-frame_probe = Path("/work/.tmp_fleetrmw_quic_frame_install/rmw_fleetqox_cpp/lib/rmw_fleetqox_cpp/fleetrmw_frame_probe")
+frame_probe = Path("/work/.tmp_fleetrmw_quic_frame_v2_install/rmw_fleetqox_cpp/lib/rmw_fleetqox_cpp/fleetrmw_frame_probe")
 
 def excerpt(text: str, limit: int = 2500) -> str:
     if len(text) <= limit:
@@ -272,9 +272,9 @@ PY
 
 
 def run_probe(*, root: Path, image: str, frame_size: int, port: int) -> dict[str, Any]:
-    build_base = root / ".tmp_fleetrmw_quic_frame_build"
-    install_base = root / ".tmp_fleetrmw_quic_frame_install"
-    log_base = root / ".tmp_fleetrmw_quic_frame_log"
+    build_base = root / ".tmp_fleetrmw_quic_frame_v2_build"
+    install_base = root / ".tmp_fleetrmw_quic_frame_v2_install"
+    log_base = root / ".tmp_fleetrmw_quic_frame_v2_log"
     try:
         run = subprocess.run(
             [

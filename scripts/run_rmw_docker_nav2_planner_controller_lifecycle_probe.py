@@ -118,9 +118,9 @@ controller_server:
 def run_probe(*, root: Path, image: str, port_base: int) -> dict[str, Any]:
     suffix = str(os.getpid())
     tmp = root / f".tmp_fleetrmw_nav2_planner_controller_{suffix}"
-    build_base = root / ".tmp_fleetrmw_nav2_pc_build"
-    install_base = root / ".tmp_fleetrmw_nav2_pc_install"
-    log_base = root / ".tmp_fleetrmw_nav2_pc_log"
+    build_base = root / ".tmp_fleetrmw_nav2_pc_v2_build"
+    install_base = root / ".tmp_fleetrmw_nav2_pc_v2_install"
+    log_base = root / ".tmp_fleetrmw_nav2_pc_v2_log"
     tmp.mkdir(parents=True, exist_ok=True)
     params = tmp / "nav2_planner_controller_params.yaml"
     params.write_text(nav2_params_yaml(), encoding="utf-8")
@@ -131,7 +131,7 @@ def run_probe(*, root: Path, image: str, port_base: int) -> dict[str, Any]:
     cli_port = port_base + 10
     expected_service_frames = 16
     router_exe = (
-        "/work/.tmp_fleetrmw_nav2_pc_install/rmw_fleetqox_cpp/lib/"
+        "/work/.tmp_fleetrmw_nav2_pc_v2_install/rmw_fleetqox_cpp/lib/"
         "rmw_fleetqox_cpp/fleetrmw_udp_router_probe"
     )
     try:

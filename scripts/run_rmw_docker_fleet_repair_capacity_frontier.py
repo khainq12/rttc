@@ -25,9 +25,9 @@ SCHEMA_VERSION = "fleetrmw.fleet_repair_capacity_frontier.v1"
 RUNNER_SEMANTICS_VERSION = "fleetrmw.fleet_repair_capacity_frontier.actuated_repair.v3"
 REPAIR_BYTES = 700
 BUILD_PATHS = (
-    ".tmp_fleetrmw_budget_plan_build",
-    ".tmp_fleetrmw_budget_plan_install",
-    ".tmp_fleetrmw_budget_plan_log",
+    ".tmp_fleetrmw_budget_plan_v2_build",
+    ".tmp_fleetrmw_budget_plan_v2_install",
+    ".tmp_fleetrmw_budget_plan_v2_log",
 )
 
 

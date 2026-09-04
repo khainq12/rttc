@@ -96,9 +96,9 @@ def parse_compute_path_output_with_error_code(text: str) -> dict[str, Any]:
 def run_probe(*, root: Path, image: str, port_base: int) -> dict[str, Any]:
     suffix = str(os.getpid())
     tmp = root / f".tmp_fleetrmw_nav2_planner_obstacle_repair_{suffix}"
-    build_base = root / ".tmp_fleetrmw_nav2_obstacle_repair_build"
-    install_base = root / ".tmp_fleetrmw_nav2_obstacle_repair_install"
-    log_base = root / ".tmp_fleetrmw_nav2_obstacle_repair_log"
+    build_base = root / ".tmp_fleetrmw_nav2_obstacle_repair_v2_build"
+    install_base = root / ".tmp_fleetrmw_nav2_obstacle_repair_v2_install"
+    log_base = root / ".tmp_fleetrmw_nav2_obstacle_repair_v2_log"
     tmp.mkdir(parents=True, exist_ok=True)
     params = tmp / "nav2_params.yaml"
     params.write_text(nav2_params_yaml(), encoding="utf-8")
@@ -112,7 +112,7 @@ def run_probe(*, root: Path, image: str, port_base: int) -> dict[str, Any]:
     expected_service_frames = 18
     router_post_satisfaction_ms = 45000
     router_exe = (
-        "/work/.tmp_fleetrmw_nav2_obstacle_repair_install/rmw_fleetqox_cpp/lib/"
+        "/work/.tmp_fleetrmw_nav2_obstacle_repair_v2_install/rmw_fleetqox_cpp/lib/"
         "rmw_fleetqox_cpp/fleetrmw_udp_router_probe"
     )
     tmp_rel = tmp.relative_to(root)

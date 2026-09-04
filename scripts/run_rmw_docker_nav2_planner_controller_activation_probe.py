@@ -88,9 +88,9 @@ def router_metrics(router_summary: dict[str, Any]) -> dict[str, Any]:
 def run_probe(*, root: Path, image: str, port_base: int) -> dict[str, Any]:
     suffix = str(os.getpid())
     tmp = root / f".tmp_fleetrmw_nav2_planner_controller_activation_{suffix}"
-    build_base = root / ".tmp_fleetrmw_nav2_pca_build"
-    install_base = root / ".tmp_fleetrmw_nav2_pca_install"
-    log_base = root / ".tmp_fleetrmw_nav2_pca_log"
+    build_base = root / ".tmp_fleetrmw_nav2_pca_v2_build"
+    install_base = root / ".tmp_fleetrmw_nav2_pca_v2_install"
+    log_base = root / ".tmp_fleetrmw_nav2_pca_v2_log"
     tmp.mkdir(parents=True, exist_ok=True)
     params = tmp / "nav2_planner_controller_params.yaml"
     params.write_text(nav2_params_yaml(), encoding="utf-8")
@@ -102,7 +102,7 @@ def run_probe(*, root: Path, image: str, port_base: int) -> dict[str, Any]:
     cli_port = port_base + 20
     expected_service_frames = 28
     router_exe = (
-        "/work/.tmp_fleetrmw_nav2_pca_install/rmw_fleetqox_cpp/lib/"
+        "/work/.tmp_fleetrmw_nav2_pca_v2_install/rmw_fleetqox_cpp/lib/"
         "rmw_fleetqox_cpp/fleetrmw_udp_router_probe"
     )
     quoted_tf_yaml = shlex.quote(dynamic_tf_message_yaml())

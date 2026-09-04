@@ -280,9 +280,9 @@ rclpy.shutdown()
 def run_probe(*, root: Path, image: str, port_base: int) -> dict[str, Any]:
     suffix = str(os.getpid())
     temp = root / f".tmp_fleetrmw_dynamic_costmap_{suffix}"
-    build = root / ".tmp_fleetrmw_dynamic_costmap_build"
-    install = root / ".tmp_fleetrmw_dynamic_costmap_install"
-    log = root / ".tmp_fleetrmw_dynamic_costmap_log"
+    build = root / ".tmp_fleetrmw_dynamic_costmap_v2_build"
+    install = root / ".tmp_fleetrmw_dynamic_costmap_v2_install"
+    log = root / ".tmp_fleetrmw_dynamic_costmap_v2_log"
     temp.mkdir(parents=True, exist_ok=True)
     params = temp / "costmap.yaml"
     client = temp / "probe.py"

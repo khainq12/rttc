@@ -63,19 +63,19 @@ def run_probe(
     htdocs = tmp / "htdocs"
     qlogs = tmp / "qlogs"
     certs = tmp / "certs"
-    build_base = root / ".tmp_fleetrmw_quic_gateway_bidirectional_build"
-    install_base = root / ".tmp_fleetrmw_quic_gateway_bidirectional_install"
-    log_base = root / ".tmp_fleetrmw_quic_gateway_bidirectional_log"
+    build_base = root / ".tmp_fleetrmw_quic_gateway_bidirectional_v2_build"
+    install_base = root / ".tmp_fleetrmw_quic_gateway_bidirectional_v2_install"
+    log_base = root / ".tmp_fleetrmw_quic_gateway_bidirectional_v2_log"
     session_file = tmp / "gtlsclient-session.bin"
     tp_file = tmp / "gtlsclient-transport-params.bin"
     token_file = tmp / "gtlsclient-token.bin"
     publish_probe = (
-        "/work/.tmp_fleetrmw_quic_gateway_bidirectional_install/"
+        "/work/.tmp_fleetrmw_quic_gateway_bidirectional_v2_install/"
         "rmw_fleetqox_cpp/lib/rmw_fleetqox_cpp/"
         "fleetrmw_quic_gateway_publish_probe"
     )
     take_probe = (
-        "/work/.tmp_fleetrmw_quic_gateway_bidirectional_install/"
+        "/work/.tmp_fleetrmw_quic_gateway_bidirectional_v2_install/"
         "rmw_fleetqox_cpp/lib/rmw_fleetqox_cpp/"
         "fleetrmw_quic_gateway_rmw_take_probe"
     )

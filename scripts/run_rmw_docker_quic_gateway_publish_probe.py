@@ -194,15 +194,15 @@ def run_probe(
 ) -> dict[str, Any]:
     suffix = str(os.getpid())
     mode = "async" if async_gateway else "sync"
-    tmp = root / f".tmp_fleetrmw_quic_gateway_publish_{mode}_{suffix}"
+    tmp = root / f".tmp_fleetrmw_quic_gateway_publish_v2_{mode}_{suffix}"
     htdocs = tmp / "htdocs"
     qlogs = tmp / "qlogs"
     certs = tmp / "certs"
-    build_base = root / f".tmp_fleetrmw_quic_gateway_publish_{mode}_build"
-    install_base = root / f".tmp_fleetrmw_quic_gateway_publish_{mode}_install"
-    log_base = root / f".tmp_fleetrmw_quic_gateway_publish_{mode}_log"
+    build_base = root / f".tmp_fleetrmw_quic_gateway_publish_v2_{mode}_build"
+    install_base = root / f".tmp_fleetrmw_quic_gateway_publish_v2_{mode}_install"
+    log_base = root / f".tmp_fleetrmw_quic_gateway_publish_v2_{mode}_log"
     probe = (
-        f"/work/.tmp_fleetrmw_quic_gateway_publish_{mode}_install/rmw_fleetqox_cpp/lib/"
+        f"/work/.tmp_fleetrmw_quic_gateway_publish_v2_{mode}_install/rmw_fleetqox_cpp/lib/"
         f"rmw_fleetqox_cpp/{probe_executable}"
     )
     try:

@@ -48,11 +48,11 @@ from scripts.run_ros2_direct_rmw_netem_probe import (  # noqa: E402
 
 SCHEMA_VERSION = "fleetrmw.ros2_relay_rmw_netem_probe.v2"
 DEFAULT_IMAGE = "localhost/fleetrmw/rmw-netem:jazzy"
-SERIALIZED_RELAY_BUILD = ".tmp_fleetrmw_matched_build"
-SERIALIZED_RELAY_INSTALL = ".tmp_fleetrmw_matched_install"
-SERIALIZED_RELAY_LOG = ".tmp_fleetrmw_matched_log"
+SERIALIZED_RELAY_BUILD = ".tmp_fleetrmw_matched_v2_build"
+SERIALIZED_RELAY_INSTALL = ".tmp_fleetrmw_matched_v2_install"
+SERIALIZED_RELAY_LOG = ".tmp_fleetrmw_matched_v2_log"
 SERIALIZED_RELAY_EXECUTABLE = (
-    "/work/.tmp_fleetrmw_matched_install/rmw_fleetqox_cpp/lib/"
+    "/work/.tmp_fleetrmw_matched_v2_install/rmw_fleetqox_cpp/lib/"
     "rmw_fleetqox_cpp/fleetrmw_generic_serialized_relay_probe"
 )
 FLEETQOX_RMW = "rmw_fleetqox_cpp"

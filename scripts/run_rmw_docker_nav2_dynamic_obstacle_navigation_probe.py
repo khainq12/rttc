@@ -1148,9 +1148,9 @@ def run_probe(
 ) -> dict[str, Any]:
     suffix = str(os.getpid())
     tmp = root / f".tmp_fleetrmw_nav2_dynamic_navigation_{suffix}"
-    build = root / ".tmp_fleetrmw_nav2_dynamic_navigation_build"
-    install = root / ".tmp_fleetrmw_nav2_dynamic_navigation_install"
-    log = root / ".tmp_fleetrmw_nav2_dynamic_navigation_log"
+    build = root / ".tmp_fleetrmw_nav2_dynamic_navigation_v2_build"
+    install = root / ".tmp_fleetrmw_nav2_dynamic_navigation_v2_install"
+    log = root / ".tmp_fleetrmw_nav2_dynamic_navigation_v2_log"
     tmp.mkdir(parents=True, exist_ok=True)
     bt_xml = tmp / "minimal_nav_to_pose.xml"
     bt_xml.write_text(minimal_navigate_to_pose_bt_xml(), encoding="utf-8")

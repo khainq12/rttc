@@ -72,9 +72,9 @@ def parse_key_value_markers(stdout: str) -> dict[str, str]:
 
 def run_probe(*, root: Path, image: str, iterations: int = 1) -> dict[str, Any]:
     run_count = max(iterations, 1)
-    build_base = root / ".tmp_fleetrmw_security_options_build"
-    install_base = root / ".tmp_fleetrmw_security_options_install"
-    log_base = root / ".tmp_fleetrmw_security_options_log"
+    build_base = root / ".tmp_fleetrmw_security_options_v2_build"
+    install_base = root / ".tmp_fleetrmw_security_options_v2_install"
+    log_base = root / ".tmp_fleetrmw_security_options_v2_log"
     try:
         build = run(
             [
