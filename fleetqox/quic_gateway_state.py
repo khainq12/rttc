@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 import hashlib
@@ -1787,12 +1788,21 @@ def parse_data_frame(payload: bytes, *, max_frame_bytes: int) -> FrameMetadata:
             raise FrameValidationError("serialized_payload must be an object")
         encoded = serialized.get("data")
         size = serialized.get("size")
-        if serialized.get("encoding") != "hex" or not isinstance(encoded, str):
-            raise FrameValidationError("serialized payload must use hex encoding")
+        encoding = serialized.get("encoding")
+        if encoding not in ("hex", "base64") or not isinstance(encoded, str):
+            raise FrameValidationError(
+                "serialized payload must use hex or base64 encoding"
+            )
         try:
-            decoded = bytes.fromhex(encoded)
+            decoded = (
+                base64.b64decode(encoded, validate=True)
+                if encoding == "base64"
+                else bytes.fromhex(encoded)
+            )
         except ValueError as exc:
-            raise FrameValidationError("serialized payload contains invalid hex") from exc
+            raise FrameValidationError(
+                "serialized payload contains invalid encoded data"
+            ) from exc
         if not isinstance(size, int) or isinstance(size, bool) or size != len(decoded):
             raise FrameValidationError("serialized payload size does not match data")
     flow_class = route.get("flow_class", "")
