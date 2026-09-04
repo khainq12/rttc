@@ -162,6 +162,19 @@ checkpoint it reports:
   bandwidth-constrained profiles without changing the wire schema's
   structure.
 
+During the fix work above, the Docker-based integration probe suite under
+`scripts/run_rmw_docker_*.py` (183 scripts, distinct from and not counted in
+the `tests/` unit/contract suite above) went from 170/183 to 182/183
+passing as tracked across the session. This is a development-session
+observation, not a re-verified, repeatable canonical figure the way
+[`capabilities.json`](ros2_ws/src/rmw_fleetqox_cpp/capabilities.json) is;
+treat it as directional evidence that the fixes above hold up across the
+broader probe suite, not as a new claim boundary. The one probe not
+counted as clean (`router_multi_robot_qos_live_adaptive_matrix`) passes
+most runs but shows p95-latency variance on a single netem profile,
+consistent with measurement noise on an 8-sample-per-profile comparison
+rather than a functional defect.
+
 ### Current measured frontier
 
 The best retained 16-robot, 32-KiB, roaming-loss, seed-7 row delivers
