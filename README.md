@@ -143,6 +143,24 @@ checkpoint it reports:
   and a repeated stress/security campaign.
 - Callback-owner teardown quiescence passed 20 fresh processes with 160
   publisher and 160 subscription cases in the latest local stress audit.
+- Durable-state QUIC gateway failover no longer races the backing Postgres
+  container's own initialization: the probe now waits for Postgres's own
+  init-complete log marker instead of `pg_isready` (which can report a
+  connectable server before the target database exists), fixing a failover
+  probe that previously succeeded only 1 run in 5.
+- The relay router scales `--timeout-ms` with flow count instead of a flat
+  20s budget, so higher-flow-count scenarios no longer truncate silently
+  before every publisher has finished.
+- Loss-resilient UDP fragments now carry a routing hint so a relay router
+  forwards each fragment to the correct topic's subscribers instead of
+  broadcasting every fragment to all known peers; the broadcast fallback
+  previously multiplied traffic by the fleet's fan-out size when fragments
+  were relayed through a router rather than sent peer-to-peer.
+- `DataFrame`/`ServiceFrame`/`ActionFrame` payloads are wire-encoded as
+  base64 instead of hex, cutting the encoded-byte overhead of large
+  payloads from 2x to ~4/3x; this measurably improves delivery under
+  bandwidth-constrained profiles without changing the wire schema's
+  structure.
 
 ### Current measured frontier
 
@@ -158,6 +176,19 @@ the callback teardown campaign pass. A fresh Jazzy ASan/UBSan Docker build also
 completed 5,000/5,000 same-process typed 32-KiB publish/take iterations without
 a sanitizer report. That narrows the search but does not reproduce the lossy
 inter-process path, so memory-safety qualification remains a release blocker.
+
+A focused investigation into large-payload delivery under severe bandwidth
+constraints (16 robots, ~30 KiB state payload, 5 Mbit/s roaming profile)
+found the dominant failure mode was IP-level fragmentation loss for
+oversized UDP datagrams, not a router or scheduler defect. The base64
+encoding change and the router's fragment-routing fix above are real,
+committed improvements to that path (state delivery under the same stress
+scenario went from 0/16 to partial success). Nine further independent
+tuning and architectural attempts (chunk sizing, publisher process
+topology, advertisement pacing/jitter) were tried and evaluated; none
+produced a reliable additional improvement, and this specific combination
+of scale, payload size, and bandwidth remains an open reliability gap
+consistent with the P0 item below rather than a newly discovered defect.
 
 Detailed evidence and caveats are in
 [Experimental Results](docs/EXPERIMENTAL_RESULTS_V1.md).
