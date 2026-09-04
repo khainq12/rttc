@@ -281,7 +281,7 @@ def run_probe(
             "-lc",
             receiver_command,
         ])
-        wait_for_container_path(receiver_name, ready_path, timeout_s=12.0)
+        wait_for_container_path(receiver_name, ready_path, timeout_s=30.0)
         injector = run([
             "docker",
             "exec",
