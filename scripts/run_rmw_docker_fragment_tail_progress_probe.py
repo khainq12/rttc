@@ -60,10 +60,6 @@ subscription = node.create_subscription(
 with open(os.environ["FLEETQOX_PROBE_READY_FILE"], "w", encoding="utf-8") as stream:
     stream.write("ready\n")
 
-deadline = time.monotonic() + 1.8
-while time.monotonic() < deadline:
-    rclpy.spin_once(node, timeout_sec=0.02)
-
 library = ctypes.CDLL("librmw_fleetqox_cpp.so")
 names = (
     "fragment_active_assemblies",
@@ -73,11 +69,23 @@ names = (
     "fragment_nack_indexes_requested",
     "fragment_duplicate_no_progress_drops",
 )
-metrics = {}
+symbols = {}
 for name in names:
     symbol = getattr(library, f"rmw_fleetqox_cpp_socket_{name}")
     symbol.restype = ctypes.c_uint64
-    metrics[name] = int(symbol())
+    symbols[name] = symbol
+
+# The injector sends 20 duplicate fragments over real network round
+# trips; under load that can take longer than a fixed short window, so
+# poll for the drop counter to actually reach 20 instead of reading it
+# once after an arbitrary delay and risking a stale, in-progress count.
+deadline = time.monotonic() + 5.0
+metrics = {}
+while time.monotonic() < deadline:
+    rclpy.spin_once(node, timeout_sec=0.02)
+    metrics = {name: int(symbol()) for name, symbol in symbols.items()}
+    if metrics["fragment_duplicate_no_progress_drops"] >= 20:
+        break
 
 expected = {
     "fragment_active_assemblies": 1,
