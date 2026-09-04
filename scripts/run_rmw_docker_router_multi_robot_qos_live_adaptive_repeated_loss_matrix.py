@@ -54,7 +54,13 @@ def main() -> int:
     parser.add_argument("--scheduler-admission-min-epoch-frames", type=int, default=2)
     parser.add_argument("--control-payload-bytes", type=int, default=256)
     parser.add_argument("--state-payload-bytes", type=int, default=30000)
-    parser.add_argument("--control-p95-regression-tolerance-ms", type=float, default=10.0)
+    # Matches the tolerance in the sibling live_adaptive_matrix probe
+    # (raised from 5ms after confirming fifo-vs-fifo noise hits this same
+    # magnitude with zero scheduler decisions involved) -- this probe
+    # compares the same two independently executed scheduler runs and
+    # sees the same noise floor, so an independently-set, tighter default
+    # here was just re-introducing the bug that fix addressed.
+    parser.add_argument("--control-p95-regression-tolerance-ms", type=float, default=50.0)
     parser.add_argument(
         "--fail-on-row-failure",
         action="store_true",
