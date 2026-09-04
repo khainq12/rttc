@@ -211,7 +211,11 @@ def run_probe(
     max_assembly_bytes: int,
     assembly_ttl_ms: int,
 ) -> dict[str, Any]:
-    suffix = f"{os.getpid()}-{time.time_ns()}"
+    # Keep this short: it feeds container names used as FLEETQOX_RMW_PEERS
+    # DNS hostnames, which getaddrinfo() rejects once the label exceeds the
+    # RFC 1035 63-character limit (a full nanosecond timestamp pushed
+    # "fleetrmw-fragment-admission-injector-<suffix>" over that limit).
+    suffix = f"{os.getpid()}-{time.time_ns() % 1_000_000}"
     network = f"fleetrmw-fragment-admission-net-{suffix}"
     receiver_name = f"fleetrmw-fragment-admission-receiver-{suffix}"
     injector_name = f"fleetrmw-fragment-admission-injector-{suffix}"
