@@ -367,20 +367,25 @@ rmw_ret_t rmw_context_fini(rmw_context_t * context)
     return RMW_RET_INVALID_ARGUMENT;
   }
 
-  rmw_context_impl_s * impl = context->impl;
-  rcutils_allocator_t allocator = impl->allocator;
-  ret = rmw_init_options_fini(&context->options);
-  impl->~rmw_context_impl_s();
-  allocator.deallocate(impl, allocator.state);
-  *context = rmw_get_zero_initialized_context();
   bool no_local_nodes = false;
   {
     std::lock_guard<std::mutex> lock(g_node_guard_mutex);
     no_local_nodes = g_node_guard_data.empty();
   }
   if (no_local_nodes) {
+    // Stop the background threads (retransmit, deadline monitor, graph
+    // renewal, remote graph lease monitor, service workers) before this
+    // context's impl is destructed and freed below, so nothing can be
+    // mid-callback against state that's about to be deallocated.
     rmw_fleetqox_cpp_shutdown_pubsub_runtime();
   }
+
+  rmw_context_impl_s * impl = context->impl;
+  rcutils_allocator_t allocator = impl->allocator;
+  ret = rmw_init_options_fini(&context->options);
+  impl->~rmw_context_impl_s();
+  allocator.deallocate(impl, allocator.state);
+  *context = rmw_get_zero_initialized_context();
   return ret;
 }
 
