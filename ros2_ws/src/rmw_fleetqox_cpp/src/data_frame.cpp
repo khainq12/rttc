@@ -291,6 +291,102 @@ std::optional<std::vector<std::uint8_t>> hex_decode(const std::string & encoded)
   return decoded;
 }
 
+// Base64 instead of hex roughly halves the on-wire blowup for a large
+// serialized_payload (4/3x vs 2x the raw byte count) -- for a payload that
+// needs application-level UDP fragmentation to survive netem rate limiting
+// (see FLEETQOX_RMW_LOSS_RESILIENT_FRAGMENT_CHUNK_BYTES), that difference
+// directly determines how many concurrent large-payload flows fit through
+// a bandwidth-constrained link before fragment loss sets in.
+std::string base64_encode(const std::vector<std::uint8_t> & bytes)
+{
+  static constexpr char kAlphabet[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string encoded;
+  encoded.reserve(((bytes.size() + 2) / 3) * 4);
+  std::size_t i = 0;
+  while (i + 3 <= bytes.size()) {
+    const std::uint32_t chunk =
+      (static_cast<std::uint32_t>(bytes[i]) << 16) |
+      (static_cast<std::uint32_t>(bytes[i + 1]) << 8) |
+      static_cast<std::uint32_t>(bytes[i + 2]);
+    encoded.push_back(kAlphabet[(chunk >> 18) & 0x3F]);
+    encoded.push_back(kAlphabet[(chunk >> 12) & 0x3F]);
+    encoded.push_back(kAlphabet[(chunk >> 6) & 0x3F]);
+    encoded.push_back(kAlphabet[chunk & 0x3F]);
+    i += 3;
+  }
+  const std::size_t remaining = bytes.size() - i;
+  if (remaining == 1) {
+    const std::uint32_t chunk = static_cast<std::uint32_t>(bytes[i]) << 16;
+    encoded.push_back(kAlphabet[(chunk >> 18) & 0x3F]);
+    encoded.push_back(kAlphabet[(chunk >> 12) & 0x3F]);
+    encoded.push_back('=');
+    encoded.push_back('=');
+  } else if (remaining == 2) {
+    const std::uint32_t chunk =
+      (static_cast<std::uint32_t>(bytes[i]) << 16) |
+      (static_cast<std::uint32_t>(bytes[i + 1]) << 8);
+    encoded.push_back(kAlphabet[(chunk >> 18) & 0x3F]);
+    encoded.push_back(kAlphabet[(chunk >> 12) & 0x3F]);
+    encoded.push_back(kAlphabet[(chunk >> 6) & 0x3F]);
+    encoded.push_back('=');
+  }
+  return encoded;
+}
+
+std::optional<std::vector<std::uint8_t>> base64_decode(const std::string & encoded)
+{
+  if (encoded.size() % 4 != 0) {
+    return std::nullopt;
+  }
+  auto sextet = [](const char c) -> int {
+      if (c >= 'A' && c <= 'Z') {
+        return c - 'A';
+      }
+      if (c >= 'a' && c <= 'z') {
+        return c - 'a' + 26;
+      }
+      if (c >= '0' && c <= '9') {
+        return c - '0' + 52;
+      }
+      if (c == '+') {
+        return 62;
+      }
+      if (c == '/') {
+        return 63;
+      }
+      return -1;
+    };
+  std::vector<std::uint8_t> decoded;
+  decoded.reserve((encoded.size() / 4) * 3);
+  for (std::size_t i = 0; i < encoded.size(); i += 4) {
+    const bool pad2 = encoded[i + 2] == '=';
+    const bool pad3 = encoded[i + 3] == '=';
+    const int s0 = sextet(encoded[i]);
+    const int s1 = sextet(encoded[i + 1]);
+    const int s2 = pad2 ? 0 : sextet(encoded[i + 2]);
+    const int s3 = pad3 ? 0 : sextet(encoded[i + 3]);
+    if (s0 < 0 || s1 < 0 || (!pad2 && s2 < 0) || (!pad3 && s3 < 0) ||
+      (pad2 && !pad3))
+    {
+      return std::nullopt;
+    }
+    const std::uint32_t chunk =
+      (static_cast<std::uint32_t>(s0) << 18) |
+      (static_cast<std::uint32_t>(s1) << 12) |
+      (static_cast<std::uint32_t>(s2) << 6) |
+      static_cast<std::uint32_t>(s3);
+    decoded.push_back(static_cast<std::uint8_t>((chunk >> 16) & 0xFF));
+    if (!pad2) {
+      decoded.push_back(static_cast<std::uint8_t>((chunk >> 8) & 0xFF));
+    }
+    if (!pad3) {
+      decoded.push_back(static_cast<std::uint8_t>(chunk & 0xFF));
+    }
+  }
+  return decoded;
+}
+
 template<typename T>
 std::optional<T> first_present(const std::optional<T> & first, const std::optional<T> & second)
 {
@@ -431,9 +527,9 @@ std::string encode_data_frame(const DataFrame & frame)
   out << "}";
   if (!frame.serialized_payload.empty()) {
     out << ",\"serialized_payload\":{";
-    out << "\"encoding\":\"hex\",";
+    out << "\"encoding\":\"base64\",";
     out << "\"size\":" << frame.serialized_payload.size() << ",";
-    out << "\"data\":\"" << hex_encode(frame.serialized_payload) << "\"}";
+    out << "\"data\":\"" << base64_encode(frame.serialized_payload) << "\"}";
   }
   if (frame.deadline_ms > 0.0) {
     out << ",\"delivery\":{\"deadline_ms\":" << frame.deadline_ms << "}";
@@ -495,10 +591,11 @@ std::optional<DataFrame> decode_data_frame(const std::string & payload)
   if (!serialized_payload.empty()) {
     const auto encoding = json_string_value(serialized_payload, "encoding");
     const auto encoded_data = json_string_value(serialized_payload, "data");
-    if (!encoding || *encoding != "hex" || !encoded_data) {
+    if (!encoding || (*encoding != "hex" && *encoding != "base64") || !encoded_data) {
       return std::nullopt;
     }
-    const auto decoded_payload = hex_decode(*encoded_data);
+    const auto decoded_payload = *encoding == "base64" ?
+      base64_decode(*encoded_data) : hex_decode(*encoded_data);
     if (!decoded_payload) {
       return std::nullopt;
     }
@@ -640,9 +737,9 @@ std::string encode_service_frame(const ServiceFrame & frame)
   out << "\"lifespan_ns\":" << frame.lifespan_ns;
   if (!frame.serialized_payload.empty()) {
     out << ",\"serialized_payload\":{";
-    out << "\"encoding\":\"hex\",";
+    out << "\"encoding\":\"base64\",";
     out << "\"size\":" << frame.serialized_payload.size() << ",";
-    out << "\"data\":\"" << hex_encode(frame.serialized_payload) << "\"}";
+    out << "\"data\":\"" << base64_encode(frame.serialized_payload) << "\"}";
   }
   out << "}";
   return out.str();
@@ -676,10 +773,11 @@ std::optional<ServiceFrame> decode_service_frame(const std::string & payload)
   if (!serialized_payload.empty()) {
     const auto encoding = json_string_value(serialized_payload, "encoding");
     const auto encoded_data = json_string_value(serialized_payload, "data");
-    if (!encoding || *encoding != "hex" || !encoded_data) {
+    if (!encoding || (*encoding != "hex" && *encoding != "base64") || !encoded_data) {
       return std::nullopt;
     }
-    const auto decoded_payload = hex_decode(*encoded_data);
+    const auto decoded_payload = *encoding == "base64" ?
+      base64_decode(*encoded_data) : hex_decode(*encoded_data);
     if (!decoded_payload) {
       return std::nullopt;
     }
@@ -727,9 +825,9 @@ std::string encode_action_frame(const ActionFrame & frame)
   out << "\"lifespan_ns\":" << frame.lifespan_ns;
   if (!frame.serialized_payload.empty()) {
     out << ",\"serialized_payload\":{";
-    out << "\"encoding\":\"hex\",";
+    out << "\"encoding\":\"base64\",";
     out << "\"size\":" << frame.serialized_payload.size() << ",";
-    out << "\"data\":\"" << hex_encode(frame.serialized_payload) << "\"}";
+    out << "\"data\":\"" << base64_encode(frame.serialized_payload) << "\"}";
   }
   out << "}";
   return out.str();
@@ -764,10 +862,11 @@ std::optional<ActionFrame> decode_action_frame(const std::string & payload)
   if (!serialized_payload.empty()) {
     const auto encoding = json_string_value(serialized_payload, "encoding");
     const auto encoded_data = json_string_value(serialized_payload, "data");
-    if (!encoding || *encoding != "hex" || !encoded_data) {
+    if (!encoding || (*encoding != "hex" && *encoding != "base64") || !encoded_data) {
       return std::nullopt;
     }
-    const auto decoded_payload = hex_decode(*encoded_data);
+    const auto decoded_payload = *encoding == "base64" ?
+      base64_decode(*encoded_data) : hex_decode(*encoded_data);
     if (!decoded_payload) {
       return std::nullopt;
     }
