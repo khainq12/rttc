@@ -387,7 +387,7 @@ def collect_sequential_qoe_epoch(
     *,
     controller: LivePathPlanController,
     telemetry_paths: list[Path],
-    publish_trigger_file: Path,
+    publisher_names: list[str],
     first_sequence: int,
     protected_robot_budget: int,
     stopping_config: QoESequentialStoppingConfig,
@@ -400,7 +400,7 @@ def collect_sequential_qoe_epoch(
     last_sequence = first_sequence - 1
     for offset in range(stopping_config.max_samples_per_robot):
         sequence_number = first_sequence + offset
-        write_trigger_epoch(publish_trigger_file, sequence_number)
+        write_trigger_epoch_to_containers(publisher_names, sequence_number)
         window_ready = wait_for_delivery_sample_window(
             telemetry_paths,
             first_sequence=first_sequence,
@@ -763,10 +763,6 @@ def run_probe(
     plan_file_container = f"/work/{plan_file.relative_to(root)}"
     repair_plan_file = plan_dir / "repair_path_plan.txt"
     repair_plan_file_container = f"/work/{repair_plan_file.relative_to(root)}"
-    publish_trigger_file = plan_dir / "publish_epoch.txt"
-    publish_trigger_file_container = (
-        f"/work/{publish_trigger_file.relative_to(root)}"
-    )
     publisher_ready_files = [
         plan_dir / f"publisher_{index:04d}.ready"
         for index in range(robot_count)
@@ -979,8 +975,6 @@ def run_probe(
         plan_dir.mkdir(parents=True, exist_ok=True)
         plan_file.write_text(initial_path_plan + "\n", encoding="utf-8")
         repair_plan_file.write_text(initial_repair_path_plan + "\n", encoding="utf-8")
-        if event_triggered_feedback:
-            write_trigger_epoch(publish_trigger_file, 0)
         run(["docker", "network", "create", network])
         reusable_install = root / install_base.removeprefix("/work/") / "setup.bash"
         if not reuse_build or not reusable_install.exists():
@@ -1119,7 +1113,7 @@ def run_probe(
                     )
                     epoch_args += (
                         "--publish-interval-ms 0 "
-                        f"--publish-trigger-file {shlex.quote(publish_trigger_file_container)} "
+                        f"--publish-trigger-file {shlex.quote(PUBLISH_TRIGGER_CONTAINER_PATH)} "
                         f"--publish-trigger-timeout-ms {publisher_trigger_timeout_ms} "
                         f"--publisher-ready-file {shlex.quote(ready_file_container)} "
                     )
@@ -1180,7 +1174,7 @@ def run_probe(
             if event_triggered_feedback else 0.0
         )
         if event_triggered_feedback and not sequential_qoe_feedback:
-            write_trigger_epoch(publish_trigger_file, 1)
+            write_trigger_epoch_to_containers(publisher_names, 1)
 
         feedback_ready = False
         second_feedback_ready = False
@@ -1199,7 +1193,7 @@ def run_probe(
             first_epoch = collect_sequential_qoe_epoch(
                 controller=feedback_controller,
                 telemetry_paths=telemetry_paths,
-                publish_trigger_file=publish_trigger_file,
+                publisher_names=publisher_names,
                 first_sequence=1,
                 protected_robot_budget=protected_count,
                 stopping_config=stopping_config,
@@ -1266,7 +1260,7 @@ def run_probe(
                     second_epoch = collect_sequential_qoe_epoch(
                         controller=feedback_controller,
                         telemetry_paths=telemetry_paths,
-                        publish_trigger_file=publish_trigger_file,
+                        publisher_names=publisher_names,
                         first_sequence=int(first_epoch["last_sequence"]) + 1,
                         protected_robot_budget=protected_count,
                         stopping_config=stopping_config,
@@ -1325,7 +1319,7 @@ def run_probe(
                         controller_epoch_summaries.append(controller_summary)
                         epoch_path_plans.append(plan.path_plan_env)
                         final_released_sequence = total_source_frames
-                        write_trigger_epoch(publish_trigger_file, total_source_frames)
+                        write_trigger_epoch_to_containers(publisher_names, total_source_frames)
         elif feedback_controller is not None:
             feedback_wait_started = time.monotonic()
             feedback_ready = wait_for_delivery_sequence(
@@ -1367,7 +1361,7 @@ def run_probe(
                         time.monotonic() - network_transition_started
                     ) * 1000.0
                     if event_triggered_feedback:
-                        write_trigger_epoch(publish_trigger_file, 2)
+                        write_trigger_epoch_to_containers(publisher_names, 2)
                     feedback_wait_started = time.monotonic()
                     second_feedback_ready = wait_for_delivery_sequence(
                         telemetry_paths, 2, timeout_s=5.0
@@ -1396,7 +1390,7 @@ def run_probe(
                         controller_epoch_summaries.append(controller_summary)
                         epoch_path_plans.append(plan.path_plan_env)
                         if event_triggered_feedback:
-                            write_trigger_epoch(publish_trigger_file, 3)
+                            write_trigger_epoch_to_containers(publisher_names, 3)
 
         publisher_returncodes = [
             int(run(["docker", "wait", name]).stdout.strip()) for name in publisher_names
@@ -1883,10 +1877,27 @@ def set_router_qdisc(container: str, netem: dict[str, float]) -> None:
     ])
 
 
-def write_trigger_epoch(path: Path, sequence_number: int) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(f"{sequence_number}\n", encoding="utf-8")
-    os.replace(temporary, path)
+PUBLISH_TRIGGER_CONTAINER_PATH = "/tmp/fleetrmw_publish_epoch.txt"
+
+
+def write_trigger_epoch_to_containers(
+    container_names: list[str], sequence_number: int
+) -> None:
+    # Writing this signal through the /work bind mount (host -> Docker
+    # Desktop VM -> container, over virtiofs) is not reliable: once a
+    # container has already read the trigger file once, a later
+    # atomic-rename update from the host is not guaranteed to become
+    # visible inside the container, so publishers can poll forever
+    # against a stale value. `docker exec` writes directly into each
+    # container's own local filesystem, bypassing that shared mount.
+    for name in container_names:
+        run(
+            [
+                "docker", "exec", name, "bash", "-c",
+                f"echo {sequence_number} > {PUBLISH_TRIGGER_CONTAINER_PATH}",
+            ],
+            check=False,
+        )
 
 
 def wait_for_paths(paths: list[Path], *, timeout_s: float) -> bool:
