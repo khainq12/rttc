@@ -9,6 +9,7 @@ It is still subprocess-backed and is not a production full-duplex QUIC backend.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 from pathlib import Path
@@ -54,13 +55,16 @@ def expected_frame_bytes() -> bytes:
         b'"source_sequence_number":31,'
         b'"source_timestamp_ns":31000000'
         b"},"
+        # Must byte-match encode_data_frame()'s current default (base64,
+        # not hex) since this probe's C++ client compares downloaded bytes
+        # against a freshly re-encoded "expected" frame for exact equality.
         b'"serialized_payload":{'
-        b'"encoding":"hex",'
+        b'"encoding":"base64",'
         b'"size":'
         + str(len(payload)).encode("ascii")
         + b","
         b'"data":"'
-        + payload.hex().encode("ascii")
+        + base64.b64encode(payload)
         + b'"}}'
     )
 
