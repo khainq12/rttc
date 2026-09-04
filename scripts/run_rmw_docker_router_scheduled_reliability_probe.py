@@ -152,14 +152,23 @@ def run_probe(
             ),
             extra_args=router_extra_args,
         )
-        time.sleep(0.5)
-        netem_qdisc = (
-            run(
-                ["docker", "exec", router_name, "tc", "qdisc", "show", "dev", "eth0"],
-                check=False,
-            ).stdout.strip()
-            if netem_profile != "none" else "disabled"
-        )
+        # The netem_command runs inside the router container's own startup
+        # shell, sequenced before the router binary -- it isn't guaranteed
+        # to have applied yet just because `docker run -d` returned. Poll
+        # briefly instead of trusting a single fixed-delay check, which
+        # under load intermittently read back the default "noqueue"
+        # qdisc before "tc qdisc replace" had actually run.
+        netem_qdisc = "disabled"
+        if netem_profile != "none":
+            qdisc_deadline = time.monotonic() + 5.0
+            while True:
+                netem_qdisc = run(
+                    ["docker", "exec", router_name, "tc", "qdisc", "show", "dev", "eth0"],
+                    check=False,
+                ).stdout.strip()
+                if "netem" in netem_qdisc or time.monotonic() >= qdisc_deadline:
+                    break
+                time.sleep(0.2)
         start_container(
             root=root,
             image=image,
