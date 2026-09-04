@@ -281,7 +281,16 @@ def run_probe(
             "-lc",
             receiver_command,
         ])
-        wait_for_container_path(receiver_name, ready_path, timeout_s=30.0)
+        try:
+            wait_for_container_path(receiver_name, ready_path, timeout_s=30.0)
+        except Exception:
+            receiver_logs = run(["docker", "logs", receiver_name], check=False)
+            print(
+                "receiver container failed to become ready; logs:\n"
+                f"stdout:\n{receiver_logs.stdout}\nstderr:\n{receiver_logs.stderr}",
+                file=sys.stderr,
+            )
+            raise
         injector = run([
             "docker",
             "exec",
