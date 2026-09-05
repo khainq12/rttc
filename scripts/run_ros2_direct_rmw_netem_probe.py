@@ -36,6 +36,15 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--image", default=DEFAULT_IMAGE)
     parser.add_argument("--rmw", default="rmw_fastrtps_cpp")
+    parser.add_argument(
+        "--extra-workspace",
+        default=None,
+        help=(
+            "container path to an additional colcon install space to source "
+            "before checking rmw availability and launching nodes (e.g. for "
+            "a custom RMW not present in the base ROS install)"
+        ),
+    )
     parser.add_argument("--profile", default="wifi")
     parser.add_argument("--enable-netem", action="store_true")
     parser.add_argument("--require-netem", action="store_true")
@@ -80,6 +89,7 @@ def main() -> int:
         publish_interval_ms=args.publish_interval_ms,
         timeout_s=args.timeout_s,
         publisher_linger_s=max(args.publisher_linger_s, 0.0),
+        extra_workspace=args.extra_workspace,
     )
     args.summary_json.parent.mkdir(parents=True, exist_ok=True)
     args.summary_json.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -110,6 +120,7 @@ def run_probe(
     publish_interval_ms: int,
     timeout_s: float,
     publisher_linger_s: float = 0.5,
+    extra_workspace: str | None = None,
 ) -> dict[str, Any]:
     if samples <= 0:
         raise ValueError("samples must be positive")
@@ -129,7 +140,7 @@ def run_probe(
     topic_specs = topic_specs_for_robot_count(robot_count)
     expected_control_count = samples * sum(1 for spec in topic_specs if spec["kind"] == "control")
     expected_state_count = samples * sum(1 for spec in topic_specs if spec["kind"] == "state")
-    availability = probe_rmw_available(image, rmw)
+    availability = probe_rmw_available(image, rmw, extra_workspace=extra_workspace)
     if not availability["available"]:
         return {
             "schema_version": SCHEMA_VERSION,
@@ -159,6 +170,8 @@ def run_probe(
     zenoh_session_config = work_dir / "zenoh-session-router.json5"
     zenoh_session_config_container = f"/work/{zenoh_session_config.relative_to(root)}"
     use_zenoh_router = rmw == "rmw_zenoh_cpp"
+    use_fleetqox_peers = rmw == "rmw_fleetqox_cpp"
+    fleetqox_port = 7400
     netem = netem_config_for_path(
         telemetry_profile,
         path_id="primary_wifi",
@@ -206,6 +219,13 @@ def run_probe(
                 zenoh_session_config_uri=(
                     zenoh_session_config_container if use_zenoh_router else None
                 ),
+                extra_workspace=extra_workspace,
+                fleetqox_bind=(
+                    f"0.0.0.0:{fleetqox_port}" if use_fleetqox_peers else None
+                ),
+                fleetqox_peers=(
+                    f"{publisher_name}:{fleetqox_port}" if use_fleetqox_peers else None
+                ),
             ),
         )
         time.sleep(1.0)
@@ -224,6 +244,13 @@ def run_probe(
                 python_path=f"/work/{publisher_script.relative_to(root)}",
                 zenoh_session_config_uri=(
                     zenoh_session_config_container if use_zenoh_router else None
+                ),
+                extra_workspace=extra_workspace,
+                fleetqox_bind=(
+                    f"0.0.0.0:{fleetqox_port}" if use_fleetqox_peers else None
+                ),
+                fleetqox_peers=(
+                    f"{subscriber_name}:{fleetqox_port}" if use_fleetqox_peers else None
                 ),
             ),
             extra_args=("--cap-add", "NET_ADMIN") if enable_netem else (),
@@ -398,17 +425,25 @@ def topic_specs_for_robot_count(robot_count: int) -> list[dict[str, str]]:
     return specs
 
 
-def probe_rmw_available(image: str, rmw: str) -> dict[str, object]:
+def probe_rmw_available(
+    image: str, rmw: str, *, extra_workspace: str | None = None
+) -> dict[str, object]:
     docker = shutil.which("docker")
     if not docker:
         return {"available": False, "reason": "docker_not_found", "docker": None}
+    extra_source = (
+        f"source {extra_workspace}/setup.bash && " if extra_workspace else ""
+    )
     completed = subprocess.run(
         [
             docker,
             "run",
             "--rm",
+            "-v",
+            f"{ROOT}:/work",
             image,
-            f"source /opt/ros/jazzy/setup.bash && ros2 pkg prefix {rmw}",
+            f"source /opt/ros/jazzy/setup.bash && {extra_source}"
+            f"ros2 pkg prefix {rmw}",
         ],
         check=False,
         capture_output=True,
@@ -428,11 +463,18 @@ def ros_command(
     domain_id: int,
     python_path: str,
     zenoh_session_config_uri: str | None = None,
+    extra_workspace: str | None = None,
+    fleetqox_bind: str | None = None,
+    fleetqox_peers: str | None = None,
 ) -> str:
-    command = (
-        "source /opt/ros/jazzy/setup.bash && "
-        f"export RMW_IMPLEMENTATION={rmw} ROS_DOMAIN_ID={domain_id} && "
-    )
+    command = "source /opt/ros/jazzy/setup.bash && "
+    if extra_workspace:
+        command += f"source {extra_workspace}/setup.bash && "
+    command += f"export RMW_IMPLEMENTATION={rmw} ROS_DOMAIN_ID={domain_id} && "
+    if fleetqox_bind:
+        command += f"export FLEETQOX_RMW_BIND={fleetqox_bind} && "
+    if fleetqox_peers:
+        command += f"export FLEETQOX_RMW_PEERS={fleetqox_peers} && "
     if zenoh_session_config_uri:
         command += f"export ZENOH_SESSION_CONFIG_URI={zenoh_session_config_uri} && "
     return command + f"python3 {python_path}"
