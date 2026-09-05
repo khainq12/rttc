@@ -234,9 +234,6 @@ def run_iteration(
                 certs=certs,
                 source_name="invalid-client.crl.pem",
             )
-            malformed_installed = malformed_installed and wait_for_log(
-                server_name, "FLEETQOX_PUBLIC_MTLS_CRL_RELOAD_FAILED", count=1
-            )
             malformed = run_exec_client(
                 root=root,
                 container=client_name,
@@ -244,6 +241,15 @@ def run_iteration(
                 certificate_name="stateful-client",
                 consumer_id="crl-malformed",
                 qlog=qlogs / "malformed.qlog",
+            )
+            # Unlike the RELOADED marker (raised by every handshake, so an
+            # earlier connection may have already satisfied it before this
+            # swap), RELOAD_FAILED can only ever be produced by a handshake
+            # that actually attempts to load this malformed file -- so it
+            # cannot appear before the connection above runs, and this
+            # confirmation must come after, not before, that attempt.
+            malformed_installed = malformed_installed and wait_for_log(
+                server_name, "FLEETQOX_PUBLIC_MTLS_CRL_RELOAD_FAILED", count=1
             )
             instance_after = server_instance(server_name)
             final_restore = replace_live_crl(

@@ -1,14 +1,17 @@
+diff --git a/examples/tls_server_context_gnutls.cc b/examples/tls_server_context_gnutls.cc
+index 65ac4362..9401fdf5 100644
 --- a/examples/tls_server_context_gnutls.cc
 +++ b/examples/tls_server_context_gnutls.cc
-@@ -27,5 +27,7 @@
- #include <array>
+@@ -28,6 +28,8 @@
  #include <cstdlib>
  #include <iostream>
  #include <string>
 +#include <string_view>
 +#include <unistd.h>
  
-@@ -45,7 +47,53 @@
+ #include <gnutls/x509.h>
+ 
+@@ -45,7 +47,91 @@ int anti_replay_db_add_func(void *dbf, time_t exp_time,
    return 0;
  }
  
@@ -18,6 +21,25 @@
 +  return value != nullptr && std::string_view{value} == "1";
 +}
 +
++// GnuTLS's gnutls_certificate_free_crls() + gnutls_certificate_set_x509_crl_file()
++// on a credentials object that has already been used for at least one prior
++// handshake has been observed (empirically, via an independent fresh
++// credentials object verifying the very same peer certificate against the
++// very same on-disk CRL file at the same instant and getting the opposite,
++// correct answer) to leave stale internal revocation state behind despite
++// reporting success. Rather than depend on in-place reload of a reused
++// credentials object, build a brand-new one on every handshake and swap it
++// into the session before verification -- a freshly allocated object cannot
++// carry over stale state from an earlier handshake. This only needs client
++// CA trust + the client CRL (verified above with the independent-object
++// test): gnutls_certificate_verify_peers3() does not consult the
++// credentials' own server certificate/key when validating the peer.
++// The swapped-in object is intentionally leaked for the process lifetime:
++// this reload path only exists for test/probe use
++// (FLEETQOX_GNUTLS_RELOAD_CLIENT_CRL_EACH_HANDSHAKE=1), where connection
++// counts are small and bounded, and gnutls_credentials_set() does not take
++// ownership -- freeing it would require tracking it past this session's
++// lifetime for no benefit in a short-lived test binary.
 +int fleetqox_reload_client_crl(gnutls_session_t session) {
 +  if (!fleetqox_reload_client_crl_enabled()) {
 +    return 0;
@@ -28,26 +50,45 @@
 +            "FLEETQOX_PUBLIC_MTLS_CRL_RELOAD_FAILED reason=missing_path\n");
 +    return GNUTLS_E_CERTIFICATE_ERROR;
 +  }
-+  void *raw_credentials = nullptr;
-+  auto rv = gnutls_credentials_get(
-+      session, GNUTLS_CRD_CERTIFICATE, &raw_credentials);
-+  if (rv < 0 || raw_credentials == nullptr) {
++  const auto *client_ca = std::getenv("FLEETQOX_GNUTLS_CLIENT_CA");
++  if (client_ca == nullptr || client_ca[0] == '\0') {
 +    dprintf(STDERR_FILENO,
 +            "FLEETQOX_PUBLIC_MTLS_CRL_RELOAD_FAILED "
-+            "reason=credentials_unavailable result=%d\n",
-+            rv);
++            "reason=missing_ca_path\n");
 +    return GNUTLS_E_CERTIFICATE_ERROR;
 +  }
-+  auto credentials =
-+      static_cast<gnutls_certificate_credentials_t>(raw_credentials);
-+  gnutls_certificate_free_crls(credentials);
-+  rv = gnutls_certificate_set_x509_crl_file(
-+      credentials, client_crl, GNUTLS_X509_FMT_PEM);
++  gnutls_certificate_credentials_t fresh_credentials;
++  if (gnutls_certificate_allocate_credentials(&fresh_credentials) < 0) {
++    dprintf(STDERR_FILENO,
++            "FLEETQOX_PUBLIC_MTLS_CRL_RELOAD_FAILED "
++            "reason=allocate_credentials_failed\n");
++    return GNUTLS_E_CERTIFICATE_ERROR;
++  }
++  if (gnutls_certificate_set_x509_trust_file(
++        fresh_credentials, client_ca, GNUTLS_X509_FMT_PEM) <= 0) {
++    dprintf(STDERR_FILENO,
++            "FLEETQOX_PUBLIC_MTLS_CRL_RELOAD_FAILED reason=invalid_ca\n");
++    gnutls_certificate_free_credentials(fresh_credentials);
++    return GNUTLS_E_CERTIFICATE_ERROR;
++  }
++  auto rv = gnutls_certificate_set_x509_crl_file(
++      fresh_credentials, client_crl, GNUTLS_X509_FMT_PEM);
 +  if (rv <= 0) {
 +    dprintf(STDERR_FILENO,
 +            "FLEETQOX_PUBLIC_MTLS_CRL_RELOAD_FAILED "
 +            "reason=invalid_crl result=%d\n",
 +            rv);
++    gnutls_certificate_free_credentials(fresh_credentials);
++    return GNUTLS_E_CERTIFICATE_ERROR;
++  }
++  auto set_rv = gnutls_credentials_set(
++      session, GNUTLS_CRD_CERTIFICATE, fresh_credentials);
++  if (set_rv < 0) {
++    dprintf(STDERR_FILENO,
++            "FLEETQOX_PUBLIC_MTLS_CRL_RELOAD_FAILED "
++            "reason=credentials_set_failed result=%d\n",
++            set_rv);
++    gnutls_certificate_free_credentials(fresh_credentials);
 +    return GNUTLS_E_CERTIFICATE_ERROR;
 +  }
 +  dprintf(STDERR_FILENO,
