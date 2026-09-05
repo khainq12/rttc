@@ -58,6 +58,16 @@ def main() -> int:
         default=0,
         help="exact UTF-8 message data size; zero preserves the metadata-only payload",
     )
+    parser.add_argument(
+        "--state-payload-bytes",
+        type=int,
+        default=0,
+        help=(
+            "override payload size for 'state' kind topics only (e.g. odom), "
+            "for asymmetric control/state contention; zero falls back to "
+            "--payload-bytes for state topics too"
+        ),
+    )
     parser.add_argument("--publish-interval-ms", type=int, default=500)
     parser.add_argument("--timeout-s", type=float, default=15.0)
     parser.add_argument(
@@ -86,6 +96,7 @@ def main() -> int:
         samples=args.samples,
         robot_count=args.robot_count,
         payload_bytes=max(args.payload_bytes, 0),
+        state_payload_bytes=max(args.state_payload_bytes, 0),
         publish_interval_ms=args.publish_interval_ms,
         timeout_s=args.timeout_s,
         publisher_linger_s=max(args.publisher_linger_s, 0.0),
@@ -117,6 +128,7 @@ def run_probe(
     samples: int,
     robot_count: int = 1,
     payload_bytes: int = 0,
+    state_payload_bytes: int = 0,
     publish_interval_ms: int,
     timeout_s: float,
     publisher_linger_s: float = 0.5,
@@ -186,6 +198,7 @@ def run_probe(
             samples=samples,
             topic_specs=topic_specs,
             payload_bytes=payload_bytes,
+            state_payload_bytes=state_payload_bytes,
             publish_interval_ms=publish_interval_ms,
             timeout_s=timeout_s,
             publisher_linger_s=publisher_linger_s,
@@ -312,6 +325,7 @@ def run_probe(
             "samples": samples,
             "samples_per_topic": samples,
             "payload_bytes": payload_bytes,
+            "state_payload_bytes": state_payload_bytes,
             "payload_size_contract_ok": (
                 publisher_result.get("payload_size_contract_ok") is True
             ),
@@ -384,6 +398,7 @@ def write_probe_scripts(
     samples: int,
     topic_specs: list[dict[str, str]] | None = None,
     payload_bytes: int = 0,
+    state_payload_bytes: int = 0,
     publish_interval_ms: int,
     timeout_s: float,
     publisher_linger_s: float = 0.5,
@@ -401,6 +416,8 @@ def write_probe_scripts(
             "__PUBLISH_INTERVAL_S__",
             repr(publish_interval_ms / 1000.0),
         ).replace("__PAYLOAD_BYTES__", str(payload_bytes)).replace(
+            "__STATE_PAYLOAD_BYTES__", str(state_payload_bytes)
+        ).replace(
             "__PUBLISHER_LINGER_S__", repr(max(publisher_linger_s, 0.0))
         ).replace(
             "__TOPIC_SPECS_JSON__", topic_specs_json
@@ -851,6 +868,7 @@ TOPIC_SPECS = __TOPIC_SPECS_JSON__
 SAMPLES = __SAMPLES__
 PUBLISH_INTERVAL_S = __PUBLISH_INTERVAL_S__
 PAYLOAD_BYTES = __PAYLOAD_BYTES__
+STATE_PAYLOAD_BYTES = __STATE_PAYLOAD_BYTES__
 PUBLISHER_ACK_HORIZON_S = __PUBLISHER_LINGER_S__
 
 rclpy.init()
@@ -895,13 +913,17 @@ for seq in range(1, SAMPLES + 1):
             "sent_ns": now,
             "topic": spec["topic"],
         }
-        if PAYLOAD_BYTES > 0:
+        target_bytes = (
+            STATE_PAYLOAD_BYTES if spec["kind"] == "state" and STATE_PAYLOAD_BYTES > 0
+            else PAYLOAD_BYTES
+        )
+        if target_bytes > 0:
             payload["padding"] = ""
             compact = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-            padding_bytes = PAYLOAD_BYTES - len(compact.encode("utf-8"))
+            padding_bytes = target_bytes - len(compact.encode("utf-8"))
             if padding_bytes < 0:
                 raise RuntimeError(
-                    f"payload target {PAYLOAD_BYTES} is smaller than metadata "
+                    f"payload target {target_bytes} is smaller than metadata "
                     f"for {spec['topic']}"
                 )
             payload["padding"] = "x" * padding_bytes
