@@ -131,6 +131,11 @@ def run_probe(
         navigate_to_pose_goal_yaml(bt_xml_in_container, goal_x=goal_x)
     )
 
+    # Remove any stray core file left in the shared repo mount by an
+    # unrelated earlier crash before this run starts, so a core file found
+    # after the docker run below can only be attributed to this run.
+    (root / "core").unlink(missing_ok=True)
+
     try:
         build = run(
             [
@@ -167,6 +172,17 @@ def run_probe(
 
         parts: list[str] = [
             "set -e; source /opt/ros/jazzy/setup.bash; ",
+            # Best-effort crash forensics: this probe has an intermittent,
+            # unreproduced-on-demand SIGSEGV in the navigate_to_pose action
+            # client's shutdown path. Docker containers get their own
+            # PID-namespace-scoped core_pattern (plain "core", not the
+            # host's apport pipe), so enabling core dumps here is fully
+            # scoped to this ephemeral container and lands in the /work
+            # bind mount where the python-side code below can rescue it
+            # into results_rmw_socket/crash_dumps/ before the temp dir is
+            # removed -- giving a real backtrace next time this reproduces
+            # instead of just an exit code.
+            "ulimit -c unlimited; ",
             "if ! ros2 pkg prefix nav2_bt_navigator >/dev/null 2>&1 || "
             "! ros2 pkg prefix nav2_behavior_tree >/dev/null 2>&1 || "
             "! ros2 pkg prefix nav2_behaviors >/dev/null 2>&1 || "
@@ -351,6 +367,17 @@ def run_probe(
             ]
         )
 
+        crash_dump_path = ""
+        core_file = root / "core"
+        if core_file.exists() and core_file.stat().st_size > 0:
+            crash_dumps_dir = root / "results_rmw_socket" / "crash_dumps"
+            crash_dumps_dir.mkdir(parents=True, exist_ok=True)
+            rescued = crash_dumps_dir / f"nav2_recovered_success_core_{suffix}"
+            shutil.move(str(core_file), str(rescued))
+            crash_dump_path = str(rescued.relative_to(root))
+        elif core_file.exists():
+            core_file.unlink()
+
         def read(name: str) -> str:
             path = tmp / name
             return path.read_text(errors="replace") if path.exists() else ""
@@ -487,6 +514,7 @@ def run_probe(
             "docker_stdout": docker.stdout,
             "docker_stderr": docker.stderr,
             "return_codes": read("return_codes.log"),
+            "crash_dump_path": crash_dump_path,
             "navigate_recovered_success_goal_excerpt": navigate_goal[-5000:],
             "planner_log_excerpt": planner_log[-3000:],
             "controller_log_excerpt": controller_log[-3000:],
