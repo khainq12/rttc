@@ -6953,10 +6953,31 @@ bool context_is_valid(const rmw_context_t * context)
          !context->impl->is_shutdown;
 }
 
+// Guards against a use-after-free crash where upstream rcl code (observed:
+// the global rosout logging fini path at process/interpreter shutdown)
+// retains a raw rmw_node_t* past this RMW's own rmw_destroy_node() call and
+// later passes it back into an rmw_* entry point. node_is_valid() cannot
+// safely dereference such a pointer at all -- even a null-checked field
+// read on freed memory is undefined behavior and has been observed to
+// SIGSEGV inside strcmp() when the freed page gets reused/unmapped under
+// heavy graph churn. Checking pointer *identity* against this registry
+// only ever compares the pointer's own bit pattern, never the memory it
+// points to, so it is safe regardless of whether the node is still alive.
+std::mutex g_live_node_registry_mutex;
+std::unordered_set<const rmw_node_t *> g_live_node_registry;
+
 bool node_is_valid(const rmw_node_t * node)
 {
-  return node != nullptr &&
-         identifier_matches(node->implementation_identifier) &&
+  if (node == nullptr) {
+    return false;
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_live_node_registry_mutex);
+    if (g_live_node_registry.find(node) == g_live_node_registry.end()) {
+      return false;
+    }
+  }
+  return identifier_matches(node->implementation_identifier) &&
          context_is_valid(node->context);
 }
 
@@ -12428,6 +12449,18 @@ void rmw_fleetqox_cpp_shutdown_pubsub_runtime()
   rmw_fleetqox_cpp_stop_service_graph_renewal_thread();
   rmw_fleetqox_cpp_stop_service_request_repair_worker();
   socket_transport().shutdown();
+}
+
+void rmw_fleetqox_cpp_register_live_node(const rmw_node_t * node)
+{
+  std::lock_guard<std::mutex> lock(g_live_node_registry_mutex);
+  g_live_node_registry.insert(node);
+}
+
+void rmw_fleetqox_cpp_unregister_live_node(const rmw_node_t * node)
+{
+  std::lock_guard<std::mutex> lock(g_live_node_registry_mutex);
+  g_live_node_registry.erase(node);
 }
 
 size_t rmw_fleetqox_cpp_socket_peer_count()

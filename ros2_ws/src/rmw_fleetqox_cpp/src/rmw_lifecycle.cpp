@@ -126,6 +126,8 @@ void rmw_fleetqox_cpp_graph_unregister_node(
 bool rmw_fleetqox_cpp_socket_ensure_started();
 const char * rmw_fleetqox_cpp_socket_init_error();
 void rmw_fleetqox_cpp_shutdown_pubsub_runtime();
+void rmw_fleetqox_cpp_register_live_node(const rmw_node_t * node);
+void rmw_fleetqox_cpp_unregister_live_node(const rmw_node_t * node);
 
 void rmw_fleetqox_cpp_trigger_graph_guard_conditions()
 {
@@ -460,6 +462,7 @@ rmw_node_t * rmw_create_node(
   }
   rmw_fleetqox_cpp_graph_register_node(
     node->name, node->namespace_, node->context->actual_domain_id);
+  rmw_fleetqox_cpp_register_live_node(node);
   return node;
 }
 
@@ -473,6 +476,12 @@ rmw_ret_t rmw_destroy_node(rmw_node_t * node)
   if (ret != RMW_RET_OK) {
     return ret;
   }
+  // Unregister before any teardown so a caller that still holds this
+  // pointer (observed: upstream rcl's global rosout logging fini, invoked
+  // well after this node was destroyed) gets a safe "invalid" verdict from
+  // node_is_valid() instead of dereferencing memory this function is about
+  // to free.
+  rmw_fleetqox_cpp_unregister_live_node(node);
   auto * data = static_cast<FleetQoxNodeData *>(node->data);
   if (data != nullptr) {
     rcutils_allocator_t allocator = data->allocator;
