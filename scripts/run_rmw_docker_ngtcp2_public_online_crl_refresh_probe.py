@@ -193,6 +193,16 @@ def run_iteration(
                 certs=certs,
                 source_name="stateful-revoked.crl.pem",
             )
+            # replace_live_crl only confirms the file swap on the client
+            # side of the shared cert mount -- it says nothing about
+            # whether the server has actually noticed and reloaded it yet.
+            # Wait for the server's own reload-confirmation log line
+            # (cumulative count, since the same marker recurs for each of
+            # the 3 expected successful reloads) before exercising the
+            # connection that depends on the new state.
+            revoked_installed = revoked_installed and wait_for_log(
+                server_name, "FLEETQOX_PUBLIC_MTLS_CRL_RELOADED", count=1
+            )
             revoked = run_exec_client(
                 root=root,
                 container=client_name,
@@ -206,6 +216,9 @@ def run_iteration(
                 root=root,
                 certs=certs,
                 source_name="initial-client.crl.pem",
+            )
+            initial_restored = initial_restored and wait_for_log(
+                server_name, "FLEETQOX_PUBLIC_MTLS_CRL_RELOADED", count=2
             )
             restored = run_exec_client(
                 root=root,
@@ -221,6 +234,9 @@ def run_iteration(
                 certs=certs,
                 source_name="invalid-client.crl.pem",
             )
+            malformed_installed = malformed_installed and wait_for_log(
+                server_name, "FLEETQOX_PUBLIC_MTLS_CRL_RELOAD_FAILED", count=1
+            )
             malformed = run_exec_client(
                 root=root,
                 container=client_name,
@@ -235,6 +251,9 @@ def run_iteration(
                 root=root,
                 certs=certs,
                 source_name="initial-client.crl.pem",
+            )
+            final_restore = final_restore and wait_for_log(
+                server_name, "FLEETQOX_PUBLIC_MTLS_CRL_RELOADED", count=3
             )
         if server_ready:
             server_exit, logs = stop_server(server_name)
