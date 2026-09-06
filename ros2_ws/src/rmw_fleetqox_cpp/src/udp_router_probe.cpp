@@ -11,6 +11,8 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -32,6 +34,8 @@ constexpr const char * kRepairFragmentPrefix =
   "FLEETQOX_REPAIR_FRAGMENT_V1|";
 constexpr const char * kRepairFragmentNackPrefix =
   "FLEETQOX_REPAIR_FRAGMENT_NACK_V1|";
+constexpr const char * kRepairFragmentCompletionPrefix =
+  "FLEETQOX_REPAIR_FRAGMENT_END_V1|";
 
 struct RouterConfig
 {
@@ -128,6 +132,32 @@ struct QueuedDataFrame
   bool test_repair = false;
 };
 
+// A large sample (e.g. a state topic) always leaves the sender as many
+// small fragment datagrams rather than one whole DataFrame, since no
+// realistic link MTU fits it in one piece. QueuedDataFrame's holdback
+// scheduling only ever sees whole, decoded DataFrames, so without a
+// fragment-aware counterpart, everything belonging to a scheduler-managed
+// (bulk/state) topic bypasses holdback entirely just because it happens to
+// be fragmented -- defeating the scheduler's purpose of pacing bulk
+// traffic to protect latency-sensitive topics sharing the same link.
+struct QueuedFragmentDatagram
+{
+  std::string encoded_frame;
+  sockaddr_in source_address{};
+  std::chrono::steady_clock::time_point enqueued_at{};
+  std::uint64_t order = 0;
+  // scheduler_forwarded_frames counts one increment per logical scheduled
+  // message (matching the whole-DataFrame path, where one queued item is
+  // one message) -- true only on the fragment that made the admission
+  // decision for its message, so a 30 KB sample split into ~25 fragments
+  // doesn't inflate this telemetry counter 25x over.
+  bool counts_as_forwarded_message = false;
+  // Only meaningful when counts_as_forwarded_message is true; carried
+  // through so per-robot telemetry can be recorded once per message
+  // (see derive_robot_id_from_topic).
+  std::string topic;
+};
+
 struct RobotSchedulerStats
 {
   std::string robot_id;
@@ -220,7 +250,8 @@ bool is_fragment_datagram(const std::string & payload)
 {
   return payload.rfind(kFragmentPrefix, 0) == 0 ||
          payload.rfind(kRepairFragmentPrefix, 0) == 0 ||
-         payload.rfind(kRepairFragmentNackPrefix, 0) == 0;
+         payload.rfind(kRepairFragmentNackPrefix, 0) == 0 ||
+         payload.rfind(kRepairFragmentCompletionPrefix, 0) == 0;
 }
 
 // The sender embeds "^^<domain_id>^^<topic>" in the fragment_id field (the
@@ -234,7 +265,8 @@ bool is_fragment_datagram(const std::string & payload)
 bool try_parse_fragment_route(
   const std::string & payload,
   std::uint64_t * domain_id,
-  std::string * topic)
+  std::string * topic,
+  std::string * fragment_id_out = nullptr)
 {
   std::string prefix;
   if (payload.rfind(kFragmentPrefix, 0) == 0) {
@@ -243,6 +275,8 @@ bool try_parse_fragment_route(
     prefix = kRepairFragmentPrefix;
   } else if (payload.rfind(kRepairFragmentNackPrefix, 0) == 0) {
     prefix = kRepairFragmentNackPrefix;
+  } else if (payload.rfind(kRepairFragmentCompletionPrefix, 0) == 0) {
+    prefix = kRepairFragmentCompletionPrefix;
   } else {
     return false;
   }
@@ -277,6 +311,75 @@ bool try_parse_fragment_route(
   }
   if (topic != nullptr) {
     *topic = topic_text;
+  }
+  if (fragment_id_out != nullptr) {
+    *fragment_id_out = fragment_id;
+  }
+  return true;
+}
+
+struct FragmentSizeInfo
+{
+  std::string fragment_id;
+  std::size_t fragment_count = 0;
+  std::size_t total_size = 0;
+};
+
+// Data-carrying fragments (kFragmentPrefix/kRepairFragmentPrefix) are laid
+// out as "<fragment_id>|<index>|<fragment_count>|<total_size>|<chunk>",
+// carrying the original, unfragmented message size in the 4th field.
+// Admission scoring on an individual fragment's own (small, chunk-sized)
+// length would make a 30 KB message that happens to be split into 25
+// fragments look 25x cheaper than the same message sent whole -- this
+// recovers the true per-message cost, and fragment_id/fragment_count let
+// the caller make exactly one admission decision per logical message
+// (see fragment_admission_decisions) instead of one per fragment. Repair-
+// NACK requests use a different, shorter layout
+// ("<fragment_id>|<fragment_count>|<indexes>") with no total-size field,
+// so they're intentionally excluded here and fall back to their own
+// (already small) datagram size at the call site.
+bool try_parse_fragment_size_info(const std::string & payload, FragmentSizeInfo * info)
+{
+  std::string prefix;
+  if (payload.rfind(kFragmentPrefix, 0) == 0) {
+    prefix = kFragmentPrefix;
+  } else if (payload.rfind(kRepairFragmentPrefix, 0) == 0) {
+    prefix = kRepairFragmentPrefix;
+  } else {
+    return false;
+  }
+  const size_t id_end = payload.find('|', prefix.size());
+  if (id_end == std::string::npos) {
+    return false;
+  }
+  const size_t index_end = payload.find('|', id_end + 1);
+  if (index_end == std::string::npos) {
+    return false;
+  }
+  const size_t count_end = payload.find('|', index_end + 1);
+  if (count_end == std::string::npos) {
+    return false;
+  }
+  const size_t total_size_end = payload.find('|', count_end + 1);
+  if (total_size_end == std::string::npos) {
+    return false;
+  }
+  const std::string count_text = payload.substr(index_end + 1, count_end - index_end - 1);
+  const std::string total_size_text =
+    payload.substr(count_end + 1, total_size_end - count_end - 1);
+  const auto all_digits = [](const std::string & text) {
+      return !text.empty() &&
+             std::all_of(
+        text.begin(), text.end(),
+        [](unsigned char c) {return c >= '0' && c <= '9';});
+    };
+  if (!all_digits(count_text) || !all_digits(total_size_text)) {
+    return false;
+  }
+  if (info != nullptr) {
+    info->fragment_id = payload.substr(prefix.size(), id_end - prefix.size());
+    info->fragment_count = static_cast<std::size_t>(std::strtoull(count_text.c_str(), nullptr, 10));
+    info->total_size = static_cast<std::size_t>(std::strtoull(total_size_text.c_str(), nullptr, 10));
   }
   return true;
 }
@@ -426,6 +529,31 @@ void increment_topic_count(
   } else {
     ++existing->second;
   }
+}
+
+// A whole (non-fragmented) DataFrame carries its sender's robot_id (set
+// from FLEETQOX_RMW_ROBOT_ID) as an explicit wire field, but a fragment's
+// wire format only carries "^^<domain_id>^^<topic>" -- robot_id itself
+// never made it into that encoding. Every topic in this transport's own
+// convention embeds the same robot_<NNNN> token the sender uses as its
+// robot_id (e.g. "/fleetqox/robot_0000/state"), so recovering it from the
+// topic is exact here, not a guess -- it's the one place fragmented
+// per-robot scheduler telemetry can still get a robot_id from at all.
+std::string derive_robot_id_from_topic(const std::string & topic)
+{
+  const std::string marker = "robot_";
+  const size_t start = topic.find(marker);
+  if (start == std::string::npos) {
+    return "";
+  }
+  size_t end = start + marker.size();
+  while (end < topic.size() && topic[end] >= '0' && topic[end] <= '9') {
+    ++end;
+  }
+  if (end == start + marker.size()) {
+    return "";
+  }
+  return topic.substr(start, end - start);
 }
 
 void record_robot_scheduler_result(
@@ -1431,6 +1559,32 @@ int main(int argc, char ** argv)
   std::vector<TopicQosLease> topic_qos_table;
   std::vector<std::string> dropped_source_sequence_keys;
   std::vector<QueuedDataFrame> queued_data_frames;
+  std::vector<QueuedFragmentDatagram> queued_fragment_datagrams;
+  // One admission (holdback vs. bypass) decision per logical message, not
+  // per fragment -- otherwise a single 30 KB sample split into ~25
+  // fragments would ask the adaptive admission policy the same question
+  // ~25 times, inflating its sample/decision counts by the fragment count
+  // instead of the actual number of messages seen. Keyed by fragment_id,
+  // value is {decision, fragments_remaining}; erased once every fragment
+  // of that message has been accounted for.
+  std::unordered_map<std::string, std::pair<bool, std::size_t>> fragment_admission_decisions;
+  // "received"/"topics" below count logical messages, not datagrams -- a
+  // whole (non-fragmented) DataFrame counts once on arrival, so a
+  // fragmented one (state topics, always fragmented at any realistic
+  // payload size) must also count exactly once, on its first-seen
+  // fragment, or expected_frames-style assertions sized for "one whole
+  // message per publish" would never be reachable once messages fragment.
+  std::unordered_set<std::string> fragment_ids_counted_as_received;
+  // Separate from fragment_admission_decisions (which is intentionally
+  // ephemeral -- it only needs to live for the remaining fragments of one
+  // send). A NACK-triggered repair resending fragments of an
+  // already-fully-accounted message reuses the same fragment_id; if
+  // telemetry counting were tied to that ephemeral map's lifecycle, the
+  // repair would look like a brand new message once the original entry
+  // had already been erased. This set is never erased, so each message
+  // counts toward scheduler_queued_frames/bypassed/forwarded and
+  // per-robot stats exactly once for the life of the process.
+  std::unordered_set<std::string> fragment_ids_counted_for_scheduler_telemetry;
   std::vector<std::pair<std::string, std::uint64_t>> forwarded_topic_source_sequences;
   std::vector<RobotSchedulerStats> robot_scheduler_stats;
   int scheduler_queued_frames = 0;
@@ -1534,6 +1688,48 @@ int main(int argc, char ** argv)
     }
     queued_data_frames.clear();
   };
+  auto forward_scheduled_fragment_datagram = [&](const QueuedFragmentDatagram & queued) {
+      const int forwarded_now = forward_fragment_datagram(
+        fd,
+        queued.encoded_frame,
+        queued.source_address,
+        peer_addresses,
+        route_table,
+        publisher_route_table,
+        service_route_table,
+        action_route_table);
+      forwarded += forwarded_now;
+      if (forwarded_now > 0 && queued.counts_as_forwarded_message) {
+        ++scheduler_forwarded_frames;
+        record_robot_scheduler_result(
+          &robot_scheduler_stats, derive_robot_id_from_topic(queued.topic), false);
+      }
+    };
+  auto flush_queued_fragment_datagrams = [&]() {
+    std::stable_sort(
+      queued_fragment_datagrams.begin(),
+      queued_fragment_datagrams.end(),
+      [](const QueuedFragmentDatagram & left, const QueuedFragmentDatagram & right) {
+        return left.order < right.order;
+      });
+    const int drain_pacing_ms =
+      config.scheduler_urgent_deadline_ms > 0 &&
+      config.scheduler_window_ms > 0 &&
+      queued_fragment_datagrams.size() > 1 ?
+      std::min(
+        2,
+        std::max(1, config.scheduler_window_ms / static_cast<int>(queued_fragment_datagrams.size()))) :
+      0;
+    scheduler_drain_pacing_ms = std::max(scheduler_drain_pacing_ms, drain_pacing_ms);
+    for (size_t i = 0; i < queued_fragment_datagrams.size(); ++i) {
+      forward_scheduled_fragment_datagram(queued_fragment_datagrams[i]);
+      if (drain_pacing_ms > 0 && i + 1 < queued_fragment_datagrams.size()) {
+        ++scheduler_paced_frames;
+        std::this_thread::sleep_for(std::chrono::milliseconds(drain_pacing_ms));
+      }
+    }
+    queued_fragment_datagrams.clear();
+  };
   std::array<char, kMaxUdpPayloadBytes> buffer{};
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(config.timeout_ms);
   auto expectations_satisfied = [&]() {
@@ -1548,7 +1744,8 @@ int main(int argc, char ** argv)
            topic_source_sequence_expectations_satisfied(
              config.expected_forwarded_topic_source_sequences,
            forwarded_topic_source_sequences) &&
-           queued_data_frames.empty();
+           queued_data_frames.empty() &&
+           queued_fragment_datagrams.empty();
   };
   auto activity_counter = [&]() -> std::int64_t {
     return static_cast<std::int64_t>(received) +
@@ -1602,12 +1799,20 @@ int main(int argc, char ** argv)
       config.scheduler_expected_frames > 0 ?
       queued_data_frames.size() >= static_cast<size_t>(config.scheduler_expected_frames) :
       received >= config.expected_frames;
-    if (!queued_data_frames.empty() &&
+    const bool data_frame_flush_due = !queued_data_frames.empty() &&
       (scheduler_batch_ready ||
       config.scheduler_window_ms <= 0 ||
-      now - queued_data_frames.front().enqueued_at >= std::chrono::milliseconds(config.scheduler_window_ms)))
-    {
+      now - queued_data_frames.front().enqueued_at >= std::chrono::milliseconds(config.scheduler_window_ms));
+    // Fragments have no whole-DataFrame count to batch against (a single
+    // state sample can be dozens of fragments), so they drain purely on the
+    // same window timeout used as the data-frame queue's fallback trigger.
+    const bool fragment_flush_due = !queued_fragment_datagrams.empty() &&
+      (config.scheduler_window_ms <= 0 ||
+      now - queued_fragment_datagrams.front().enqueued_at >=
+      std::chrono::milliseconds(config.scheduler_window_ms));
+    if (data_frame_flush_due || fragment_flush_due) {
       flush_queued_data_frames();
+      flush_queued_fragment_datagrams();
       continue;
     }
     sockaddr_in source_address{};
@@ -1631,15 +1836,124 @@ int main(int argc, char ** argv)
 
     const std::string encoded_frame(buffer.data(), static_cast<size_t>(size));
     if (is_fragment_datagram(encoded_frame)) {
-      forwarded += forward_fragment_datagram(
-        fd,
-        encoded_frame,
-        source_address,
-        peer_addresses,
-        route_table,
-        publisher_route_table,
-        service_route_table,
-        action_route_table);
+      std::uint64_t fragment_domain_id = 0;
+      std::string fragment_topic;
+      std::string fragment_id_for_counting;
+      if (try_parse_fragment_route(
+          encoded_frame, &fragment_domain_id, &fragment_topic, &fragment_id_for_counting) &&
+        fragment_ids_counted_as_received.insert(fragment_id_for_counting).second)
+      {
+        ++received;
+        topics.push_back(fragment_topic);
+      }
+      const bool fragment_topic_matches =
+        config.scheduler_window_ms > 0 &&
+        !config.scheduler_topic_prefix.empty() &&
+        !fragment_topic.empty() &&
+        fragment_topic.rfind(config.scheduler_topic_prefix, 0) == 0;
+      bool count_bypass_as_scheduled_message = false;
+      if (fragment_topic_matches) {
+        FragmentSizeInfo size_info;
+        bool admit;
+        if (try_parse_fragment_size_info(encoded_frame, &size_info) &&
+          !size_info.fragment_id.empty())
+        {
+          auto existing = fragment_admission_decisions.find(size_info.fragment_id);
+          if (existing == fragment_admission_decisions.end()) {
+            admit = scheduler_admits_holdback(
+              config, size_info.total_size, &scheduler_admission_state);
+            const std::size_t remaining =
+              size_info.fragment_count > 0 ? size_info.fragment_count - 1 : 0;
+            if (remaining > 0) {
+              fragment_admission_decisions.emplace(
+                size_info.fragment_id, std::make_pair(admit, remaining));
+            }
+          } else {
+            admit = existing->second.first;
+            if (--existing->second.second == 0) {
+              fragment_admission_decisions.erase(existing);
+            }
+          }
+        } else if (!fragment_id_for_counting.empty() &&
+          fragment_ids_counted_for_scheduler_telemetry.count(fragment_id_for_counting) > 0)
+        {
+          // A NACK request or completion marker (different layout than a
+          // data fragment, so try_parse_fragment_size_info can't read it)
+          // for a message whose data fragments we've already admission-
+          // scored. Its own admission decision no longer matters -- the
+          // holdback-vs-bypass call was already made for this message --
+          // so skip re-invoking the adaptive policy (which would otherwise
+          // count a second, spurious sample/decision for the same
+          // message) and just forward it promptly.
+          admit = false;
+        } else {
+          // Genuinely unidentifiable (e.g. a NACK for a message this
+          // router never saw the data fragments of) -- fall back to a
+          // one-off decision on this datagram's own size rather than
+          // silently always admitting or always bypassing it.
+          admit = scheduler_admits_holdback(
+            config, encoded_frame.size(), &scheduler_admission_state);
+        }
+        // Telemetry identity uses fragment_id_for_counting (parsed once,
+        // above, from ANY fragment-family prefix) rather than
+        // size_info.fragment_id (only populated for data fragments) --
+        // the completion marker that follows a message's data fragments
+        // shares the exact same fragment_id, and must be recognized as
+        // "already counted", not scored as a second, brand-new message.
+        // scheduler_queued_frames/scheduler_admission_bypassed_frames/
+        // scheduler_forwarded_frames count admission *decisions* (one per
+        // message), not datagrams -- every fragment of an admitted message
+        // still gets queued individually below so it actually gets
+        // forwarded, but only the fragment that triggers this counts
+        // toward telemetry. Gated on the permanent set (not the ephemeral
+        // fragment_admission_decisions entry) so a later NACK-triggered
+        // repair resending fragments of an already-fully-counted message
+        // doesn't look like a brand new one just because that entry was
+        // already erased when the original send completed.
+        const bool count_for_telemetry =
+          fragment_id_for_counting.empty() ||
+          fragment_ids_counted_for_scheduler_telemetry.insert(fragment_id_for_counting).second;
+        if (count_for_telemetry) {
+          if (admit) {
+            ++scheduler_queued_frames;
+          } else {
+            ++scheduler_admission_bypassed_frames;
+          }
+        }
+        if (admit) {
+          queued_fragment_datagrams.push_back(
+            QueuedFragmentDatagram{
+              encoded_frame,
+              source_address,
+              std::chrono::steady_clock::now(),
+              next_queue_order++,
+              count_for_telemetry,
+              fragment_topic});
+          continue;
+        }
+        // Bypassed (not held back) admitted-eligible messages still go
+        // through the scheduler's accounting immediately below, matching
+        // the whole-DataFrame path: bypass means "don't queue it", not
+        // "don't count it as a scheduled message".
+        count_bypass_as_scheduled_message = count_for_telemetry;
+      }
+      {
+        const int forwarded_now = forward_fragment_datagram(
+          fd,
+          encoded_frame,
+          source_address,
+          peer_addresses,
+          route_table,
+          publisher_route_table,
+          service_route_table,
+          action_route_table);
+        forwarded += forwarded_now;
+        if (forwarded_now > 0 && count_bypass_as_scheduled_message) {
+          ++scheduler_forwarded_frames;
+          record_robot_scheduler_result(
+            &robot_scheduler_stats, derive_robot_id_from_topic(fragment_topic), false);
+        }
+      }
       continue;
     }
 

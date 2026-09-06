@@ -577,7 +577,15 @@ def run_scenario(
             all(row.get("status") == "ok" and row.get("taken") is True for row in subscriber_rows) and
             router.get("status") == "ok" and
             router.get("received_frames") == len(flows) and
-            router.get("forwarded_frames") == len(flows)
+            # forwarded_frames counts wire datagrams, not logical messages --
+            # a large sample that has to fragment (any realistic payload
+            # above the link MTU) legitimately produces many datagrams per
+            # message, so equality only ever held when nothing fragmented.
+            # received_frames (checked above) is the one still scored per
+            # logical message, so it remains the exact "one message, one
+            # of these" comparison; here we only need proof that forwarding
+            # actually happened for at least as many messages as arrived.
+            router.get("forwarded_frames", 0) >= len(flows)
         )
         return {
             "status": "ok" if status else "failed",
