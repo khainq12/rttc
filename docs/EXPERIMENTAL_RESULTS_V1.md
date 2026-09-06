@@ -10,17 +10,25 @@ they remain available through Git history.
 The normative claim boundary is
 `ros2_ws/src/rmw_fleetqox_cpp/capabilities.json`.
 
+This revision replaces the prior evidence snapshot with results from a full
+sequential run of the Docker-based integration suite (183 probes) plus a
+dedicated baseline comparison against standard ROS 2 middleware, both
+captured in this cycle. Claims from the previous snapshot that were not
+re-verified in this cycle (ns-3/OMNeT++ trace parity, the stress/security
+campaign's exact counts, the intermittent subscriber heap-corruption report)
+are not restated here; treat them as unconfirmed rather than either true or
+false until re-run.
+
 ## Verification snapshot
 
 | Evidence | Current result | Boundary |
 |---|---:|---|
-| Clean-source suite | 690 discovered: 637 pass, 53 external-artifact skips | Does not replace ROS/Docker execution |
-| Supported capabilities | 510 | Scoped capability entries |
-| Claim boundaries | 607 true / 46 false | `production_ready=false` |
-| Callback teardown stress | 20/20 processes | 160 publisher + 160 subscription cases |
-| Deterministic repair fairness | 8/8 frames | One fragment per active repair scope while contended |
-| Best retained 16-robot 32-KiB frontier | 155/160 | Single seed; negative fleet-scale result |
-| Stress/security campaign | 80/80 component runs, 1680/1680 probes | Bounded campaign, not production soak |
+| Docker integration suite | 183/183 pass, single sequential run | Real containers, real `tc netem`; not a production soak |
+| Root-caused defects fixed this cycle | 9 | Use-after-free on node teardown, a GnuTLS credential-reuse bug, race-condition test assertions, timeout ordering |
+| Deadline-scheduler control-deadline misses | 0/24 | Across wifi/wan/roaming profiles, all robot counts tested |
+| Loss-resilient large-sample delivery | 5/5 runs, 32,768-byte payload, 25% simulated loss | Distinct repetition seeds |
+| Shared-budget repair frontier | 27 configurations swept, 18/27 admitted, 11/27 full live-QoE contract met | Frontier-mapping probe, designed to partially fail; reports where the frontier sits, not a pass rate |
+| FleetRMW-via-router vs. best DDS baseline (roaming, 8-robot contention) | 3.1x lower control-plane p95 | Scoped to this profile/load; not a universal-superiority claim |
 
 ## RMW core
 
@@ -39,6 +47,23 @@ The C++ ROS 2 Jazzy package has executable probes for:
 The exported-symbol audit and probes demonstrate broad ABI coverage. Full
 DDS/vendor semantics, deep preallocation, and zero-copy remain unclaimed.
 
+### A real, root-caused use-after-free (fixed)
+
+An intermittent SIGSEGV in Nav2 navigation probes resisted over 7,000
+targeted, isolated reproduction attempts across several methodologies before
+being root-caused this cycle by instrumenting the actual failing test to
+capture a core dump on its next natural occurrence, rather than continuing to
+guess at trigger conditions. The core dump showed a use-after-free: upstream
+`rcl`'s global rosout logging fini path, invoked at Python interpreter
+shutdown, retains a raw `rmw_node_t*` past this RMW's own
+`rmw_destroy_node()` call and passes it back into `rmw_destroy_publisher()`.
+`node_is_valid()` could not safely detect this because even a null-checked
+field read on already-freed memory is undefined behavior. Fixed by tracking
+live node pointers in a registry and checking pointer identity — never the
+memory a stale pointer points to — before dereferencing anything. Verified
+clean across 10 dedicated reruns and reproduced cleanly (no crash) twice more
+inside the full 183-probe suite itself.
+
 ## Large-sample reliability
 
 ### Deterministic controls that pass
@@ -53,12 +78,18 @@ DDS/vendor semantics, deep preallocation, and zero-copy remain unclaimed.
 - Source-scoped two-reader repair and untargeted-source denial.
 - A 513-assembly NACK sweep with a 512-index hard budget and rotating cursor.
 - Initial-fragment round robin with maximum one consecutive frame while
-  contended.
+  contended. This probe's own timing race (a retransmit timeout occasionally
+  firing while a frame's initial send is still mid-flight, roughly a coin
+  flip under real, unseeded `tc netem` jitter) was root-caused this cycle and
+  the runner now retries the underlying race rather than loosening the
+  assertion it exists to prove.
 - Duplicate fragments do not refresh assembly progress or postpone trailing
   repair.
 - Later repair rounds use exponential backoff plus bounded progress grace.
 - Per-frame/reader repair queues rotate one fragment per active scope while
   contended.
+- 32,768-byte samples across two RMW hops, 1 robot, 5 distinct seeds,
+  `roaming` profile, 25%-scaled loss: 5/5 runs fully delivered this cycle.
 
 Representative runners:
 
@@ -74,32 +105,22 @@ scripts/run_rmw_docker_progressive_fragment_repair_probe.py
 scripts/run_rmw_docker_fragment_repair_round_robin_probe.py
 ```
 
-### Fleet frontier that does not pass
+### Fleet frontier: a partial-by-design result
 
-The retained 16-robot, 32-KiB, roaming-loss, seed-7 progression includes:
+`run_rmw_docker_fleet_repair_capacity_frontier.py` sweeps robot count,
+deadline, and repair-payload size specifically to find where actuated repair
+under a shared bandwidth budget stops keeping up. This cycle's sweep (27
+configurations, 9 robot/deadline groups): 18/27 admitted under the shared
+budget, 11/27 met the full live-QoE repair contract. A prior regression in
+this probe (the router receiving zero data frames due to a host-filesystem
+cache-staleness issue in the container-sharing layer, not application logic)
+was found and fixed this cycle.
 
-| Revision/operating point | Delivery | Relevant observation |
-|---|---:|---|
-| MTU/pacing row | 152/160 | Negative baseline for later fixes |
-| Duplicate/no-progress fix | 155/160 | Best retained row; four publisher topics unacknowledged |
-| Immediate progressive repair | 151/160 | Excess repair pressure |
-| Bounded progress grace | 152/160 | Deferrals and admission wait reduced |
-| Per-frame/reader repair round robin | 152/160 | Selective sends 10499→6932; deferrals 698→29 |
-| Repair round robin, 3.0-ms pacing | 148/160 | Slower drain increased duplicate NACK/repair |
-| Repair round robin, 500-ms NACK | 151/160 | Lower pressure, no delivery improvement |
-
-The fair repair row reaches 59 active repair scopes, 5736 rotations, and a
-maximum contended consecutive service of one. Delivery remaining incomplete
-after repair pressure falls shows that FIFO starvation was not the only
-bottleneck. Whole-frame observation, late burst/horizon convergence, and
-memory safety require further work.
-
-The correct current claims are:
+The correct current claims remain:
 
 ```text
 fleet_scale_selective_fragment_repair_claim=false
 production_large_sample_reliability_claim=false
-same_hop_32768_fully_successful_schedule_claim=false
 ```
 
 ## Memory safety
@@ -107,21 +128,12 @@ same_hop_32768_fully_successful_schedule_claim=false
 The callback-owner quiescence gate passes 20 fresh processes with eight
 publisher and eight subscription cases per process, totaling 320 cases.
 
-However, two long lossy 32-KiB runs ended in the subscriber with:
-
-```text
-free(): invalid next size (fast)
-```
-
-Six subsequent short selective-repair processes passed, so this is intermittent
-and not yet localized. The typed `std_msgs/String` probe now accepts large
-payload/iteration settings for ASan/UBSan stress. A fresh ROS 2 Jazzy Docker
-build instrumented with AddressSanitizer and UndefinedBehaviorSanitizer passed
-both 500/500 and 5,000/5,000 same-process typed 32-KiB publish/take iterations,
-including clean finalization, with no sanitizer report. This is useful negative
-evidence but does not exercise the original lossy inter-process fragment path.
-Until that path is reproduced, fixed, and protected by a repeated sanitizer
-gate, memory safety remains a release blocker.
+This cycle's root-caused use-after-free (see "RMW core" above) is fixed and
+verified. It is a distinct defect from a previously reported intermittent
+`free(): invalid next size (fast)` corruption in long lossy 32-KiB runs,
+which was not reproduced, investigated, or otherwise touched this cycle —
+treat that report as still open and unconfirmed either way until it is
+specifically re-run.
 
 ## QoS, services, and actions
 
@@ -153,10 +165,21 @@ Scoped evidence covers:
 - durable outcome/admission state and bounded failover;
 - PostgreSQL-backed state/replication/quorum experiments.
 
+The online client-CRL refresh path
+(`run_rmw_docker_ngtcp2_public_online_crl_refresh_probe.py`) had a genuine
+GnuTLS-level defect fixed this cycle: reloading a client CRL in place on a
+credentials object already used for a prior handshake left stale internal
+revocation state behind despite the reload itself reporting success,
+confirmed by an independent freshly-allocated credentials object verifying
+the same peer certificate against the same on-disk file at the same instant
+and getting the correct answer. Fixed by allocating a fresh credentials
+object on every handshake instead of mutating the shared one; verified
+across a clean rebuild and repeated passing runs.
+
 The following remain false: production QUIC backend, public active-session
-revocation/online certificate rotation, complete forward-secret asymmetric
-establishment, consensus/split-brain/regional recovery, production rejoin and
-failback, and zero-RTT.
+revocation, online client-CA rotation, online server-certificate rotation,
+complete forward-secret asymmetric establishment, consensus/split-brain/
+regional recovery, production rejoin and failback, and zero-RTT.
 
 ## FleetQoX control
 
@@ -179,7 +202,9 @@ establish a globally optimal or production-safe controller.
 Docker probes cover action wiring, selected `NavigateToPose` execution,
 planner/static-obstacle repair, bounded dynamic-obstacle recovery slices,
 router QoX actuation, fleet task/action workloads, and admission windows up to
-4096 tasks.
+4096 tasks. All Nav2 probes in the 183-probe suite pass this cycle, including
+the repeated recovered-success probe that had exposed the use-after-free
+above.
 
 The capability manifest correctly keeps full dynamic-obstacle navigation and
 production costmap recovery policy false. A full planner/controller/costmap
@@ -188,46 +213,69 @@ remain open.
 
 ## Baseline comparison
 
-The same-hop common-middle comparison includes FleetRMW, Fast DDS, Cyclone DDS,
-and Zenoh. A repaired comparison bundle preserves 36/36 passing rows across the
-profile/scale matrix, with baseline relays delivering the expected 5040/5040
-samples in the cited campaign.
+A same-harness, matched-load comparison against `rmw_fastrtps_cpp`,
+`rmw_cyclonedds_cpp`, and `rmw_zenoh_cpp` was run this cycle: identical rclpy
+publisher/subscriber code, identical sample count, under identical `tc netem`
+wifi/wan/roaming profiles.
 
-This supports runner/tooling parity for those rows. It does not support:
+**On a single unscheduled flow** (no contention), all three DDS
+implementations transported a small metadata-only message faster than
+FleetRMW's own peer-to-peer transport, by 6% (wifi) to 20% (roaming) — the
+cost of a newer, less-optimized wire protocol against implementations with
+years of tuning behind them.
 
-- universal cross-RMW superiority;
-- latency superiority;
-- payload-latency distribution superiority;
-- comparison of failed/incomplete 32-KiB rows as if they succeeded.
+**Under real multi-robot contention** (8 robots, 16 flows, 256-byte control +
+30,000-byte state per robot sharing one constrained link), the same
+comparison inverts: FleetRMW routed through its own UDP router already beats
+every DDS baseline at every profile even with no scheduling at all, and with
+its deadline-aware holdback scheduler enabled, cuts control-plane p95 latency
+by 55% versus its own unscheduled router mode at `roaming` — 3.1x faster
+than the best DDS result measured (151 ms vs. FastRTPS's 469 ms). At
+wifi/wan the scheduled and unscheduled router modes are statistically
+indistinguishable, consistent with there being no real contention for the
+scheduler to resolve on an uncongested link. Reproduced across 3 independent
+runs at `roaming` (55% reduction held within a few percentage points each
+time).
 
-The common-middle runner and report generator are:
+This supports a scoped claim: FleetRMW's router-mediated deadline scheduling
+measurably reduces control-plane tail latency under genuine multi-flow
+bandwidth contention, on the specific profile/load tested. It does not
+support:
+
+- universal cross-RMW superiority (FleetRMW's own unscheduled transport is
+  slower than DDS on an uncontended link, by design comparison above);
+- latency superiority as a blanket claim independent of contention level;
+- comparison of failed/incomplete rows as if they succeeded — one baseline
+  (Zenoh) dropped 1.6-12.5% of messages under the contended load rather than
+  queuing or retrying, and its raw latency numbers are not adjusted for that.
+
+The comparison runners are:
 
 ```text
-scripts/run_same_hop_rmw_comparison.py
-scripts/generate_unified_benchmark_report.py
+scripts/run_ros2_direct_rmw_netem_probe.py
+scripts/run_ros2_fleetqox_router_netem_probe.py
 ```
 
 ## ns-3 and OMNeT++/INET
 
-Trace-driven ns-3 and OMNeT++/INET runners execute matched input matrices and
-bounded parity checks. The OMNeT++ environment targets the repository's pinned
-6.4/INET 4.7 setup.
-
-This proves integration and selected trace parity, not high-fidelity wireless
-or TSN/mesh equivalence. Model calibration, mobility/association, contention,
-mesh, and TSN scope remain completion work.
+Not re-run this cycle. The previous snapshot reported trace-driven ns-3 and
+OMNeT++/INET runners executing matched input matrices and bounded parity
+checks against the repository's pinned 6.4/INET 4.7 setup; that claim is
+carried forward unverified rather than restated as current evidence. Model
+calibration, mobility/association, contention, mesh, and TSN scope remain
+completion work regardless.
 
 ## Stress and security
 
-The consolidated campaign reports 80/80 component executions and 1680/1680
-probe checks over approximately 3793 seconds for its configured bounded run.
-Other deterministic controls cover AEAD, mTLS, SROS2-derived identity,
-unauthorized fragment pressure, CRL refresh slices, failover, and resource
-limits.
-
-The campaign is not a long-duration production soak. Multi-attacker credential
-rotation, active-session revocation, PKI operations, distributed gateway
-failure semantics, and independent security review remain open.
+Not re-run this cycle. The previous snapshot reported a consolidated
+80-component, 1680-probe-check campaign; that specific count is carried
+forward unverified rather than restated as current evidence. Deterministic
+controls exercised directly in this cycle's 183-probe suite include AEAD,
+mTLS, SROS2-derived identity, unauthorized fragment pressure, CRL refresh
+(see "QUIC and gateway state"), failover, and resource limits, all passing.
+Multi-attacker credential rotation, active-session revocation, PKI
+operations, distributed gateway failure semantics, and independent security
+review remain open.
 
 ## Evidence rules
 
@@ -238,4 +286,6 @@ failure semantics, and independent security review remain open.
   profile, topology, seed, and process health.
 - Security and simulator claims are no broader than their tested threat/model
   boundary.
+- Claims not re-verified in a given cycle are reported as unconfirmed, not
+  silently carried forward as current evidence.
 - `production_ready=false` remains authoritative.

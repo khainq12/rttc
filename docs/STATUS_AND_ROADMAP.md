@@ -14,6 +14,9 @@ Current checkpoint:
 - 607 true and 46 false scoped claim boundaries;
 - 690 tests discovered in a clean checkout: 637 pass and 53 external Docker
   evidence tests skip until their ignored artifact bundle is regenerated;
+- 183/183 Docker integration probes pass in the latest full sequential run
+  (see `docs/EXPERIMENTAL_RESULTS_V1.md`), including a same-harness baseline
+  comparison against Fast DDS/Cyclone DDS/Zenoh;
 - research prototype, not a production release.
 
 ## Original target
@@ -78,6 +81,10 @@ endpoint-only delivery:
 ### Evidence
 
 - Fast DDS, Cyclone DDS, Zenoh, and FleetRMW common-middle runners.
+- A same-harness contention comparison (Fast DDS/Cyclone DDS/Zenoh/FleetRMW
+  direct/FleetRMW-via-router) showing a scoped, reproducible latency
+  advantage for the router's deadline scheduler under genuine multi-flow
+  bandwidth contention (see `docs/EXPERIMENTAL_RESULTS_V1.md`).
 - Profile, scale, payload, and offered-load matrices.
 - Nav2/RMF-related Docker workloads and fleet admission scale probes.
 - Trace-driven ns-3 and OMNeT++/INET parity.
@@ -98,6 +105,14 @@ A fresh Jazzy ASan/UBSan Docker build passed 5,000/5,000 same-process typed
 likelihood of a simple serializer-only failure but does not cover the original
 lossy inter-process fragment/repair path.
 
+A distinct use-after-free (not this one) was root-caused and fixed this
+cycle: `rmw_destroy_publisher()` could be called with a `node` pointer that
+`rmw_destroy_node()` had already freed, by upstream `rcl`'s global rosout
+logging fini path at process shutdown. Fixed via pointer-identity tracking in
+`node_is_valid()`; see `docs/EXPERIMENTAL_RESULTS_V1.md`. This does not close
+B0 — the `free(): invalid next size (fast)` report above was not reproduced,
+investigated, or touched this cycle and remains open.
+
 Exit gate:
 
 - deterministic reproducer or a statistically meaningful stress reproducer;
@@ -111,7 +126,11 @@ Exit gate:
 The best retained 16-robot, 32-KiB, roaming-loss seed-7 result is `155/160`.
 The fair repair queue reduces amplification and deferrals but does not improve
 the delivery frontier. One seed and an incomplete row cannot support a fleet
-reliability claim.
+reliability claim. (A separate regression in this probe's harness — the
+router receiving zero data frames due to a host-filesystem cache-staleness
+issue in the container-sharing layer, not application logic — was found and
+fixed this cycle; it does not change the 16-robot figure above, which is a
+different specific run.)
 
 Exit gate:
 
@@ -125,6 +144,14 @@ Exit gate:
 
 Current QUIC evidence proves real paths and scoped failover behaviors. It does
 not prove production certificate lifecycle or distributed gateway operations.
+
+A genuine defect in the online client-CRL refresh path was root-caused and
+fixed this cycle (a GnuTLS credentials object reloaded in place across
+handshakes retained stale revocation state despite reporting a successful
+reload). This closes one specific sub-item of this blocker's exit gate
+(online client-CRL refresh); server-certificate rotation, CA rotation, and
+active-session revocation are untouched and remain false per
+`capabilities.json`.
 
 Exit gate:
 

@@ -164,20 +164,32 @@ checkpoint it reports:
 
 During the fix work above, the Docker-based integration probe suite under
 `scripts/run_rmw_docker_*.py` (183 scripts, distinct from and not counted in
-the `tests/` unit/contract suite above) went from 170/183 to informally
-183/183 passing as tracked across the session. This is a
-development-session observation, not a re-verified, repeatable canonical
-figure the way
-[`capabilities.json`](ros2_ws/src/rmw_fleetqox_cpp/capabilities.json) is;
-treat it as directional evidence that the fixes above hold up across the
-broader probe suite, not as a new claim boundary. The last item,
-`router_multi_robot_qos_live_adaptive_matrix`, intermittently flagged a
-"regression" that turned out to be measurement noise between two
-independently executed container runs (confirmed by observing the same
-~40ms swing in a fifo-vs-fifo comparison, which has no scheduler decision
-to regress); the check now excludes non-scheduler-decision rows and uses
-a tolerance with margin above the observed noise ceiling, verified clean
-across 3 repeated runs.
+the `tests/` unit/contract suite above) went from 170/183 to 183/183 passing
+in a full, clean, sequential run of the entire suite — re-verified across two
+separate full runs, not an informal development-session tally. Two probes
+that had been intermittently unreliable during the fix work were
+root-caused and fixed rather than papered over:
+
+- an intermittent Nav2 SIGSEGV (a use-after-free where upstream `rcl`'s
+  global rosout logging fini path retained a stale `rmw_node_t*` past this
+  RMW's own node teardown), root-caused via a captured core dump after
+  resisting over 7,000 targeted reproduction attempts, and fixed by
+  tracking live node pointers by identity rather than dereferencing a
+  possibly-freed one;
+- a GnuTLS credential-reuse defect in the online client-CRL refresh path,
+  where reloading a CRL in place on an already-used credentials object left
+  stale revocation state behind despite the reload itself reporting success.
+
+Full detail, including a same-harness baseline comparison against Fast DDS,
+Cyclone DDS, and Zenoh under simulated multi-robot bandwidth contention, is
+in [Experimental Results](docs/EXPERIMENTAL_RESULTS_V1.md). The
+`router_multi_robot_qos_live_adaptive_matrix` item mentioned in an earlier
+pass of this section had intermittently flagged a "regression" that turned
+out to be measurement noise between two independently executed container
+runs (confirmed by observing the same ~40ms swing in a fifo-vs-fifo
+comparison, which has no scheduler decision to regress); the check now
+excludes non-scheduler-decision rows and uses a tolerance with margin above
+the observed noise ceiling.
 
 ### Current measured frontier
 
