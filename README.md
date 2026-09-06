@@ -201,18 +201,11 @@ completed 5,000/5,000 same-process typed 32-KiB publish/take iterations without
 a sanitizer report. That narrows the search but does not reproduce the lossy
 inter-process path, so memory-safety qualification remains a release blocker.
 
-A focused investigation into large-payload delivery under severe bandwidth
-constraints (16 robots, ~30 KiB state payload, 5 Mbit/s roaming profile)
-found the dominant failure mode was IP-level fragmentation loss for
-oversized UDP datagrams, not a router or scheduler defect. The base64
-encoding change and the router's fragment-routing fix above are real,
-committed improvements to that path (state delivery under the same stress
-scenario went from 0/16 to partial success). Nine further independent
-tuning and architectural attempts (chunk sizing, publisher process
-topology, advertisement pacing/jitter) were tried and evaluated; none
-produced a reliable additional improvement, and this specific combination
-of scale, payload size, and bandwidth remains an open reliability gap
-consistent with the P0 item below rather than a newly discovered defect.
+At 16 robots with a ~30 KiB state payload on a 5 Mbit/s roaming profile, the
+dominant failure mode is IP-level fragmentation loss for oversized UDP
+datagrams, not a router or scheduler defect. This combination of scale,
+payload size, and bandwidth remains an open reliability gap, consistent
+with the P0 item below.
 
 Detailed evidence and caveats are in
 [Experimental Results](docs/EXPERIMENTAL_RESULTS_V1.md).
