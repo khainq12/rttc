@@ -215,6 +215,7 @@ def run_omnetpp_case(
         '"$(if test -f /opt/inet/.nedexclusions; '
         "then tr '\\n' ';' </opt/inet/.nedexclusions; fi)\""
     )
+    trace_flag = shlex.quote('--*.traceFile="' + _container_path(trace) + '"')
     command = (
         f"cd {shlex.quote(_container_path(build_dir))} && "
         "opp_run_release -u Cmdenv "
@@ -222,7 +223,7 @@ def run_omnetpp_case(
         f"-n .:/opt/inet/src -x {exclusions} "
         "-f omnetpp.ini -c MatchedP2p "
         f"--*.numRobots={robots} "
-        f"{shlex.quote(f'--*.traceFile=\"{_container_path(trace)}\"')} "
+        f"{trace_flag} "
         f"--*.linkDataRate={_data_rate_bps(str(profile['data_rate']))}bps "
         f"--*.linkDelay={per_link_delay_seconds:.12g}s "
         f"--*.linkPacketErrorRate={per_link:.12g} "

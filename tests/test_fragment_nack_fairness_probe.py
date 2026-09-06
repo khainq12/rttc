@@ -16,6 +16,8 @@ class FragmentNackFairnessProbeTests(unittest.TestCase):
             "status": "ok",
             "metrics": {
                 "fragment_active_assemblies": 513,
+                "fragment_active_missing_indexes": 513 * 15,
+                "fragment_nack_exhausted_assemblies": 513,
                 "fragment_nacks_sent": 513,
                 "fragment_nack_indexes_requested": 520,
                 "fragment_nack_index_budget_reductions": 512,
@@ -45,7 +47,10 @@ class FragmentNackFairnessProbeTests(unittest.TestCase):
             summary["production_large_sample_reliability_claim"]
         )
 
-        injector["index_ranges"] = ["0-1", "0-7"]
+        # "0-8" exceeds the configured per-assembly index limit of 7 and is
+        # rejected by _valid_index_range, unlike "0-1" which is a legitimate
+        # (if smaller) fair-share grant.
+        injector["index_ranges"] = ["0-8", "0-7"]
         failed = summarize_probe(
             receiver,
             injector,

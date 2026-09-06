@@ -14,9 +14,16 @@ class Ngtcp2PublicOnlineCrlRefreshTest(unittest.TestCase):
         patch = (
             ROOT / "external/ngtcp2-public-mtls/online-crl-refresh.patch"
         ).read_text(encoding="utf-8")
-        self.assertIn("gnutls_credentials_get", patch)
-        self.assertIn("gnutls_certificate_free_crls", patch)
+        # A prior in-place-reload approach (gnutls_credentials_get +
+        # gnutls_certificate_free_crls on the existing credentials object)
+        # was replaced after empirical proof that GnuTLS leaves stale
+        # revocation state behind on a reused credentials object even when
+        # the reload itself reports success. The current approach allocates
+        # a fresh credentials object on every handshake instead.
+        self.assertIn("gnutls_certificate_allocate_credentials", patch)
+        self.assertIn("gnutls_certificate_set_x509_trust_file", patch)
         self.assertIn("gnutls_certificate_set_x509_crl_file", patch)
+        self.assertIn("gnutls_credentials_set", patch)
         self.assertIn(
             "FLEETQOX_GNUTLS_RELOAD_CLIENT_CRL_EACH_HANDSHAKE",
             patch,
