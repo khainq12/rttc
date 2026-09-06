@@ -59,6 +59,7 @@ class RmwFleetQoxCppPackageTest(unittest.TestCase):
         self.assertIn("fleetrmw_content_filter_probe", cmake)
         self.assertIn("fleetrmw_content_filter_sql_probe", cmake)
         self.assertIn("fleetrmw_content_filter_typed_probe", cmake)
+        self.assertIn("fleetrmw_wstring_content_filter_probe", cmake)
         self.assertIn("fleetrmw_service_qos_probe", cmake)
         self.assertIn("fleetrmw_domain_isolation_probe", cmake)
         self.assertIn("fleetrmw_domain_isolation_smoke", cmake)
@@ -4029,6 +4030,30 @@ int main()
         self.assertIn(
             "content_filter_typed_reflection_repeated_claim",
             content_filter_typed_runner_source,
+        )
+        wstring_content_filter_probe = (
+            PKG / "src" / "wstring_content_filter_probe.cpp"
+        )
+        self.assertTrue(wstring_content_filter_probe.exists())
+        wstring_content_filter_probe_source = wstring_content_filter_probe.read_text()
+        self.assertIn(
+            "fleetrmw.wstring_content_filter_probe.v1",
+            wstring_content_filter_probe_source,
+        )
+        self.assertIn("surrogate_pair_preserved", wstring_content_filter_probe_source)
+        self.assertIn("label = %0", wstring_content_filter_probe_source)
+        wstring_content_filter_runner = (
+            ROOT / "scripts" / "run_rmw_docker_wstring_content_filter_probe.py"
+        )
+        self.assertTrue(wstring_content_filter_runner.exists())
+        wstring_content_filter_runner_source = wstring_content_filter_runner.read_text()
+        self.assertIn(
+            "fleetrmw.docker_wstring_content_filter_probe.v1",
+            wstring_content_filter_runner_source,
+        )
+        self.assertIn(
+            "content_filter_wstring_field_claim",
+            wstring_content_filter_runner_source,
         )
         loan_runner = ROOT / "scripts" / "run_rmw_docker_loaned_message_probe.py"
         self.assertTrue(loan_runner.exists())

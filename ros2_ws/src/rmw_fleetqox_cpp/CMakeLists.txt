@@ -8,6 +8,7 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
 endif()
 
 find_package(ament_cmake REQUIRED)
+find_package(fleetrmw_interfaces REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(rcl REQUIRED)
@@ -418,6 +419,20 @@ ament_target_dependencies(fleetrmw_content_filter_typed_probe
   rosidl_typesupport_c
   rosidl_typesupport_cpp
   std_msgs
+)
+
+add_executable(fleetrmw_wstring_content_filter_probe
+  src/wstring_content_filter_probe.cpp
+)
+target_compile_features(fleetrmw_wstring_content_filter_probe PRIVATE cxx_std_17)
+target_link_libraries(fleetrmw_wstring_content_filter_probe
+  ${PROJECT_NAME}
+)
+ament_target_dependencies(fleetrmw_wstring_content_filter_probe
+  fleetrmw_interfaces
+  rcutils
+  rmw
+  rosidl_typesupport_cpp
 )
 
 add_executable(fleetrmw_service_qos_probe
@@ -1295,6 +1310,7 @@ install(
     fleetrmw_content_filter_probe
     fleetrmw_content_filter_sql_probe
     fleetrmw_content_filter_typed_probe
+    fleetrmw_wstring_content_filter_probe
     fleetrmw_service_qos_probe
     fleetrmw_domain_isolation_probe
     fleetrmw_udp_pmtu_discovery_probe

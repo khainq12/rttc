@@ -58,6 +58,7 @@
 #include "rosidl_runtime_c/string.h"
 #include "rosidl_runtime_c/string_functions.h"
 #include "rosidl_runtime_c/type_hash.h"
+#include "rosidl_runtime_c/u16string_functions.h"
 #include "rosidl_typesupport_c/identifier.h"
 #include "rosidl_typesupport_c/message_type_support_dispatch.h"
 #include "rosidl_typesupport_cpp/identifier.hpp"
@@ -8451,6 +8452,14 @@ bool max_serialized_size_introspection_c_member(
     }
     return checked_size_add(8, member.string_upper_bound_, size);
   }
+  if (member.type_id_ == rosidl_typesupport_introspection_c__ROS_TYPE_WSTRING) {
+    if (member.string_upper_bound_ == 0) {
+      return false;
+    }
+    size_t data_size = 0;
+    return checked_size_multiply(member.string_upper_bound_, sizeof(std::uint16_t), &data_size) &&
+      checked_size_add(8, data_size, size);
+  }
   if (member.type_id_ == rosidl_typesupport_introspection_c__ROS_TYPE_MESSAGE) {
     return max_serialized_size_introspection_c_message(
       introspection_c_members(member.members_), size);
@@ -8508,6 +8517,14 @@ bool max_serialized_size_introspection_cpp_member(
       return false;
     }
     return checked_size_add(8, member.string_upper_bound_, size);
+  }
+  if (member.type_id_ == rosidl_typesupport_introspection_cpp::ROS_TYPE_WSTRING) {
+    if (member.string_upper_bound_ == 0) {
+      return false;
+    }
+    size_t data_size = 0;
+    return checked_size_multiply(member.string_upper_bound_, sizeof(std::uint16_t), &data_size) &&
+      checked_size_add(8, data_size, size);
   }
   if (member.type_id_ == rosidl_typesupport_introspection_cpp::ROS_TYPE_MESSAGE) {
     return max_serialized_size_introspection_cpp_message(
@@ -8622,6 +8639,15 @@ bool serialize_introspection_c_member(
     }
     return true;
   }
+  if (member.type_id_ == rosidl_typesupport_introspection_c__ROS_TYPE_WSTRING) {
+    const auto * value = static_cast<const rosidl_runtime_c__U16String *>(member_data);
+    const size_t code_units = value->data == nullptr ? 0 : value->size;
+    append_u64(out, static_cast<std::uint64_t>(code_units));
+    if (code_units > 0) {
+      append_bytes(out, value->data, code_units * sizeof(std::uint16_t));
+    }
+    return true;
+  }
   if (member.type_id_ == rosidl_typesupport_introspection_c__ROS_TYPE_MESSAGE) {
     return serialize_introspection_c_message(introspection_c_members(member.members_), member_data, out);
   }
@@ -8733,6 +8759,24 @@ bool deserialize_introspection_c_member(
     *offset += static_cast<size_t>(size);
     return true;
   }
+  if (member.type_id_ == rosidl_typesupport_introspection_c__ROS_TYPE_WSTRING) {
+    std::uint64_t code_units = 0;
+    size_t byte_size = 0;
+    if (!read_u64(payload, offset, &code_units) ||
+      !checked_size_multiply(static_cast<size_t>(code_units), sizeof(std::uint16_t), &byte_size) ||
+      *offset + byte_size > payload.size() ||
+      (member.string_upper_bound_ > 0 && code_units > member.string_upper_bound_))
+    {
+      return false;
+    }
+    auto * value = static_cast<rosidl_runtime_c__U16String *>(member_data);
+    const auto * source = reinterpret_cast<const std::uint16_t *>(payload.data() + *offset);
+    if (!rosidl_runtime_c__U16String__assignn(value, source, static_cast<size_t>(code_units))) {
+      return false;
+    }
+    *offset += byte_size;
+    return true;
+  }
   if (member.type_id_ == rosidl_typesupport_introspection_c__ROS_TYPE_MESSAGE) {
     return deserialize_introspection_c_message(
       introspection_c_members(member.members_), payload, offset, member_data);
@@ -8825,6 +8869,14 @@ bool serialize_introspection_cpp_member(
     append_u64(out, static_cast<std::uint64_t>(value.size()));
     if (!value.empty()) {
       append_bytes(out, value.data(), value.size());
+    }
+    return true;
+  }
+  if (member.type_id_ == rosidl_typesupport_introspection_cpp::ROS_TYPE_WSTRING) {
+    const auto & value = *static_cast<const std::u16string *>(member_data);
+    append_u64(out, static_cast<std::uint64_t>(value.size()));
+    if (!value.empty()) {
+      append_bytes(out, value.data(), value.size() * sizeof(char16_t));
     }
     return true;
   }
@@ -8950,6 +9002,22 @@ bool deserialize_introspection_cpp_member(
     *offset += static_cast<size_t>(size);
     return true;
   }
+  if (member.type_id_ == rosidl_typesupport_introspection_cpp::ROS_TYPE_WSTRING) {
+    std::uint64_t code_units = 0;
+    size_t byte_size = 0;
+    if (!read_u64(payload, offset, &code_units) ||
+      !checked_size_multiply(static_cast<size_t>(code_units), sizeof(char16_t), &byte_size) ||
+      *offset + byte_size > payload.size() ||
+      (member.string_upper_bound_ > 0 && code_units > member.string_upper_bound_))
+    {
+      return false;
+    }
+    auto & value = *static_cast<std::u16string *>(member_data);
+    value.assign(
+      reinterpret_cast<const char16_t *>(payload.data() + *offset), static_cast<size_t>(code_units));
+    *offset += byte_size;
+    return true;
+  }
   if (member.type_id_ == rosidl_typesupport_introspection_cpp::ROS_TYPE_MESSAGE) {
     return deserialize_introspection_cpp_message(
       introspection_cpp_members(member.members_), payload, offset, member_data);
@@ -9022,6 +9090,44 @@ bool deserialize_introspection_cpp_message(
     }
   }
   return true;
+}
+
+// Converts a wstring field's wire-format UTF-16 code units to UTF-8 for
+// content-filter predicate matching, which operates on std::string. Handles
+// surrogate pairs for code points beyond the BMP; an unpaired/truncated
+// high surrogate at the end of the buffer is encoded as its own (invalid,
+// but harmless for substring/LIKE-style matching) 3-byte sequence rather
+// than silently dropped.
+std::string utf16_to_utf8(const std::uint16_t * units, size_t count)
+{
+  std::string result;
+  result.reserve(count * 3);
+  for (size_t i = 0; i < count; ++i) {
+    std::uint32_t code_point = units[i];
+    if (code_point >= 0xD800 && code_point <= 0xDBFF && i + 1 < count) {
+      const std::uint32_t low = units[i + 1];
+      if (low >= 0xDC00 && low <= 0xDFFF) {
+        code_point = 0x10000 + ((code_point - 0xD800) << 10) + (low - 0xDC00);
+        ++i;
+      }
+    }
+    if (code_point <= 0x7F) {
+      result.push_back(static_cast<char>(code_point));
+    } else if (code_point <= 0x7FF) {
+      result.push_back(static_cast<char>(0xC0 | (code_point >> 6)));
+      result.push_back(static_cast<char>(0x80 | (code_point & 0x3F)));
+    } else if (code_point <= 0xFFFF) {
+      result.push_back(static_cast<char>(0xE0 | (code_point >> 12)));
+      result.push_back(static_cast<char>(0x80 | ((code_point >> 6) & 0x3F)));
+      result.push_back(static_cast<char>(0x80 | (code_point & 0x3F)));
+    } else {
+      result.push_back(static_cast<char>(0xF0 | (code_point >> 18)));
+      result.push_back(static_cast<char>(0x80 | ((code_point >> 12) & 0x3F)));
+      result.push_back(static_cast<char>(0x80 | ((code_point >> 6) & 0x3F)));
+      result.push_back(static_cast<char>(0x80 | (code_point & 0x3F)));
+    }
+  }
+  return result;
 }
 
 template<typename T>
@@ -9225,6 +9331,22 @@ bool reflect_introspection_c_member(
     *offset += static_cast<size_t>(size);
     return true;
   }
+  if (member.type_id_ == rosidl_typesupport_introspection_c__ROS_TYPE_WSTRING) {
+    std::uint64_t code_units = 0;
+    size_t byte_size = 0;
+    if (!read_u64(payload, offset, &code_units) ||
+      !checked_size_multiply(static_cast<size_t>(code_units), sizeof(std::uint16_t), &byte_size) ||
+      byte_size > payload.size() - *offset ||
+      (member.string_upper_bound_ > 0 && code_units > member.string_upper_bound_))
+    {
+      return false;
+    }
+    (*fields)[path] = utf16_to_utf8(
+      reinterpret_cast<const std::uint16_t *>(payload.data() + *offset),
+      static_cast<size_t>(code_units));
+    *offset += byte_size;
+    return true;
+  }
   if (member.type_id_ == rosidl_typesupport_introspection_c__ROS_TYPE_MESSAGE) {
     return reflect_introspection_c_message(
       introspection_c_members(member.members_), payload, offset, path, fields);
@@ -9325,6 +9447,22 @@ bool reflect_introspection_cpp_member(
       reinterpret_cast<const char *>(payload.data() + *offset),
       static_cast<size_t>(size));
     *offset += static_cast<size_t>(size);
+    return true;
+  }
+  if (member.type_id_ == rosidl_typesupport_introspection_cpp::ROS_TYPE_WSTRING) {
+    std::uint64_t code_units = 0;
+    size_t byte_size = 0;
+    if (!read_u64(payload, offset, &code_units) ||
+      !checked_size_multiply(static_cast<size_t>(code_units), sizeof(std::uint16_t), &byte_size) ||
+      byte_size > payload.size() - *offset ||
+      (member.string_upper_bound_ > 0 && code_units > member.string_upper_bound_))
+    {
+      return false;
+    }
+    (*fields)[path] = utf16_to_utf8(
+      reinterpret_cast<const std::uint16_t *>(payload.data() + *offset),
+      static_cast<size_t>(code_units));
+    *offset += byte_size;
     return true;
   }
   if (member.type_id_ == rosidl_typesupport_introspection_cpp::ROS_TYPE_MESSAGE) {
