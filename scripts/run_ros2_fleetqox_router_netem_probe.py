@@ -46,6 +46,11 @@ from scripts.run_rmw_docker_multi_robot_live_telemetry_plan_probe import (  # no
 
 SCHEMA_VERSION = "fleetrmw.ros2_fleetqox_router_netem_probe.v1"
 FLEETQOX_RMW = "rmw_fleetqox_cpp"
+# See run_ros2_direct_rmw_netem_probe.py: the shared DEFAULT_IMAGE has no
+# `tc` binary, so netem silently never applies against it. This probe's
+# whole purpose is netem-conditioned comparison, so it needs the
+# netem-capable image by default.
+NETEM_CAPABLE_IMAGE = "localhost/fleetrmw/rmw-netem:jazzy"
 
 
 def run(command: list[str], *, timeout: float = 60.0) -> subprocess.CompletedProcess[str]:
@@ -54,7 +59,7 @@ def run(command: list[str], *, timeout: float = 60.0) -> subprocess.CompletedPro
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--image", default=DEFAULT_IMAGE)
+    parser.add_argument("--image", default=NETEM_CAPABLE_IMAGE)
     parser.add_argument(
         "--extra-workspace",
         required=True,

@@ -30,11 +30,18 @@ from scripts.run_rmw_docker_multi_robot_live_telemetry_plan_probe import (
 
 SCHEMA_VERSION = "fleetrmw.ros2_direct_rmw_netem_probe.v1"
 DEFAULT_RMWS = "rmw_fastrtps_cpp,rmw_cyclonedds_cpp,rmw_zenoh_cpp"
+# The shared DEFAULT_IMAGE ("ros:jazzy-ros-base") has no `tc` binary, so
+# --enable-netem never actually applies any impairment against it (the
+# netem_status entries report "missing_tc"). This probe's whole purpose is
+# netem-conditioned comparison, so it needs the netem-capable image by
+# default; scripts that import DEFAULT_IMAGE for non-netem uses are left
+# alone rather than changing that shared constant's meaning for everyone.
+NETEM_CAPABLE_IMAGE = "localhost/fleetrmw/rmw-netem:jazzy"
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--image", default=DEFAULT_IMAGE)
+    parser.add_argument("--image", default=NETEM_CAPABLE_IMAGE)
     parser.add_argument("--rmw", default="rmw_fastrtps_cpp")
     parser.add_argument(
         "--extra-workspace",
@@ -456,9 +463,12 @@ def probe_rmw_available(
             docker,
             "run",
             "--rm",
+            "--entrypoint",
+            "bash",
             "-v",
             f"{ROOT}:/work",
             image,
+            "-lc",
             f"source /opt/ros/jazzy/setup.bash && {extra_source}"
             f"ros2 pkg prefix {rmw}",
         ],
@@ -580,6 +590,14 @@ def start_container(
     command: str,
     extra_args: tuple[str, ...] = (),
 ) -> None:
+    # The base image's ENTRYPOINT is ros_entrypoint.sh, which sources the
+    # ROS setup then does `exec "$@"` -- passing this multi-word command as
+    # a single positional CMD argument makes exec treat it as one literal
+    # (space-containing) executable name and fail with "No such file or
+    # directory" instead of running it as shell source. Every container
+    # started this way exits immediately without ever running the ROS
+    # node it was meant to; --entrypoint bash + -lc is required, matching
+    # every docker exec call elsewhere in this file.
     run(
         [
             "docker",
@@ -590,11 +608,14 @@ def start_container(
             "--network",
             network,
             *extra_args,
+            "--entrypoint",
+            "bash",
             "-v",
             f"{root}:/work",
             "-w",
             "/work",
             image,
+            "-lc",
             command,
         ]
     )
