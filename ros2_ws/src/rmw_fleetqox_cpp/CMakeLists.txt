@@ -1090,6 +1090,18 @@ ament_target_dependencies(fleetrmw_interprocess_pubsub_probe
   rmw
 )
 
+add_executable(fleetrmw_udp_pmtu_discovery_probe
+  src/udp_pmtu_discovery_probe.cpp
+)
+target_compile_features(fleetrmw_udp_pmtu_discovery_probe PRIVATE cxx_std_17)
+target_link_libraries(fleetrmw_udp_pmtu_discovery_probe
+  ${PROJECT_NAME}
+)
+ament_target_dependencies(fleetrmw_udp_pmtu_discovery_probe
+  rcutils
+  rmw
+)
+
 add_executable(fleetrmw_udp_router_probe
   src/udp_router_probe.cpp
 )
@@ -1259,6 +1271,7 @@ install(
     fleetrmw_content_filter_typed_probe
     fleetrmw_service_qos_probe
     fleetrmw_domain_isolation_probe
+    fleetrmw_udp_pmtu_discovery_probe
     fleetrmw_service_error_probe
     fleetrmw_service_resource_limit_probe
     fleetrmw_service_client_isolation_probe

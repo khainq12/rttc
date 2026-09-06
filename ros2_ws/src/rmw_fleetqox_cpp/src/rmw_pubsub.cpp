@@ -29,9 +29,12 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/ip_icmp.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
+
+#include <linux/errqueue.h>
 
 #include <tinyxml2.h>
 
@@ -2499,6 +2502,22 @@ public:
   std::uint64_t udp_datagram_budget_failures() const
   {
     return udp_datagram_budget_failures_.load(std::memory_order_relaxed);
+  }
+
+  std::uint64_t udp_pmtu_discovery_events() const
+  {
+    return udp_pmtu_discovery_events_.load(std::memory_order_relaxed);
+  }
+
+  std::uint64_t udp_pmtu_rejections() const
+  {
+    return udp_pmtu_rejections_.load(std::memory_order_relaxed);
+  }
+
+  std::uint64_t udp_pmtu_discovered_min_bytes() const
+  {
+    return static_cast<std::uint64_t>(
+      udp_pmtu_discovered_min_bytes_.load(std::memory_order_relaxed));
   }
 
   std::uint64_t fragment_queue_admission_waits() const
@@ -5131,6 +5150,113 @@ private:
     return RMW_RET_OK;
   }
 
+  static std::uint64_t udp_peer_key(const sockaddr_in & addr)
+  {
+    return (static_cast<std::uint64_t>(addr.sin_addr.s_addr) << 16) |
+      static_cast<std::uint64_t>(addr.sin_port);
+  }
+
+  void record_discovered_path_mtu(const sockaddr_in & peer, int discovered_mtu)
+  {
+    if (discovered_mtu <= 0) {
+      return;
+    }
+    // IPv4 minimum header (20 bytes, no options observed on this reference
+    // transport) plus an 8-byte UDP header separates the link MTU from the
+    // usable datagram payload budget. The floor here only guards against a
+    // pathological/negative reading -- it must stay far below any real
+    // frame size, or a genuinely small discovered MTU would silently be
+    // reported as roomier than it actually is.
+    const int effective_budget = std::max(68, discovered_mtu - 20 - 8);
+    const std::uint64_t peer_key = udp_peer_key(peer);
+    {
+      std::lock_guard<std::mutex> lock(udp_pmtu_mutex_);
+      auto it = udp_pmtu_discovered_bytes_by_peer_.find(peer_key);
+      if (it == udp_pmtu_discovered_bytes_by_peer_.end() || it->second != effective_budget) {
+        udp_pmtu_discovered_bytes_by_peer_[peer_key] = effective_budget;
+      }
+    }
+    udp_pmtu_discovery_events_.fetch_add(1, std::memory_order_relaxed);
+    int current_min = udp_pmtu_discovered_min_bytes_.load(std::memory_order_relaxed);
+    while ((current_min == 0 || effective_budget < current_min) &&
+      !udp_pmtu_discovered_min_bytes_.compare_exchange_weak(
+        current_min, effective_budget, std::memory_order_relaxed))
+    {
+    }
+  }
+
+  // Drains any asynchronous ICMP "fragmentation needed" notifications
+  // queued by the kernel for previously sent datagrams (see IP_RECVERR in
+  // socket setup). This is how a smaller MTU on a link further downstream
+  // than this host's own interface gets discovered, as opposed to the
+  // synchronous EMSGSIZE case handled at the sendto() call site below.
+  void drain_udp_pmtu_error_queue()
+  {
+    for (;;) {
+      char control[512];
+      char discard[1];
+      iovec iov{discard, sizeof(discard)};
+      sockaddr_in offender{};
+      msghdr msg{};
+      msg.msg_name = &offender;
+      msg.msg_namelen = sizeof(offender);
+      msg.msg_iov = &iov;
+      msg.msg_iovlen = 1;
+      msg.msg_control = control;
+      msg.msg_controllen = sizeof(control);
+      const ssize_t received = ::recvmsg(fd_, &msg, MSG_ERRQUEUE | MSG_DONTWAIT);
+      if (received < 0) {
+        break;
+      }
+      for (cmsghdr * cmsg = CMSG_FIRSTHDR(&msg); cmsg != nullptr;
+        cmsg = CMSG_NXTHDR(&msg, cmsg))
+      {
+        if (cmsg->cmsg_level != IPPROTO_IP || cmsg->cmsg_type != IP_RECVERR) {
+          continue;
+        }
+        const auto * serr = reinterpret_cast<const sock_extended_err *>(CMSG_DATA(cmsg));
+        if (serr->ee_origin != SO_EE_ORIGIN_ICMP ||
+          serr->ee_type != ICMP_DEST_UNREACH ||
+          serr->ee_code != ICMP_FRAG_NEEDED)
+        {
+          continue;
+        }
+        record_discovered_path_mtu(offender, static_cast<int>(serr->ee_info));
+      }
+    }
+  }
+
+  // Handles the synchronous case: the payload does not even fit this
+  // host's own outgoing interface MTU, so the kernel rejects the send
+  // immediately with EMSGSIZE (no ICMP round trip needed). A throwaway
+  // connected probe socket to the same destination lets us read back the
+  // kernel's cached route MTU via IP_MTU, which getsockopt only reports
+  // for a connected socket.
+  void discover_path_mtu_via_probe_socket(const sockaddr_in & dest)
+  {
+    const int probe_fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (probe_fd < 0) {
+      return;
+    }
+    const int pmtu_mode = IP_PMTUDISC_DO;
+    (void)::setsockopt(probe_fd, IPPROTO_IP, IP_MTU_DISCOVER, &pmtu_mode, sizeof(pmtu_mode));
+    if (::connect(probe_fd, reinterpret_cast<const sockaddr *>(&dest), sizeof(dest)) == 0) {
+      int mtu = 0;
+      socklen_t mtu_len = sizeof(mtu);
+      if (::getsockopt(probe_fd, IPPROTO_IP, IP_MTU, &mtu, &mtu_len) == 0 && mtu > 0) {
+        record_discovered_path_mtu(dest, mtu);
+      }
+    }
+    ::close(probe_fd);
+  }
+
+  int discovered_path_mtu_budget_for(const sockaddr_in & peer)
+  {
+    std::lock_guard<std::mutex> lock(udp_pmtu_mutex_);
+    auto it = udp_pmtu_discovered_bytes_by_peer_.find(udp_peer_key(peer));
+    return it == udp_pmtu_discovered_bytes_by_peer_.end() ? 0 : it->second;
+  }
+
   rmw_ret_t send_datagram_to_targets(
     const std::string & payload,
     const std::vector<sockaddr_in> & targets,
@@ -5151,6 +5277,21 @@ private:
       RMW_SET_ERROR_MSG("FleetRMW UDP payload exceeds configured datagram budget");
       return RMW_RET_ERROR;
     }
+    drain_udp_pmtu_error_queue();
+    if (udp_datagram_budget_bytes_ <= 0) {
+      // No manual budget configured: fall back to whichever path MTU has
+      // already been auto-discovered for these destinations, instead of
+      // sending blind and relying on an uninformative kernel EMSGSIZE.
+      for (const sockaddr_in & target : targets) {
+        const int discovered_budget = discovered_path_mtu_budget_for(target);
+        if (discovered_budget > 0 && payload_size > static_cast<size_t>(discovered_budget)) {
+          udp_pmtu_rejections_.fetch_add(1, std::memory_order_relaxed);
+          RMW_SET_ERROR_MSG(
+            "FleetRMW UDP payload exceeds automatically discovered path MTU");
+          return RMW_RET_ERROR;
+        }
+      }
+    }
     std::lock_guard<std::mutex> lock(udp_send_mutex_);
     for (const sockaddr_in & target : targets) {
       pace_udp_send_locked();
@@ -5162,6 +5303,14 @@ private:
         reinterpret_cast<const sockaddr *>(&target),
         sizeof(target));
       if (sent < 0 || static_cast<size_t>(sent) != payload.size()) {
+        if (sent < 0 && errno == EMSGSIZE && udp_datagram_budget_bytes_ <= 0) {
+          // The payload does not even fit this host's own outgoing
+          // interface MTU. Learn the real budget now so the next attempt
+          // (the fragmentation/repair path above already retries at a
+          // smaller chunk size) is rejected before ever calling sendto()
+          // again, rather than repeating this same kernel round trip.
+          discover_path_mtu_via_probe_socket(target);
+        }
         RMW_SET_ERROR_MSG(label == nullptr ?
           "failed to send FleetRMW payload through UDP transport" :
           "failed to send FleetRMW payload through UDP transport");
@@ -5329,6 +5478,20 @@ private:
     if (fd_ < 0) {
       init_error_ = "failed to create UDP loopback socket";
       return;
+    }
+    // Enable kernel path-MTU discovery (sets the Don't-Fragment bit and
+    // rejects sends that exceed the outgoing interface's MTU with EMSGSIZE
+    // instead of silently fragmenting) plus the error queue that reports an
+    // asynchronous ICMP "fragmentation needed" from a smaller-MTU link
+    // further downstream. Best-effort: an old kernel or restricted sandbox
+    // without these options still works, just without auto-discovery.
+    {
+      const int pmtu_mode = IP_PMTUDISC_DO;
+      (void)::setsockopt(
+        fd_, IPPROTO_IP, IP_MTU_DISCOVER, &pmtu_mode, sizeof(pmtu_mode));
+      const int recverr_enable = 1;
+      (void)::setsockopt(
+        fd_, IPPROTO_IP, IP_RECVERR, &recverr_enable, sizeof(recverr_enable));
     }
 
     udp_socket_buffer_bytes_ = parse_nonnegative_int_env(
@@ -6582,6 +6745,9 @@ private:
   std::atomic<size_t> fragment_effective_chunk_bytes_max_{0};
   std::atomic<std::uint64_t> fragment_chunk_budget_reductions_{0};
   std::atomic<std::uint64_t> udp_datagram_budget_failures_{0};
+  std::atomic<std::uint64_t> udp_pmtu_discovery_events_{0};
+  std::atomic<std::uint64_t> udp_pmtu_rejections_{0};
+  std::atomic<int> udp_pmtu_discovered_min_bytes_{0};
   std::atomic<std::uint64_t> fragment_queue_admission_waits_{0};
   std::atomic<std::uint64_t> fragment_queue_admission_timeouts_{0};
   std::atomic<std::uint64_t> fragment_queue_admission_wait_ns_{0};
@@ -6654,6 +6820,8 @@ private:
   std::unordered_map<std::string, std::int64_t>
     fragment_repair_recent_send_ns_;
   std::mutex udp_send_mutex_;
+  std::mutex udp_pmtu_mutex_;
+  std::unordered_map<std::uint64_t, int> udp_pmtu_discovered_bytes_by_peer_;
   std::chrono::steady_clock::time_point next_udp_send_time_{};
   int udp_socket_buffer_bytes_{0};
   int udp_send_pacing_us_{0};
@@ -11907,6 +12075,21 @@ std::uint64_t rmw_fleetqox_cpp_socket_fragment_chunk_budget_reductions()
 std::uint64_t rmw_fleetqox_cpp_socket_udp_datagram_budget_failures()
 {
   return socket_transport().udp_datagram_budget_failures();
+}
+
+std::uint64_t rmw_fleetqox_cpp_socket_udp_pmtu_discovery_events()
+{
+  return socket_transport().udp_pmtu_discovery_events();
+}
+
+std::uint64_t rmw_fleetqox_cpp_socket_udp_pmtu_rejections()
+{
+  return socket_transport().udp_pmtu_rejections();
+}
+
+std::uint64_t rmw_fleetqox_cpp_socket_udp_pmtu_discovered_min_bytes()
+{
+  return socket_transport().udp_pmtu_discovered_min_bytes();
 }
 
 std::uint64_t rmw_fleetqox_cpp_socket_fragment_queue_admission_waits()

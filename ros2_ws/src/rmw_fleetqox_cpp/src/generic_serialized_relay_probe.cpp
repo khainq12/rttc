@@ -356,6 +356,12 @@ int main(int argc, char ** argv)
     "rmw_fleetqox_cpp_socket_fragment_chunk_budget_reductions", nullptr) << ",";
   std::cout << "\"udp_datagram_budget_failures\":" << fleetqox_metric(
     "rmw_fleetqox_cpp_socket_udp_datagram_budget_failures", nullptr) << ",";
+  std::cout << "\"udp_pmtu_discovery_events\":" << fleetqox_metric(
+    "rmw_fleetqox_cpp_socket_udp_pmtu_discovery_events", nullptr) << ",";
+  std::cout << "\"udp_pmtu_rejections\":" << fleetqox_metric(
+    "rmw_fleetqox_cpp_socket_udp_pmtu_rejections", nullptr) << ",";
+  std::cout << "\"udp_pmtu_discovered_min_bytes\":" << fleetqox_metric(
+    "rmw_fleetqox_cpp_socket_udp_pmtu_discovered_min_bytes", nullptr) << ",";
   std::cout << "\"fragment_queue_admission_waits\":" << fleetqox_metric(
     "rmw_fleetqox_cpp_socket_fragment_queue_admission_waits", nullptr) << ",";
   std::cout << "\"fragment_queue_admission_timeouts\":" << fleetqox_metric(
