@@ -504,6 +504,21 @@ def ros_command(
         command += f"export FLEETQOX_RMW_PEERS={fleetqox_peers} && "
     if zenoh_session_config_uri:
         command += f"export ZENOH_SESSION_CONFIG_URI={zenoh_session_config_uri} && "
+    if fleetqox_peers:
+        # FleetRMW resolves FLEETQOX_RMW_PEERS via getaddrinfo() once at
+        # rmw_create_node() time and fails the whole node creation if it
+        # can't resolve -- there is no retry. The two containers are
+        # started via separate `docker run -d` calls, so whichever one's
+        # process reaches node creation first will try to resolve a peer
+        # container name that Docker's embedded DNS may not have a record
+        # for yet (docker run -d returns as soon as the container exists,
+        # but the *other* container may not have even been created by the
+        # time this one's rclpy/RMW startup finishes importing and runs).
+        # A short fixed delay here is cheap insurance against that
+        # container-creation race, independent of whichever side happens
+        # to start first or how long Python/rclpy import takes on a given
+        # image.
+        command += "sleep 2 && "
     return command + f"python3 {python_path}"
 
 
