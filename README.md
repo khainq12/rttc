@@ -105,6 +105,7 @@ checkpoint it reports:
 | Explicitly unsupported items | 14 |
 | Passing scoped claim boundaries | 607 / 653 |
 | Clean-source test suite | 690 discovered: 637 pass, 53 external-artifact skips |
+| Docker integration probes | 183 / 183 |
 | Production-ready | **No** |
 
 ### Implemented and evidenced
