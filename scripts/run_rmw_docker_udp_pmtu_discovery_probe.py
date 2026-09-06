@@ -43,7 +43,10 @@ def main() -> int:
         print("fleetrmw-udp-pmtu-discovery-probe")
         print(f"  status: {summary['status']}")
         probe = summary.get("probe", {})
-        print(f"  oversized_payload_rejected: {probe.get('oversized_payload_rejected')}")
+        print(
+            "  oversized_payload_delivered_via_fragmentation: "
+            f"{probe.get('oversized_payload_delivered_via_fragmentation')}"
+        )
         print(f"  udp_pmtu_discovered_min_bytes: {probe.get('udp_pmtu_discovered_min_bytes')}")
         print(
             "  small_payload_after_discovery_succeeded: "
@@ -105,7 +108,7 @@ summary["status"] = "ok" if (
     summary["probe_returncode"] == 0 and
     probe.get("schema_version") == "{PROBE_SCHEMA_VERSION}" and
     probe.get("status") == "ok" and
-    probe.get("oversized_payload_rejected") is True and
+    probe.get("oversized_payload_delivered_via_fragmentation") is True and
     probe.get("udp_pmtu_discovery_events", 0) >= 1 and
     0 < probe.get("udp_pmtu_discovered_min_bytes", 0) < {LOOPBACK_MTU} and
     probe.get("small_payload_after_discovery_succeeded") is True

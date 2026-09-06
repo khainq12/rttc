@@ -73,9 +73,16 @@ int main()
 
   // Sized to comfortably exceed the effective budget of a 1000-byte MTU
   // (1000 - 20 IPv4 - 8 UDP = 972 usable bytes) while staying far below the
-  // existing large-sample fragmentation threshold, so this goes out as one
-  // frame through send_datagram_to_targets() rather than being pre-split.
-  const bool oversized_rejected = !publish_payload_of_size(publisher, 4000);
+  // existing large-sample fragmentation threshold, so this first attempt
+  // goes out as one frame through send_datagram_to_targets() rather than
+  // being pre-split. It should still be *delivered*: the kernel rejects
+  // that first oversized attempt with EMSGSIZE (send_datagram_to_targets
+  // learns the real path MTU from it), and the caller
+  // (send_payload_to_targets) retries once through the loss-resilient
+  // fragmentation path at that discovered budget instead of surfacing a
+  // hard failure -- a single too-large publish must never be fatal to the
+  // caller.
+  const bool oversized_payload_delivered = publish_payload_of_size(publisher, 4000);
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
   const std::uint64_t discovery_events = rmw_fleetqox_cpp_socket_udp_pmtu_discovery_events();
@@ -87,15 +94,15 @@ int main()
   // effective budget, not block the socket outright.
   const bool small_payload_succeeded = publish_payload_of_size(publisher, 64);
 
-  const bool ok = oversized_rejected &&
+  const bool ok = oversized_payload_delivered &&
     discovery_events >= 1 &&
     discovered_min_bytes > 0 && discovered_min_bytes < 1000 &&
     small_payload_succeeded;
 
   std::cout << "{\"schema_version\":\"fleetrmw.rmw_udp_pmtu_discovery_probe.v1\",";
   std::cout << "\"status\":\"" << (ok ? "ok" : "failed") << "\",";
-  std::cout << "\"oversized_payload_rejected\":" <<
-    (oversized_rejected ? "true" : "false") << ",";
+  std::cout << "\"oversized_payload_delivered_via_fragmentation\":" <<
+    (oversized_payload_delivered ? "true" : "false") << ",";
   std::cout << "\"udp_pmtu_discovery_events\":" << discovery_events << ",";
   std::cout << "\"udp_pmtu_rejections\":" <<
     rmw_fleetqox_cpp_socket_udp_pmtu_rejections() << ",";
