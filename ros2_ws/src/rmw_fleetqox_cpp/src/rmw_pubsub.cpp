@@ -56,6 +56,7 @@
 #include "rcutils/allocator.h"
 #include "rosidl_runtime_c/string.h"
 #include "rosidl_runtime_c/string_functions.h"
+#include "rosidl_runtime_c/type_hash.h"
 #include "rosidl_typesupport_c/identifier.h"
 #include "rosidl_typesupport_c/message_type_support_dispatch.h"
 #include "rosidl_typesupport_cpp/identifier.hpp"
@@ -8158,6 +8159,27 @@ const rosidl_message_type_support_t * resolve_effective_type_support(
   return type_support;
 }
 
+// get_type_hash_func is generated on the outer, language-specific
+// typesupport handle (e.g. rosidl_typesupport_c) that rclcpp/rclpy pass
+// into rmw_create_publisher/rmw_create_subscription -- not necessarily on
+// the introspection handle resolve_effective_type_support() resolves down
+// to for serialization, so this must run on the original, unresolved
+// handle.
+bool compute_message_type_hash(
+  const rosidl_message_type_support_t * type_support,
+  rosidl_type_hash_t * out)
+{
+  if (type_support == nullptr || out == nullptr || type_support->get_type_hash_func == nullptr) {
+    return false;
+  }
+  const rosidl_type_hash_t * hash = type_support->get_type_hash_func(type_support);
+  if (hash == nullptr || hash->version == ROSIDL_TYPE_HASH_VERSION_UNSET) {
+    return false;
+  }
+  *out = *hash;
+  return true;
+}
+
 std::string type_name_from_type_support(const rosidl_message_type_support_t * type_support)
 {
   const auto * effective = resolve_effective_type_support(type_support);
@@ -11631,7 +11653,8 @@ void rmw_fleetqox_cpp_graph_register_publisher_endpoint(
   const std::uint8_t * endpoint_gid,
   size_t endpoint_gid_size,
   const rmw_qos_profile_t * qos,
-  std::size_t domain_id);
+  std::size_t domain_id,
+  const rosidl_type_hash_t * type_hash);
 void rmw_fleetqox_cpp_graph_unregister_publisher_endpoint(const char * endpoint_id);
 void rmw_fleetqox_cpp_graph_register_subscription_endpoint(
   const char * node_name,
@@ -11642,7 +11665,8 @@ void rmw_fleetqox_cpp_graph_register_subscription_endpoint(
   const std::uint8_t * endpoint_gid,
   size_t endpoint_gid_size,
   const rmw_qos_profile_t * qos,
-  std::size_t domain_id);
+  std::size_t domain_id,
+  const rosidl_type_hash_t * type_hash);
 void rmw_fleetqox_cpp_graph_unregister_subscription_endpoint(const char * endpoint_id);
 void rmw_fleetqox_cpp_graph_apply_remote_advertisement_with_info_in_domain(
   const char * action,
@@ -12948,6 +12972,9 @@ rmw_publisher_t * rmw_create_publisher(
     record_liveliness_for_new_publisher_locked(data, &matched_callbacks);
   }
   notify_event_callbacks(matched_callbacks);
+  rosidl_type_hash_t publisher_type_hash{};
+  const bool publisher_type_hash_valid =
+    compute_message_type_hash(type_support, &publisher_type_hash);
   rmw_fleetqox_cpp_graph_register_publisher_endpoint(
     data->node_name.c_str(),
     data->node_namespace.c_str(),
@@ -12957,7 +12984,8 @@ rmw_publisher_t * rmw_create_publisher(
     data->endpoint_gid.data(),
     data->endpoint_gid.size(),
     &data->qos,
-    data->domain_id);
+    data->domain_id,
+    publisher_type_hash_valid ? &publisher_type_hash : nullptr);
   send_publisher_graph_advertisement(data, "add");
   ensure_pubsub_graph_renewal_thread();
   ensure_reliable_retransmit_thread();
@@ -13179,6 +13207,9 @@ rmw_subscription_t * rmw_create_subscription(
     record_liveliness_for_new_subscription_locked(data, &matched_callbacks);
   }
   notify_event_callbacks(matched_callbacks);
+  rosidl_type_hash_t subscription_type_hash{};
+  const bool subscription_type_hash_valid =
+    compute_message_type_hash(type_support, &subscription_type_hash);
   rmw_fleetqox_cpp_graph_register_subscription_endpoint(
     data->node_name.c_str(),
     data->node_namespace.c_str(),
@@ -13188,7 +13219,8 @@ rmw_subscription_t * rmw_create_subscription(
     data->endpoint_gid.data(),
     data->endpoint_gid.size(),
     &data->qos,
-    data->domain_id);
+    data->domain_id,
+    subscription_type_hash_valid ? &subscription_type_hash : nullptr);
   send_subscription_graph_advertisement(data, "add");
   ensure_pubsub_graph_renewal_thread();
   if (qos_deadline_enabled(data->qos) ||

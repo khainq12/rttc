@@ -839,6 +839,20 @@ ament_target_dependencies(fleetrmw_loaned_message_probe
   std_msgs
 )
 
+add_executable(fleetrmw_topic_type_hash_probe
+  src/topic_type_hash_probe.cpp
+)
+target_compile_features(fleetrmw_topic_type_hash_probe PRIVATE cxx_std_17)
+target_link_libraries(fleetrmw_topic_type_hash_probe
+  ${PROJECT_NAME}
+)
+ament_target_dependencies(fleetrmw_topic_type_hash_probe
+  rcutils
+  rmw
+  rosidl_typesupport_cpp
+  std_msgs
+)
+
 add_executable(fleetrmw_allocation_probe
   src/allocation_probe.cpp
 )
@@ -1272,6 +1286,7 @@ install(
     fleetrmw_service_qos_probe
     fleetrmw_domain_isolation_probe
     fleetrmw_udp_pmtu_discovery_probe
+    fleetrmw_topic_type_hash_probe
     fleetrmw_service_error_probe
     fleetrmw_service_resource_limit_probe
     fleetrmw_service_client_isolation_probe

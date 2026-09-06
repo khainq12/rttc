@@ -17,6 +17,7 @@
 #include "rcutils/allocator.h"
 #include "rcutils/strdup.h"
 #include "rcutils/types/string_array.h"
+#include "rosidl_runtime_c/type_hash.h"
 #include "rmw/error_handling.h"
 #include "rmw/get_node_info_and_types.h"
 #include "rmw/get_service_names_and_types.h"
@@ -97,6 +98,8 @@ struct LocalGraphEndpoint
   std::string endpoint_id;
   std::array<std::uint8_t, RMW_GID_STORAGE_SIZE> endpoint_gid{};
   rmw_qos_profile_t qos = rmw_qos_profile_default;
+  rosidl_type_hash_t type_hash = rosidl_get_zero_initialized_type_hash();
+  bool type_hash_valid = false;
 };
 
 struct TopicEndpointSnapshot
@@ -108,6 +111,8 @@ struct TopicEndpointSnapshot
   std::string type_name;
   std::array<std::uint8_t, RMW_GID_STORAGE_SIZE> endpoint_gid{};
   rmw_qos_profile_t qos = rmw_qos_profile_default;
+  rosidl_type_hash_t type_hash = rosidl_get_zero_initialized_type_hash();
+  bool type_hash_valid = false;
 };
 
 struct LocalServiceGraphEndpoint
@@ -371,7 +376,8 @@ void add_local_endpoint(
   const std::uint8_t * endpoint_gid,
   size_t endpoint_gid_size,
   const rmw_qos_profile_t * qos,
-  std::size_t domain_id)
+  std::size_t domain_id,
+  const rosidl_type_hash_t * type_hash)
 {
   if (topic_name == nullptr || type_name == nullptr || endpoint_id == nullptr) {
     return;
@@ -395,7 +401,9 @@ void add_local_endpoint(
       type_name,
       endpoint_id,
       copy_endpoint_gid(endpoint_gid, endpoint_gid_size),
-      qos != nullptr ? *qos : rmw_qos_profile_default});
+      qos != nullptr ? *qos : rmw_qos_profile_default,
+      type_hash != nullptr ? *type_hash : rosidl_get_zero_initialized_type_hash(),
+      type_hash != nullptr});
   rmw_fleetqox_cpp_trigger_graph_guard_conditions_for_domain(domain_id);
 }
 
@@ -617,7 +625,9 @@ std::vector<TopicEndpointSnapshot> endpoint_snapshot(
         endpoint.topic_name,
         endpoint.type_name,
         endpoint.endpoint_gid,
-        endpoint.qos});
+        endpoint.qos,
+        endpoint.type_hash,
+        endpoint.type_hash_valid});
   }
   for (const auto & item : g_remote_graph_endpoints) {
     const RemoteGraphEndpoint & endpoint = item.second;
@@ -707,7 +717,21 @@ rmw_ret_t set_topic_endpoint_info(
   if (ret != RMW_RET_OK) {
     return ret;
   }
-  return rmw_topic_endpoint_info_set_qos_profile(info, &endpoint.qos);
+  ret = rmw_topic_endpoint_info_set_qos_profile(info, &endpoint.qos);
+  if (ret != RMW_RET_OK) {
+    return ret;
+  }
+  if (endpoint.type_hash_valid) {
+    // Only ever known for a local endpoint, computed from its own
+    // rosidl-generated get_type_hash_func at creation time. A remote
+    // endpoint's hash is not exchanged over the wire, so it stays the
+    // zero-initialized/unset sentinel rather than a guessed value.
+    ret = rmw_topic_endpoint_info_set_topic_type_hash(info, &endpoint.type_hash);
+    if (ret != RMW_RET_OK) {
+      return ret;
+    }
+  }
+  return RMW_RET_OK;
 }
 
 rmw_ret_t fill_topic_endpoint_info_array(
@@ -1055,7 +1079,8 @@ void rmw_fleetqox_cpp_graph_register_publisher_endpoint(
   const std::uint8_t * endpoint_gid,
   size_t endpoint_gid_size,
   const rmw_qos_profile_t * qos,
-  std::size_t domain_id)
+  std::size_t domain_id,
+  const rosidl_type_hash_t * type_hash)
 {
   add_local_endpoint(
     true,
@@ -1067,7 +1092,8 @@ void rmw_fleetqox_cpp_graph_register_publisher_endpoint(
     endpoint_gid,
     endpoint_gid_size,
     qos,
-    domain_id);
+    domain_id,
+    type_hash);
 }
 
 void rmw_fleetqox_cpp_graph_unregister_publisher_endpoint(const char * endpoint_id)
@@ -1088,7 +1114,8 @@ void rmw_fleetqox_cpp_graph_register_subscription_endpoint(
   const std::uint8_t * endpoint_gid,
   size_t endpoint_gid_size,
   const rmw_qos_profile_t * qos,
-  std::size_t domain_id)
+  std::size_t domain_id,
+  const rosidl_type_hash_t * type_hash)
 {
   add_local_endpoint(
     false,
@@ -1100,7 +1127,8 @@ void rmw_fleetqox_cpp_graph_register_subscription_endpoint(
     endpoint_gid,
     endpoint_gid_size,
     qos,
-    domain_id);
+    domain_id,
+    type_hash);
 }
 
 void rmw_fleetqox_cpp_graph_unregister_subscription_endpoint(const char * endpoint_id)
