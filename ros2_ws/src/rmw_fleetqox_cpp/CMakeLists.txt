@@ -1104,6 +1104,18 @@ ament_target_dependencies(fleetrmw_interprocess_pubsub_probe
   rmw
 )
 
+add_executable(fleetrmw_udp_peer_auth_crl_reload_probe
+  src/udp_peer_auth_crl_reload_probe.cpp
+)
+target_compile_features(fleetrmw_udp_peer_auth_crl_reload_probe PRIVATE cxx_std_17)
+target_link_libraries(fleetrmw_udp_peer_auth_crl_reload_probe
+  ${PROJECT_NAME}
+)
+ament_target_dependencies(fleetrmw_udp_peer_auth_crl_reload_probe
+  rcutils
+  rmw
+)
+
 add_executable(fleetrmw_udp_pmtu_discovery_probe
   src/udp_pmtu_discovery_probe.cpp
 )
@@ -1287,6 +1299,7 @@ install(
     fleetrmw_domain_isolation_probe
     fleetrmw_udp_pmtu_discovery_probe
     fleetrmw_topic_type_hash_probe
+    fleetrmw_udp_peer_auth_crl_reload_probe
     fleetrmw_service_error_probe
     fleetrmw_service_resource_limit_probe
     fleetrmw_service_client_isolation_probe

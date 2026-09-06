@@ -42,6 +42,8 @@ extern "C" std::uint64_t rmw_fleetqox_cpp_udp_peer_auth_identity_denied();
 extern "C" bool rmw_fleetqox_cpp_udp_peer_auth_crl_enabled();
 extern "C" std::uint64_t rmw_fleetqox_cpp_udp_peer_auth_revoked_certificate_drops();
 extern "C" const char * rmw_fleetqox_cpp_udp_peer_auth_last_identity();
+extern "C" std::uint64_t rmw_fleetqox_cpp_udp_peer_auth_crl_reload_successes();
+extern "C" std::uint64_t rmw_fleetqox_cpp_udp_peer_auth_crl_reload_failures();
 
 namespace
 {
@@ -255,6 +257,10 @@ void print_json_result(
     rmw_fleetqox_cpp_udp_peer_auth_revoked_certificate_drops() << ",";
   std::cout << "\"udp_peer_auth_last_identity\":\"" << json_escape(
     rmw_fleetqox_cpp_udp_peer_auth_last_identity()) << "\",";
+  std::cout << "\"udp_peer_auth_crl_reload_successes\":" <<
+    rmw_fleetqox_cpp_udp_peer_auth_crl_reload_successes() << ",";
+  std::cout << "\"udp_peer_auth_crl_reload_failures\":" <<
+    rmw_fleetqox_cpp_udp_peer_auth_crl_reload_failures() << ",";
   std::cout << "\"taken\":" << (taken ? "true" : "false") << ",";
   std::cout << "\"bytes\":" << bytes << ",";
   std::cout << "\"take_age_ms\":" << take_age_ms << ",";

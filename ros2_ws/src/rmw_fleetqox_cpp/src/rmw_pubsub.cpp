@@ -31,6 +31,7 @@
 #include <netinet/in.h>
 #include <netinet/ip_icmp.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -2334,6 +2335,16 @@ public:
     return udp_peer_auth_chain_failures_.load(std::memory_order_relaxed);
   }
 
+  std::uint64_t udp_peer_auth_crl_reload_successes() const
+  {
+    return udp_peer_auth_crl_reload_successes_.load(std::memory_order_relaxed);
+  }
+
+  std::uint64_t udp_peer_auth_crl_reload_failures() const
+  {
+    return udp_peer_auth_crl_reload_failures_.load(std::memory_order_relaxed);
+  }
+
   std::uint64_t udp_peer_auth_signature_failures() const
   {
     return udp_peer_auth_signature_failures_.load(std::memory_order_relaxed);
@@ -3727,6 +3738,7 @@ private:
       init_error_ = openssl_error_text("udp_peer_auth_private_key_mismatch");
       return false;
     }
+    udp_peer_auth_identity_ca_path_ = credentials.identity_ca_path;
     udp_peer_auth_trust_store_ = X509_STORE_new();
     if (udp_peer_auth_trust_store_ == nullptr ||
       X509_STORE_load_locations(
@@ -3751,6 +3763,13 @@ private:
       }
       X509_CRL_free(crl);
       udp_peer_auth_crl_enabled_ = true;
+      udp_peer_auth_crl_path_ = crl_env;
+      struct stat crl_stat{};
+      if (::stat(crl_env, &crl_stat) == 0) {
+        udp_peer_auth_crl_last_mtime_ns_ =
+          static_cast<std::int64_t>(crl_stat.st_mtim.tv_sec) * 1000000000ll +
+          crl_stat.st_mtim.tv_nsec;
+      }
     }
     const int certificate_der_size =
       i2d_X509(udp_peer_auth_local_certificate_, nullptr);
@@ -3877,6 +3896,64 @@ private:
     return true;
   }
 
+  // Rebuilds udp_peer_auth_trust_store_ from disk when the configured CRL
+  // file's mtime has changed since it was last loaded, so a certificate
+  // revoked after this process started is rejected on the next verified
+  // message rather than only after a restart. Called on every verification
+  // attempt but bounded to one cheap stat() call in the common case where
+  // nothing changed. Unlike the QUIC gateway's per-connection CRL reload,
+  // a failed reload here keeps the last good store instead of failing
+  // closed: this store also carries the process's own CA trust anchor for
+  // every UDP peer, and no fresher CRL was successfully validated to
+  // justify discarding a still-good one over a transient read/parse error
+  // (e.g. observing the CRL file mid-rewrite).
+  void maybe_reload_udp_peer_auth_crl()
+  {
+    if (udp_peer_auth_crl_path_.empty()) {
+      return;
+    }
+    struct stat crl_stat{};
+    if (::stat(udp_peer_auth_crl_path_.c_str(), &crl_stat) != 0) {
+      return;
+    }
+    const std::int64_t mtime_ns =
+      static_cast<std::int64_t>(crl_stat.st_mtim.tv_sec) * 1000000000ll +
+      crl_stat.st_mtim.tv_nsec;
+    std::lock_guard<std::mutex> lock(udp_peer_auth_trust_store_mutex_);
+    if (mtime_ns == udp_peer_auth_crl_last_mtime_ns_) {
+      return;
+    }
+    X509_STORE * fresh_store = X509_STORE_new();
+    if (fresh_store == nullptr ||
+      X509_STORE_load_locations(
+        fresh_store, udp_peer_auth_identity_ca_path_.c_str(), nullptr) != 1)
+    {
+      if (fresh_store != nullptr) {
+        X509_STORE_free(fresh_store);
+      }
+      udp_peer_auth_crl_reload_failures_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    BIO * crl_bio = BIO_new_file(udp_peer_auth_crl_path_.c_str(), "rb");
+    X509_CRL * crl = crl_bio == nullptr ? nullptr :
+      PEM_read_bio_X509_CRL(crl_bio, nullptr, nullptr, nullptr);
+    BIO_free(crl_bio);
+    if (crl == nullptr ||
+      X509_STORE_add_crl(fresh_store, crl) != 1 ||
+      X509_STORE_set_flags(fresh_store, X509_V_FLAG_CRL_CHECK) != 1)
+    {
+      X509_CRL_free(crl);
+      X509_STORE_free(fresh_store);
+      udp_peer_auth_crl_reload_failures_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    X509_CRL_free(crl);
+    X509_STORE_free(udp_peer_auth_trust_store_);
+    udp_peer_auth_trust_store_ = fresh_store;
+    udp_peer_auth_crl_last_mtime_ns_ = mtime_ns;
+    udp_peer_auth_crl_reload_successes_.fetch_add(1, std::memory_order_relaxed);
+  }
+
   bool unprotect_udp_peer_authenticated_payload(
     const std::string & payload,
     std::string * authenticated_content)
@@ -3923,13 +4000,20 @@ private:
       udp_peer_auth_chain_failures_.fetch_add(1, std::memory_order_relaxed);
       return false;
     }
+    maybe_reload_udp_peer_auth_crl();
     X509_STORE_CTX * verify_context = X509_STORE_CTX_new();
-    const bool verify_context_ready = verify_context != nullptr &&
-      X509_STORE_CTX_init(
-        verify_context, udp_peer_auth_trust_store_, peer_certificate, nullptr) == 1;
-    const bool chain_valid = verify_context_ready && X509_verify_cert(verify_context) == 1;
-    const int verify_error = verify_context_ready ?
-      X509_STORE_CTX_get_error(verify_context) : X509_V_ERR_UNSPECIFIED;
+    bool verify_context_ready = false;
+    bool chain_valid = false;
+    int verify_error = X509_V_ERR_UNSPECIFIED;
+    {
+      std::lock_guard<std::mutex> lock(udp_peer_auth_trust_store_mutex_);
+      verify_context_ready = verify_context != nullptr &&
+        X509_STORE_CTX_init(
+          verify_context, udp_peer_auth_trust_store_, peer_certificate, nullptr) == 1;
+      chain_valid = verify_context_ready && X509_verify_cert(verify_context) == 1;
+      verify_error = verify_context_ready ?
+        X509_STORE_CTX_get_error(verify_context) : X509_V_ERR_UNSPECIFIED;
+    }
     X509_STORE_CTX_free(verify_context);
     if (!chain_valid) {
       X509_free(peer_certificate);
@@ -6704,6 +6788,12 @@ private:
   X509 * udp_peer_auth_local_certificate_{nullptr};
   EVP_PKEY * udp_peer_auth_local_private_key_{nullptr};
   X509_STORE * udp_peer_auth_trust_store_{nullptr};
+  std::mutex udp_peer_auth_trust_store_mutex_;
+  std::string udp_peer_auth_identity_ca_path_;
+  std::string udp_peer_auth_crl_path_;
+  std::int64_t udp_peer_auth_crl_last_mtime_ns_{-1};
+  std::atomic<std::uint64_t> udp_peer_auth_crl_reload_successes_{0};
+  std::atomic<std::uint64_t> udp_peer_auth_crl_reload_failures_{0};
   std::string udp_peer_auth_local_certificate_der_;
   std::vector<std::string> udp_peer_auth_allowed_identities_;
   std::atomic<bool> udp_peer_auth_tamper_done_{false};
@@ -11925,6 +12015,16 @@ std::uint64_t rmw_fleetqox_cpp_udp_peer_auth_failures()
 std::uint64_t rmw_fleetqox_cpp_udp_peer_auth_chain_failures()
 {
   return socket_transport().udp_peer_auth_chain_failures();
+}
+
+std::uint64_t rmw_fleetqox_cpp_udp_peer_auth_crl_reload_successes()
+{
+  return socket_transport().udp_peer_auth_crl_reload_successes();
+}
+
+std::uint64_t rmw_fleetqox_cpp_udp_peer_auth_crl_reload_failures()
+{
+  return socket_transport().udp_peer_auth_crl_reload_failures();
 }
 
 std::uint64_t rmw_fleetqox_cpp_udp_peer_auth_signature_failures()
