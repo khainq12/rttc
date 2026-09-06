@@ -938,6 +938,7 @@ if start_file:
 sent = {"control": 0, "state": 0}
 sent_by_topic = {spec["topic"]: 0 for spec in TOPIC_SPECS}
 payload_sizes = []
+payload_size_contract_violated = False
 for seq in range(1, SAMPLES + 1):
     now = time.time_ns()
     for spec in TOPIC_SPECS:
@@ -970,7 +971,10 @@ for seq in range(1, SAMPLES + 1):
             )
         else:
             msg.data = json.dumps(payload, sort_keys=True)
-        payload_sizes.append(len(msg.data.encode("utf-8")))
+        actual_bytes = len(msg.data.encode("utf-8"))
+        payload_sizes.append(actual_bytes)
+        if target_bytes > 0 and actual_bytes != target_bytes:
+            payload_size_contract_violated = True
         publishers[spec["topic"]].publish(msg)
         sent[spec["kind"]] += 1
         sent_by_topic[spec["topic"]] += 1
@@ -1089,11 +1093,7 @@ result = {
     "payload_size_min_bytes": min(payload_sizes) if payload_sizes else 0,
     "payload_size_max_bytes": max(payload_sizes) if payload_sizes else 0,
     "payload_size_contract_ok": (
-        bool(payload_sizes)
-        and (
-            PAYLOAD_BYTES == 0
-            or all(size == PAYLOAD_BYTES for size in payload_sizes)
-        )
+        bool(payload_sizes) and not payload_size_contract_violated
     ),
     "control_sent": sent["control"],
     "state_sent": sent["state"],
