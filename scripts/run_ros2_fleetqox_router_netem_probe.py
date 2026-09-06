@@ -289,7 +289,12 @@ def run_probe(
         publisher_logs = run(["docker", "logs", publisher_name])
         subscriber_rc = int(run(["docker", "wait", subscriber_name], timeout=timeout_s + 30).stdout.strip())
         subscriber_logs = run(["docker", "logs", subscriber_name])
-        router_rc = int(run(["docker", "wait", router_name], timeout=30).stdout.strip())
+        router_rc = int(
+            run(
+                ["docker", "wait", router_name],
+                timeout=router_timeout_ms / 1000 + 30,
+            ).stdout.strip()
+        )
         router_logs = run(["docker", "logs", router_name])
         router_result = parse_last_json(router_logs.stdout)
 

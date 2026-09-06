@@ -4335,7 +4335,41 @@ private:
       }
       return send_fragmented_payload_to_targets(wire_payload, targets, label);
     }
-    return send_datagram_to_targets(wire_payload, targets, label);
+    bool exceeds_path_mtu = false;
+    const rmw_ret_t direct_send_ret =
+      send_datagram_to_targets(wire_payload, targets, label, &exceeds_path_mtu);
+    if (direct_send_ret == RMW_RET_OK || !exceeds_path_mtu) {
+      return direct_send_ret;
+    }
+    // IP_PMTUDISC_DO forces the DF bit on this socket, so the kernel never
+    // silently IP-fragments an oversized-for-the-link datagram the way it
+    // would without path-MTU discovery enabled -- it just rejects the send.
+    // Retry once through the loss-resilient fragmentation path at the real,
+    // just-(re)discovered MTU instead of failing this publish outright.
+    int smallest_discovered_budget = 0;
+    for (const sockaddr_in & target : targets) {
+      const int discovered_budget = discovered_path_mtu_budget_for(target);
+      if (discovered_budget > 0 &&
+        (smallest_discovered_budget == 0 || discovered_budget < smallest_discovered_budget))
+      {
+        smallest_discovered_budget = discovered_budget;
+      }
+    }
+    const size_t protection_overhead = udp_protection_overhead_upper_bound();
+    constexpr size_t kFragmentWrapperMargin = 200;
+    const size_t path_mtu_budget = smallest_discovered_budget > 0 ?
+      static_cast<size_t>(smallest_discovered_budget) : 1200;
+    if (protection_overhead == std::numeric_limits<size_t>::max() ||
+      protection_overhead + kFragmentWrapperMargin >= path_mtu_budget)
+    {
+      RMW_SET_ERROR_MSG(
+        "FleetRMW UDP payload cannot fit the discovered path MTU after fragmentation overhead");
+      return RMW_RET_ERROR;
+    }
+    const size_t retry_chunk_bytes =
+      path_mtu_budget - protection_overhead - kFragmentWrapperMargin;
+    return send_loss_resilient_fragmented_payload_to_targets(
+      payload, targets, label, is_data_frame, retry_chunk_bytes);
   }
 
   static std::string stable_fragment_id(const std::string & payload)
@@ -5345,7 +5379,8 @@ private:
   rmw_ret_t send_datagram_to_targets(
     const std::string & payload,
     const std::vector<sockaddr_in> & targets,
-    const char * label)
+    const char * label,
+    bool * out_exceeds_path_mtu = nullptr)
   {
     const size_t payload_size = payload.size();
     size_t previous_high_water = udp_datagram_size_high_water_.load(
@@ -5371,6 +5406,9 @@ private:
         const int discovered_budget = discovered_path_mtu_budget_for(target);
         if (discovered_budget > 0 && payload_size > static_cast<size_t>(discovered_budget)) {
           udp_pmtu_rejections_.fetch_add(1, std::memory_order_relaxed);
+          if (out_exceeds_path_mtu != nullptr) {
+            *out_exceeds_path_mtu = true;
+          }
           RMW_SET_ERROR_MSG(
             "FleetRMW UDP payload exceeds automatically discovered path MTU");
           return RMW_RET_ERROR;
@@ -5390,11 +5428,14 @@ private:
       if (sent < 0 || static_cast<size_t>(sent) != payload.size()) {
         if (sent < 0 && errno == EMSGSIZE && udp_datagram_budget_bytes_ <= 0) {
           // The payload does not even fit this host's own outgoing
-          // interface MTU. Learn the real budget now so the next attempt
-          // (the fragmentation/repair path above already retries at a
-          // smaller chunk size) is rejected before ever calling sendto()
-          // again, rather than repeating this same kernel round trip.
+          // interface MTU. Learn the real budget now so the caller's
+          // fragmentation retry (see send_payload_to_targets) picks a
+          // chunk size that actually fits, instead of repeating this same
+          // kernel round trip on every future send to this peer.
           discover_path_mtu_via_probe_socket(target);
+          if (out_exceeds_path_mtu != nullptr) {
+            *out_exceeds_path_mtu = true;
+          }
         }
         RMW_SET_ERROR_MSG(label == nullptr ?
           "failed to send FleetRMW payload through UDP transport" :
