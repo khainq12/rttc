@@ -5891,6 +5891,16 @@ private:
           request_stale_missing_fragments();
           continue;
         }
+        if (errno == ECONNREFUSED || errno == EHOSTUNREACH || errno == ENETUNREACH) {
+          // These surface asynchronously via IP_RECVERR whenever a prior
+          // outbound datagram provoked an ICMP error (e.g. the peer's
+          // socket wasn't bound yet during startup). They describe that one
+          // send, not this socket -- the peer can still come up and start
+          // replying normally, so treat them like a transient EAGAIN
+          // instead of permanently killing the receive thread.
+          request_stale_missing_fragments();
+          continue;
+        }
         break;
       }
       if (received == 0) {
