@@ -24,7 +24,7 @@ asserted true or false.
 | Deadline-scheduler control-deadline misses | 0/24 | Across wifi/wan/roaming profiles, all robot counts tested |
 | Loss-resilient large-sample delivery | 5/5 runs, 32,768-byte payload, 25% simulated loss | Distinct repetition seeds |
 | Shared-budget repair frontier | 27 configurations swept, 18/27 admitted, 11/27 full live-QoE contract met | Frontier-mapping probe, designed to partially fail; reports where the frontier sits, not a pass rate |
-| FleetRMW-via-router vs. best DDS baseline (roaming, 8-robot contention) | 3.1x lower control-plane p95 | Scoped to this profile/load; not a universal-superiority claim |
+| FleetRMW-via-router vs. best DDS baseline, 8-robot contention | 1.9-2.5x lower control-plane p95 at wifi/wan; 1.5-1.6x higher (slower) at roaming | Profile-dependent, not a universal-superiority claim; see "Baseline comparison" |
 
 ## RMW core
 
@@ -209,33 +209,52 @@ wifi/wan/roaming profiles.
 
 **On a single unscheduled flow** (no contention), all three DDS
 implementations transported a small metadata-only message faster than
-FleetRMW's own peer-to-peer transport, by 6% (wifi) to 20% (roaming) — the
+FleetRMW's own peer-to-peer transport, by 5.5% (wan) to 8.4% (wifi) — the
 cost of a newer, less-optimized wire protocol against implementations with
 years of tuning behind them.
 
 **Under real multi-robot contention** (8 robots, 16 flows, 256-byte control +
-30,000-byte state per robot sharing one constrained link), the same
-comparison inverts: FleetRMW routed through its own UDP router already beats
-every DDS baseline at every profile even with no scheduling at all, and with
-its deadline-aware holdback scheduler enabled, cuts control-plane p95 latency
-by 55% versus its own unscheduled router mode at `roaming` — 3.1x faster
-than the best DDS result measured (151 ms vs. FastRTPS's 469 ms). At
-wifi/wan the scheduled and unscheduled router modes are statistically
-indistinguishable, consistent with there being no real contention for the
-scheduler to resolve on an uncongested link. Reproduced across 3 independent
-runs at `roaming` (55% reduction held within a few percentage points each
-time).
+30,000-byte state per robot sharing one constrained link), the picture is
+profile-dependent rather than a uniform FleetRMW win. At `wifi` and `wan`,
+FleetRMW routed through its own UDP router clearly beats both 100%-delivery
+DDS baselines even with no scheduling at all (control-plane p95: 86 ms vs.
+164 ms at wifi, 107 ms vs. 270 ms at wan — roughly 1.9x and 2.5x faster).
+At `roaming`, the same router-based FleetRMW path is *slower* than both DDS
+baselines: 722-743 ms vs. 476-479 ms, about 55% higher p95, reproduced across
+3 independent runs at each end of the comparison. The deadline-aware
+holdback scheduler makes no measurable difference at any profile in this
+run (within 1% of unscheduled at wifi/wan, and if anything slightly slower,
+not faster, at roaming across all 3 reps) — a genuine reversal from a
+previously published `roaming` result that no longer reproduces.
 
-This supports a scoped claim: FleetRMW's router-mediated deadline scheduling
-measurably reduces control-plane tail latency under genuine multi-flow
-bandwidth contention, on the specific profile/load tested. It does not
-support:
+That previous number was measured against a build where FleetRMW's UDP
+transport had two root-caused defects (an async-ICMP receive-thread death
+and an `EMSGSIZE` crash on large publishes over the router, both fixed in
+this run) that silently prevented the 30,000-byte state channel from ever
+actually being delivered under contention. With state delivery at 0%, the
+prior "roaming" measurement never actually put real 30 KB-per-robot traffic
+on the link — it was, in effect, measuring control-only traffic on an
+otherwise-idle path. Now that state delivery genuinely works, `roaming`'s
+much lower link rate (5 Mbit/s vs. wifi's 20 Mbit/s) becomes the dominant
+bottleneck, and routing all 8 robots' state traffic through one central
+relay pays a real bandwidth cost the multicast/peer-to-peer DDS baselines
+do not. The wifi/wan win is real and reproducible; the roaming win was not.
+
+This supports a narrower scoped claim than before: FleetRMW's router-mediated
+transport measurably reduces control-plane tail latency under multi-flow
+contention when the link is not itself the bottleneck (wifi/wan here). It
+does not support:
 
 - universal cross-RMW superiority (FleetRMW's own unscheduled transport is
-  slower than DDS on an uncontended link, by design comparison above);
-- latency superiority as a blanket claim independent of contention level;
+  slower than DDS on an uncontended link, by the single-flow comparison
+  above, and slower than DDS under contention on a bandwidth-constrained
+  link, by the roaming comparison above);
+- any deadline-scheduler latency benefit — none was measurable in this run
+  at any profile, contradicting the previously published `roaming` claim;
+- latency superiority as a blanket claim independent of contention level or
+  link bandwidth;
 - comparison of failed/incomplete rows as if they succeeded — one baseline
-  (Zenoh) dropped 1.6-12.5% of messages under the contended load rather than
+  (Zenoh) dropped 1.6-6.3% of messages under the contended load rather than
   queuing or retrying, and its raw latency numbers are not adjusted for that.
 
 The comparison runners are:
