@@ -1,0 +1,278 @@
+--- a/examples/server.h	2026-09-06 13:49:43.909151942 +0700
++++ b/examples/server.h	2026-09-06 13:50:14.921629265 +0700
+@@ -200,6 +200,8 @@
+ 
+   void write_qlog(const void *data, size_t datalen);
+   const std::string &client_identity() const;
++  const std::string &client_certificate_serial_hex() const;
++  int force_close_for_revocation();
+   uint64_t backend_generation() const;
+   int complete_backend_response(int64_t stream_id, bool available,
+                                 unsigned int status,
+@@ -221,6 +223,7 @@
+   nghttp3_conn *httpconn_;
+   std::unordered_map<int64_t, std::unique_ptr<Stream>> streams_;
+   std::string client_identity_;
++  std::string client_certificate_serial_hex_;
+   uint64_t backend_generation_;
+   // conn_closebuf_ contains a packet which contains CONNECTION_CLOSE.
+   // This packet is repeatedly sent as a response to the incoming
+@@ -282,6 +285,7 @@
+                                      unsigned int ecn, const uint8_t *data,
+                                      size_t datalen, size_t gso_size);
+   void remove(const Handler *h);
++  void close_connections_with_revoked_certificates(const std::string &crl_path);
+ 
+   void associate_cid(const ngtcp2_cid *cid, Handler *h);
+   void dissociate_cid(const ngtcp2_cid *cid);
+--- a/examples/server.cc	2026-09-06 13:49:43.909151942 +0700
++++ b/examples/server.cc	2026-09-06 13:53:22.700519624 +0700
+@@ -35,6 +35,9 @@
+ #include <optional>
+ #include <atomic>
+ #include <cctype>
++#include <sstream>
++#include <set>
++#include <array>
+ 
+ #include <unistd.h>
+ #include <getopt.h>
+@@ -268,6 +271,93 @@
+   return identity;
+ }
+ 
++namespace {
++std::string fleetqox_hex_encode(const unsigned char *bytes, size_t size) {
++  std::ostringstream out;
++  out << std::hex << std::setfill('0');
++  for (size_t i = 0; i < size; ++i) {
++    out << std::setw(2) << static_cast<unsigned int>(bytes[i]);
++  }
++  return out.str();
++}
++} // namespace
++
++// Extracts the verified peer certificate's serial number as a lowercase
++// hex string, computed the same way fleetqox_verified_client_identity()
++// extracts the SAN identity above (same gnutls_certificate_get_peers()
++// entry point, called once per completed handshake). Used to recognize
++// a specific already-connected client against a freshly reloaded CRL's
++// revoked-serial list, since the CRL only ever carries serial numbers.
++std::string fleetqox_client_certificate_serial_hex(gnutls_session_t session) {
++  unsigned int peer_count = 0;
++  const auto *peers = gnutls_certificate_get_peers(session, &peer_count);
++  if (peers == nullptr || peer_count == 0) {
++    return {};
++  }
++  gnutls_x509_crt_t certificate;
++  if (gnutls_x509_crt_init(&certificate) < 0) {
++    return {};
++  }
++  if (gnutls_x509_crt_import(certificate, &peers[0], GNUTLS_X509_FMT_DER) <
++      0) {
++    gnutls_x509_crt_deinit(certificate);
++    return {};
++  }
++  std::array<unsigned char, 64> serial{};
++  size_t serial_size = serial.size();
++  auto rv =
++      gnutls_x509_crt_get_serial(certificate, serial.data(), &serial_size);
++  gnutls_x509_crt_deinit(certificate);
++  if (rv < 0) {
++    return {};
++  }
++  return fleetqox_hex_encode(serial.data(), serial_size);
++}
++
++// Parses the CRL file directly (rather than relying on
++// gnutls_certificate_set_x509_crl_file(), which folds revocation
++// checking into gnutls_certificate_verify_peers3() without exposing the
++// underlying serial list) to get a plain set of revoked serials that
++// already-established connections' cached peer certificates can be
++// checked against without repeating a full handshake-time chain
++// verification for each one.
++std::set<std::string> fleetqox_revoked_serials_from_crl_file(
++    const std::string &path) {
++  std::set<std::string> revoked;
++  if (path.empty()) {
++    return revoked;
++  }
++  gnutls_datum_t data{};
++  if (gnutls_load_file(path.c_str(), &data) < 0) {
++    return revoked;
++  }
++  gnutls_x509_crl_t crl;
++  if (gnutls_x509_crl_init(&crl) < 0) {
++    gnutls_free(data.data);
++    return revoked;
++  }
++  if (gnutls_x509_crl_import(crl, &data, GNUTLS_X509_FMT_PEM) < 0) {
++    gnutls_x509_crl_deinit(crl);
++    gnutls_free(data.data);
++    return revoked;
++  }
++  gnutls_free(data.data);
++  auto count = gnutls_x509_crl_get_crt_count(crl);
++  for (int index = 0; index < count; ++index) {
++    std::array<unsigned char, 64> serial{};
++    size_t serial_size = serial.size();
++    time_t revocation_time = 0;
++    if (gnutls_x509_crl_get_crt_serial(
++            crl, static_cast<unsigned>(index), serial.data(), &serial_size,
++            &revocation_time) < 0) {
++      continue;
++    }
++    revoked.insert(fleetqox_hex_encode(serial.data(), serial_size));
++  }
++  gnutls_x509_crl_deinit(crl);
++  return revoked;
++}
++
+ std::optional<FleetQoxBackendResponse> fleetqox_backend_request(
+     const std::string_view &socket_path, const std::string_view &method,
+     const std::string_view &path, const std::string_view &client_identity,
+@@ -1017,6 +1107,21 @@
+   return client_identity_;
+ }
+ 
++const std::string &Handler::client_certificate_serial_hex() const {
++  return client_certificate_serial_hex_;
++}
++
++// Mirrors the existing error path in handle_expiry(): stash a transport
++// close error into last_error_ and drive the same handle_error() ->
++// (start_closing_period() -> send_conn_close()) sequence every other
++// forced-teardown path in this file already uses, rather than
++// introducing a second way to tear down a connection.
++int Handler::force_close_for_revocation() {
++  ngtcp2_connection_close_error_set_transport_error_liberr(
++      &last_error_, NGTCP2_CONNECTION_REFUSED, nullptr, 0);
++  return handle_error();
++}
++
+ uint64_t Handler::backend_generation() const { return backend_generation_; }
+ 
+ int Handler::complete_backend_response(int64_t stream_id, bool available,
+@@ -1075,6 +1180,8 @@
+     }
+     std::cerr << "FLEETQOX_PUBLIC_MTLS_IDENTITY identity="
+               << client_identity_ << std::endl;
++    client_certificate_serial_hex_ = fleetqox_client_certificate_serial_hex(
++        tls_session_.get_native_handle());
+   }
+ 
+   if (tls_session_.send_session_ticket() != 0) {
+@@ -3652,6 +3759,42 @@
+   delete h;
+ }
+ 
++// Called after the online CRL reload path (see
++// tls_server_context_gnutls.cc) successfully reloads a fresh CRL, so a
++// certificate revoked while its connection is already established is
++// torn down on the next reload rather than staying trusted for the rest
++// of that connection's lifetime -- previously only new connections
++// consulted the reloaded CRL at all.
++//
++// handlers_ maps each of a connection's several CIDs (client-initial
++// DCID plus every SCID) to the SAME Handler pointer, so the matching
++// step below deduplicates by pointer before closing anything: calling
++// force_close_for_revocation() then remove() twice on the same Handler
++// would delete it twice.
++void Server::close_connections_with_revoked_certificates(
++    const std::string &crl_path) {
++  auto revoked = fleetqox_revoked_serials_from_crl_file(crl_path);
++  if (revoked.empty()) {
++    return;
++  }
++  std::set<Handler *> to_close;
++  for (auto &entry : handlers_) {
++    auto h = entry.second;
++    const auto &serial = h->client_certificate_serial_hex();
++    if (!serial.empty() && revoked.count(serial) > 0) {
++      to_close.insert(h);
++    }
++  }
++  for (auto h : to_close) {
++    std::cerr << "FLEETQOX_PUBLIC_MTLS_ACTIVE_SESSION_REVOKED serial="
++              << h->client_certificate_serial_hex() << std::endl;
++    auto rv = h->force_close_for_revocation();
++    if (rv != NETWORK_ERR_CLOSE_WAIT) {
++      remove(h);
++    }
++  }
++}
++
+ namespace {
+ int parse_host_port(Address &dest, int af, const char *first,
+                     const char *last) {
+@@ -3925,6 +4068,28 @@
+ 
+ std::ofstream keylog_file;
+ 
++namespace {
++// Set once in main() right after the single Server instance is
++// constructed. tls_server_context_gnutls.cc runs the CRL-reload path
++// deep inside a per-handshake TLS verification callback with no access
++// to the Server object that owns the connection table, so it reaches
++// this global through fleetqox_notify_client_crl_reloaded() instead of
++// either threading a Server& through the whole TLS callback chain or
++// having tls_server_context_gnutls.cc include server.h.
++Server *g_fleetqox_crl_reload_server = nullptr;
++} // namespace
++
++// Declared for tls_server_context_gnutls.cc to call by simple forward
++// declaration (both translation units are linked into one binary, see
++// the Dockerfile build command); not declared in a shared header since
++// it is the only symbol either side needs from the other for this.
++void fleetqox_notify_client_crl_reloaded(const std::string &crl_path) {
++  if (g_fleetqox_crl_reload_server != nullptr) {
++    g_fleetqox_crl_reload_server->close_connections_with_revoked_certificates(
++        crl_path);
++  }
++}
++
+ int main(int argc, char **argv) {
+   config_set_default(config);
+ 
+@@ -4359,12 +4524,14 @@
+   }
+ 
+   Server s(EV_DEFAULT, tls_ctx);
++  g_fleetqox_crl_reload_server = &s;
+   if (s.init(addr, port) != 0) {
+     exit(EXIT_FAILURE);
+   }
+ 
+   ev_run(EV_DEFAULT, 0);
+ 
++  g_fleetqox_crl_reload_server = nullptr;
+   s.disconnect();
+   s.close();
+ 
+--- a/examples/tls_server_context_gnutls.cc	2026-09-06 13:49:43.911151973 +0700
++++ b/examples/tls_server_context_gnutls.cc	2026-09-06 13:55:10.896185212 +0700
+@@ -40,6 +40,16 @@
+ 
+ extern Config config;
+ 
++// Defined in server.cc, which owns the live connection table that this
++// translation unit has no access to. Declared here rather than via a
++// shared header since it is the only symbol either side needs from the
++// other; both are linked into one binary (see the Dockerfile). This
++// declaration must stay outside the anonymous namespace below so it
++// resolves to server.cc's externally-linked definition rather than
++// silently declaring an unrelated, never-defined static of the same
++// name local to this file.
++void fleetqox_notify_client_crl_reloaded(const std::string &crl_path);
++
+ namespace {
+ int anti_replay_db_add_func(void *dbf, time_t exp_time,
+                             const gnutls_datum_t *key,
+@@ -125,6 +135,7 @@
+   }
+   dprintf(STDERR_FILENO,
+           "FLEETQOX_PUBLIC_MTLS_CRL_RELOADED certificates=%d\n", rv);
++  fleetqox_notify_client_crl_reloaded(client_crl);
+   return 0;
+ }
+ 
