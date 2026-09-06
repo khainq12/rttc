@@ -127,6 +127,18 @@ def run_probe(
     control_deadline_ms: int,
     scheduler_window_ms: int,
 ) -> dict[str, Any]:
+    # Matches the formula already validated by the router qos-matrix
+    # probes: a queued (state) frame can be held for the full scheduler
+    # window before the safety-valve flush releases it, so the window
+    # must scale with robot/flow count -- otherwise a new batch of state
+    # frames arrives (every publish_interval_ms) before the previous
+    # batch has even been released, and the queue backlog compounds
+    # across samples instead of draining between bursts.
+    if scheduler_mode == "scheduled":
+        scheduler_window_ms = max(scheduler_window_ms, robot_count * 1000)
+        min_timeout_s = (scheduler_window_ms / 1000.0) + (samples * publish_interval_ms / 1000.0) + 10.0
+        timeout_s = max(timeout_s, min_timeout_s)
+
     telemetry_profile = profile_by_name(profile)
     # The router's --scheduler-topic-prefix identifies which topics are
     # subject to deadline-aware holdback by a plain string-prefix match, so
