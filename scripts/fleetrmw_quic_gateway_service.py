@@ -80,6 +80,7 @@ class ServiceTelemetry:
     publisher_identity_authorization_rejected: int = 0
     application_outcome_identity_authorization_rejected: int = 0
     malformed_h3_requests_rejected: int = 0
+    client_crl_reload_failures: int = 0
     mtls_private_adapter_installs: int = 0
     native_path_observer_installs: int = 0
     native_path_observation_updates: int = 0
@@ -106,6 +107,7 @@ class ServiceTelemetry:
                 self.application_outcome_identity_authorization_rejected
             ),
             "malformed_h3_requests_rejected": self.malformed_h3_requests_rejected,
+            "client_crl_reload_failures": self.client_crl_reload_failures,
             "mtls_private_adapter_installs": self.mtls_private_adapter_installs,
             "native_path_observer_installs": self.native_path_observer_installs,
             "native_path_observation_updates": self.native_path_observation_updates,
@@ -131,6 +133,7 @@ class FleetQoxGatewayProtocol(QuicConnectionProtocol):
         require_client_certificate: bool,
         client_ca: str | None,
         revoked_client_serials: frozenset[int],
+        client_crl_reload_failed: bool = False,
         bind_client_cn_to_publisher_id: bool,
         publisher_identity_uri_prefix: str | None,
         native_path_observations: bool,
@@ -157,16 +160,24 @@ class FleetQoxGatewayProtocol(QuicConnectionProtocol):
         if require_client_certificate:
             if not client_ca:
                 raise ValueError("client CA is required for mutual TLS")
-            install_aioquic_mtls_adapter(
-                self._quic,
-                client_ca=client_ca,
-                revoked_client_serials=revoked_client_serials,
-                on_missing_certificate=self._on_missing_client_certificate,
-                on_untrusted_certificate=self._on_untrusted_client_certificate,
-                on_revoked_certificate=self._on_revoked_client_certificate,
-                on_authenticated_certificate=self._on_authenticated_client_certificate,
-            )
-            self.service_telemetry.mtls_private_adapter_installs += 1
+            if client_crl_reload_failed:
+                # Fail closed: a CRL that cannot currently be read/validated
+                # means revocation status is unknown for this connection, so
+                # no client certificate is authenticated. self.client_authenticated
+                # already defaults to False above and every request is gated
+                # on it, so simply not installing the adapter is sufficient.
+                self.service_telemetry.client_crl_reload_failures += 1
+            else:
+                install_aioquic_mtls_adapter(
+                    self._quic,
+                    client_ca=client_ca,
+                    revoked_client_serials=revoked_client_serials,
+                    on_missing_certificate=self._on_missing_client_certificate,
+                    on_untrusted_certificate=self._on_untrusted_client_certificate,
+                    on_revoked_certificate=self._on_revoked_client_certificate,
+                    on_authenticated_certificate=self._on_authenticated_client_certificate,
+                )
+                self.service_telemetry.mtls_private_adapter_installs += 1
         if native_path_observations:
             self.native_path_observer = install_aioquic_path_observer(self._quic)
             self.service_telemetry.native_path_observer_installs += 1
@@ -487,11 +498,11 @@ async def run_service(args: argparse.Namespace) -> int:
         on_wait=report_lease_wait,
     )
     service_telemetry = ServiceTelemetry()
-    revoked_client_serials = (
+    if args.client_crl:
+        # Fail fast on an obviously misconfigured CRL/CA pair at startup;
+        # each connection also reloads it fresh below so a serial revoked
+        # after startup takes effect without a restart.
         load_revoked_client_serials(args.client_ca, args.client_crl)
-        if args.client_crl
-        else frozenset()
-    )
     configuration = QuicConfiguration(
         is_client=False,
         alpn_protocols=H3_ALPN,
@@ -507,6 +518,17 @@ async def run_service(args: argparse.Namespace) -> int:
         configuration.quic_logger = QuicFileLogger(args.qlog_dir)
     def create_protocol(*protocol_args: Any, **protocol_kwargs: Any) -> FleetQoxGatewayProtocol:
         service_telemetry.connections_created += 1
+        # Reload the CRL from disk for every new connection rather than once
+        # at service startup, so a serial revoked after the service started
+        # takes effect on the very next connection without a restart.
+        revoked_client_serials: frozenset[int] = frozenset()
+        client_crl_reload_failed = False
+        if args.client_crl:
+            try:
+                revoked_client_serials = load_revoked_client_serials(
+                    args.client_ca, args.client_crl)
+            except Exception:
+                client_crl_reload_failed = True
         return FleetQoxGatewayProtocol(
             *protocol_args,
             gateway_state=state,
@@ -514,6 +536,7 @@ async def run_service(args: argparse.Namespace) -> int:
             require_client_certificate=args.require_client_certificate,
             client_ca=args.client_ca,
             revoked_client_serials=revoked_client_serials,
+            client_crl_reload_failed=client_crl_reload_failed,
             bind_client_cn_to_publisher_id=args.bind_client_cn_to_publisher_id,
             publisher_identity_uri_prefix=args.publisher_identity_uri_prefix,
             native_path_observations=args.native_path_observations,
