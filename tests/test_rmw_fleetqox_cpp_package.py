@@ -60,6 +60,7 @@ class RmwFleetQoxCppPackageTest(unittest.TestCase):
         self.assertIn("fleetrmw_content_filter_sql_probe", cmake)
         self.assertIn("fleetrmw_content_filter_typed_probe", cmake)
         self.assertIn("fleetrmw_wstring_content_filter_probe", cmake)
+        self.assertIn("fleetrmw_keyed_instance_retransmit_probe", cmake)
         self.assertIn("fleetrmw_service_qos_probe", cmake)
         self.assertIn("fleetrmw_domain_isolation_probe", cmake)
         self.assertIn("fleetrmw_domain_isolation_smoke", cmake)
@@ -4054,6 +4055,41 @@ int main()
         self.assertIn(
             "content_filter_wstring_field_claim",
             wstring_content_filter_runner_source,
+        )
+        keyed_instance_retransmit_probe = (
+            PKG / "src" / "keyed_instance_retransmit_probe.cpp"
+        )
+        self.assertTrue(keyed_instance_retransmit_probe.exists())
+        keyed_instance_retransmit_probe_source = (
+            keyed_instance_retransmit_probe.read_text()
+        )
+        self.assertIn(
+            "fleetrmw.keyed_instance_retransmit_probe.v1",
+            keyed_instance_retransmit_probe_source,
+        )
+        self.assertIn(
+            "per_instance_bounding_observed", keyed_instance_retransmit_probe_source
+        )
+        self.assertIn(
+            "keyless_behavior_unchanged", keyed_instance_retransmit_probe_source
+        )
+        keyed_instance_idl = PKG.parent / "fleetrmw_interfaces" / "msg" / "KeyedInstanceSample.idl"
+        self.assertTrue(keyed_instance_idl.exists())
+        self.assertIn("@key", keyed_instance_idl.read_text())
+        keyed_instance_retransmit_runner = (
+            ROOT / "scripts" / "run_rmw_docker_keyed_instance_retransmit_probe.py"
+        )
+        self.assertTrue(keyed_instance_retransmit_runner.exists())
+        keyed_instance_retransmit_runner_source = (
+            keyed_instance_retransmit_runner.read_text()
+        )
+        self.assertIn(
+            "fleetrmw.docker_keyed_instance_retransmit_probe.v1",
+            keyed_instance_retransmit_runner_source,
+        )
+        self.assertIn(
+            "reliability_key_instance_bound_claim",
+            keyed_instance_retransmit_runner_source,
         )
         loan_runner = ROOT / "scripts" / "run_rmw_docker_loaned_message_probe.py"
         self.assertTrue(loan_runner.exists())

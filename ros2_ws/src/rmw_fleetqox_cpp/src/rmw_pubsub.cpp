@@ -246,6 +246,13 @@ struct ReliableRetransmitEntry
   size_t fragment_initial_send_batches_pending{0};
   bool fragment_initial_pending_suppression_recorded{false};
   bool fragment_fallback_grace_deferral_recorded{false};
+  // Empty for every message type with no @key-annotated field (i.e. every
+  // stock ROS 2 message today): those entries are scoped by publisher_id
+  // alone, exactly as before this field was added. Only a message with a
+  // @key field (only expressible via a hand-authored .idl, never .msg;
+  // see KeyedInstanceSample.idl) gets a non-empty instance_key, which
+  // further scopes this publisher's history bound to that one instance.
+  std::string instance_key{};
 };
 
 struct RemotePubSubEndpoint
@@ -9563,6 +9570,92 @@ content_filter_typed_fields(
   return std::nullopt;
 }
 
+// Only top-level, non-array @key members are collected: DDS-style instance
+// keys on nested sub-messages or array elements are a real IDL possibility
+// but are not exercised by any message this RMW ships or tests, so bounding
+// on them is left unimplemented rather than guessed at.
+void collect_introspection_c_key_paths(
+  const rosidl_typesupport_introspection_c__MessageMembers * members,
+  std::vector<std::string> * paths)
+{
+  if (members == nullptr || paths == nullptr) {
+    return;
+  }
+  for (uint32_t index = 0; index < members->member_count_; ++index) {
+    const auto & member = members->members_[index];
+    if (!member.is_key_ || member.is_array_) {
+      continue;
+    }
+    const std::string path = nested_content_filter_path("", member.name_);
+    if (!path.empty()) {
+      paths->push_back(path);
+    }
+  }
+}
+
+void collect_introspection_cpp_key_paths(
+  const rosidl_typesupport_introspection_cpp::MessageMembers * members,
+  std::vector<std::string> * paths)
+{
+  if (members == nullptr || paths == nullptr) {
+    return;
+  }
+  for (uint32_t index = 0; index < members->member_count_; ++index) {
+    const auto & member = members->members_[index];
+    if (!member.is_key_ || member.is_array_) {
+      continue;
+    }
+    const std::string path = nested_content_filter_path("", member.name_);
+    if (!path.empty()) {
+      paths->push_back(path);
+    }
+  }
+}
+
+// Returns nullopt for every message type with no top-level @key field --
+// i.e. every stock ROS 2 message today, since the .msg grammar cannot
+// express @key at all (only a hand-authored .idl can; see
+// KeyedInstanceSample.idl) -- so the retransmit ledger's existing
+// per-publisher-only history bound is left completely unchanged for them.
+// For a message with one or more @key fields, returns a stable string built
+// from those fields' reflected text, suitable for scoping the retransmit
+// ledger's history bound to one DDS-style instance rather than the whole
+// publisher.
+std::optional<std::string> compute_publish_instance_key(
+  const rosidl_message_type_support_t * type_support,
+  const std::vector<std::uint8_t> & payload)
+{
+  const rosidl_message_type_support_t * effective =
+    resolve_effective_type_support(type_support);
+  std::vector<std::string> key_paths;
+  const auto * c_members = introspection_c_members(effective);
+  if (c_members != nullptr) {
+    collect_introspection_c_key_paths(c_members, &key_paths);
+  } else {
+    const auto * cpp_members = introspection_cpp_members(effective);
+    collect_introspection_cpp_key_paths(cpp_members, &key_paths);
+  }
+  if (key_paths.empty()) {
+    return std::nullopt;
+  }
+  const auto fields = content_filter_typed_fields(type_support, payload);
+  if (!fields.has_value()) {
+    return std::nullopt;
+  }
+  std::sort(key_paths.begin(), key_paths.end());
+  std::string instance_key;
+  for (const auto & path : key_paths) {
+    const auto found = fields->find(path);
+    instance_key += path;
+    instance_key += '=';
+    if (found != fields->end()) {
+      instance_key += found->second;
+    }
+    instance_key += '\x1f';
+  }
+  return instance_key;
+}
+
 std::string trim_text(const std::string & value)
 {
   const auto begin = std::find_if_not(
@@ -10281,6 +10374,74 @@ FleetQoxSubscriptionData * subscription_data(const rmw_subscription_t * subscrip
   return subscription == nullptr ? nullptr : static_cast<FleetQoxSubscriptionData *>(subscription->data);
 }
 
+}  // namespace
+
+// White-box accessors for probing the retransmit ledger's per-@key-instance
+// history bound (see ReliableRetransmitEntry::instance_key). Not part of the
+// public RMW API; test-only, like the counters just below.
+extern "C"
+{
+
+size_t rmw_fleetqox_cpp_test_retransmit_ledger_total_entries_for_publisher(
+  const rmw_publisher_t * publisher)
+{
+  const FleetQoxPublisherData * data = publisher_data(publisher);
+  if (data == nullptr) {
+    return 0;
+  }
+  std::lock_guard<std::mutex> lock(g_bus_mutex);
+  size_t total = 0;
+  for (const auto & entry_pair : g_retransmit_ledger) {
+    if (entry_pair.second.publisher_id == data->publisher_id) {
+      ++total;
+    }
+  }
+  return total;
+}
+
+size_t rmw_fleetqox_cpp_test_retransmit_ledger_distinct_instances_for_publisher(
+  const rmw_publisher_t * publisher)
+{
+  const FleetQoxPublisherData * data = publisher_data(publisher);
+  if (data == nullptr) {
+    return 0;
+  }
+  std::lock_guard<std::mutex> lock(g_bus_mutex);
+  std::unordered_set<std::string> instances;
+  for (const auto & entry_pair : g_retransmit_ledger) {
+    if (entry_pair.second.publisher_id == data->publisher_id) {
+      instances.insert(entry_pair.second.instance_key);
+    }
+  }
+  return instances.size();
+}
+
+size_t rmw_fleetqox_cpp_test_retransmit_ledger_max_entries_per_instance_for_publisher(
+  const rmw_publisher_t * publisher)
+{
+  const FleetQoxPublisherData * data = publisher_data(publisher);
+  if (data == nullptr) {
+    return 0;
+  }
+  std::lock_guard<std::mutex> lock(g_bus_mutex);
+  std::unordered_map<std::string, size_t> counts;
+  for (const auto & entry_pair : g_retransmit_ledger) {
+    if (entry_pair.second.publisher_id == data->publisher_id) {
+      ++counts[entry_pair.second.instance_key];
+    }
+  }
+  size_t max_count = 0;
+  for (const auto & count_pair : counts) {
+    max_count = std::max(max_count, count_pair.second);
+  }
+  return max_count;
+}
+
+}  // extern "C"
+
+namespace
+{
+
 class PayloadScratch
 {
 public:
@@ -10389,6 +10550,8 @@ rmw_ret_t publish_payload(FleetQoxPublisherData * data, const std::vector<std::u
     rmw_fleetqox_cpp_graph_matched_subscription_endpoint_ids(
       data->domain_id, data->topic_name, data->type_name, data->qos) :
     std::vector<std::string>{};
+  const std::string publish_instance_key =
+    compute_publish_instance_key(data->type_support, payload).value_or(std::string());
   {
     std::lock_guard<std::mutex> lock(g_bus_mutex);
     record_offered_deadline_miss_locked(data, now_ns, &deadline_callbacks);
@@ -10400,7 +10563,7 @@ rmw_ret_t publish_payload(FleetQoxPublisherData * data, const std::vector<std::u
     size_t publisher_history_size = 0;
     for (auto it = g_retransmit_ledger.begin(); it != g_retransmit_ledger.end();) {
       const ReliableRetransmitEntry & entry = it->second;
-      if (entry.publisher_id != data->publisher_id) {
+      if (entry.publisher_id != data->publisher_id || entry.instance_key != publish_instance_key) {
         ++it;
         continue;
       }
@@ -10415,6 +10578,7 @@ rmw_ret_t publish_payload(FleetQoxPublisherData * data, const std::vector<std::u
       auto oldest = g_retransmit_ledger.end();
       for (auto it = g_retransmit_ledger.begin(); it != g_retransmit_ledger.end(); ++it) {
         if (it->second.publisher_id == data->publisher_id &&
+          it->second.instance_key == publish_instance_key &&
           (oldest == g_retransmit_ledger.end() ||
           it->second.source_sequence_number < oldest->second.source_sequence_number))
         {
@@ -10446,6 +10610,7 @@ rmw_ret_t publish_payload(FleetQoxPublisherData * data, const std::vector<std::u
       // subscriber-less reliable publisher still bounds fine via the
       // existing history_limit eviction just below.
       !reliable};
+    retransmit_entry.instance_key = publish_instance_key;
     retransmit_entry.expected_acknowledgments = matched_subscription_ids.size();
     retransmit_entry.pending_subscriber_ids.insert(
       matched_subscription_ids.begin(), matched_subscription_ids.end());

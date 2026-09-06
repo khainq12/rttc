@@ -15,6 +15,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/QualifiedOdometry.msg"
   "msg/QualifiedLaserScan.msg"
   "msg/WStringSample.msg"
+  "msg/KeyedInstanceSample.idl"
   "srv/FleetShape.srv"
   "action/NavigateFleet.action"
   "action/DispatchFleetTask.action"

@@ -1,0 +1,23 @@
+// Hand-authored (not msg2idl-generated): the legacy .msg grammar has no
+// annotation syntax, so a field can only be marked with the OMG IDL4 @key
+// annotation -- and therefore rosidl_typesupport_introspection_c/cpp's
+// MessageMember::is_key_ can only ever be true -- via a native .idl file.
+// This message exists to probe FleetRMW's per-@key-instance retransmission
+// history bound, which no stock ROS 2 message can exercise.
+
+module fleetrmw_interfaces {
+  module msg {
+    @verbatim (language="comment", text=
+      "A minimal @key-bearing message used to probe per-instance retransmit" "\n"
+      "history bounding. key_id is the DDS-style instance key; sequence and" "\n"
+      "tag vary per sample within one instance.")
+    struct KeyedInstanceSample {
+      @key
+      uint32 key_id;
+
+      uint32 sequence;
+
+      string tag;
+    };
+  };
+};

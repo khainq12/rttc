@@ -435,6 +435,20 @@ ament_target_dependencies(fleetrmw_wstring_content_filter_probe
   rosidl_typesupport_cpp
 )
 
+add_executable(fleetrmw_keyed_instance_retransmit_probe
+  src/keyed_instance_retransmit_probe.cpp
+)
+target_compile_features(fleetrmw_keyed_instance_retransmit_probe PRIVATE cxx_std_17)
+target_link_libraries(fleetrmw_keyed_instance_retransmit_probe
+  ${PROJECT_NAME}
+)
+ament_target_dependencies(fleetrmw_keyed_instance_retransmit_probe
+  fleetrmw_interfaces
+  rcutils
+  rmw
+  rosidl_typesupport_cpp
+)
+
 add_executable(fleetrmw_service_qos_probe
   src/service_qos_probe.cpp
 )
@@ -1311,6 +1325,7 @@ install(
     fleetrmw_content_filter_sql_probe
     fleetrmw_content_filter_typed_probe
     fleetrmw_wstring_content_filter_probe
+    fleetrmw_keyed_instance_retransmit_probe
     fleetrmw_service_qos_probe
     fleetrmw_domain_isolation_probe
     fleetrmw_udp_pmtu_discovery_probe
