@@ -2,29 +2,25 @@
 
 ## Scope
 
-This document is the concise evidence snapshot for the current repository. It
-records what has been demonstrated, what failed, and which claims remain open.
-Historical milestone-by-milestone reports were removed from the working tree;
-they remain available through Git history.
+This document is the evidence snapshot for the current repository. It records
+what is demonstrated, what fails, and which claims remain open.
 
 The normative claim boundary is
 `ros2_ws/src/rmw_fleetqox_cpp/capabilities.json`.
 
-This revision replaces the prior evidence snapshot with results from a full
-sequential run of the Docker-based integration suite (183 probes) plus a
-dedicated baseline comparison against standard ROS 2 middleware, both
-captured in this cycle. Claims from the previous snapshot that were not
-re-verified in this cycle (ns-3/OMNeT++ trace parity, the stress/security
-campaign's exact counts, the intermittent subscriber heap-corruption report)
-are not restated here; treat them as unconfirmed rather than either true or
-false until re-run.
+Evidence here comes from a full sequential run of the Docker-based
+integration suite (183 probes) plus a dedicated baseline comparison against
+standard ROS 2 middleware. Anything not covered by that run (ns-3/OMNeT++
+trace parity, the stress/security campaign's exact counts, the intermittent
+subscriber heap-corruption report) is marked unconfirmed below rather than
+asserted true or false.
 
 ## Verification snapshot
 
-| Evidence | Current result | Boundary |
+| Evidence | Result | Boundary |
 |---|---:|---|
 | Docker integration suite | 183/183 pass, single sequential run | Real containers, real `tc netem`; not a production soak |
-| Root-caused defects fixed this cycle | 9 | Use-after-free on node teardown, a GnuTLS credential-reuse bug, race-condition test assertions, timeout ordering |
+| Root-caused defects fixed | 9 | Use-after-free on node teardown, a GnuTLS credential-reuse bug, race-condition test assertions, timeout ordering |
 | Deadline-scheduler control-deadline misses | 0/24 | Across wifi/wan/roaming profiles, all robot counts tested |
 | Loss-resilient large-sample delivery | 5/5 runs, 32,768-byte payload, 25% simulated loss | Distinct repetition seeds |
 | Shared-budget repair frontier | 27 configurations swept, 18/27 admitted, 11/27 full live-QoE contract met | Frontier-mapping probe, designed to partially fail; reports where the frontier sits, not a pass rate |
@@ -49,20 +45,18 @@ DDS/vendor semantics, deep preallocation, and zero-copy remain unclaimed.
 
 ### A real, root-caused use-after-free (fixed)
 
-An intermittent SIGSEGV in Nav2 navigation probes resisted over 7,000
-targeted, isolated reproduction attempts across several methodologies before
-being root-caused this cycle by instrumenting the actual failing test to
-capture a core dump on its next natural occurrence, rather than continuing to
-guess at trigger conditions. The core dump showed a use-after-free: upstream
+An intermittent SIGSEGV in Nav2 navigation probes is root-caused by
+instrumenting the actual failing test to capture a core dump on its next
+natural occurrence, rather than guessing at trigger conditions. The core
+dump shows a use-after-free: upstream
 `rcl`'s global rosout logging fini path, invoked at Python interpreter
 shutdown, retains a raw `rmw_node_t*` past this RMW's own
 `rmw_destroy_node()` call and passes it back into `rmw_destroy_publisher()`.
-`node_is_valid()` could not safely detect this because even a null-checked
+`node_is_valid()` cannot safely detect this because even a null-checked
 field read on already-freed memory is undefined behavior. Fixed by tracking
 live node pointers in a registry and checking pointer identity — never the
 memory a stale pointer points to — before dereferencing anything. Verified
-clean across 10 dedicated reruns and reproduced cleanly (no crash) twice more
-inside the full 183-probe suite itself.
+clean across 10 dedicated reruns and clean inside the full 183-probe suite.
 
 ## Large-sample reliability
 
@@ -78,18 +72,18 @@ inside the full 183-probe suite itself.
 - Source-scoped two-reader repair and untargeted-source denial.
 - A 513-assembly NACK sweep with a 512-index hard budget and rotating cursor.
 - Initial-fragment round robin with maximum one consecutive frame while
-  contended. This probe's own timing race (a retransmit timeout occasionally
-  firing while a frame's initial send is still mid-flight, roughly a coin
-  flip under real, unseeded `tc netem` jitter) was root-caused this cycle and
-  the runner now retries the underlying race rather than loosening the
-  assertion it exists to prove.
+  contended. This probe has its own timing race (a retransmit timeout
+  occasionally firing while a frame's initial send is still mid-flight,
+  roughly a coin flip under real, unseeded `tc netem` jitter); the runner
+  retries the underlying race rather than loosening the assertion it exists
+  to prove.
 - Duplicate fragments do not refresh assembly progress or postpone trailing
   repair.
 - Later repair rounds use exponential backoff plus bounded progress grace.
 - Per-frame/reader repair queues rotate one fragment per active scope while
   contended.
 - 32,768-byte samples across two RMW hops, 1 robot, 5 distinct seeds,
-  `roaming` profile, 25%-scaled loss: 5/5 runs fully delivered this cycle.
+  `roaming` profile, 25%-scaled loss: 5/5 runs fully delivered.
 
 Representative runners:
 
@@ -109,12 +103,9 @@ scripts/run_rmw_docker_fragment_repair_round_robin_probe.py
 
 `run_rmw_docker_fleet_repair_capacity_frontier.py` sweeps robot count,
 deadline, and repair-payload size specifically to find where actuated repair
-under a shared bandwidth budget stops keeping up. This cycle's sweep (27
+under a shared bandwidth budget stops keeping up. The sweep (27
 configurations, 9 robot/deadline groups): 18/27 admitted under the shared
-budget, 11/27 met the full live-QoE repair contract. A prior regression in
-this probe (the router receiving zero data frames due to a host-filesystem
-cache-staleness issue in the container-sharing layer, not application logic)
-was found and fixed this cycle.
+budget, 11/27 met the full live-QoE repair contract.
 
 The correct current claims remain:
 
@@ -128,12 +119,10 @@ production_large_sample_reliability_claim=false
 The callback-owner quiescence gate passes 20 fresh processes with eight
 publisher and eight subscription cases per process, totaling 320 cases.
 
-This cycle's root-caused use-after-free (see "RMW core" above) is fixed and
-verified. It is a distinct defect from a previously reported intermittent
-`free(): invalid next size (fast)` corruption in long lossy 32-KiB runs,
-which was not reproduced, investigated, or otherwise touched this cycle —
-treat that report as still open and unconfirmed either way until it is
-specifically re-run.
+The use-after-free described under "RMW core" above is fixed and verified.
+It is a distinct defect from an intermittent `free(): invalid next size
+(fast)` corruption in long lossy 32-KiB runs, whose root cause is unknown
+and which remains open.
 
 ## QoS, services, and actions
 
@@ -166,13 +155,13 @@ Scoped evidence covers:
 - PostgreSQL-backed state/replication/quorum experiments.
 
 The online client-CRL refresh path
-(`run_rmw_docker_ngtcp2_public_online_crl_refresh_probe.py`) had a genuine
-GnuTLS-level defect fixed this cycle: reloading a client CRL in place on a
+(`run_rmw_docker_ngtcp2_public_online_crl_refresh_probe.py`) is fixed: it
+had a GnuTLS-level defect where reloading a client CRL in place on a
 credentials object already used for a prior handshake left stale internal
 revocation state behind despite the reload itself reporting success,
 confirmed by an independent freshly-allocated credentials object verifying
 the same peer certificate against the same on-disk file at the same instant
-and getting the correct answer. Fixed by allocating a fresh credentials
+and getting the correct answer. The fix allocates a fresh credentials
 object on every handshake instead of mutating the shared one; verified
 across a clean rebuild and repeated passing runs.
 
@@ -202,8 +191,8 @@ establish a globally optimal or production-safe controller.
 Docker probes cover action wiring, selected `NavigateToPose` execution,
 planner/static-obstacle repair, bounded dynamic-obstacle recovery slices,
 router QoX actuation, fleet task/action workloads, and admission windows up to
-4096 tasks. All Nav2 probes in the 183-probe suite pass this cycle, including
-the repeated recovered-success probe that had exposed the use-after-free
+4096 tasks. All Nav2 probes in the 183-probe suite pass, including the
+repeated recovered-success probe that exercises the use-after-free fix
 above.
 
 The capability manifest correctly keeps full dynamic-obstacle navigation and
@@ -214,7 +203,7 @@ remain open.
 ## Baseline comparison
 
 A same-harness, matched-load comparison against `rmw_fastrtps_cpp`,
-`rmw_cyclonedds_cpp`, and `rmw_zenoh_cpp` was run this cycle: identical rclpy
+`rmw_cyclonedds_cpp`, and `rmw_zenoh_cpp` uses identical rclpy
 publisher/subscriber code, identical sample count, under identical `tc netem`
 wifi/wan/roaming profiles.
 
@@ -258,24 +247,21 @@ scripts/run_ros2_fleetqox_router_netem_probe.py
 
 ## ns-3 and OMNeT++/INET
 
-Not re-run this cycle. The previous snapshot reported trace-driven ns-3 and
-OMNeT++/INET runners executing matched input matrices and bounded parity
-checks against the repository's pinned 6.4/INET 4.7 setup; that claim is
-carried forward unverified rather than restated as current evidence. Model
-calibration, mobility/association, contention, mesh, and TSN scope remain
-completion work regardless.
+Trace-driven ns-3 and OMNeT++/INET runners exist in the repository against
+a pinned 6.4/INET 4.7 setup, but are not part of the current verification
+run and are marked unconfirmed. Model calibration, mobility/association,
+contention, mesh, and TSN scope remain completion work regardless.
 
 ## Stress and security
 
-Not re-run this cycle. The previous snapshot reported a consolidated
-80-component, 1680-probe-check campaign; that specific count is carried
-forward unverified rather than restated as current evidence. Deterministic
-controls exercised directly in this cycle's 183-probe suite include AEAD,
-mTLS, SROS2-derived identity, unauthorized fragment pressure, CRL refresh
-(see "QUIC and gateway state"), failover, and resource limits, all passing.
-Multi-attacker credential rotation, active-session revocation, PKI
-operations, distributed gateway failure semantics, and independent security
-review remain open.
+Deterministic controls exercised directly in the 183-probe suite include
+AEAD, mTLS, SROS2-derived identity, unauthorized fragment pressure, CRL
+refresh (see "QUIC and gateway state"), failover, and resource limits, all
+passing. A broader consolidated stress/security campaign exists in the
+repository but is not part of the current verification run and is marked
+unconfirmed. Multi-attacker credential rotation, active-session revocation,
+PKI operations, distributed gateway failure semantics, and independent
+security review remain open.
 
 ## Evidence rules
 
@@ -286,6 +272,6 @@ review remain open.
   profile, topology, seed, and process health.
 - Security and simulator claims are no broader than their tested threat/model
   boundary.
-- Claims not re-verified in a given cycle are reported as unconfirmed, not
-  silently carried forward as current evidence.
+- Claims not covered by the current verification run are reported as
+  unconfirmed, not carried forward as current evidence.
 - `production_ready=false` remains authoritative.
