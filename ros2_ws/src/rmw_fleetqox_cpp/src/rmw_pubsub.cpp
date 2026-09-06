@@ -3232,6 +3232,8 @@ public:
 
 private:
   static constexpr size_t kMaxUdpPayloadBytes = 65507;
+  static constexpr int kSendRetryLimit = 20;
+  static constexpr int kSendRetryBackoffMs = 5;
   static constexpr size_t kUdpFragmentChunkBytes = 60000;
   static constexpr std::int64_t kFragmentHistoryTtlNs = 60000000000ll;
   static constexpr size_t kMaxFragmentRepairIndexesPerRequest = 64;
@@ -5426,6 +5428,39 @@ private:
         reinterpret_cast<const sockaddr *>(&target),
         sizeof(target));
       if (sent < 0 || static_cast<size_t>(sent) != payload.size()) {
+        if (sent < 0 && (errno == ENOBUFS || errno == EAGAIN || errno == EWOULDBLOCK)) {
+          // The local kernel send buffer is momentarily full -- typical
+          // when several fragments are produced faster than a
+          // bandwidth-constrained link (e.g. netem-limited roaming) can
+          // drain them. This describes transient backpressure on this one
+          // send, not a broken socket, so back off briefly and retry a
+          // bounded number of times instead of failing the whole publish
+          // (and, via rclpy, crashing the caller) over what is usually a
+          // few milliseconds of catch-up.
+          bool retried_ok = false;
+          for (int attempt = 0; attempt < kSendRetryLimit; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(kSendRetryBackoffMs));
+            const auto retry_sent = ::sendto(
+              fd_,
+              payload.data(),
+              payload.size(),
+              0,
+              reinterpret_cast<const sockaddr *>(&target),
+              sizeof(target));
+            if (retry_sent >= 0 && static_cast<size_t>(retry_sent) == payload.size()) {
+              retried_ok = true;
+              break;
+            }
+            if (!(retry_sent < 0 &&
+              (errno == ENOBUFS || errno == EAGAIN || errno == EWOULDBLOCK)))
+            {
+              break;
+            }
+          }
+          if (retried_ok) {
+            continue;
+          }
+        }
         if (sent < 0 && errno == EMSGSIZE && udp_datagram_budget_bytes_ <= 0) {
           // The payload does not even fit this host's own outgoing
           // interface MTU. Learn the real budget now so the caller's

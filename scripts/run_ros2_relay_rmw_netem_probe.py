@@ -134,6 +134,12 @@ def write_relay_probe_scripts(
         PUBLISHER_SCRIPT.replace("__SAMPLES__", str(samples))
         .replace("__PUBLISH_INTERVAL_S__", repr(publish_interval_ms / 1000.0))
         .replace("__PAYLOAD_BYTES__", str(payload_bytes))
+        # PUBLISHER_SCRIPT (imported from run_ros2_direct_rmw_netem_probe,
+        # which supports an independent --state-payload-bytes override) also
+        # references __STATE_PAYLOAD_BYTES__. This script has no such
+        # separate flag, so the single --payload-bytes value applies
+        # uniformly to control and state topics alike.
+        .replace("__STATE_PAYLOAD_BYTES__", str(payload_bytes))
         .replace("__PUBLISHER_LINGER_S__", repr(publisher_linger_s))
         .replace("__TOPIC_SPECS_JSON__", source_json),
         encoding="utf-8",
