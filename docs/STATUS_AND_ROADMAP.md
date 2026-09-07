@@ -301,26 +301,63 @@ Exit gate (met):
 
 ### B2: production QUIC and PKI
 
-Current QUIC evidence proves real paths and scoped failover behaviors. It does
-not prove production certificate lifecycle or distributed gateway operations.
+This section was stale: it previously read "server-certificate rotation, CA
+rotation, and active-session revocation are untouched and remain false" --
+`capabilities.json` shows all three are `true` and were closed in an earlier
+session (`quic_public_api_active_session_revocation_claim`,
+`quic_public_api_online_client_ca_rotation_claim`,
+`quic_public_api_online_server_certificate_rotation_claim`, each backed by a
+5/5 Docker/netem probe), alongside the online client-CRL refresh fix. Actual
+current scope, checked directly against `capabilities.json` rather than
+this doc's prior text:
 
-A defect in the online client-CRL refresh path is root-caused and fixed
-(a GnuTLS credentials object reloaded in place across handshakes retained
-stale revocation state despite reporting a successful reload). This closes
-one specific sub-item of this blocker's exit gate
-(online client-CRL refresh); server-certificate rotation, CA rotation, and
-active-session revocation are untouched and remain false per
-`capabilities.json`.
+**Done** (each backed by a 5/5 Docker/netem probe, public GnuTLS/ngtcp2 APIs
+only): mTLS with CA/CRL verification, online client-CRL refresh and
+client-CA rotation, online server-certificate rotation, active-session
+revocation (already-open connections torn down on revocation, not just new
+ones rejected), per-identity/per-stream admission and QoE/repair-scheduler
+coupling, PostgreSQL-backed durable state with synchronous replication and
+writer fencing, etcd/Raft-coordinated automatic database promotion on
+primary loss (quorum-gated, fail-closed on quorum loss), Docker-based STONITH
+fencing before promotion, automated rejoin of a fenced primary as a
+synchronous standby, and controlled planned failback with fail-closed
+preconditions.
+
+**Still open** (`capabilities.json` `false`), narrower than previously
+documented:
+
+- built-in/native consensus-based leader election and a true distributed
+  database, as opposed to the current design (external etcd/Raft as the
+  distributed configuration store, with a single synchronously-replicated
+  PostgreSQL as the actual data store) -- `quic_gateway_automatic_leader_election_claim`,
+  `quic_gateway_active_active_consensus_claim`, `quic_gateway_consensus_backend_claim`,
+  `quic_gateway_distributed_database_claim`;
+- partition/split-brain tolerance and regional disaster recovery as general
+  claims, beyond the specific quorum-loss and STONITH-fencing scenarios
+  already proven -- `quic_gateway_partition_split_brain_tolerance_claim`,
+  `quic_gateway_regional_disaster_recovery_claim`;
+- hardware-level STONITH, as opposed to the Docker-container fencing already
+  proven -- `quic_gateway_hardware_stonith_claim`;
+- production certification of the automatic rejoin/failback paths, as
+  opposed to the Docker/netem evidence already proven -- 
+  `quic_gateway_production_automatic_rejoin_claim`,
+  `quic_gateway_production_automatic_failback_claim`;
+- forward secrecy and asymmetric session establishment --
+  `forward_secrecy_claim`, `asymmetric_session_key_exchange_claim`;
+- 0-RTT -- `quic_zero_rtt_claim`.
 
 Exit gate:
 
-- public maintained APIs only;
-- online server/client certificate and CA rotation;
-- active-session revocation and fail-closed expiry;
-- forward secrecy and asymmetric session establishment;
+- public maintained APIs only -- **met**;
+- online server/client certificate and CA rotation -- **met**;
+- active-session revocation and fail-closed expiry -- **met**;
+- forward secrecy and asymmetric session establishment -- open;
 - leader election/consensus, split-brain fencing, rejoin/failback, regional
-  recovery, and operational runbooks;
-- long multi-attacker soak.
+  recovery, and operational runbooks -- **rejoin/failback and
+  quorum-gated/STONITH-fenced promotion met via etcd/Raft DCS + Docker
+  STONITH; built-in consensus, general split-brain tolerance, regional
+  recovery, and production (non-Docker) certification remain open**;
+- long multi-attacker soak -- open.
 
 ### B3: complete RMW semantics
 
