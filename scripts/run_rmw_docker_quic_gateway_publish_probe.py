@@ -130,22 +130,49 @@ def parse_quic_session_reuse_telemetry(*logs: str) -> dict[str, Any]:
         combined,
         (r"\b0RTT\s+[A-Z_]+\(", r"\b0-RTT\s+[A-Z_]+\("),
     )
-    zero_rtt_accepted_observed = count_log_patterns(
-        combined,
-        (
-            r"\bearly data accepted\b",
-            r"\b0[- ]?RTT accepted\b",
-            r"\bzero[- ]rtt accepted\b",
-        ),
-    ) > 0
+    zero_rtt_packet_observed = zero_rtt_tx_packet_count > 0 or zero_rtt_tx_frame_count > 0
+    # ngtcp2's own client example never prints an "accepted" message -- the
+    # only textual signal it emits about early-data outcome is the rejection
+    # path, driven directly by ngtcp2_conn_get_early_data_rejected() (see
+    # "Early data was rejected by server" in gtlsclient's source/strings).
+    # So the reliable positive signal is functional, not textual: the
+    # client actually transmitted 0-RTT STREAM data (zero_rtt_packet_observed)
+    # and that authoritative rejection check never fired. This also matches
+    # what the raw packet logs show directly -- the server's "frm rx ...
+    # 0RTT STREAM(...)" lines prove it decrypted and processed the 0-RTT
+    # payload, which is only possible if the early keys it derived matched
+    # (i.e. the same ticket/resumption secret used to encrypt them), and the
+    # subsequent HTTP response body byte-count match (checked by the caller)
+    # confirms that data was genuinely acted on, not just accepted at the
+    # QUIC layer and discarded above it.
     zero_rtt_rejected_observed = count_log_patterns(
         combined,
         (
+            r"\bEarly data was rejected by server\b",
             r"\bearly data rejected\b",
             r"\b0[- ]?RTT rejected\b",
             r"\bzero[- ]rtt rejected\b",
         ),
     ) > 0
+    zero_rtt_server_stream_frames_received = count_log_patterns(
+        combined,
+        (r"\bfrm rx \d+ 0RTT STREAM\(",),
+    )
+    zero_rtt_accepted_observed = (
+        count_log_patterns(
+            combined,
+            (
+                r"\bearly data accepted\b",
+                r"\b0[- ]?RTT accepted\b",
+                r"\bzero[- ]rtt accepted\b",
+            ),
+        ) > 0
+        or (
+            zero_rtt_packet_observed
+            and zero_rtt_server_stream_frames_received > 0
+            and not zero_rtt_rejected_observed
+        )
+    )
     explicit_resumption_observed = count_log_patterns(
         combined,
         (
@@ -155,7 +182,6 @@ def parse_quic_session_reuse_telemetry(*logs: str) -> dict[str, Any]:
             r"\bTLS session resumed\b",
         ),
     ) > 0
-    zero_rtt_packet_observed = zero_rtt_tx_packet_count > 0 or zero_rtt_tx_frame_count > 0
     return {
         "session_file_read_count": session_file_read_count,
         "session_file_missing_count": session_file_missing_count,
@@ -179,6 +205,7 @@ def parse_quic_session_reuse_telemetry(*logs: str) -> dict[str, Any]:
         "zero_rtt_tx_frame_count": zero_rtt_tx_frame_count,
         "zero_rtt_accepted_observed": zero_rtt_accepted_observed,
         "zero_rtt_rejected_observed": zero_rtt_rejected_observed,
+        "zero_rtt_server_stream_frames_received": zero_rtt_server_stream_frames_received,
     }
 
 

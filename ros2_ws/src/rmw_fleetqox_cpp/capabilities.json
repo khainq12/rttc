@@ -1190,7 +1190,7 @@
     "docker_quic_gateway_async_burst_soak_3run_netem": true,
     "docker_quic_gateway_async_burst_soak_10run_netem": true,
     "unified_benchmark_report_claim_boundary_guards": true,
-    "quic_zero_rtt_claim": false,
+    "quic_zero_rtt_claim": true,
     "rmw_integrated_quic_backend_claim": true,
     "production_quic_backend_claim": false,
     "full_bidirectional_quic_backend_claim": true,

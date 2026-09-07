@@ -317,6 +317,17 @@ data frame while ordinary delivery is unaffected, and enabling ECDH without
 peer authentication already on fails closed at init. Not part of the
 183-probe suite yet.
 
+`quic_zero_rtt_claim` (legacy ngtcp2/GnuTLS subprocess-backed QUIC gateway
+path, not the separate stateful aioquic FleetQoX gateway) is now also
+`true`. The client already sent 0-RTT data by default; the evidence parser
+was the gap, looking for an "early data accepted" phrase ngtcp2's example
+client never prints. Fixed to detect acceptance functionally -- the
+server's `frm rx ... 0RTT STREAM(...)` log lines plus the absence of the
+authoritative `ngtcp2_conn_get_early_data_rejected()`-driven rejection
+message -- and confirmed with a `FLEETQOX_RMW_QUIC_DISABLE_EARLY_DATA=1`
+negative control across the session-reuse, take-path, and bidirectional
+probes so the signal is falsifiable.
+
 ## Evidence rules
 
 - Deterministic probes establish contracts, not broad performance claims.

@@ -368,8 +368,25 @@ documented:
 - production certification of the automatic rejoin/failback paths, as
   opposed to the Docker/netem evidence already proven -- 
   `quic_gateway_production_automatic_rejoin_claim`,
-  `quic_gateway_production_automatic_failback_claim`;
-- 0-RTT -- `quic_zero_rtt_claim`.
+  `quic_gateway_production_automatic_failback_claim`.
+
+Also **done**, closed this session: 0-RTT for the legacy ngtcp2/GnuTLS
+subprocess-backed QUIC gateway path (`quic_zero_rtt_claim` -- the
+`gtlsclient`/`gtlsserver` example-binary fallback used by
+`run_rmw_docker_quic_gateway_*` probes, not the separate stateful aioquic
+FleetQoX gateway, which still has no 0-RTT support and remains correctly
+unclaimed there). The client already attempted 0-RTT by default once a
+session/transport-parameter file existed; the probe's evidence parser was
+the actual gap -- it only looked for an "early data accepted" log phrase
+that ngtcp2's example client never prints (it only ever prints on
+*rejection*, driven by `ngtcp2_conn_get_early_data_rejected()`). Fixed by
+detecting genuine acceptance functionally instead: the server's own `frm rx
+... 0RTT STREAM(...)` log lines prove it decrypted and processed the 0-RTT
+payload (only possible with correct early keys), combined with the absence
+of the authoritative rejection message. Verified with a negative control
+(`FLEETQOX_RMW_QUIC_DISABLE_EARLY_DATA=1` correctly reports no packet/no
+acceptance) so the signal is falsifiable, not vacuous, across the session
+reuse, take-path, and bidirectional probes.
 
 Exit gate:
 
@@ -378,6 +395,7 @@ Exit gate:
 - active-session revocation and fail-closed expiry -- **met**;
 - forward secrecy and asymmetric session establishment -- **met** (UDP AEAD
   data plane, via ephemeral ECDH; see above);
+- 0-RTT -- **met** (legacy ngtcp2 subprocess gateway path; see above);
 - leader election/consensus, split-brain fencing, rejoin/failback, regional
   recovery, and operational runbooks -- **rejoin/failback and
   quorum-gated/STONITH-fenced promotion met via etcd/Raft DCS + Docker
