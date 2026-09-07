@@ -103,7 +103,7 @@ checkpoint it reports:
 | Supported capabilities | 510 |
 | Partial capability groups | 22 |
 | Explicitly unsupported items | 14 |
-| Passing scoped claim boundaries | 611 / 656 |
+| Passing scoped claim boundaries | 613 / 657 |
 | Clean-source test suite | 690 discovered: 637 pass, 53 external-artifact skips |
 | Docker integration probes | 183 / 183 |
 | Production-ready | **No** |
