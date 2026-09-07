@@ -176,19 +176,30 @@ container load (`Cannot connect to the Docker daemon`, `EOF` mid-`docker run`
   capacity tiers. This is new, valid, clean evidence -- every prior sweep
   attempt at this scale was contaminated by the Docker Desktop outage before
   producing a full clean picture.
-- **32 robots: 0/9 runs (all 3 seeds x all 3 capacity tiers) fail before
-  producing any output**, with `Error response from daemon: container ... is
-  not running`. Root cause: this harness spawns one publisher container and
-  one subscriber container per robot (`run_rmw_docker_router_multi_robot_budgeted_fleet_plan_probe.py`),
-  so 32 robots means 64+ concurrent containers. `docker info` on this host
-  reports the Docker Desktop VM has only ~3.8 GiB of memory total, and 64+
-  rclpy-based ROS 2 processes exceed that well before the test logic runs --
-  a test-host capacity ceiling, not a demonstrated FleetRMW defect. Confirming
-  this precisely (vs. some other 32-robot-specific code path) requires either
-  more VM memory than this host can spare, or reworking the harness to
-  multiplex multiple robots' topics through fewer processes (as
-  `scripts/run_heap_soak_fleet_asan_probe.py` already does for B0's 3-hop
-  topology) instead of one container pair per robot.
+- **32 robots: 0/9 runs (all 3 seeds x all 3 capacity tiers) fail**, mostly
+  with `Error response from daemon: container ... is not running` (a
+  container the test expects to still be alive has already exited). This
+  harness spawns one publisher container and one subscriber container per
+  robot (`run_rmw_docker_router_multi_robot_budgeted_fleet_plan_probe.py`),
+  so 32 robots means 64+ concurrent containers -- initially suspected to be a
+  simple memory ceiling, since this host's default Docker Desktop VM only
+  gets ~3.8 GiB (`docker info`). Tested that hypothesis directly: raising the
+  VM to 8 GiB changed the outcome by exactly one run (1/9 admission-ok
+  instead of 0/9); raising it further to ~10.7 GiB, with host RAM headroom
+  confirmed stable throughout (never dropped below ~3.8 GiB available),
+  produced the **identical** 1/9 result. More VM memory does not move this
+  number, which rules out a simple capacity ceiling as the primary cause. The
+  remaining, more likely explanation is a scaling limit in the one-container-
+  per-robot harness design itself (container start-rate, Docker daemon
+  contention, or a timing budget in the probe that does not scale enough with
+  `robot_count`) rather than anything resource proportional -- consistent
+  with 8 and 16 robots (16 and 32 containers respectively) working perfectly
+  cleanly while 32 robots (64+ containers) fails outright regardless of RAM.
+  Confirming this precisely, and fixing it, most plausibly requires reworking
+  the harness to multiplex multiple robots' topics through fewer processes
+  (as `scripts/run_heap_soak_fleet_asan_probe.py` already does for B0's
+  3-hop topology) instead of one container pair per robot -- not simply
+  giving the test host more memory.
 
 Exit gate:
 
