@@ -323,6 +323,33 @@ fencing before promotion, automated rejoin of a fenced primary as a
 synchronous standby, and controlled planned failback with fail-closed
 preconditions.
 
+Also **done**, closed this session: forward secrecy and asymmetric session
+key exchange for the UDP AEAD data plane (`forward_secrecy_claim`,
+`asymmetric_session_key_exchange_claim` -- separate from the QUIC/PKI control
+plane above). Mutual ephemeral EC keypairs (same curve as the long-term
+SROS2 identity key) are exchanged via a new `FQKEX1` message that reuses the
+existing SROS2 signature wrapper for authentication, so a forged ephemeral
+key is rejected the same way a forged data frame is -- without that, ECDH
+would trade "confidentiality depends on the PSK" for "confidentiality
+depends on an unauthenticated key exchange," i.e. a trivial active MITM.
+The derived per-peer secret is mixed into the existing PSK-based HKDF
+(`HKDF-Extract(salt, PSK || ecdh_secret)`), so a compromised PSK alone can no
+longer reconstruct a session key from a completed handshake, and each
+ephemeral private key is destroyed immediately after derivation. Opt-in via
+`FLEETQOX_RMW_UDP_ECDH_ENABLE=1`, fails closed without SROS2 peer
+authentication already enabled (there would be no way to distinguish a real
+peer's ephemeral key from an attacker's otherwise). Because a per-peer
+secret can't encrypt one ciphertext for a multi-target broadcast, enabling
+it switches multi-target sends to one single-target send per peer.
+Verified end to end via `scripts/run_rmw_docker_udp_ecdh_probe.py`: the
+handshake completes and subsequent frames measurably use the ECDH-mixed key
+(`udp_ecdh_encrypted_frames` increments) across repeated real two-process
+runs, a tampered KEX signature is rejected exactly like a tampered data
+frame while ordinary delivery is unaffected, and `FLEETQOX_RMW_UDP_ECDH_ENABLE`
+is refused when peer auth isn't already enabled. Known scope limit: no
+re-keying loop if a peer restarts and offers a new ephemeral key after an
+existing handshake already completed.
+
 **Still open** (`capabilities.json` `false`), narrower than previously
 documented:
 
@@ -342,8 +369,6 @@ documented:
   opposed to the Docker/netem evidence already proven -- 
   `quic_gateway_production_automatic_rejoin_claim`,
   `quic_gateway_production_automatic_failback_claim`;
-- forward secrecy and asymmetric session establishment --
-  `forward_secrecy_claim`, `asymmetric_session_key_exchange_claim`;
 - 0-RTT -- `quic_zero_rtt_claim`.
 
 Exit gate:
@@ -351,7 +376,8 @@ Exit gate:
 - public maintained APIs only -- **met**;
 - online server/client certificate and CA rotation -- **met**;
 - active-session revocation and fail-closed expiry -- **met**;
-- forward secrecy and asymmetric session establishment -- open;
+- forward secrecy and asymmetric session establishment -- **met** (UDP AEAD
+  data plane, via ephemeral ECDH; see above);
 - leader election/consensus, split-brain fencing, rejoin/failback, regional
   recovery, and operational runbooks -- **rejoin/failback and
   quorum-gated/STONITH-fenced promotion met via etcd/Raft DCS + Docker

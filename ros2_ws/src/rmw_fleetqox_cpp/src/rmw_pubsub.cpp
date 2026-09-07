@@ -2390,6 +2390,36 @@ public:
     return udp_peer_auth_last_identity_;
   }
 
+  bool udp_ecdh_enabled() const
+  {
+    return udp_ecdh_enabled_;
+  }
+
+  std::uint64_t udp_ecdh_kex_sent() const
+  {
+    return udp_ecdh_kex_sent_.load(std::memory_order_relaxed);
+  }
+
+  std::uint64_t udp_ecdh_kex_received() const
+  {
+    return udp_ecdh_kex_received_.load(std::memory_order_relaxed);
+  }
+
+  std::uint64_t udp_ecdh_derive_failures() const
+  {
+    return udp_ecdh_derive_failures_.load(std::memory_order_relaxed);
+  }
+
+  std::uint64_t udp_ecdh_handshakes_completed() const
+  {
+    return udp_ecdh_handshakes_completed_.load(std::memory_order_relaxed);
+  }
+
+  std::uint64_t udp_ecdh_encrypted_frames() const
+  {
+    return udp_ecdh_encrypted_frames_.load(std::memory_order_relaxed);
+  }
+
   std::uint64_t ack_nack_sent() const
   {
     return ack_nack_sent_.load(std::memory_order_relaxed);
@@ -3575,7 +3605,7 @@ private:
       return false;
     }
     if (!derive_udp_aead_session_key(
-        udp_aead_session_salt_, &udp_aead_session_key_))
+        udp_aead_session_salt_, nullptr, &udp_aead_session_key_))
     {
       init_error_ = openssl_error_text("udp_aead_session_key_derivation_failed");
       return false;
@@ -3591,18 +3621,34 @@ private:
     return true;
   }
 
+  // ecdh_secret == nullptr reproduces the exact original PSK-only
+  // derivation (session_key = HKDF-Expand(HKDF-Extract(salt, PSK))) for
+  // every caller that doesn't know about a per-peer ECDH secret, which is
+  // every caller unless FLEETQOX_RMW_UDP_ECDH_ENABLE is set. When present,
+  // the ECDH secret is appended to the PSK before HKDF-Extract, so the
+  // resulting key depends on both: an attacker who obtains the PSK alone
+  // (e.g. after the fact, having recorded traffic) still cannot reconstruct
+  // a session key derived with a peer whose ephemeral keys are already
+  // gone.
   bool derive_udp_aead_session_key(
     const std::array<unsigned char, 16> & salt,
+    const std::array<unsigned char, 32> * ecdh_secret,
     std::array<unsigned char, 32> * session_key) const
   {
     if (session_key == nullptr) {
       return false;
     }
+    std::string ikm(
+      reinterpret_cast<const char *>(udp_aead_key_.data()), udp_aead_key_.size());
+    if (ecdh_secret != nullptr) {
+      ikm.append(
+        reinterpret_cast<const char *>(ecdh_secret->data()), ecdh_secret->size());
+    }
     std::array<unsigned char, EVP_MAX_MD_SIZE> pseudorandom_key{};
     unsigned int pseudorandom_key_size = 0;
     if (HMAC(
         EVP_sha256(), salt.data(), static_cast<int>(salt.size()),
-        udp_aead_key_.data(), udp_aead_key_.size(),
+        reinterpret_cast<const unsigned char *>(ikm.data()), ikm.size(),
         pseudorandom_key.data(), &pseudorandom_key_size) == nullptr ||
       pseudorandom_key_size == 0)
     {
@@ -3627,13 +3673,25 @@ private:
     return true;
   }
 
+  // target == nullptr (or no completed ECDH handshake for it yet) keeps the
+  // salt-rotation schedule and returned key byte-identical to the PSK-only
+  // original. When ECDH is enabled and a handshake has completed for
+  // `target`, the salt/rotation bookkeeping is still shared and global (it
+  // just paces how often the salt itself changes), but the returned
+  // session_key is re-derived per call by mixing in that peer's shared
+  // secret, so distinct peers never share ciphertext under the same key
+  // even though they may be using the same salt at that moment.
   bool current_udp_aead_session_material(
+    const sockaddr_in * target,
     std::array<unsigned char, 16> * salt,
     std::array<unsigned char, 32> * session_key)
   {
     if (salt == nullptr || session_key == nullptr) {
       return false;
     }
+    std::array<unsigned char, 32> ecdh_secret{};
+    const bool have_ecdh_secret = target != nullptr &&
+      ecdh_shared_secret_for_target(*target, &ecdh_secret);
     std::lock_guard<std::mutex> lock(udp_aead_session_mutex_);
     if (udp_aead_session_key_rotate_frames_ > 0 &&
       udp_aead_session_frames_ >=
@@ -3643,7 +3701,7 @@ private:
           udp_aead_session_salt_.data(),
           static_cast<int>(udp_aead_session_salt_.size())) != 1 ||
         !derive_udp_aead_session_key(
-          udp_aead_session_salt_, &udp_aead_session_key_))
+          udp_aead_session_salt_, nullptr, &udp_aead_session_key_))
       {
         return false;
       }
@@ -3656,12 +3714,20 @@ private:
     }
     ++udp_aead_session_frames_;
     *salt = udp_aead_session_salt_;
+    if (have_ecdh_secret) {
+      if (!derive_udp_aead_session_key(*salt, &ecdh_secret, session_key)) {
+        return false;
+      }
+      udp_ecdh_encrypted_frames_.fetch_add(1, std::memory_order_relaxed);
+      return true;
+    }
     *session_key = udp_aead_session_key_;
     return true;
   }
 
   bool received_udp_aead_session_key(
     const unsigned char * salt_data,
+    const sockaddr_in * source,
     std::array<unsigned char, 32> * session_key)
   {
     if (salt_data == nullptr || session_key == nullptr) {
@@ -3669,8 +3735,19 @@ private:
     }
     std::array<unsigned char, 16> salt{};
     std::copy_n(salt_data, salt.size(), salt.begin());
-    const std::string cache_key(
+    std::array<unsigned char, 32> ecdh_secret{};
+    const bool have_ecdh_secret = source != nullptr &&
+      ecdh_established_secret_for_peer(udp_peer_key(*source), &ecdh_secret);
+    // Once a peer's key is mixed in, the same salt can map to a different
+    // key per source peer, so the cache key must include the peer identity
+    // whenever ECDH is in play -- salt alone (the original, PSK-only cache
+    // key) is only safe when every sender derives from the same PSK.
+    std::string cache_key(
       reinterpret_cast<const char *>(salt.data()), salt.size());
+    if (have_ecdh_secret) {
+      const std::uint64_t peer_key = udp_peer_key(*source);
+      cache_key.append(reinterpret_cast<const char *>(&peer_key), sizeof(peer_key));
+    }
     std::lock_guard<std::mutex> lock(udp_aead_received_session_mutex_);
     const auto found = udp_aead_received_session_keys_.find(cache_key);
     if (found != udp_aead_received_session_keys_.end()) {
@@ -3678,8 +3755,13 @@ private:
       udp_aead_session_key_reuses_.fetch_add(1, std::memory_order_relaxed);
       return true;
     }
-    if (!derive_udp_aead_session_key(salt, session_key)) {
+    if (!derive_udp_aead_session_key(
+        salt, have_ecdh_secret ? &ecdh_secret : nullptr, session_key))
+    {
       return false;
+    }
+    if (have_ecdh_secret) {
+      udp_ecdh_encrypted_frames_.fetch_add(1, std::memory_order_relaxed);
     }
     udp_aead_received_session_keys_[cache_key] = *session_key;
     udp_aead_received_session_order_.push_back(cache_key);
@@ -3836,6 +3918,340 @@ private:
     return true;
   }
 
+  bool configure_udp_ecdh()
+  {
+    const char * enable_env = std::getenv("FLEETQOX_RMW_UDP_ECDH_ENABLE");
+    const bool requested = enable_env != nullptr &&
+      (trim_copy(enable_env) == "1" || trim_copy(enable_env) == "true" ||
+      trim_copy(enable_env) == "yes");
+    if (!requested) {
+      return true;
+    }
+    if (!udp_peer_auth_enabled_) {
+      // Without an authenticated identity there is no way to tell a real
+      // peer's ephemeral public key from one an on-path attacker
+      // substituted -- that would trade confidentiality-if-PSK-leaks for a
+      // trivial active man-in-the-middle instead of removing a real risk.
+      init_error_ =
+        "FLEETQOX_RMW_UDP_ECDH_ENABLE requires SROS2 peer authentication "
+        "(FLEETQOX_RMW_UDP_PEER_AUTH_REQUIRE plus SROS2 identity credentials) "
+        "to authenticate the ephemeral key exchange";
+      return false;
+    }
+    udp_ecdh_enabled_ = true;
+    const char * tamper_kex_env =
+      std::getenv("FLEETQOX_RMW_UDP_ECDH_TAMPER_KEX_OUTBOUND_ONCE");
+    udp_ecdh_tamper_kex_outbound_once_ = tamper_kex_env != nullptr &&
+      (trim_copy(tamper_kex_env) == "1" || trim_copy(tamper_kex_env) == "true" ||
+      trim_copy(tamper_kex_env) == "yes");
+    return true;
+  }
+
+  // Generates a fresh EC keypair on the same curve/domain parameters as our
+  // long-term SROS2 identity key (EVP_PKEY_CTX_new(existing_key, ...) makes
+  // keygen inherit those parameters rather than requiring the curve be
+  // hardcoded), so no new key material needs provisioning to add this.
+  bool generate_udp_ecdh_ephemeral_keypair(
+    EVP_PKEY ** out_keypair, std::string * out_pubkey_der)
+  {
+    if (out_keypair == nullptr || out_pubkey_der == nullptr ||
+      udp_peer_auth_local_private_key_ == nullptr)
+    {
+      return false;
+    }
+    using PkeyCtx = std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)>;
+    PkeyCtx param_context(
+      EVP_PKEY_CTX_new(udp_peer_auth_local_private_key_, nullptr), EVP_PKEY_CTX_free);
+    EVP_PKEY * keypair = nullptr;
+    if (!param_context ||
+      EVP_PKEY_keygen_init(param_context.get()) != 1 ||
+      EVP_PKEY_keygen(param_context.get(), &keypair) != 1 ||
+      keypair == nullptr)
+    {
+      EVP_PKEY_free(keypair);
+      return false;
+    }
+    const int pubkey_der_size = i2d_PUBKEY(keypair, nullptr);
+    if (pubkey_der_size <= 0) {
+      EVP_PKEY_free(keypair);
+      return false;
+    }
+    out_pubkey_der->assign(static_cast<size_t>(pubkey_der_size), '\0');
+    auto * pubkey_der_output =
+      reinterpret_cast<unsigned char *>(out_pubkey_der->data());
+    if (i2d_PUBKEY(keypair, &pubkey_der_output) != pubkey_der_size) {
+      EVP_PKEY_free(keypair);
+      out_pubkey_der->clear();
+      return false;
+    }
+    *out_keypair = keypair;
+    return true;
+  }
+
+  // Computes the ECDH shared point between our ephemeral private key and a
+  // peer's ephemeral public key, then whitens it with SHA-256 before it is
+  // ever mixed into key material -- a raw ECDH output is an x-coordinate,
+  // not a uniformly random value, and must not be used as key material
+  // directly.
+  bool derive_udp_ecdh_shared_secret(
+    EVP_PKEY * local_ephemeral_private_key,
+    const std::string & peer_ephemeral_pubkey_der,
+    std::array<unsigned char, 32> * shared_secret_out)
+  {
+    if (local_ephemeral_private_key == nullptr || shared_secret_out == nullptr ||
+      peer_ephemeral_pubkey_der.empty())
+    {
+      return false;
+    }
+    const auto * cursor =
+      reinterpret_cast<const unsigned char *>(peer_ephemeral_pubkey_der.data());
+    EVP_PKEY * peer_pubkey = d2i_PUBKEY(
+      nullptr, &cursor, static_cast<long>(peer_ephemeral_pubkey_der.size()));
+    if (peer_pubkey == nullptr ||
+      cursor != reinterpret_cast<const unsigned char *>(
+        peer_ephemeral_pubkey_der.data()) + peer_ephemeral_pubkey_der.size())
+    {
+      EVP_PKEY_free(peer_pubkey);
+      return false;
+    }
+    using PkeyCtx = std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)>;
+    PkeyCtx derive_context(
+      EVP_PKEY_CTX_new(local_ephemeral_private_key, nullptr), EVP_PKEY_CTX_free);
+    size_t raw_secret_size = 0;
+    if (!derive_context ||
+      EVP_PKEY_derive_init(derive_context.get()) != 1 ||
+      EVP_PKEY_derive_set_peer(derive_context.get(), peer_pubkey) != 1 ||
+      EVP_PKEY_derive(derive_context.get(), nullptr, &raw_secret_size) != 1 ||
+      raw_secret_size == 0 || raw_secret_size > 256)
+    {
+      EVP_PKEY_free(peer_pubkey);
+      return false;
+    }
+    std::vector<unsigned char> raw_secret(raw_secret_size);
+    const bool derived = EVP_PKEY_derive(
+      derive_context.get(), raw_secret.data(), &raw_secret_size) == 1;
+    EVP_PKEY_free(peer_pubkey);
+    if (!derived) {
+      return false;
+    }
+    unsigned int hashed_size = 0;
+    std::array<unsigned char, EVP_MAX_MD_SIZE> hashed{};
+    if (EVP_Digest(
+        raw_secret.data(), raw_secret.size(), hashed.data(), &hashed_size,
+        EVP_sha256(), nullptr) != 1 ||
+      hashed_size < shared_secret_out->size())
+    {
+      return false;
+    }
+    std::copy_n(hashed.begin(), shared_secret_out->size(), shared_secret_out->begin());
+    return true;
+  }
+
+  static bool build_udp_ecdh_kex_message(
+    const std::string & ephemeral_pubkey_der, std::string * message)
+  {
+    constexpr char kMagic[] = "FQKEX1|";
+    constexpr size_t kMagicSize = sizeof(kMagic) - 1;
+    if (message == nullptr || ephemeral_pubkey_der.empty() ||
+      ephemeral_pubkey_der.size() > 65536)
+    {
+      return false;
+    }
+    message->assign(kMagic, kMagicSize);
+    append_u32_be(message, static_cast<std::uint32_t>(ephemeral_pubkey_der.size()));
+    message->append(ephemeral_pubkey_der);
+    return true;
+  }
+
+  static bool parse_udp_ecdh_kex_message(
+    const std::string & message, std::string * ephemeral_pubkey_der)
+  {
+    constexpr char kMagic[] = "FQKEX1|";
+    constexpr size_t kMagicSize = sizeof(kMagic) - 1;
+    if (ephemeral_pubkey_der == nullptr ||
+      message.size() < kMagicSize + sizeof(std::uint32_t) ||
+      message.compare(0, kMagicSize, kMagic, kMagicSize) != 0)
+    {
+      return false;
+    }
+    std::uint32_t pubkey_size = 0;
+    if (!read_u32_be(message, kMagicSize, &pubkey_size) ||
+      pubkey_size == 0 || pubkey_size > 65536 ||
+      kMagicSize + sizeof(std::uint32_t) + static_cast<size_t>(pubkey_size) !=
+      message.size())
+    {
+      return false;
+    }
+    *ephemeral_pubkey_der = message.substr(
+      kMagicSize + sizeof(std::uint32_t), pubkey_size);
+    return true;
+  }
+
+  static bool is_udp_ecdh_kex_message(const std::string & content)
+  {
+    constexpr char kMagic[] = "FQKEX1|";
+    constexpr size_t kMagicSize = sizeof(kMagic) - 1;
+    return content.compare(0, kMagicSize, kMagic, kMagicSize) == 0;
+  }
+
+  // Looks up (or lazily starts) this peer's ECDH state and returns whatever
+  // shared secret is currently available for it (none, if no handshake with
+  // this destination has completed yet -- protect_udp_payload then falls
+  // back to the PSK-only derivation for this send, same as when ECDH is
+  // disabled entirely). Also opportunistically (re)sends our own ephemeral
+  // public key to this destination -- UDP is lossy and there is no separate
+  // reliability layer for this handshake, so a bounded best-effort retry is
+  // the only way an initial loss doesn't strand the handshake forever.
+  bool ecdh_shared_secret_for_target(
+    const sockaddr_in & target, std::array<unsigned char, 32> * shared_secret_out)
+  {
+    if (!udp_ecdh_enabled_ || shared_secret_out == nullptr) {
+      return false;
+    }
+    const std::uint64_t peer_key = udp_peer_key(target);
+    bool need_send = false;
+    bool have_secret = false;
+    std::string pubkey_der_copy;
+    {
+      std::lock_guard<std::mutex> lock(udp_ecdh_mutex_);
+      UdpEcdhPeerState & state = udp_ecdh_peers_[peer_key];
+      const auto now = std::chrono::steady_clock::now();
+      if (state.local_ephemeral_pubkey_der.empty()) {
+        EVP_PKEY * keypair = nullptr;
+        std::string pubkey_der;
+        if (generate_udp_ecdh_ephemeral_keypair(&keypair, &pubkey_der)) {
+          state.ephemeral_keypair = keypair;
+          state.local_ephemeral_pubkey_der = pubkey_der;
+          state.kex_sent_at = now;
+          need_send = true;
+        }
+      } else if (!state.handshake_complete &&
+        now - state.kex_sent_at > std::chrono::milliseconds(500))
+      {
+        state.kex_sent_at = now;
+        need_send = true;
+      }
+      if (need_send) {
+        pubkey_der_copy = state.local_ephemeral_pubkey_der;
+      }
+      if (state.handshake_complete) {
+        *shared_secret_out = state.shared_secret;
+        have_secret = true;
+      }
+    }
+    if (need_send && !pubkey_der_copy.empty()) {
+      std::string kex_message;
+      std::string signed_kex_message;
+      if (build_udp_ecdh_kex_message(pubkey_der_copy, &kex_message) &&
+        protect_udp_peer_authenticated_payload(
+          kex_message, /*is_data_frame=*/false, &signed_kex_message))
+      {
+        udp_ecdh_kex_sent_.fetch_add(1, std::memory_order_relaxed);
+        send_datagram_to_targets(signed_kex_message, {target}, "udp-ecdh-kex");
+      }
+    }
+    return have_secret;
+  }
+
+  // Handles an incoming, already signature-verified key-exchange message:
+  // completes our side of the ECDH derivation against the sender's
+  // ephemeral public key (once, per known scope limit above) and replies
+  // with our own cached ephemeral public key -- but only while our side of
+  // this handshake wasn't already complete before this message arrived.
+  // Replying unconditionally on every receipt (including duplicates and
+  // this very reply crossing back) would turn a lost first response into
+  // an infinite KEX ping-pong between two already-complete peers; capping
+  // it to "at most one reply per not-yet-complete state" bounds the
+  // exchange to a handful of messages while still covering a lost initial
+  // response (the sender's 500ms bootstrap retry in
+  // ecdh_shared_secret_for_target re-arms this by re-sending its own KEX,
+  // which this side hasn't seen before and will still complete/reply to
+  // exactly once).
+  void handle_udp_ecdh_kex_message(
+    const std::string & message, const sockaddr_in * source)
+  {
+    if (!udp_ecdh_enabled_ || source == nullptr) {
+      return;
+    }
+    std::string peer_ephemeral_pubkey_der;
+    if (!parse_udp_ecdh_kex_message(message, &peer_ephemeral_pubkey_der)) {
+      return;
+    }
+    udp_ecdh_kex_received_.fetch_add(1, std::memory_order_relaxed);
+    const std::uint64_t peer_key = udp_peer_key(*source);
+    std::string our_pubkey_der_to_send;
+    bool became_complete = false;
+    bool already_complete_before = false;
+    {
+      std::lock_guard<std::mutex> lock(udp_ecdh_mutex_);
+      UdpEcdhPeerState & state = udp_ecdh_peers_[peer_key];
+      already_complete_before = state.handshake_complete;
+      if (state.local_ephemeral_pubkey_der.empty()) {
+        EVP_PKEY * keypair = nullptr;
+        std::string pubkey_der;
+        if (!generate_udp_ecdh_ephemeral_keypair(&keypair, &pubkey_der)) {
+          return;
+        }
+        state.ephemeral_keypair = keypair;
+        state.local_ephemeral_pubkey_der = pubkey_der;
+        state.kex_sent_at = std::chrono::steady_clock::now();
+      }
+      if (!state.handshake_complete && state.ephemeral_keypair != nullptr) {
+        std::array<unsigned char, 32> shared_secret{};
+        if (derive_udp_ecdh_shared_secret(
+            state.ephemeral_keypair, peer_ephemeral_pubkey_der, &shared_secret))
+        {
+          state.shared_secret = shared_secret;
+          state.handshake_complete = true;
+          became_complete = true;
+          // The ephemeral private key has served its only purpose --
+          // destroy it now rather than at session/process teardown, so it
+          // cannot be recovered even from this process's own later memory.
+          EVP_PKEY_free(state.ephemeral_keypair);
+          state.ephemeral_keypair = nullptr;
+        } else {
+          udp_ecdh_derive_failures_.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+      our_pubkey_der_to_send = state.local_ephemeral_pubkey_der;
+    }
+    if (became_complete) {
+      udp_ecdh_handshakes_completed_.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (already_complete_before) {
+      return;
+    }
+    std::string kex_message;
+    std::string signed_kex_message;
+    if (build_udp_ecdh_kex_message(our_pubkey_der_to_send, &kex_message) &&
+      protect_udp_peer_authenticated_payload(
+        kex_message, /*is_data_frame=*/false, &signed_kex_message))
+    {
+      udp_ecdh_kex_sent_.fetch_add(1, std::memory_order_relaxed);
+      send_datagram_to_targets(signed_kex_message, {*source}, "udp-ecdh-kex-response");
+    }
+  }
+
+  // Read-only lookup used on the receive path: unlike
+  // ecdh_shared_secret_for_target, this never starts a handshake or sends
+  // anything -- a received data frame from a peer whose handshake hasn't
+  // completed yet just falls back to the PSK-only derivation for that one
+  // frame, the same as when ECDH is disabled entirely.
+  bool ecdh_established_secret_for_peer(
+    std::uint64_t peer_key, std::array<unsigned char, 32> * shared_secret_out)
+  {
+    if (!udp_ecdh_enabled_ || shared_secret_out == nullptr) {
+      return false;
+    }
+    std::lock_guard<std::mutex> lock(udp_ecdh_mutex_);
+    const auto found = udp_ecdh_peers_.find(peer_key);
+    if (found == udp_ecdh_peers_.end() || !found->second.handshake_complete) {
+      return false;
+    }
+    *shared_secret_out = found->second.shared_secret;
+    return true;
+  }
+
   bool udp_peer_identity_allowed(const std::string & identity) const
   {
     return std::any_of(
@@ -3910,6 +4326,21 @@ private:
     if (udp_peer_auth_tamper_outbound_once_ && is_data_frame &&
       !udp_peer_auth_tamper_done_.exchange(true, std::memory_order_relaxed) &&
       !signature.empty())
+    {
+      (*authenticated_payload)[signature_offset] = static_cast<char>(
+        (*authenticated_payload)[signature_offset] ^ 0x01);
+    }
+    // Dedicated MITM-on-the-handshake test knob: unlike the data-frame
+    // tamper flag above, this targets specifically an ephemeral-pubkey KEX
+    // message (identified by its own magic, independent of is_data_frame,
+    // since KEX messages share this same signing path with plain control
+    // frames) -- proving a forged ephemeral key is rejected the same way a
+    // forged data frame is, without which ECDH would trade "confidentiality
+    // depends on the PSK" for "confidentiality depends on an unauthenticated
+    // key exchange," i.e. a trivial active on-path attacker.
+    if (udp_ecdh_tamper_kex_outbound_once_ &&
+      !udp_ecdh_tamper_kex_done_.exchange(true, std::memory_order_relaxed) &&
+      !signature.empty() && is_udp_ecdh_kex_message(payload))
     {
       (*authenticated_payload)[signature_offset] = static_cast<char>(
         (*authenticated_payload)[signature_offset] ^ 0x01);
@@ -4093,7 +4524,9 @@ private:
     return true;
   }
 
-  bool protect_udp_payload(const std::string & plaintext, std::string * protected_payload)
+  bool protect_udp_payload(
+    const std::string & plaintext, std::string * protected_payload,
+    const sockaddr_in * target = nullptr)
   {
     if (protected_payload == nullptr) {
       return false;
@@ -4110,7 +4543,7 @@ private:
     std::array<unsigned char, kNonceSize> nonce{};
     std::array<unsigned char, kSaltSize> session_salt{};
     std::array<unsigned char, 32> session_key{};
-    if (!current_udp_aead_session_material(&session_salt, &session_key)) {
+    if (!current_udp_aead_session_material(target, &session_salt, &session_key)) {
       return false;
     }
     std::copy(
@@ -4186,7 +4619,9 @@ private:
     return true;
   }
 
-  bool unprotect_udp_payload(const std::string & payload, std::string * plaintext)
+  bool unprotect_udp_payload(
+    const std::string & payload, std::string * plaintext,
+    const sockaddr_in * source = nullptr)
   {
     if (plaintext == nullptr) {
       return false;
@@ -4216,7 +4651,7 @@ private:
     const size_t ciphertext_size =
       payload.size() - kMagicSize - kSaltSize - kNonceSize - kTagSize;
     std::array<unsigned char, 32> session_key{};
-    if (!received_udp_aead_session_key(session_salt, &session_key)) {
+    if (!received_udp_aead_session_key(session_salt, source, &session_key)) {
       udp_aead_authentication_failures_.fetch_add(1, std::memory_order_relaxed);
       return false;
     }
@@ -4292,11 +4727,26 @@ private:
     return true;
   }
 
+  // A per-peer ECDH secret can't encrypt one ciphertext for a whole
+  // multi-target broadcast the way the PSK-only path does, so once it's
+  // enabled every send with more than one target is split here into one
+  // single-target call per peer -- each using that peer's own session key.
+  // Best-effort fan-out: one peer being unreachable, or still mid-KEX
+  // handshake, doesn't block delivery to the others.
   rmw_ret_t send_payload_to_targets(
     const std::string & payload,
     const std::vector<sockaddr_in> & targets,
     const char * label)
   {
+    if (udp_ecdh_enabled_ && targets.size() > 1) {
+      bool any_ok = false;
+      for (const sockaddr_in & target : targets) {
+        if (send_payload_to_targets(payload, {target}, label) == RMW_RET_OK) {
+          any_ok = true;
+        }
+      }
+      return any_ok ? RMW_RET_OK : RMW_RET_ERROR;
+    }
     const bool is_data_frame =
       rmw_fleetqox_cpp::decode_data_frame(payload).has_value();
     if (loss_resilient_fragment_chunk_bytes_ > 0 &&
@@ -4323,7 +4773,9 @@ private:
       }
     }
     std::string wire_payload;
-    if (!protect_udp_payload(payload, &wire_payload)) {
+    if (!protect_udp_payload(
+        payload, &wire_payload, targets.empty() ? nullptr : &targets.front()))
+    {
       RMW_SET_ERROR_MSG("failed to encrypt FleetRMW UDP payload with AES-256-GCM");
       return RMW_RET_ERROR;
     }
@@ -5192,6 +5644,17 @@ private:
         1, std::memory_order_relaxed);
       return RMW_RET_INVALID_ARGUMENT;
     }
+    if (udp_ecdh_enabled_ && targets.size() > 1) {
+      bool any_ok = false;
+      for (const sockaddr_in & target : targets) {
+        if (send_fragment_completion_marker(
+            {target}, fragment_id, fragment_count, total_size, is_data_frame) == RMW_RET_OK)
+        {
+          any_ok = true;
+        }
+      }
+      return any_ok ? RMW_RET_OK : RMW_RET_ERROR;
+    }
     std::string marker(kRepairFragmentCompletionPrefix);
     marker.append(fragment_id);
     marker.push_back('|');
@@ -5199,7 +5662,7 @@ private:
     marker.push_back('|');
     marker.append(std::to_string(total_size));
     std::string protected_marker;
-    if (!protect_udp_payload(marker, &protected_marker)) {
+    if (!protect_udp_payload(marker, &protected_marker, &targets.front())) {
       fragment_completion_marker_failures_.fetch_add(
         1, std::memory_order_relaxed);
       return RMW_RET_ERROR;
@@ -5237,6 +5700,19 @@ private:
     const std::vector<size_t> & indexes,
     bool selective_retransmission)
   {
+    if (udp_ecdh_enabled_ && targets.size() > 1) {
+      rmw_ret_t last_ret = RMW_RET_ERROR;
+      bool any_ok = false;
+      for (const sockaddr_in & target : targets) {
+        last_ret = send_loss_resilient_fragment_indexes(
+          payload, {target}, label, is_data_frame, fragment_id, chunk_bytes,
+          fragment_count, indexes, selective_retransmission);
+        if (last_ret == RMW_RET_OK) {
+          any_ok = true;
+        }
+      }
+      return any_ok ? RMW_RET_OK : last_ret;
+    }
     for (const size_t index : indexes) {
       if (index >= fragment_count) {
         return RMW_RET_INVALID_ARGUMENT;
@@ -5260,7 +5736,7 @@ private:
       fragment.append(payload.data() + offset, chunk_size);
 
       std::string protected_fragment;
-      if (!protect_udp_payload(fragment, &protected_fragment)) {
+      if (!protect_udp_payload(fragment, &protected_fragment, &targets.front())) {
         RMW_SET_ERROR_MSG(
           "failed to encrypt loss-resilient FleetRMW UDP fragment");
         return RMW_RET_ERROR;
@@ -5652,6 +6128,9 @@ private:
       return;
     }
     if (!configure_udp_peer_auth()) {
+      return;
+    }
+    if (!configure_udp_ecdh()) {
       return;
     }
     fd_ = ::socket(AF_INET, SOCK_DGRAM, 0);
@@ -6806,8 +7285,17 @@ private:
     {
       return;
     }
+    if (is_udp_ecdh_kex_message(authenticated_content)) {
+      // KEX messages ride the same SROS2 signature wrapper as ordinary
+      // frames (so a forged ephemeral key is rejected the same way a
+      // forged data frame would be) but are never AEAD-encrypted -- they
+      // carry the very key material AEAD encryption would otherwise need,
+      // so unprotect_udp_payload is skipped for this message type.
+      handle_udp_ecdh_kex_message(authenticated_content, source);
+      return;
+    }
     std::string plaintext;
-    if (!unprotect_udp_payload(authenticated_content, &plaintext)) {
+    if (!unprotect_udp_payload(authenticated_content, &plaintext, source)) {
       return;
     }
     std::string repaired_payload;
@@ -6911,6 +7399,46 @@ private:
   std::atomic<std::uint64_t> udp_peer_auth_revoked_certificate_drops_{0};
   mutable std::mutex udp_peer_auth_identity_mutex_;
   std::string udp_peer_auth_last_identity_;
+  // Ephemeral ECDH key exchange for UDP AEAD forward secrecy: the static
+  // PSK above (udp_aead_key_) alone cannot provide it, since every session
+  // key is a deterministic function of (PSK, salt) and salt travels in
+  // cleartext on every frame -- a PSK compromised at any future point lets
+  // an attacker who recorded traffic recompute every past session key. This
+  // performs a mutual ephemeral-ephemeral ECDH exchange, authenticated by
+  // the existing SROS2 identity signature
+  // (protect/unprotect_udp_peer_authenticated_payload), producing a
+  // per-peer shared secret from two freshly-generated EC keypairs that are
+  // destroyed immediately after deriving it. Mixing that shared secret into
+  // the existing HKDF alongside the PSK means a fully compromised PSK no
+  // longer suffices to recover a session key established after this peer's
+  // handshake completed, since the ephemeral private keys that produced the
+  // ECDH secret no longer exist anywhere to be recovered. Since the shared
+  // secret is inherently pairwise and one process may hold sessions with
+  // several statically configured peers (FLEETQOX_RMW_PEERS), encryption
+  // becomes per-destination when this is enabled (see
+  // send_payload_to_targets) rather than the single
+  // encrypt-once-broadcast-to-many-targets path used when it's off. Known
+  // scope limit: once a handshake completes for a given peer address it is
+  // used for that relationship's lifetime; there is no re-keying loop if a
+  // peer restarts and offers a new ephemeral key after completion.
+  bool udp_ecdh_enabled_{false};
+  std::mutex udp_ecdh_mutex_;
+  struct UdpEcdhPeerState
+  {
+    EVP_PKEY * ephemeral_keypair{nullptr};
+    std::string local_ephemeral_pubkey_der;
+    bool handshake_complete{false};
+    std::array<unsigned char, 32> shared_secret{};
+    std::chrono::steady_clock::time_point kex_sent_at{};
+  };
+  std::unordered_map<std::uint64_t, UdpEcdhPeerState> udp_ecdh_peers_;
+  std::atomic<std::uint64_t> udp_ecdh_kex_sent_{0};
+  std::atomic<std::uint64_t> udp_ecdh_kex_received_{0};
+  std::atomic<std::uint64_t> udp_ecdh_derive_failures_{0};
+  std::atomic<std::uint64_t> udp_ecdh_handshakes_completed_{0};
+  std::atomic<std::uint64_t> udp_ecdh_encrypted_frames_{0};
+  bool udp_ecdh_tamper_kex_outbound_once_{false};
+  std::atomic<bool> udp_ecdh_tamper_kex_done_{false};
   std::atomic<std::uint64_t> fragment_sequence_{0};
   std::atomic<std::uint64_t> ack_nack_sent_{0};
   std::atomic<std::uint64_t> ack_nack_received_{0};
@@ -12464,6 +12992,36 @@ const char * rmw_fleetqox_cpp_udp_peer_auth_last_identity()
   static thread_local std::string identity;
   identity = socket_transport().udp_peer_auth_last_identity();
   return identity.c_str();
+}
+
+bool rmw_fleetqox_cpp_udp_ecdh_enabled()
+{
+  return socket_transport().udp_ecdh_enabled();
+}
+
+std::uint64_t rmw_fleetqox_cpp_udp_ecdh_kex_sent()
+{
+  return socket_transport().udp_ecdh_kex_sent();
+}
+
+std::uint64_t rmw_fleetqox_cpp_udp_ecdh_kex_received()
+{
+  return socket_transport().udp_ecdh_kex_received();
+}
+
+std::uint64_t rmw_fleetqox_cpp_udp_ecdh_derive_failures()
+{
+  return socket_transport().udp_ecdh_derive_failures();
+}
+
+std::uint64_t rmw_fleetqox_cpp_udp_ecdh_handshakes_completed()
+{
+  return socket_transport().udp_ecdh_handshakes_completed();
+}
+
+std::uint64_t rmw_fleetqox_cpp_udp_ecdh_encrypted_frames()
+{
+  return socket_transport().udp_ecdh_encrypted_frames();
 }
 
 std::uint64_t rmw_fleetqox_cpp_socket_ack_nack_sent()

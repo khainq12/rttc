@@ -44,6 +44,12 @@ extern "C" std::uint64_t rmw_fleetqox_cpp_udp_peer_auth_revoked_certificate_drop
 extern "C" const char * rmw_fleetqox_cpp_udp_peer_auth_last_identity();
 extern "C" std::uint64_t rmw_fleetqox_cpp_udp_peer_auth_crl_reload_successes();
 extern "C" std::uint64_t rmw_fleetqox_cpp_udp_peer_auth_crl_reload_failures();
+extern "C" bool rmw_fleetqox_cpp_udp_ecdh_enabled();
+extern "C" std::uint64_t rmw_fleetqox_cpp_udp_ecdh_kex_sent();
+extern "C" std::uint64_t rmw_fleetqox_cpp_udp_ecdh_kex_received();
+extern "C" std::uint64_t rmw_fleetqox_cpp_udp_ecdh_derive_failures();
+extern "C" std::uint64_t rmw_fleetqox_cpp_udp_ecdh_handshakes_completed();
+extern "C" std::uint64_t rmw_fleetqox_cpp_udp_ecdh_encrypted_frames();
 
 namespace
 {
@@ -62,6 +68,8 @@ struct ProbeConfig
   int post_take_ms{0};
   int payload_output_limit{256};
   bool expect_taken{true};
+  int publish_count{1};
+  int publish_interval_ms{50};
 };
 
 std::string json_escape(const std::string & value)
@@ -114,6 +122,10 @@ ProbeConfig parse_args(int argc, char ** argv)
       config.expect_taken = parse_bool(argv[++i]);
     } else if (arg == "--timeout-ms" && i + 1 < argc) {
       config.timeout_ms = std::stoi(argv[++i]);
+    } else if (arg == "--publish-count" && i + 1 < argc) {
+      config.publish_count = std::max(1, std::stoi(argv[++i]));
+    } else if (arg == "--publish-interval-ms" && i + 1 < argc) {
+      config.publish_interval_ms = std::max(0, std::stoi(argv[++i]));
     }
   }
   if (config.payload_size > 0) {
@@ -213,7 +225,8 @@ void print_json_result(
   bool taken,
   size_t bytes,
   const std::string & payload,
-  double take_age_ms)
+  double take_age_ms,
+  int messages_taken = -1)
 {
   const size_t output_limit = static_cast<size_t>(config.payload_output_limit);
   const bool payload_truncated = payload.size() > output_limit;
@@ -261,6 +274,22 @@ void print_json_result(
     rmw_fleetqox_cpp_udp_peer_auth_crl_reload_successes() << ",";
   std::cout << "\"udp_peer_auth_crl_reload_failures\":" <<
     rmw_fleetqox_cpp_udp_peer_auth_crl_reload_failures() << ",";
+  std::cout << "\"udp_ecdh_enabled\":" <<
+    (rmw_fleetqox_cpp_udp_ecdh_enabled() ? "true" : "false") << ",";
+  std::cout << "\"udp_ecdh_kex_sent\":" <<
+    rmw_fleetqox_cpp_udp_ecdh_kex_sent() << ",";
+  std::cout << "\"udp_ecdh_kex_received\":" <<
+    rmw_fleetqox_cpp_udp_ecdh_kex_received() << ",";
+  std::cout << "\"udp_ecdh_derive_failures\":" <<
+    rmw_fleetqox_cpp_udp_ecdh_derive_failures() << ",";
+  std::cout << "\"udp_ecdh_handshakes_completed\":" <<
+    rmw_fleetqox_cpp_udp_ecdh_handshakes_completed() << ",";
+  std::cout << "\"udp_ecdh_encrypted_frames\":" <<
+    rmw_fleetqox_cpp_udp_ecdh_encrypted_frames() << ",";
+  std::cout << "\"publish_count\":" << config.publish_count << ",";
+  if (messages_taken >= 0) {
+    std::cout << "\"messages_taken\":" << messages_taken << ",";
+  }
   std::cout << "\"taken\":" << (taken ? "true" : "false") << ",";
   std::cout << "\"bytes\":" << bytes << ",";
   std::cout << "\"take_age_ms\":" << take_age_ms << ",";
@@ -308,16 +337,24 @@ int run_publisher(const ProbeConfig & config)
   if (config.pre_publish_ms > 0) {
     std::this_thread::sleep_for(std::chrono::milliseconds(config.pre_publish_ms));
   }
-  const rmw_ret_t publish_ret = publisher != nullptr && message_init_ok ?
+  rmw_ret_t publish_ret = publisher != nullptr && message_init_ok ?
     rmw_publish_serialized_message(publisher, &outgoing, nullptr) : RMW_RET_ERROR;
+  for (int i = 1; i < config.publish_count && publish_ret == RMW_RET_OK; ++i) {
+    if (config.publish_interval_ms > 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(config.publish_interval_ms));
+    }
+    publish_ret = rmw_publish_serialized_message(publisher, &outgoing, nullptr);
+  }
   std::this_thread::sleep_for(std::chrono::milliseconds(20));
   const std::uint64_t sent_delta = rmw_fleetqox_cpp_socket_frames_sent() - sent_before;
   const std::string endpoint = rmw_fleetqox_cpp_socket_bound_endpoint();
   const size_t peer_count = rmw_fleetqox_cpp_socket_peer_count();
 
+  const bool publisher_ok = publish_ret == RMW_RET_OK &&
+    sent_delta >= static_cast<std::uint64_t>(config.publish_count);
   print_json_result(
     config,
-    publish_ret == RMW_RET_OK && sent_delta >= 1 ? "ok" : "failed",
+    publisher_ok ? "ok" : "failed",
     endpoint,
     peer_count,
     sent_delta,
@@ -344,7 +381,7 @@ int run_publisher(const ProbeConfig & config)
     (void)destroy_node_ret;
   }
   cleanup_context(&context, &options);
-  return publish_ret == RMW_RET_OK && sent_delta >= 1 ? 0 : 1;
+  return publisher_ok ? 0 : 1;
 }
 
 int run_subscriber(const ProbeConfig & config)
@@ -382,23 +419,36 @@ int run_subscriber(const ProbeConfig & config)
 
   bool taken = false;
   rmw_ret_t take_ret = RMW_RET_OK;
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(config.timeout_ms);
-  while (subscription != nullptr && message_init_ok && std::chrono::steady_clock::now() < deadline) {
-    take_ret = rmw_take_serialized_message(subscription, &incoming, &taken, nullptr);
-    if (take_ret != RMW_RET_OK || taken) {
+  int messages_taken = 0;
+  bool all_payloads_ok = true;
+  std::string received_payload;
+  const auto overall_deadline =
+    std::chrono::steady_clock::now() + std::chrono::milliseconds(config.timeout_ms);
+  for (int i = 0; i < config.publish_count; ++i) {
+    taken = false;
+    while (subscription != nullptr && message_init_ok &&
+      std::chrono::steady_clock::now() < overall_deadline)
+    {
+      take_ret = rmw_take_serialized_message(subscription, &incoming, &taken, nullptr);
+      if (take_ret != RMW_RET_OK || taken) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (!taken) {
       break;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  }
-
-  std::string received_payload;
-  if (taken && incoming.buffer != nullptr) {
-    received_payload.assign(
-      reinterpret_cast<const char *>(incoming.buffer),
-      reinterpret_cast<const char *>(incoming.buffer + incoming.buffer_length));
-  }
-  if (taken && config.post_take_ms > 0) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(config.post_take_ms));
+    received_payload.clear();
+    if (incoming.buffer != nullptr) {
+      received_payload.assign(
+        reinterpret_cast<const char *>(incoming.buffer),
+        reinterpret_cast<const char *>(incoming.buffer + incoming.buffer_length));
+    }
+    ++messages_taken;
+    all_payloads_ok = all_payloads_ok && received_payload == config.payload;
+    if (config.post_take_ms > 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(config.post_take_ms));
+    }
   }
   const std::uint64_t received_delta =
     rmw_fleetqox_cpp_socket_frames_received() - received_before;
@@ -410,9 +460,10 @@ int run_subscriber(const ProbeConfig & config)
   const double take_age_ms = taken && take_timestamp_ns >= source_timestamp_ns ?
     static_cast<double>(take_timestamp_ns - source_timestamp_ns) / 1000000.0 : 0.0;
   const bool ok = take_ret == RMW_RET_OK &&
-                  ((config.expect_taken && taken && received_payload == config.payload &&
+                  ((config.expect_taken &&
+                  messages_taken == config.publish_count && all_payloads_ok &&
                   received_delta >= 1) ||
-                  (!config.expect_taken && !taken));
+                  (!config.expect_taken && messages_taken == 0));
 
   print_json_result(
     config,
@@ -428,7 +479,8 @@ int run_subscriber(const ProbeConfig & config)
     taken,
     incoming.buffer_length,
     received_payload,
-    take_age_ms);
+    take_age_ms,
+    messages_taken);
 
   if (message_init_ok) {
     const rmw_ret_t message_fini_ret = rmw_serialized_message_fini(&incoming);

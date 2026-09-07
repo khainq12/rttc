@@ -305,6 +305,18 @@ unconfirmed. Multi-attacker credential rotation, active-session revocation,
 PKI operations, distributed gateway failure semantics, and independent
 security review remain open.
 
+Ephemeral ECDH forward secrecy for the UDP AEAD data plane
+(`FLEETQOX_RMW_UDP_ECDH_ENABLE=1`, `forward_secrecy_claim` /
+`asymmetric_session_key_exchange_claim`) is verified by
+`scripts/run_rmw_docker_udp_ecdh_probe.py` over real two-process peers with
+SROS2 identities: 3/3 repeated runs each show a completed mutual-ephemeral
+handshake and subsequent frames actually using the ECDH-mixed session key
+(`udp_ecdh_encrypted_frames` increments, not just `udp_ecdh_handshakes_completed`),
+a tampered ephemeral-pubkey signature is rejected exactly like a tampered
+data frame while ordinary delivery is unaffected, and enabling ECDH without
+peer authentication already on fails closed at init. Not part of the
+183-probe suite yet.
+
 ## Evidence rules
 
 - Deterministic probes establish contracts, not broad performance claims.
