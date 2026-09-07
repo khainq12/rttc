@@ -158,18 +158,51 @@ Exit gate (met):
 
 ### B1: fleet-scale large-sample convergence
 
-The best retained 16-robot, 32-KiB, roaming-loss seed-7 result is `155/160`.
-The fair repair queue reduces amplification and deferrals but does not improve
-the delivery frontier. One seed and an incomplete row cannot support a fleet
-reliability claim.
+Historical: the best retained 16-robot, 32-KiB, roaming-loss seed-7 result was
+`155/160`. The fair repair queue reduced amplification and deferrals but did
+not improve the delivery frontier at the time. One seed and an incomplete row
+could not support a fleet reliability claim.
+
+`run_rmw_docker_fleet_repair_capacity_frontier.py` (27 configs: robot counts
+8/16/32, seeds 7/13/29, capacity fractions 0.25/0.5/1.0 of a per-robot repair
+budget) re-run clean on this branch, after several prior attempts were
+invalidated by the test host's Docker Desktop VM becoming unresponsive under
+container load (`Cannot connect to the Docker daemon`, `EOF` mid-`docker run`
+-- a host/infra flake, not a code defect; see below):
+
+- **8 and 16 robots, at the full per-robot capacity tier (350 bytes/robot:
+  2800 bytes at 8 robots, 5600 bytes at 16 robots): 3/3 seeds pass with 100%
+  admission-qualified and 100% live-QoE-qualified ratios**, monotonic across
+  capacity tiers. This is new, valid, clean evidence -- every prior sweep
+  attempt at this scale was contaminated by the Docker Desktop outage before
+  producing a full clean picture.
+- **32 robots: 0/9 runs (all 3 seeds x all 3 capacity tiers) fail before
+  producing any output**, with `Error response from daemon: container ... is
+  not running`. Root cause: this harness spawns one publisher container and
+  one subscriber container per robot (`run_rmw_docker_router_multi_robot_budgeted_fleet_plan_probe.py`),
+  so 32 robots means 64+ concurrent containers. `docker info` on this host
+  reports the Docker Desktop VM has only ~3.8 GiB of memory total, and 64+
+  rclpy-based ROS 2 processes exceed that well before the test logic runs --
+  a test-host capacity ceiling, not a demonstrated FleetRMW defect. Confirming
+  this precisely (vs. some other 32-robot-specific code path) requires either
+  more VM memory than this host can spare, or reworking the harness to
+  multiplex multiple robots' topics through fewer processes (as
+  `scripts/run_heap_soak_fleet_asan_probe.py` already does for B0's 3-hop
+  topology) instead of one container pair per robot.
 
 Exit gate:
 
-- complete delivery and ACK convergence for 8/16/32 robots;
-- at least three fixed seeds per profile;
+- complete delivery and ACK convergence for 8/16/32 robots -- **8 and 16 met
+  cleanly at the full capacity tier; 32 blocked on test-host container
+  capacity, not yet demonstrated either way**;
+- at least three fixed seeds per profile -- **met for 8 and 16 robots**;
 - bounded queue/state/CPU/RSS and no hidden unbounded retry;
 - exact payload size and same-hop provenance;
-- repeatable result from a clean Docker image.
+- repeatable result from a clean Docker image -- **the test host's Docker
+  Desktop VM has repeatedly become unresponsive under sustained container
+  churn during this investigation, requiring `docker desktop stop --force` /
+  `start` to recover; this is an environment fragility worth tracking
+  separately from the fleet-scale results themselves.**
 
 ### B2: production QUIC and PKI
 
