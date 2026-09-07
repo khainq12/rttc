@@ -2119,12 +2119,6 @@ int main(int argc, char ** argv)
       for (const sockaddr_in & peer : graph_peer_addresses) {
         append_unique_peer(&graph_targets, peer);
       }
-      for (const ServiceRoute & route : service_route_table) {
-        append_unique_peer(&graph_targets, route.address);
-      }
-      for (const ActionRoute & route : action_route_table) {
-        append_unique_peer(&graph_targets, route.address);
-      }
       // Plain pub/sub clients are never in peer_addresses/graph_peer_addresses
       // (those are for static router-to-router/graph-peer config, and a
       // publisher's ephemeral bind port can't be known ahead of time
@@ -2135,11 +2129,47 @@ int main(int argc, char ** argv)
       // acknowledged. route_table/publisher_route_table are already learned
       // dynamically from route advertisements and data frames, so reuse
       // them here the same way service/action routes are reused above.
+      //
+      // These four tables grow with the number of distinct topics/services/
+      // actions the router has ever seen, so forwarding every advertisement
+      // to every entry unconditionally is O(known routes) work per
+      // advertisement -- O(N) advertisements (plus periodic re-advertisement
+      // on every graph renewal interval) times O(N) targets is O(N^2)
+      // forwarded frames. At fleet scale this quadratic fan-out alone can
+      // saturate the router's single-threaded receive loop and starve real
+      // data frames of timely processing (confirmed: at 32 robots this
+      // produced ~25,000 forwarded graph frames against 64 expected
+      // advertisements, while every robot's control-topic delivery missed
+      // its deadline). Only a route matching the advertisement's own
+      // topic/service/action name and domain can possibly care about it, so
+      // scope the fan-out to those instead of the full route table.
+      for (const ServiceRoute & route : service_route_table) {
+        if (route.service_name == graph_advertisement->topic &&
+          route.domain_id == graph_advertisement->domain_id)
+        {
+          append_unique_peer(&graph_targets, route.address);
+        }
+      }
+      for (const ActionRoute & route : action_route_table) {
+        if (route.action_name == graph_advertisement->topic &&
+          route.domain_id == graph_advertisement->domain_id)
+        {
+          append_unique_peer(&graph_targets, route.address);
+        }
+      }
       for (const TopicRoute & route : route_table) {
-        append_unique_peer(&graph_targets, route.address);
+        if (route.topic == graph_advertisement->topic &&
+          route.domain_id == graph_advertisement->domain_id)
+        {
+          append_unique_peer(&graph_targets, route.address);
+        }
       }
       for (const PublisherRoute & route : publisher_route_table) {
-        append_unique_peer(&graph_targets, route.address);
+        if (route.topic == graph_advertisement->topic &&
+          route.domain_id == graph_advertisement->domain_id)
+        {
+          append_unique_peer(&graph_targets, route.address);
+        }
       }
       for (const sockaddr_in & peer : graph_targets) {
         if (endpoints_match(peer, source_address)) {
