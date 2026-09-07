@@ -153,6 +153,19 @@ std::atomic<bool> g_remote_graph_lease_monitor_running{false};
 std::thread g_remote_graph_lease_monitor_thread;
 std::mutex g_remote_graph_lease_monitor_lifecycle_mutex;
 std::once_flag g_remote_graph_lease_monitor_atexit_once;
+// Set once stop_remote_graph_lease_monitor_thread() has run (via its
+// std::atexit registration, which only ever fires once) so a later call to
+// ensure_remote_graph_lease_monitor() from a still-running worker thread --
+// e.g. one racing to process a just-arrived graph packet during process
+// exit -- cannot restart the thread. A restart at that point would create a
+// std::thread with no atexit callback left to join it, so it would still be
+// joinable when the global g_remote_graph_lease_monitor_thread object's own
+// destructor runs at final process teardown, calling std::terminate() (the
+// B0 crash: reproduced live under ASan/UBSan on the 16-robot/32KiB/roaming-
+// loss three-hop relay scenario). Guarded by the same lifecycle mutex as
+// both functions' other state, so there is no window between a stop and a
+// racing ensure.
+bool g_remote_graph_lease_monitor_shutting_down = false;
 
 bool identifier_matches(const char * identifier)
 {
@@ -578,6 +591,11 @@ void remote_graph_lease_monitor_loop()
 void stop_remote_graph_lease_monitor_thread()
 {
   std::lock_guard<std::mutex> lifecycle_lock(g_remote_graph_lease_monitor_lifecycle_mutex);
+  // Permanent: this runs via std::atexit, which fires at most once, so no
+  // later ensure_remote_graph_lease_monitor() call may be allowed to
+  // recreate the thread -- there would be no remaining atexit registration
+  // left to join it.
+  g_remote_graph_lease_monitor_shutting_down = true;
   g_remote_graph_lease_monitor_running.store(false, std::memory_order_release);
   if (g_remote_graph_lease_monitor_thread.joinable()) {
     g_remote_graph_lease_monitor_thread.join();
@@ -588,6 +606,9 @@ void stop_remote_graph_lease_monitor_thread()
 void ensure_remote_graph_lease_monitor()
 {
   std::lock_guard<std::mutex> lifecycle_lock(g_remote_graph_lease_monitor_lifecycle_mutex);
+  if (g_remote_graph_lease_monitor_shutting_down) {
+    return;
+  }
   if (g_remote_graph_lease_monitor_started.load(std::memory_order_acquire)) {
     return;
   }

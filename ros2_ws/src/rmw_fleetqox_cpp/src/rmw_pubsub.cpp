@@ -323,6 +323,17 @@ std::thread g_pubsub_graph_renewal_thread;
 std::once_flag g_reliable_retransmit_atexit_once;
 std::once_flag g_qos_deadline_monitor_atexit_once;
 std::once_flag g_pubsub_graph_renewal_atexit_once;
+// See g_remote_graph_lease_monitor_shutting_down in rmw_graph.cpp for why
+// these exist: each stop_*_thread() below runs via a std::atexit callback
+// that fires at most once, so once it has run, the matching ensure_*_thread()
+// must permanently refuse to recreate the thread -- a thread started after
+// that point would have no remaining atexit registration to join it, and
+// would still be joinable when the global std::thread object's own
+// destructor runs at process teardown (std::terminate(); the reproduced B0
+// crash). Guarded by each pair's existing lifecycle mutex.
+bool g_reliable_retransmit_shutting_down = false;
+bool g_qos_deadline_monitor_shutting_down = false;
+bool g_pubsub_graph_renewal_shutting_down = false;
 
 std::mutex g_last_take_mutex;
 std::string g_last_take_topic;
@@ -10786,6 +10797,7 @@ void reliable_retransmit_loop()
 void stop_reliable_retransmit_thread()
 {
   std::lock_guard<std::mutex> lifecycle_lock(g_reliable_retransmit_lifecycle_mutex);
+  g_reliable_retransmit_shutting_down = true;
   g_reliable_retransmit_running.store(false, std::memory_order_release);
   if (g_reliable_retransmit_thread.joinable()) {
     g_reliable_retransmit_thread.join();
@@ -10799,6 +10811,9 @@ void ensure_reliable_retransmit_thread()
     return;
   }
   std::lock_guard<std::mutex> lifecycle_lock(g_reliable_retransmit_lifecycle_mutex);
+  if (g_reliable_retransmit_shutting_down) {
+    return;
+  }
   if (g_reliable_retransmit_started.load(std::memory_order_acquire)) {
     return;
   }
@@ -11504,6 +11519,7 @@ void qos_deadline_monitor_loop()
 void stop_qos_deadline_monitor_thread()
 {
   std::lock_guard<std::mutex> lifecycle_lock(g_qos_deadline_monitor_lifecycle_mutex);
+  g_qos_deadline_monitor_shutting_down = true;
   g_qos_deadline_monitor_running.store(false, std::memory_order_release);
   if (g_qos_deadline_monitor_thread.joinable()) {
     g_qos_deadline_monitor_thread.join();
@@ -11514,6 +11530,9 @@ void stop_qos_deadline_monitor_thread()
 void ensure_qos_deadline_monitor_thread()
 {
   std::lock_guard<std::mutex> lifecycle_lock(g_qos_deadline_monitor_lifecycle_mutex);
+  if (g_qos_deadline_monitor_shutting_down) {
+    return;
+  }
   if (g_qos_deadline_monitor_started.load(std::memory_order_acquire)) {
     return;
   }
@@ -11806,6 +11825,7 @@ void pubsub_graph_renewal_loop()
 void stop_pubsub_graph_renewal_thread()
 {
   std::lock_guard<std::mutex> lifecycle_lock(g_pubsub_graph_renewal_lifecycle_mutex);
+  g_pubsub_graph_renewal_shutting_down = true;
   g_pubsub_graph_renewal_running.store(false, std::memory_order_release);
   if (g_pubsub_graph_renewal_thread.joinable()) {
     g_pubsub_graph_renewal_thread.join();
@@ -11816,6 +11836,9 @@ void stop_pubsub_graph_renewal_thread()
 void ensure_pubsub_graph_renewal_thread()
 {
   std::lock_guard<std::mutex> lifecycle_lock(g_pubsub_graph_renewal_lifecycle_mutex);
+  if (g_pubsub_graph_renewal_shutting_down) {
+    return;
+  }
   if (g_pubsub_graph_renewal_started.load(std::memory_order_acquire)) {
     return;
   }

@@ -286,6 +286,13 @@ std::atomic<bool> g_service_graph_renewal_running{false};
 std::thread g_service_graph_renewal_thread;
 std::mutex g_service_graph_renewal_lifecycle_mutex;
 std::once_flag g_service_graph_renewal_atexit_once;
+// See g_remote_graph_lease_monitor_shutting_down in rmw_graph.cpp: once
+// stop_service_graph_renewal_thread() has run via its std::atexit callback
+// (fires at most once), ensure_service_graph_renewal_thread() must
+// permanently refuse to recreate the thread, or a restart racing process
+// exit would leave a joinable std::thread with no atexit left to join it
+// (std::terminate() at final teardown). Guarded by the same lifecycle mutex.
+bool g_service_graph_renewal_shutting_down = false;
 std::atomic<std::uint64_t> g_next_service_endpoint_id{1};
 std::atomic<std::uint64_t> g_next_client_endpoint_id{1};
 std::atomic<std::uint64_t> g_service_expired_frames_dropped{0};
@@ -311,6 +318,15 @@ std::condition_variable g_service_request_repair_cv;
 std::vector<PendingServiceRequestRepair> g_pending_service_request_repairs;
 std::thread g_service_request_repair_thread;
 bool g_service_request_repair_stop{false};
+// See g_remote_graph_lease_monitor_shutting_down in rmw_graph.cpp: once
+// stop_service_request_repair_worker() has run (from
+// ServiceRequestRepairShutdownGuard's destructor, which fires exactly once
+// during static teardown), schedule_service_request_repair() must
+// permanently refuse to recreate the thread it lazily starts, or a restart
+// racing process exit would leave a joinable std::thread nothing will ever
+// join again. Guarded by g_service_request_repair_mutex, like the rest of
+// this worker's state.
+bool g_service_request_repair_shutting_down{false};
 std::atomic<std::uint64_t> g_service_request_repairs_scheduled{0};
 std::atomic<std::uint64_t> g_service_request_retries_sent{0};
 std::atomic<std::uint64_t> g_service_request_repairs_cancelled{0};
@@ -1155,6 +1171,9 @@ bool schedule_service_request_repair(
         retries);
       return false;
     }
+    if (g_service_request_repair_shutting_down) {
+      return false;
+    }
     if (!g_service_request_repair_thread.joinable()) {
       g_service_request_repair_stop = false;
       try {
@@ -1242,6 +1261,7 @@ void stop_service_request_repair_worker()
 {
   {
     std::lock_guard<std::mutex> lock(g_service_request_repair_mutex);
+    g_service_request_repair_shutting_down = true;
     g_service_request_repair_stop = true;
     g_pending_service_request_repairs.clear();
   }
@@ -1716,6 +1736,7 @@ void service_graph_renewal_loop()
 void stop_service_graph_renewal_thread()
 {
   std::lock_guard<std::mutex> lifecycle_lock(g_service_graph_renewal_lifecycle_mutex);
+  g_service_graph_renewal_shutting_down = true;
   g_service_graph_renewal_running.store(false, std::memory_order_release);
   if (g_service_graph_renewal_thread.joinable()) {
     g_service_graph_renewal_thread.join();
@@ -1732,6 +1753,9 @@ void ensure_service_graph_renewal_thread()
     return;
   }
   std::lock_guard<std::mutex> lifecycle_lock(g_service_graph_renewal_lifecycle_mutex);
+  if (g_service_graph_renewal_shutting_down) {
+    return;
+  }
   if (g_service_graph_renewal_started.load(std::memory_order_acquire)) {
     return;
   }

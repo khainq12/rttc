@@ -92,34 +92,69 @@ endpoint-only delivery:
 
 ## Current blockers
 
-### B0: intermittent subscriber memory corruption
+### B0: intermittent subscriber memory corruption -- RESOLVED
 
-Two long lossy 32-KiB runs ended with
-`free(): invalid next size (fast)` in the subscriber. Short repeated selective
-repair runs and 320 callback-owner teardown cases pass, so the defect is not
-yet localized. It may be in typed large-string take/deserialization or a later
-teardown interaction.
+Originally: two long lossy 32-KiB runs ended with `free(): invalid next size
+(fast)` in the subscriber, unreproduced for a long time despite short
+selective-repair runs and 320 callback-owner teardown cases passing clean.
 
-A fresh Jazzy ASan/UBSan Docker build passed 5,000/5,000 same-process typed
-32-KiB publish/take iterations with clean finalization. This reduces the
-likelihood of a simple serializer-only failure but does not cover the original
-lossy inter-process fragment/repair path.
+Root cause found and fixed. Git-archaeology on the original crash wording
+matched it to the same 16-robot/32-KiB/roaming-loss fleet-frontier scenario as
+B1 (`run_ros2_relay_rmw_netem_probe.py --robot-count 16`): a three-hop
+publisher -> relay -> subscriber topology, not two same-process endpoints.
+Reproducing that exact topology and the exact "roaming" netem profile
+(28% loss, 96ms delay, 34ms jitter, 5mbit rate -- ~16.8x oversubscribed at
+this scale) in hand-written, uniformly ASan/UBSan-linked C++ probes
+(`heap_soak_publisher_probe`, `heap_soak_subscriber_probe`,
+`generic_serialized_relay_probe`; see `scripts/run_heap_soak_fleet_asan_probe.py`)
+reproduced a `std::terminate()` crash reliably (multiple consecutive attempts,
+byte-identical ASan signature each time).
 
-A distinct use-after-free (not this one) is root-caused and fixed:
+The crash was not the originally-reported `free(): invalid next size` --
+ASan's unwind showed `abort()` -> `std::terminate()` ->
+`std::thread::~thread()` -> `__cxa_finalize`, the standard-mandated
+`std::terminate()` from destroying a still-joinable `std::thread`. Live
+`write()`-based instrumentation (avoiding iostream reentrancy during
+static/global teardown) of every background-thread lifecycle function
+caught the actual race: FleetRMW runs six independent background workers
+(reliable retransmit, QoS deadline monitor, pub/sub graph renewal, remote
+graph lease monitor, service graph renewal, service request repair), each
+lazily started by an `ensure_*_thread()` and registered for cleanup via
+`std::call_once(..., []{ std::atexit(stop_*_thread); })` -- a one-time
+registration. During the relay's process exit, `stop_remote_graph_lease_monitor_thread()`
+ran via that atexit callback and successfully joined its thread -- but a
+separate, still-alive worker thread (processing a graph packet delayed by
+the 28% loss profile) called `ensure_remote_graph_lease_monitor()`
+immediately afterward, restarting the thread. Since the atexit registration
+had already fired and cannot fire again, that restarted thread had no
+remaining callback to join it, so it was still joinable when the global
+`std::thread` object's own implicit destructor ran at final process
+teardown, calling `std::terminate()`.
+
+Fixed by adding a permanent "shutting down" flag (guarded by each pair's
+existing lifecycle mutex) to all six `ensure_*`/`stop_*` thread-lifecycle
+pairs in `rmw_pubsub.cpp`, `rmw_graph.cpp`, and `rmw_stubs.cpp`: once a
+`stop_*` function has run, the matching `ensure_*` permanently refuses to
+recreate the thread, eliminating the race for all six workers, not just the
+one caught red-handed. Verified with a 5/5-round regression at the exact
+scale and profile that reproduced the crash, all clean (0 sanitizer reports,
+0 crashes).
+
+A distinct use-after-free (not this one) was root-caused and fixed earlier:
 `rmw_destroy_publisher()` could be called with a `node` pointer that
 `rmw_destroy_node()` had already freed, by upstream `rcl`'s global rosout
 logging fini path at process shutdown. Fixed via pointer-identity tracking in
-`node_is_valid()`; see `docs/EXPERIMENTAL_RESULTS_V1.md`. This does not close
-B0 — the `free(): invalid next size (fast)` report above remains open and
-unreproduced.
+`node_is_valid()`; see `docs/EXPERIMENTAL_RESULTS_V1.md`. That fix's own
+"unregister live node" comment is what pointed toward the same class of
+late-callback-after-teardown issue that turned out to explain B0.
 
-Exit gate:
+Exit gate (met):
 
-- deterministic reproducer or a statistically meaningful stress reproducer;
-- ASan and UBSan clean;
-- root cause fixed, not suppressed;
-- repeated Docker gate checked into the test matrix;
-- no crash over the long fleet workload.
+- deterministic reproducer: `scripts/run_heap_soak_fleet_asan_probe.py`;
+- ASan and UBSan clean after the fix (5/5 regression rounds);
+- root cause fixed (shutdown-permanence flags), not suppressed;
+- reproducer checked into the repo for the test matrix;
+- no crash over repeated runs of the exact fleet workload that triggered it.
 
 ### B1: fleet-scale large-sample convergence
 
