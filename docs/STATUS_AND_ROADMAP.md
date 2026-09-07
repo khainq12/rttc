@@ -176,36 +176,45 @@ container load (`Cannot connect to the Docker daemon`, `EOF` mid-`docker run`
   capacity tiers. This is new, valid, clean evidence -- every prior sweep
   attempt at this scale was contaminated by the Docker Desktop outage before
   producing a full clean picture.
-- **32 robots: 0/9 runs (all 3 seeds x all 3 capacity tiers) fail**, mostly
-  with `Error response from daemon: container ... is not running` (a
-  container the test expects to still be alive has already exited). This
-  harness spawns one publisher container and one subscriber container per
-  robot (`run_rmw_docker_router_multi_robot_budgeted_fleet_plan_probe.py`),
-  so 32 robots means 64+ concurrent containers -- initially suspected to be a
-  simple memory ceiling, since this host's default Docker Desktop VM only
-  gets ~3.8 GiB (`docker info`). Tested that hypothesis directly: raising the
-  VM to 8 GiB changed the outcome by exactly one run (1/9 admission-ok
-  instead of 0/9); raising it further to ~10.7 GiB, with host RAM headroom
-  confirmed stable throughout (never dropped below ~3.8 GiB available),
-  produced the **identical** 1/9 result. More VM memory does not move this
-  number, which rules out a simple capacity ceiling as the primary cause. The
-  remaining, more likely explanation is a scaling limit in the one-container-
-  per-robot harness design itself (container start-rate, Docker daemon
-  contention, or a timing budget in the probe that does not scale enough with
-  `robot_count`) rather than anything resource proportional -- consistent
-  with 8 and 16 robots (16 and 32 containers respectively) working perfectly
-  cleanly while 32 robots (64+ containers) fails outright regardless of RAM.
-  Confirming this precisely, and fixing it, most plausibly requires reworking
-  the harness to multiplex multiple robots' topics through fewer processes
-  (as `scripts/run_heap_soak_fleet_asan_probe.py` already does for B0's
-  3-hop topology) instead of one container pair per robot -- not simply
-  giving the test host more memory.
+- **32 robots: initially 0/9 runs (all 3 seeds x all 3 capacity tiers)
+  failed**, mostly with `Error response from daemon: container ... is not
+  running`. First suspected a simple Docker Desktop VM memory ceiling
+  (~3.8 GiB default), since this harness spawns one publisher + one
+  subscriber container per robot (64+ containers at 32 robots) -- but raising
+  the VM to 8 GiB, then to ~10.7 GiB (host RAM confirmed stable throughout,
+  never dropping below ~3.8 GiB available), produced the **identical**
+  near-zero result both times. That ruled out memory as the cause.
+
+  Root-caused instead via a diagnostic wrapper that captured every
+  container's `docker logs`/`docker inspect` output right before the
+  script's own cleanup removed them: the test router
+  (`udp_router_probe.cpp`, a standalone simulation tool for this multi-robot
+  topology, not part of the shipped `librmw_fleetqox_cpp.so`) forwarded
+  every incoming graph advertisement to *all* known routes regardless of
+  topic, and those route tables grow with robot count -- O(N) advertisements
+  (re-sent on every ~1.7s graph renewal) times O(N) forward targets is
+  O(N^2) traffic. At 32 robots this produced `graph_forwarded: 25317`
+  against `expected_graph_advertisements: 64`, saturating the router's
+  single-threaded receive loop and starving every robot's real data of
+  timely delivery uniformly (`on_time_sequences: []` across all 32) -- not a
+  resource ceiling, a quadratic fan-out bug in a test tool.
+
+  Fixed by scoping the fan-out to routes whose topic/service-name/
+  action-name and domain actually match the advertisement. Verified on the
+  same 32-robot scenario: `graph_forwarded` dropped from 25317 to 311
+  (~80x), and the first two configs of a fresh sweep went from uniform
+  total failure to genuine 4/4 and 8/8 full admission with zero infra
+  crashes. Later configs in the same sweep still hit residual
+  `container ... is not running` errors -- a separate, likely more mundane
+  resource-cleanup issue across a long sequential sweep (not the quadratic
+  storm, which is confirmed fixed) -- still open.
 
 Exit gate:
 
 - complete delivery and ACK convergence for 8/16/32 robots -- **8 and 16 met
-  cleanly at the full capacity tier; 32 blocked on test-host container
-  capacity, not yet demonstrated either way**;
+  cleanly at the full capacity tier; 32 no longer blocked by the router
+  storm, but still not yet demonstrated clean across a full 9-config sweep
+  due to the separate residual sweep-cleanup flakiness above**;
 - at least three fixed seeds per profile -- **met for 8 and 16 robots**;
 - bounded queue/state/CPU/RSS and no hidden unbounded retry;
 - exact payload size and same-hop provenance;
