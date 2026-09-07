@@ -328,6 +328,28 @@ message -- and confirmed with a `FLEETQOX_RMW_QUIC_DISABLE_EARLY_DATA=1`
 negative control across the session-reuse, take-path, and bidirectional
 probes so the signal is falsifiable.
 
+`quic_gateway_partition_split_brain_tolerance_claim` is also now `true`.
+Every prior partition probe cut the primary off from everyone at once,
+which can't exercise real split-brain risk (a fully isolated primary can't
+silently serve writes it can't sync). A new probe
+(`scripts/run_rmw_docker_postgres_replication_partition_split_brain_probe.py`,
+3/3 runs) cuts only the primary-to-standby replication link (a `tc` filter
+matched on the standby's IP) while the primary keeps serving clients, and
+proves: a write attempted during the cut never returns any result while
+partitioned (no silent divergent commit); aborting that stuck write with an
+ordinary query cancel (`pg_cancel_backend`) reports a **false success**
+("INSERT 0 1" plus only a warning) -- a genuine, previously-undocumented
+PostgreSQL hazard this probe now demonstrates directly; aborting the same
+write with `pg_terminate_backend` instead reports a clean failure, matching
+the safety level of this system's actual SIGKILL-based STONITH
+(`fleetqox_postgres_fence_agent.py`); and the partition heals without
+divergence, converging to matching row counts on both sides.
+`quic_gateway_regional_disaster_recovery_claim` stays unclaimed: automatic
+recovery from losing an entire majority-holding region isn't possible for
+any quorum system without a witness in a fourth location, and no dedicated
+three-region topology probe exists yet to earn a narrower version of that
+specific claim.
+
 ## Evidence rules
 
 - Deterministic probes establish contracts, not broad performance claims.

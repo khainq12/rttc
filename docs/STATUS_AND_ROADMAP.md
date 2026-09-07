@@ -359,10 +359,16 @@ documented:
   PostgreSQL as the actual data store) -- `quic_gateway_automatic_leader_election_claim`,
   `quic_gateway_active_active_consensus_claim`, `quic_gateway_consensus_backend_claim`,
   `quic_gateway_distributed_database_claim`;
-- partition/split-brain tolerance and regional disaster recovery as general
-  claims, beyond the specific quorum-loss and STONITH-fencing scenarios
-  already proven -- `quic_gateway_partition_split_brain_tolerance_claim`,
-  `quic_gateway_regional_disaster_recovery_claim`;
+- regional disaster recovery specifically -- automatic, unattended recovery
+  after an entire region (a majority-holding one) goes dark is not something
+  any quorum system can do without a witness in a fourth location; that is
+  an inherent property of consensus, not a gap here. What IS proven (see
+  below) is safe behavior under both a minority-region loss (unaffected)
+  and a majority-region loss (correctly fail-closed, no split promotion) --
+  `quic_gateway_regional_disaster_recovery_claim` stays unclaimed because
+  neither of those is "recovery" in the stronger sense the name implies,
+  and no dedicated three-region topology probe exists yet to earn a
+  narrower version of the claim;
 - hardware-level STONITH, as opposed to the Docker-container fencing already
   proven -- `quic_gateway_hardware_stonith_claim`;
 - production certification of the automatic rejoin/failback paths, as
@@ -388,6 +394,37 @@ of the authoritative rejection message. Verified with a negative control
 acceptance) so the signal is falsifiable, not vacuous, across the session
 reuse, take-path, and bidirectional probes.
 
+Also **done**, closed this session: general network-partition split-brain
+tolerance (`quic_gateway_partition_split_brain_tolerance_claim`). Every
+prior partition probe used one shape -- the primary loses ALL connectivity
+at once (etcd, standbys, and clients alike), which can't actually exercise
+the classic split-brain risk, since a primary that can't talk to anyone
+also can't silently serve clients writes it can't sync. A new probe
+(`scripts/run_rmw_docker_postgres_replication_partition_split_brain_probe.py`)
+targets the harder, previously-untested shape instead: a *replication-only*
+partition (a tc filter matched on just the standby's destination IP, not a
+blanket interface loss), so the primary keeps serving clients while cut off
+from its synchronous standby specifically.
+
+Building it surfaced a real, previously-undocumented PostgreSQL hazard that
+now shapes the claim's evidence: a transaction waiting on
+`synchronous_commit` has *already committed locally* before the wait even
+starts. Aborting that wait with an ordinary query cancel
+(`pg_cancel_backend` -- notably, `statement_timeout` does NOT interrupt
+this wait at all, by design) lets the original command report a clean
+success ("INSERT 0 1") with only a WARNING that it might not be replicated
+-- a real false-success hazard for any client that doesn't scan warnings.
+Aborting the same stuck backend with `pg_terminate_backend` instead reports
+a clear client-visible failure, no false success. This system's actual
+STONITH path (`fleetqox_postgres_fence_agent.py`) SIGKILLs the whole
+container, which is at least as safe as `pg_terminate_backend` -- the probe
+verifies this contrast directly (both outcomes, on the same stuck write)
+rather than assuming it. Combined with the existing quorum-loss-fail-closed
+and fenced-promotion evidence (a full-isolation partition still safely
+elects a new primary; total quorum loss still correctly refuses to
+promote), this closes the "general," not just single-scenario, partition
+tolerance gap.
+
 Exit gate:
 
 - public maintained APIs only -- **met**;
@@ -396,11 +433,14 @@ Exit gate:
 - forward secrecy and asymmetric session establishment -- **met** (UDP AEAD
   data plane, via ephemeral ECDH; see above);
 - 0-RTT -- **met** (legacy ngtcp2 subprocess gateway path; see above);
+- general network-partition split-brain tolerance -- **met** (see above;
+  regional disaster recovery specifically remains open, see above);
 - leader election/consensus, split-brain fencing, rejoin/failback, regional
-  recovery, and operational runbooks -- **rejoin/failback and
-  quorum-gated/STONITH-fenced promotion met via etcd/Raft DCS + Docker
-  STONITH; built-in consensus, general split-brain tolerance, regional
-  recovery, and production (non-Docker) certification remain open**;
+  recovery, and operational runbooks -- **rejoin/failback,
+  quorum-gated/STONITH-fenced promotion, and general split-brain tolerance
+  met via etcd/Raft DCS + Docker STONITH + synchronous replication; built-in
+  consensus, regional recovery, and production (non-Docker) certification
+  remain open**;
 - long multi-attacker soak -- open.
 
 ### B3: complete RMW semantics

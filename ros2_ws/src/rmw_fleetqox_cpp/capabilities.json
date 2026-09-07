@@ -1150,7 +1150,7 @@
     "quic_gateway_seeded_state_zero_loss_after_promotion_claim": true,
     "quic_gateway_automatic_database_leader_election_claim": true,
     "quic_gateway_consensus_backend_claim": false,
-    "quic_gateway_partition_split_brain_tolerance_claim": false,
+    "quic_gateway_partition_split_brain_tolerance_claim": true,
     "quic_gateway_regional_disaster_recovery_claim": false,
     "docker_quic_postgresql_quorum_failover_5run_probe": true,
     "quic_gateway_etcd_raft_failover_dcs_claim": true,
