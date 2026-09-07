@@ -175,6 +175,13 @@ def run_frontier(
                         force_primary_drop_sequence_two=True,
                         repair_capacity_fault=True,
                         reuse_build=True,
+                        # 8/16 robots (16/32 containers) already pass
+                        # reliably one-container-per-robot; only 32 robots
+                        # (64+ containers) hits the Docker Desktop VM's
+                        # container-churn fragility, so only opt in there --
+                        # keeps the proven-working path untouched at smaller
+                        # scale.
+                        multiplex_robots=robot_count >= 32,
                     )
                     rows.append(frontier_row(
                         result=result,

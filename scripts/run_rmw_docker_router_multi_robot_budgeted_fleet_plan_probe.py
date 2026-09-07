@@ -747,7 +747,25 @@ def run_probe(
     force_primary_drop_sequence_two: bool = False,
     repair_capacity_fault: bool = False,
     reuse_build: bool = False,
+    multiplex_robots: bool = False,
 ) -> dict[str, Any]:
+    # multiplex_robots=False (default) preserves the original one-container-
+    # per-robot behavior exactly, for every existing caller. When True, all
+    # subscriber processes run as background jobs inside a single container
+    # (likewise for publishers), instead of one container per robot -- e.g.
+    # 32 robots becomes 2 containers instead of 64. Each robot's own stdout
+    # and exit code are captured to files on the already-shared /work mount
+    # instead of via `docker logs`/`docker wait` per container, and
+    # publisher triggering targets the one grouped container instead of
+    # execing into 32 individually. This exists because a 32-robot sweep of
+    # this probe (64+ containers per row, ~600 across a 9-row sweep) was
+    # observed to make this host's Docker Desktop VM itself become
+    # unresponsive at an unpredictable row (ruled out as a memory ceiling
+    # and as a leak in this probe's own container/network accounting via
+    # direct measurement of the Docker daemon's own resource counters,
+    # which returned cleanly to baseline every row) -- i.e. a container
+    # *churn rate* problem, addressed here by simply using far fewer
+    # containers.
     enabled_modes = sum(bool(value) for value in (epoch_transition, qoe_feedback, qoe_migration))
     if enabled_modes > 1:
         raise ValueError("epoch_transition, qoe_feedback, and qoe_migration are mutually exclusive")
@@ -770,6 +788,11 @@ def run_probe(
     backup_name = f"fleetrmw-budget-plan-backup-{suffix}"
     subscriber_names = [f"fleetrmw-budget-plan-sub-{suffix}-{i}" for i in range(robot_count)]
     publisher_names = [f"fleetrmw-budget-plan-pub-{suffix}-{i}" for i in range(robot_count)]
+    # When multiplexed, only publisher_names[0] is ever actually started as a
+    # container (all robots' publisher processes run inside it) -- signaling
+    # must exec into just that one container, not the other 31 nonexistent
+    # names.
+    trigger_container_names = [publisher_names[0]] if multiplex_robots else publisher_names
     build_base = "/work/.tmp_fleetrmw_budget_plan_v2_build"
     install_base = "/work/.tmp_fleetrmw_budget_plan_v2_install"
     log_base = "/work/.tmp_fleetrmw_budget_plan_v2_log"
@@ -1068,9 +1091,7 @@ def run_probe(
         primary_qdisc = qdisc(primary_name)
         backup_qdisc = qdisc(backup_name)
 
-        for index, (name, robot_id, topic, telemetry_path) in enumerate(
-            zip(subscriber_names, robot_ids, topics, telemetry_paths)
-        ):
+        def subscriber_invocation(index: int, robot_id: str, topic: str, telemetry_path: Path) -> str:
             subscriber_payloads = payload_sequence
             subscriber_min_ack_nack = 3
             if repair_capacity_fault and robot_id in deferred_repair_robot_ids:
@@ -1080,43 +1101,65 @@ def run_probe(
                     if sequence != 2
                 ]
                 subscriber_min_ack_nack = 2
+            return (
+                f"FLEETQOX_RMW_GRAPH_RENEW_INTERVAL_MS={graph_renew_interval_ms} "
+                f"FLEETQOX_RMW_ROBOT_ID={shlex.quote(robot_id)} "
+                f"FLEETQOX_RMW_BIND=0.0.0.0:{49500 + index} "
+                f"FLEETQOX_RMW_PEERS={primary_name}:{primary_port},{backup_name}:{backup_port} "
+                f"{endpoint_binary} --mode subscriber --topic {shlex.quote(topic)} "
+                f"--robot-id {shlex.quote(robot_id)} "
+                f"--payload-sequence {shlex.quote(','.join(subscriber_payloads))} "
+                f"--timeout-ms {subscriber_timeout_ms} "
+                f"--min-ack-nack-sent {subscriber_min_ack_nack} "
+                f"--deadline-ms {deadline_ms} --subscriber-deadline-ms {deadline_ms} "
+                f"--subscriber-telemetry-file /work/{telemetry_path.name}"
+            )
+
+        if multiplex_robots:
+            jobs = "\n".join(
+                f"({subscriber_invocation(index, robot_id, topic, telemetry_path)} "
+                f"> /work/{plan_dir.relative_to(root)}/sub_out_{index:04d}.log 2>&1; "
+                f"echo $? > /work/{plan_dir.relative_to(root)}/sub_rc_{index:04d}.txt) &"
+                for index, (robot_id, topic, telemetry_path) in enumerate(
+                    zip(robot_ids, topics, telemetry_paths)
+                )
+            )
             start_container(
                 root=root,
                 image=image,
-                name=name,
+                name=subscriber_names[0],
                 network=network,
                 command=(
                     f"source /opt/ros/jazzy/setup.bash && source {install_base}/setup.bash && "
-                    "export RMW_IMPLEMENTATION=rmw_fleetqox_cpp && "
-                    f"FLEETQOX_RMW_GRAPH_RENEW_INTERVAL_MS={graph_renew_interval_ms} "
-                    f"FLEETQOX_RMW_ROBOT_ID={shlex.quote(robot_id)} "
-                    f"FLEETQOX_RMW_BIND=0.0.0.0:{49500 + index} "
-                    f"FLEETQOX_RMW_PEERS={primary_name}:{primary_port},{backup_name}:{backup_port} "
-                    f"{endpoint_binary} --mode subscriber --topic {shlex.quote(topic)} "
-                    f"--robot-id {shlex.quote(robot_id)} "
-                    f"--payload-sequence {shlex.quote(','.join(subscriber_payloads))} "
-                    f"--timeout-ms {subscriber_timeout_ms} "
-                    f"--min-ack-nack-sent {subscriber_min_ack_nack} "
-                    f"--deadline-ms {deadline_ms} --subscriber-deadline-ms {deadline_ms} "
-                    f"--subscriber-telemetry-file /work/{telemetry_path.name}"
+                    "export RMW_IMPLEMENTATION=rmw_fleetqox_cpp\n"
+                    f"{jobs}\n"
+                    "wait"
                 ),
             )
+        else:
+            for index, (name, robot_id, topic, telemetry_path) in enumerate(
+                zip(subscriber_names, robot_ids, topics, telemetry_paths)
+            ):
+                start_container(
+                    root=root,
+                    image=image,
+                    name=name,
+                    network=network,
+                    command=(
+                        f"source /opt/ros/jazzy/setup.bash && source {install_base}/setup.bash && "
+                        "export RMW_IMPLEMENTATION=rmw_fleetqox_cpp && "
+                        f"{subscriber_invocation(index, robot_id, topic, telemetry_path)}"
+                    ),
+                )
         time.sleep(1.0)
 
-        publisher_order = list(range(robot_count))
-        leader_index = publisher_order[-1]
-        if epoch_transition:
-            publisher_order = publisher_order[:-1] + [leader_index]
-        for order_position, index in enumerate(publisher_order):
-            if epoch_transition and order_position == robot_count - 1:
-                time.sleep(0.7)
-            name = publisher_names[index]
+        def publisher_invocation(index: int) -> str:
             robot_id = robot_ids[index]
             topic = topics[index]
             epoch_args = ""
             if epoch_transition:
                 epoch_args += "--publish-interval-ms 1200 "
-                if index == leader_index:
+                if index == robot_count - 1:
                     epoch_args += (
                         "--plan-update-after-publishes 1 "
                         f"--plan-update-text {shlex.quote(plan.path_plan_env)} "
@@ -1145,39 +1188,70 @@ def run_probe(
                 if repair_capacity_fault and robot_id in deferred_repair_robot_ids
                 else 3
             )
+            return (
+                f"FLEETQOX_RMW_GRAPH_RENEW_INTERVAL_MS={graph_renew_interval_ms} "
+                f"FLEETQOX_RMW_ROBOT_ID={shlex.quote(robot_id)} "
+                "FLEETQOX_RMW_BIND=0.0.0.0:0 "
+                "FLEETQOX_RMW_PEER_POLICY=fleet_plan "
+                f"FLEETQOX_RMW_FLEET_PATH_PLAN_FILE={shlex.quote(plan_file_container)} "
+                f"FLEETQOX_RMW_REPAIR_PATH_PLAN_FILE={shlex.quote(repair_plan_file_container)} "
+                "FLEETQOX_RMW_REPAIR_RETRANSMISSION_BUDGET="
+                f"{max(int(fallback_repair_budget), 0)} "
+                "FLEETQOX_RMW_REPAIR_MIN_INTERVAL_MS="
+                f"{max(int(fallback_repair_min_interval_ms), 0)} "
+                "FLEETQOX_RMW_REPAIR_MAX_ATTEMPTS_PER_SEQUENCE="
+                f"{max(int(fallback_repair_max_attempts_per_sequence), 0)} "
+                "FLEETQOX_RMW_REPAIR_ADMISSION_STRICT="
+                f"{1 if fleet_repair_capacity_bytes > 0 else 0} "
+                f"FLEETQOX_RMW_PEERS=primary_wifi={primary_name}:{primary_port},"
+                f"backup_5g={backup_name}:{backup_port} "
+                f"{endpoint_binary} --mode publisher --topic {shlex.quote(topic)} "
+                f"--robot-id {shlex.quote(robot_id)} "
+                f"{epoch_args}"
+                f"--payload-sequence {shlex.quote(','.join(payload_sequence))} "
+                "--hold-ms 10000 --min-retransmissions 0 "
+                f"--min-ack-nack-received {min_ack_nack_received} "
+                f"--deadline-ms {deadline_ms}"
+            )
+
+        if multiplex_robots:
+            jobs = "\n".join(
+                f"({publisher_invocation(index)} "
+                f"> /work/{plan_dir.relative_to(root)}/pub_out_{index:04d}.log 2>&1; "
+                f"echo $? > /work/{plan_dir.relative_to(root)}/pub_rc_{index:04d}.txt) &"
+                for index in range(robot_count)
+            )
             start_container(
                 root=root,
                 image=image,
-                name=name,
+                name=publisher_names[0],
                 network=network,
                 command=(
                     f"source /opt/ros/jazzy/setup.bash && source {install_base}/setup.bash && "
-                    "export RMW_IMPLEMENTATION=rmw_fleetqox_cpp && "
-                    f"FLEETQOX_RMW_GRAPH_RENEW_INTERVAL_MS={graph_renew_interval_ms} "
-                    f"FLEETQOX_RMW_ROBOT_ID={shlex.quote(robot_id)} "
-                    "FLEETQOX_RMW_BIND=0.0.0.0:0 "
-                    "FLEETQOX_RMW_PEER_POLICY=fleet_plan "
-                    f"FLEETQOX_RMW_FLEET_PATH_PLAN_FILE={shlex.quote(plan_file_container)} "
-                    f"FLEETQOX_RMW_REPAIR_PATH_PLAN_FILE={shlex.quote(repair_plan_file_container)} "
-                    "FLEETQOX_RMW_REPAIR_RETRANSMISSION_BUDGET="
-                    f"{max(int(fallback_repair_budget), 0)} "
-                    "FLEETQOX_RMW_REPAIR_MIN_INTERVAL_MS="
-                    f"{max(int(fallback_repair_min_interval_ms), 0)} "
-                    "FLEETQOX_RMW_REPAIR_MAX_ATTEMPTS_PER_SEQUENCE="
-                    f"{max(int(fallback_repair_max_attempts_per_sequence), 0)} "
-                    "FLEETQOX_RMW_REPAIR_ADMISSION_STRICT="
-                    f"{1 if fleet_repair_capacity_bytes > 0 else 0} "
-                    f"FLEETQOX_RMW_PEERS=primary_wifi={primary_name}:{primary_port},"
-                    f"backup_5g={backup_name}:{backup_port} "
-                    f"{endpoint_binary} --mode publisher --topic {shlex.quote(topic)} "
-                    f"--robot-id {shlex.quote(robot_id)} "
-                    f"{epoch_args}"
-                    f"--payload-sequence {shlex.quote(','.join(payload_sequence))} "
-                    "--hold-ms 10000 --min-retransmissions 0 "
-                    f"--min-ack-nack-received {min_ack_nack_received} "
-                    f"--deadline-ms {deadline_ms}"
+                    "export RMW_IMPLEMENTATION=rmw_fleetqox_cpp\n"
+                    f"{jobs}\n"
+                    "wait"
                 ),
             )
+        else:
+            publisher_order = list(range(robot_count))
+            leader_index = publisher_order[-1]
+            if epoch_transition:
+                publisher_order = publisher_order[:-1] + [leader_index]
+            for order_position, index in enumerate(publisher_order):
+                if epoch_transition and order_position == robot_count - 1:
+                    time.sleep(0.7)
+                start_container(
+                    root=root,
+                    image=image,
+                    name=publisher_names[index],
+                    network=network,
+                    command=(
+                        f"source /opt/ros/jazzy/setup.bash && source {install_base}/setup.bash && "
+                        "export RMW_IMPLEMENTATION=rmw_fleetqox_cpp && "
+                        f"{publisher_invocation(index)}"
+                    ),
+                )
 
         publisher_barrier_started = time.monotonic()
         publisher_barrier_ready = (
@@ -1189,7 +1263,7 @@ def run_probe(
             if event_triggered_feedback else 0.0
         )
         if event_triggered_feedback and not sequential_qoe_feedback:
-            write_trigger_epoch_to_containers(publisher_names, 1)
+            write_trigger_epoch_to_containers(trigger_container_names, 1)
 
         feedback_ready = False
         second_feedback_ready = False
@@ -1208,7 +1282,7 @@ def run_probe(
             first_epoch = collect_sequential_qoe_epoch(
                 controller=feedback_controller,
                 telemetry_paths=telemetry_paths,
-                publisher_names=publisher_names,
+                publisher_names=trigger_container_names,
                 first_sequence=1,
                 protected_robot_budget=protected_count,
                 stopping_config=stopping_config,
@@ -1275,7 +1349,7 @@ def run_probe(
                     second_epoch = collect_sequential_qoe_epoch(
                         controller=feedback_controller,
                         telemetry_paths=telemetry_paths,
-                        publisher_names=publisher_names,
+                        publisher_names=trigger_container_names,
                         first_sequence=int(first_epoch["last_sequence"]) + 1,
                         protected_robot_budget=protected_count,
                         stopping_config=stopping_config,
@@ -1334,7 +1408,7 @@ def run_probe(
                         controller_epoch_summaries.append(controller_summary)
                         epoch_path_plans.append(plan.path_plan_env)
                         final_released_sequence = total_source_frames
-                        write_trigger_epoch_to_containers(publisher_names, total_source_frames)
+                        write_trigger_epoch_to_containers(trigger_container_names, total_source_frames)
         elif feedback_controller is not None:
             feedback_wait_started = time.monotonic()
             feedback_ready = wait_for_delivery_sequence(
@@ -1376,7 +1450,7 @@ def run_probe(
                         time.monotonic() - network_transition_started
                     ) * 1000.0
                     if event_triggered_feedback:
-                        write_trigger_epoch_to_containers(publisher_names, 2)
+                        write_trigger_epoch_to_containers(trigger_container_names, 2)
                     feedback_wait_started = time.monotonic()
                     second_feedback_ready = wait_for_delivery_sequence(
                         telemetry_paths, 2, timeout_s=5.0
@@ -1405,24 +1479,48 @@ def run_probe(
                         controller_epoch_summaries.append(controller_summary)
                         epoch_path_plans.append(plan.path_plan_env)
                         if event_triggered_feedback:
-                            write_trigger_epoch_to_containers(publisher_names, 3)
+                            write_trigger_epoch_to_containers(trigger_container_names, 3)
 
-        publisher_returncodes = [
-            int(run(["docker", "wait", name]).stdout.strip()) for name in publisher_names
-        ]
-        subscriber_returncodes = [
-            int(run(["docker", "wait", name]).stdout.strip()) for name in subscriber_names
-        ]
+        if multiplex_robots:
+            # docker wait still blocks until the one grouped container's own
+            # "wait" shell builtin returns, i.e. until every backgrounded
+            # robot process inside it has exited -- the same synchronization
+            # point as waiting on each individual container, just once per
+            # role instead of once per robot.
+            run(["docker", "wait", publisher_names[0]])
+            run(["docker", "wait", subscriber_names[0]])
+
+            def read_role_results(prefix: str) -> tuple[list[int], list[dict[str, Any] | None]]:
+                returncodes = []
+                results = []
+                for index in range(robot_count):
+                    rc_path = plan_dir / f"{prefix}_rc_{index:04d}.txt"
+                    out_path = plan_dir / f"{prefix}_out_{index:04d}.log"
+                    rc_text = rc_path.read_text(encoding="utf-8").strip() if rc_path.exists() else ""
+                    returncodes.append(int(rc_text) if rc_text else -1)
+                    out_text = out_path.read_text(encoding="utf-8", errors="replace") if out_path.exists() else ""
+                    results.append(parse_last_json(out_text))
+                return returncodes, results
+
+            publisher_returncodes, publishers = read_role_results("pub")
+            subscriber_returncodes, subscribers = read_role_results("sub")
+        else:
+            publisher_returncodes = [
+                int(run(["docker", "wait", name]).stdout.strip()) for name in publisher_names
+            ]
+            subscriber_returncodes = [
+                int(run(["docker", "wait", name]).stdout.strip()) for name in subscriber_names
+            ]
+            publishers = [
+                parse_last_json(run(["docker", "logs", name], check=False).stdout)
+                for name in publisher_names
+            ]
+            subscribers = [
+                parse_last_json(run(["docker", "logs", name], check=False).stdout)
+                for name in subscriber_names
+            ]
         primary_rc = int(run(["docker", "wait", primary_name]).stdout.strip())
         backup_rc = int(run(["docker", "wait", backup_name]).stdout.strip())
-        publishers = [
-            parse_last_json(run(["docker", "logs", name], check=False).stdout)
-            for name in publisher_names
-        ]
-        subscribers = [
-            parse_last_json(run(["docker", "logs", name], check=False).stdout)
-            for name in subscriber_names
-        ]
         primary_log = run(["docker", "logs", primary_name], check=False).stdout.strip()
         backup_log = run(["docker", "logs", backup_name], check=False).stdout.strip()
         primary_result = parse_last_json(primary_log)
@@ -1870,10 +1968,12 @@ def run_probe(
             "stderr": exc.stderr,
         }
     finally:
-        run(
-            ["docker", "rm", "-f", primary_name, backup_name, *subscriber_names, *publisher_names],
-            check=False,
+        actual_names = (
+            [primary_name, backup_name, subscriber_names[0], publisher_names[0]]
+            if multiplex_robots else
+            [primary_name, backup_name, *subscriber_names, *publisher_names]
         )
+        run(["docker", "rm", "-f", *actual_names], check=False)
         run(["docker", "network", "rm", network], check=False)
         for path in telemetry_paths:
             path.unlink(missing_ok=True)
