@@ -44,6 +44,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--image", default=DEFAULT_IMAGE)
     parser.add_argument("--keep-temp", action="store_true")
+    parser.add_argument("--iterations", type=int, default=1)
     parser.add_argument(
         "--summary-json",
         default=(
@@ -54,7 +55,9 @@ def main() -> int:
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
-    summary = run_probe(root=ROOT, image=args.image, keep_temp=args.keep_temp)
+    summary = run_probe(
+        root=ROOT, image=args.image, keep_temp=args.keep_temp, iterations=args.iterations
+    )
     summary_path = ROOT / args.summary_json
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.write_text(json.dumps(summary, sort_keys=True) + "\n", encoding="utf-8")
@@ -152,7 +155,24 @@ def revoke_client_a_command(certs: Path, root: Path) -> str:
     return f"python3 -c {shlex.quote(revoke_python)}"
 
 
-def run_probe(*, root: Path, image: str, keep_temp: bool) -> dict[str, Any]:
+def run_probe(*, root: Path, image: str, keep_temp: bool, iterations: int) -> dict[str, Any]:
+    run_count = max(1, iterations)
+    runs = [run_probe_once(root=root, image=image, keep_temp=keep_temp) for _ in range(run_count)]
+    ok_run_count = sum(1 for row in runs if row["status"] == "ok")
+    last = runs[-1]
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "ok" if ok_run_count == run_count else "failed",
+        "run_count": run_count,
+        "ok_run_count": ok_run_count,
+        "client_a_force_closed": last.get("client_a_force_closed"),
+        "client_b_succeeded": last.get("client_b_succeeded"),
+        "server_logged_revocation": last.get("server_logged_revocation"),
+        "runs": runs,
+    }
+
+
+def run_probe_once(*, root: Path, image: str, keep_temp: bool) -> dict[str, Any]:
     temp_root = root / f".tmp_fleetrmw_asr_{os.getpid()}"
     certs = temp_root / "certs"
     certs.mkdir(parents=True, exist_ok=True)
