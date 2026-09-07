@@ -216,11 +216,32 @@ container load (`Cannot connect to the Docker daemon`, `EOF` mid-`docker run`
   ephemeral ports) wasn't released fast enough for 64+ container churn per
   row. Effect across repeated trials was a real but inconsistent
   improvement -- the first clean row count varied between 1 and 3 across
-  runs rather than landing on a fixed threshold, suggesting genuine
-  run-to-run resource variance on this host rather than a single
-  deterministic bug fully closed by either change. Both changes are safe,
-  low-risk, and kept; the residual flakiness itself is unrelated to the
-  O(N^2) storm (confirmed fixed) and remains open.
+  runs rather than landing on a fixed threshold.
+
+  Dug further to find a deterministic cause rather than stop at "inconsistent
+  improvement": traced the Docker daemon's own resource counters
+  (`docker info`'s `NFd`/`NGoroutines`/`Containers`, and network count) at
+  5-second resolution across an entire sweep. All of them cleanly returned to
+  their pre-sweep baseline after every row's containers were torn down, with
+  no growth trend across rows -- ruling out a leak in this test's own
+  container/network/fd usage as the cause. A follow-up instrumented run then
+  got the furthest yet: 6 consecutive clean rows (all 66 containers each,
+  consistent ~36-54s wall time per row, no timing degradation trend) before
+  the failure recurred -- and this time the failure was the Docker daemon
+  itself becoming fully unresponsive (`docker ps` timing out), not a specific
+  container dying, requiring a `docker desktop stop --force`/`start` to
+  recover. This matches the same Docker Desktop VM fragility under sustained
+  container churn observed repeatedly elsewhere in this investigation
+  (independent of this specific test), and explains the varying "breaks
+  after N rows" point across trials: it is ambient host/VM load at the time,
+  not a fixed threshold in the test code. Conclusion: the residual flakiness
+  is a pre-existing host/Docker Desktop infrastructure limitation under high
+  container churn rate (594 containers created/destroyed across a 9-row,
+  32-robot sweep), not a FleetRMW or test-harness defect -- distinct from,
+  and already ruled out as, both a memory ceiling and a resource-cleanup bug
+  in this test's own code. The unique-naming and inter-row-prune changes are
+  kept as real, low-risk hardening; no further code-level fix is expected to
+  fully close this on this specific host.
 
 Exit gate:
 
