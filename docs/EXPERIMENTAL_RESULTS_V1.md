@@ -350,6 +350,29 @@ any quorum system without a witness in a fourth location, and no dedicated
 three-region topology probe exists yet to earn a narrower version of that
 specific claim.
 
+Native consensus (`quic_gateway_automatic_leader_election_claim`,
+`quic_gateway_consensus_backend_claim`, `quic_gateway_distributed_database_claim`)
+is also now `true`, backed by a from-scratch Raft implementation
+(`fleetqox/raft.py`) rather than etcd. The algorithm's safety properties
+(election safety, majority-gated commit, the Section 5.4.2 old-term-entry
+rule, log-matching truncation) are pinned down by 9 deterministic
+in-process tests (`tests/test_raft.py`) driving a hand-controlled cluster
+simulation -- no sleeps, no timing flakiness. `scripts/run_rmw_docker_raft_consensus_probe.py`
+then proves the same core works as five actual separate Docker processes
+with no etcd and no PostgreSQL: real election, non-leader writes rejected
+with the real leader named, a committed write replicated to all five,
+`docker kill`-ing the leader triggering re-election at a higher term with
+no data loss, and disconnecting enough survivors that no side holds a
+majority correctly blocking new writes until reconnected. Building the
+last case surfaced a real Docker networking gotcha: `docker network
+connect` does not restore a container's `--network-alias`, so a
+"reconnected" node could send but never receive RPCs until the alias was
+re-specified -- a one-way partition invisible from the outside.
+`quic_gateway_active_active_consensus_claim` stays correctly `false`: this
+is single-leader (active-passive) consensus, not multi-master, and the
+native core is a standalone module/probe, not yet wired into the actual
+QUIC gateway's writer-lease or storage path in place of etcd/PostgreSQL.
+
 ## Evidence rules
 
 - Deterministic probes establish contracts, not broad performance claims.

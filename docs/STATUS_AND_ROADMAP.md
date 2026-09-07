@@ -353,12 +353,14 @@ existing handshake already completed.
 **Still open** (`capabilities.json` `false`), narrower than previously
 documented:
 
-- built-in/native consensus-based leader election and a true distributed
-  database, as opposed to the current design (external etcd/Raft as the
-  distributed configuration store, with a single synchronously-replicated
-  PostgreSQL as the actual data store) -- `quic_gateway_automatic_leader_election_claim`,
-  `quic_gateway_active_active_consensus_claim`, `quic_gateway_consensus_backend_claim`,
-  `quic_gateway_distributed_database_claim`;
+- active-active (multi-master) consensus -- `quic_gateway_active_active_consensus_claim`
+  stays unclaimed on purpose. Raft (native or etcd) is single-leader by
+  design: exactly one node accepts writes at a time, everyone else
+  rejects them. That is active-*passive* with automatic, safe failover,
+  which is what's actually proven (see below) -- true active-active
+  (multiple nodes accepting writes concurrently) is a different
+  architecture (e.g. CRDTs or multi-leader conflict resolution) that
+  nothing in this codebase implements;
 - regional disaster recovery specifically -- automatic, unattended recovery
   after an entire region (a majority-holding one) goes dark is not something
   any quorum system can do without a witness in a fourth location; that is
@@ -425,6 +427,47 @@ elects a new primary; total quorum loss still correctly refuses to
 promote), this closes the "general," not just single-scenario, partition
 tolerance gap.
 
+Also **done**, closed this session: native (not etcd-backed) consensus and
+a genuinely distributed database (`quic_gateway_automatic_leader_election_claim`,
+`quic_gateway_consensus_backend_claim`, `quic_gateway_distributed_database_claim`).
+`fleetqox/raft.py` is a from-scratch Raft implementation -- leader
+election, replicated log, and the commit-safety rules (majority
+replication, the current-term-entry rule from Section 5.4.2, log-matching
+truncation on conflict) -- built as a transport-free "functional core" so
+every safety property could be pinned down with a deterministic in-process
+test harness (`tests/test_raft.py`, 9 tests) rather than a timing-dependent
+integration test: election safety (never two leaders in one term), a
+partitioned minority-of-one leader that can never commit, an old-term
+entry that reaches every node but still isn't committed until the new
+leader replicates something from its own term, and more.
+
+`scripts/fleetqox_raft_node_service.py` turns that core into a real
+networked key-value store (JSON-over-HTTP), and
+`scripts/run_rmw_docker_raft_consensus_probe.py` proves it end to end over
+five actual separate Docker containers, with no etcd and no PostgreSQL
+anywhere in the loop: election among real processes, a non-leader
+rejecting a write and naming the real leader, a committed write replicated
+to all five, `docker kill`-ing the leader triggering automatic re-election
+at a higher term with the committed value intact, and -- the interesting
+one -- disconnecting enough survivors that no side holds a majority of the
+original five makes the cluster correctly refuse new writes (fail-closed,
+mirroring `quic_gateway_quorum_loss_promotion_fail_closed_claim`) and
+recover cleanly once reconnected. That last step also surfaced a real
+Docker networking gotcha worth recording: `docker network connect` does
+NOT restore the `--network-alias` a container had at `docker run` time, so
+a "reconnected" node can send RPCs out but silently never receive any back
+until the alias is re-specified on the connect call -- a subtle one-way
+partition that looks healed from the outside.
+
+Scope, stated precisely: this is single-leader consensus (active-passive
+with automatic failover), not active-active/multi-master --
+`quic_gateway_active_active_consensus_claim` stays correctly false (see
+above). It is also a standalone module and probe, not yet wired into the
+actual QUIC gateway's writer-lease or state-storage path in place of
+etcd/PostgreSQL -- that integration is a separate, not-yet-started step;
+what's proven here is that the native consensus core itself is correct and
+works over real processes.
+
 Exit gate:
 
 - public maintained APIs only -- **met**;
@@ -437,10 +480,10 @@ Exit gate:
   regional disaster recovery specifically remains open, see above);
 - leader election/consensus, split-brain fencing, rejoin/failback, regional
   recovery, and operational runbooks -- **rejoin/failback,
-  quorum-gated/STONITH-fenced promotion, and general split-brain tolerance
-  met via etcd/Raft DCS + Docker STONITH + synchronous replication; built-in
-  consensus, regional recovery, and production (non-Docker) certification
-  remain open**;
+  quorum-gated/STONITH-fenced promotion, general split-brain tolerance, and
+  a native (non-etcd) consensus/distributed-database core all met; regional
+  recovery, active-active consensus, integrating the native core into the
+  actual gateway, and production (non-Docker) certification remain open**;
 - long multi-attacker soak -- open.
 
 ### B3: complete RMW semantics
