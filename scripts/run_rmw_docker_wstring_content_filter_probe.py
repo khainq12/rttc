@@ -51,7 +51,20 @@ def run_probe(*, root: Path, image: str, iterations: int) -> dict[str, Any]:
         "/tmp/fq-wstring-content-filter-install /tmp/fq-wstring-content-filter-log && "
         "colcon --log-base /tmp/fq-wstring-content-filter-log build "
         "--base-paths ros2_ws/src "
-        "--packages-select fleetrmw_interfaces rmw_fleetqox_cpp "
+        "--packages-select fleetrmw_interfaces "
+        "--build-base /tmp/fq-wstring-content-filter-build "
+        "--install-base /tmp/fq-wstring-content-filter-install "
+        "--cmake-args -DCMAKE_BUILD_TYPE=Release >/dev/null && "
+        # rmw_fleetqox_cpp does not declare fleetrmw_interfaces as a package.xml
+        # dependency (most run_rmw_docker_*.py scripts build it alone, without
+        # fleetrmw_interfaces, so it can't be a hard colcon dependency). Its
+        # find_package(fleetrmw_interfaces QUIET) only succeeds if the install
+        # is already sourced -- hence two separate colcon invocations here,
+        # not one combined --packages-select.
+        "source /tmp/fq-wstring-content-filter-install/setup.bash && "
+        "colcon --log-base /tmp/fq-wstring-content-filter-log build "
+        "--base-paths ros2_ws/src "
+        "--packages-select rmw_fleetqox_cpp "
         "--build-base /tmp/fq-wstring-content-filter-build "
         "--install-base /tmp/fq-wstring-content-filter-install "
         "--cmake-args -DCMAKE_BUILD_TYPE=Release >/dev/null && "

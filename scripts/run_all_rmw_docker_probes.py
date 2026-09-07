@@ -158,7 +158,7 @@ def main() -> int:
     scripts = discover_probe_scripts(args.only)
     total = len(scripts)
     results: list[dict[str, Any]] = []
-    if args.resume:
+    if args.resume and jsonl_path.exists():
         for line in jsonl_path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if line:

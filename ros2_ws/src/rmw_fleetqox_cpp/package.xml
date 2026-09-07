@@ -11,7 +11,6 @@
   <depend>rcutils</depend>
   <depend>rmw</depend>
   <depend>rmw_dds_common</depend>
-  <depend>fleetrmw_interfaces</depend>
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>
   <depend>openssl</depend>
