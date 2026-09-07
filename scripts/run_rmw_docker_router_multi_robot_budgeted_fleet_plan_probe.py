@@ -61,6 +61,19 @@ SCHEMA_VERSION = "fleetrmw.rmw_router_multi_robot_budgeted_fleet_plan_probe.v1"
 DEFAULT_IMAGE = "localhost/fleetrmw/rmw-netem:jazzy"
 DEFAULT_TOPIC_PREFIX = "/fleetqox/budgeted_fleet_plan"
 
+# os.getpid() alone is constant across every run_probe() call made by a
+# single long-running caller (e.g. a frontier sweep iterating many
+# configs in one process), so container/network names built from it are
+# identical run to run. If Docker hasn't fully released a prior run's
+# network/veth/iptables state by the time the next run creates "the same"
+# network, containers on it can fail in ways that surface as a live
+# container unexpectedly not running -- observed as a consistent pattern
+# where the first config in a sweep passes clean and every later config in
+# the same sweep fails. Appending a per-call counter makes every run's
+# names unique regardless of process lifetime, removing any possibility of
+# such state bleed between sequential runs.
+_RUN_PROBE_CALL_COUNT = 0
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()
@@ -749,7 +762,9 @@ def run_probe(
         raise ValueError(
             "repair_capacity_fault requires fleet repair capacity and sequential QoE feedback"
         )
-    suffix = str(os.getpid())
+    global _RUN_PROBE_CALL_COUNT
+    _RUN_PROBE_CALL_COUNT += 1
+    suffix = f"{os.getpid()}-{_RUN_PROBE_CALL_COUNT}"
     network = f"fleetrmw-budget-plan-net-{suffix}"
     primary_name = f"fleetrmw-budget-plan-primary-{suffix}"
     backup_name = f"fleetrmw-budget-plan-backup-{suffix}"

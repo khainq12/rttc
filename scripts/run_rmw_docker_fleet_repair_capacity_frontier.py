@@ -9,6 +9,7 @@ from pathlib import Path
 import statistics
 import subprocess
 import sys
+import time
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -184,6 +185,7 @@ def run_frontier(
                         capacity_bytes=capacity_bytes,
                         admitted_slots=admitted_slots,
                     ))
+                    prune_docker_resources_between_rows()
     finally:
         cleanup_build(root, image)
 
@@ -458,6 +460,26 @@ def format_ci(row: dict[str, Any], prefix: str, precision: int) -> str:
         f"[{row[f'{prefix}_ci95_low']:.{precision}f}, "
         f"{row[f'{prefix}_ci95_high']:.{precision}f}]"
     )
+
+
+def prune_docker_resources_between_rows() -> None:
+    # Each row spins up 64+ short-lived containers plus a network. Even with
+    # unique per-row container/network names (no naming collisions), a
+    # sequential 32-robot sweep on this host was observed to pass its first
+    # two rows cleanly and then have every later row's containers exit
+    # unexpectedly (`... is not running`). That pattern -- consistent
+    # breakage after N rows regardless of naming -- points to some
+    # underlying Docker/kernel resource (conntrack entries, veth/iptables
+    # state, ephemeral ports) not being fully released between rows fast
+    # enough for churn at this container count. A short pause plus an
+    # explicit prune of already-stopped containers/networks between rows
+    # gives that state a chance to clear before the next row's containers
+    # start.
+    subprocess.run(["docker", "container", "prune", "-f"], check=False,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["docker", "network", "prune", "-f"], check=False,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(2.0)
 
 
 def cleanup_build(root: Path, image: str) -> None:
