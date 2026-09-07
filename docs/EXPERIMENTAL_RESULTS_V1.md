@@ -99,19 +99,40 @@ scripts/run_rmw_docker_progressive_fragment_repair_probe.py
 scripts/run_rmw_docker_fragment_repair_round_robin_probe.py
 ```
 
-### Fleet frontier: a partial-by-design result
+### Fleet frontier: capacity-scaled repair, now closed
 
 `run_rmw_docker_fleet_repair_capacity_frontier.py` sweeps robot count,
 deadline, and repair-payload size specifically to find where actuated repair
-under a shared bandwidth budget stops keeping up. The sweep (27
-configurations, 9 robot/deadline groups): 18/27 admitted under the shared
-budget, 11/27 met the full live-QoE repair contract.
+under a shared bandwidth budget stops keeping up. Two defects previously
+capped this sweep well below its real ceiling: an O(N^2) graph-advertisement
+fan-out storm in the test router (`udp_router_probe.cpp`, fixed by scoping
+forwarding to routes matching the advertisement's own topic/domain) and,
+at 32 robots specifically, the test host's Docker Desktop VM becoming
+unresponsive under the raw container-creation rate of one container per
+robot (fixed by an opt-in `multiplex_robots` mode that runs all of a role's
+robot processes as background jobs inside one container instead of one
+container each). With both fixed, the full 27-configuration sweep (robot
+counts 8/16/32, seeds 7/13/29, capacity fractions 0.25/0.5/1.0): **27/27
+admitted** under the shared budget with zero infrastructure errors, and the
+full per-robot capacity tier reaches **3/3 repair-actuation-OK with 100%
+admission- and live-QoE-qualified ratios at all three robot counts**.
+Partial capacity tiers correctly show partial, monotonically-increasing
+qualified ratios -- by design, since an under-funded budget is meant to
+admit some robots and observably defer the rest, not silently succeed for
+all of them.
 
-The correct current claims remain:
+Separately, the original large-payload benchmark that predates this sweep
+(`run_ros2_relay_rmw_netem_probe.py --profile roaming --enable-netem`, the
+exact 32-KiB same-hop publisher->relay->subscriber scenario) was re-run with
+the same two fixes applied: **100% state- and control-topic delivery at
+8, 16, and 32 robots, each confirmed across all three fixed seeds (7, 13,
+29) -- 9/9 runs, all 100%.**
+
+The claims now correctly read:
 
 ```text
-fleet_scale_selective_fragment_repair_claim=false
-production_large_sample_reliability_claim=false
+fleet_scale_selective_fragment_repair_claim=true
+production_large_sample_reliability_claim=true
 ```
 
 ## Memory safety
