@@ -426,6 +426,37 @@ ament_target_dependencies(fleetrmw_content_filter_typed_probe
   std_msgs
 )
 
+# Two-process (not in-process) B0 heap-corruption reproduction attempt; see
+# heap_soak_publisher_probe.cpp for why this is deliberately not an
+# in-process probe like everything else in this file.
+add_executable(fleetrmw_heap_soak_publisher_probe
+  src/heap_soak_publisher_probe.cpp
+)
+target_compile_features(fleetrmw_heap_soak_publisher_probe PRIVATE cxx_std_17)
+target_link_libraries(fleetrmw_heap_soak_publisher_probe
+  ${PROJECT_NAME}
+)
+ament_target_dependencies(fleetrmw_heap_soak_publisher_probe
+  rcutils
+  rmw
+  rosidl_typesupport_cpp
+  std_msgs
+)
+
+add_executable(fleetrmw_heap_soak_subscriber_probe
+  src/heap_soak_subscriber_probe.cpp
+)
+target_compile_features(fleetrmw_heap_soak_subscriber_probe PRIVATE cxx_std_17)
+target_link_libraries(fleetrmw_heap_soak_subscriber_probe
+  ${PROJECT_NAME}
+)
+ament_target_dependencies(fleetrmw_heap_soak_subscriber_probe
+  rcutils
+  rmw
+  rosidl_typesupport_cpp
+  std_msgs
+)
+
 # Built only when fleetrmw_interfaces was selected into the same colcon
 # build (it provides WStringSample/KeyedInstanceSample); see the QUIET
 # find_package near the top of this file for why that can't be REQUIRED.
@@ -1338,6 +1369,8 @@ install(
     fleetrmw_content_filter_probe
     fleetrmw_content_filter_sql_probe
     fleetrmw_content_filter_typed_probe
+    fleetrmw_heap_soak_publisher_probe
+    fleetrmw_heap_soak_subscriber_probe
     fleetrmw_service_qos_probe
     fleetrmw_domain_isolation_probe
     fleetrmw_udp_pmtu_discovery_probe
