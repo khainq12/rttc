@@ -462,11 +462,36 @@ partition that looks healed from the outside.
 Scope, stated precisely: this is single-leader consensus (active-passive
 with automatic failover), not active-active/multi-master --
 `quic_gateway_active_active_consensus_claim` stays correctly false (see
-above). It is also a standalone module and probe, not yet wired into the
-actual QUIC gateway's writer-lease or state-storage path in place of
-etcd/PostgreSQL -- that integration is a separate, not-yet-started step;
-what's proven here is that the native consensus core itself is correct and
-works over real processes.
+above).
+
+Also **done**, closed this session: the native core is no longer just a
+standalone module -- it now actually gates the real QUIC gateway's writer
+lease (`quic_gateway_consensus_leader_election_claim`,
+`quic_gateway_raft_backed_writer_lease_claim`). `scripts/fleetrmw_quic_gateway_service.py`
+gained `--raft-status-url`/`--raft-node-id`: when set, the gateway blocks
+at startup on `fleetqox/raft_writer_lease.py`'s `RaftLeaderLease.require_leadership()`
+against its own co-located Raft node instead of accepting a fixed, operator-assigned
+`--writer-lease-instance-id`, and periodically re-checks that same
+leadership during renewal so a demoted node stops itself on its own next
+tick rather than waiting for someone else to notice. This deliberately
+does not touch `quic_gateway_state.py`'s existing, separately-proven SQL
+lease/fencing logic at all: Raft's current term (strictly increasing
+across every leadership change) is folded into the holder_id string handed
+to that unchanged SQL path (`raft-{node_id}-term-{term}`), so a leadership
+change still produces a fresh SQL `fence_token` exactly the way a new
+static instance id would -- Raft supplies the leadership *decision*, the
+existing SQL store still enforces it at write time.
+
+`scripts/run_rmw_docker_quic_gateway_raft_writer_lease_probe.py` proves
+this end to end over a real QUIC v1/H3 connection, a real 3-node Raft
+cluster, and two real gateway processes sharing one SQLite durable store:
+a gateway whose Raft node is not the leader fails closed immediately; the
+Raft leader's gateway accepts a real durable admission write; killing the
+leader's Raft node (and its gateway) triggers a genuine Raft election among
+the two survivors -- the actual winner is discovered by polling, not
+assumed, since either could legitimately win -- and the next gateway,
+pointed at whichever node really won, automatically recovers the prior
+gateway's durable state with a strictly higher SQL fence_token. 3/3 runs.
 
 Exit gate:
 
@@ -480,10 +505,11 @@ Exit gate:
   regional disaster recovery specifically remains open, see above);
 - leader election/consensus, split-brain fencing, rejoin/failback, regional
   recovery, and operational runbooks -- **rejoin/failback,
-  quorum-gated/STONITH-fenced promotion, general split-brain tolerance, and
-  a native (non-etcd) consensus/distributed-database core all met; regional
-  recovery, active-active consensus, integrating the native core into the
-  actual gateway, and production (non-Docker) certification remain open**;
+  quorum-gated/STONITH-fenced promotion, general split-brain tolerance, a
+  native (non-etcd) consensus/distributed-database core, and that core
+  actually gating the real gateway's writer lease all met; regional
+  recovery, active-active consensus, and production (non-Docker)
+  certification remain open**;
 - long multi-attacker soak -- open.
 
 ### B3: complete RMW semantics

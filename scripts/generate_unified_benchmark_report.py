@@ -1631,6 +1631,8 @@ CLAIM_BOUNDARY_KEYS = (
     "quic_gateway_automatic_shared_store_takeover_claim",
     "quic_gateway_standby_waits_while_active_live_claim",
     "quic_gateway_consensus_leader_election_claim",
+    "docker_quic_gateway_raft_writer_lease_probe",
+    "quic_gateway_raft_backed_writer_lease_claim",
     "docker_quic_postgresql_failover_5run_probe",
     "quic_gateway_networked_postgresql_state_claim",
     "quic_gateway_postgresql_synchronous_commit_claim",

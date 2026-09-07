@@ -34,6 +34,7 @@ from fleetqox.aioquic_path_observer import (
     require_aioquic_path_observer_compatibility,
 )
 from fleetqox.quic_gateway_lease import acquire_gateway_state_with_lease_wait
+from fleetqox.raft_writer_lease import RaftLeaderLease, RaftLeaseError
 from fleetqox.quic_gateway_state import (
     APPLICATION_OUTCOME_API_PATH,
     FrameValidationError,
@@ -466,6 +467,57 @@ async def run_service(args: argparse.Namespace) -> int:
                     "application outcome QoE debt requires certificate publisher "
                     "identity binding"
                 )
+    # When --raft-status-url is set, this gateway's write eligibility comes
+    # from winning leadership of its own co-located fleetqox.raft cluster
+    # instead of from a fixed, operator-assigned --writer-lease-instance-id.
+    # The current Raft term (strictly increasing across every leadership
+    # change) becomes part of the holder_id handed to the existing SQL-based
+    # durable store below, so a term change still produces a fresh
+    # fence_token there exactly the way a new static instance id would --
+    # Raft supplies the leadership *decision*, the already-proven SQL store
+    # still enforces it at write time. See fleetqox/raft_writer_lease.py.
+    raft_lease: RaftLeaderLease | None = None
+    raft_term: int | None = None
+    writer_lease_instance_id = args.writer_lease_instance_id
+    if args.raft_status_url:
+        raft_lease = RaftLeaderLease(status_url=args.raft_status_url)
+
+        def report_raft_wait() -> None:
+            print(
+                json.dumps(
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "status": "raft_leadership_waiting",
+                        "raft_node_id": args.raft_node_id,
+                        "timeout_ms": args.raft_writer_lease_wait_timeout_ms,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+
+        try:
+            raft_term = await raft_lease.require_leadership(
+                wait_timeout_ms=args.raft_writer_lease_wait_timeout_ms,
+                retry_ms=args.raft_writer_lease_retry_ms,
+                on_wait=report_raft_wait,
+            )
+        except RaftLeaseError as exc:
+            print(
+                json.dumps(
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "status": "raft_leadership_failed",
+                        "raft_node_id": args.raft_node_id,
+                        "error": str(exc),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            return 1
+        writer_lease_instance_id = f"raft-{args.raft_node_id}-term-{raft_term}"
+
     def create_state() -> FleetQoxGatewayState:
         return FleetQoxGatewayState(
             max_frames_per_topic=args.max_frames_per_topic,
@@ -473,7 +525,7 @@ async def run_service(args: argparse.Namespace) -> int:
             dedup_capacity_per_topic=args.dedup_capacity_per_topic,
             admission_policy=admission_policy,
             durable_state_path=args.state_db,
-            durable_writer_id=args.writer_lease_instance_id,
+            durable_writer_id=writer_lease_instance_id,
             durable_writer_lease_ms=args.writer_lease_ms,
         )
 
@@ -483,7 +535,7 @@ async def run_service(args: argparse.Namespace) -> int:
                 {
                     "schema_version": SCHEMA_VERSION,
                     "status": "writer_lease_waiting",
-                    "instance_id": args.writer_lease_instance_id,
+                    "instance_id": writer_lease_instance_id,
                     "timeout_ms": args.writer_lease_wait_timeout_ms,
                 },
                 sort_keys=True,
@@ -552,7 +604,7 @@ async def run_service(args: argparse.Namespace) -> int:
     stopped = asyncio.Event()
     lease_task: asyncio.Task[None] | None = None
     writer_lease_lost = False
-    if args.writer_lease_instance_id:
+    if writer_lease_instance_id:
         async def renew_writer_lease() -> None:
             nonlocal writer_lease_lost
             interval_seconds = max(0.05, args.writer_lease_ms / 3000.0)
@@ -560,6 +612,18 @@ async def run_service(args: argparse.Namespace) -> int:
                 await asyncio.sleep(interval_seconds)
                 try:
                     state.renew_writer_lease()
+                    # The SQL-side TTL alone can't see a Raft leadership
+                    # change until it actually causes a write failure --
+                    # checking Raft directly here means a demoted node
+                    # stops on its OWN next renewal tick instead of only
+                    # once some other node has already raced it for the
+                    # SQL row.
+                    if raft_lease is not None and not await raft_lease.is_still_leader_async(
+                        expected_term=raft_term
+                    ):
+                        raise RaftLeaseError(
+                            f"no longer the Raft leader for term {raft_term}"
+                        )
                 except Exception as exc:
                     writer_lease_lost = True
                     print(
@@ -567,7 +631,7 @@ async def run_service(args: argparse.Namespace) -> int:
                             {
                                 "schema_version": SCHEMA_VERSION,
                                 "status": "writer_lease_lost",
-                                "instance_id": args.writer_lease_instance_id,
+                                "instance_id": writer_lease_instance_id,
                                 "error": str(exc),
                             },
                             sort_keys=True,
@@ -616,11 +680,14 @@ async def run_service(args: argparse.Namespace) -> int:
                     and admission_policy.application_outcome_qoe_debt_enabled
                 ),
                 "durable_state_configured": bool(args.state_db),
-                "writer_lease_configured": bool(args.writer_lease_instance_id),
-                "writer_lease_instance_id": args.writer_lease_instance_id or "",
+                "writer_lease_configured": bool(writer_lease_instance_id),
+                "writer_lease_instance_id": writer_lease_instance_id or "",
                 "writer_lease_ms": (
-                    args.writer_lease_ms if args.writer_lease_instance_id else None
+                    args.writer_lease_ms if writer_lease_instance_id else None
                 ),
+                "raft_leadership_configured": raft_lease is not None,
+                "raft_node_id": args.raft_node_id or "",
+                "raft_term": raft_term,
                 **lease_acquisition,
                 "recovered_frame_count": state.snapshot()["recovered_frames"],
                 "recovered_consumer_count": state.snapshot()["recovered_consumers"],
@@ -677,11 +744,14 @@ async def run_service(args: argparse.Namespace) -> int:
                     and admission_policy.application_outcome_qoe_debt_enabled
                 ),
                 "durable_state_configured": bool(args.state_db),
-                "writer_lease_configured": bool(args.writer_lease_instance_id),
-                "writer_lease_instance_id": args.writer_lease_instance_id or "",
+                "writer_lease_configured": bool(writer_lease_instance_id),
+                "writer_lease_instance_id": writer_lease_instance_id or "",
                 "writer_lease_ms": (
-                    args.writer_lease_ms if args.writer_lease_instance_id else None
+                    args.writer_lease_ms if writer_lease_instance_id else None
                 ),
+                "raft_leadership_configured": raft_lease is not None,
+                "raft_node_id": args.raft_node_id or "",
+                "raft_term": raft_term,
                 "writer_lease_lost": writer_lease_lost,
                 **lease_acquisition,
                 "metrics": final_metrics,
@@ -716,6 +786,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--writer-lease-ms", type=int, default=5000)
     parser.add_argument("--writer-lease-wait-timeout-ms", type=int, default=0)
     parser.add_argument("--writer-lease-retry-ms", type=int, default=100)
+    parser.add_argument(
+        "--raft-status-url",
+        help=(
+            "status URL of this gateway's own co-located fleetqox.raft node "
+            "(e.g. http://raft-n1:5000); when set, write eligibility comes "
+            "from winning that cluster's leadership instead of a fixed "
+            "--writer-lease-instance-id -- see fleetqox/raft_writer_lease.py"
+        ),
+    )
+    parser.add_argument(
+        "--raft-node-id",
+        help="this gateway's node id within the Raft cluster named by --raft-status-url",
+    )
+    parser.add_argument("--raft-writer-lease-wait-timeout-ms", type=int, default=0)
+    parser.add_argument("--raft-writer-lease-retry-ms", type=int, default=100)
     parser.add_argument("--native-path-observations", action="store_true")
     args = parser.parse_args()
     if args.require_client_certificate and not args.client_ca:
@@ -742,10 +827,29 @@ def parse_args() -> argparse.Namespace:
         parser.error("--writer-lease-wait-timeout-ms must be non-negative")
     if args.writer_lease_retry_ms <= 0:
         parser.error("--writer-lease-retry-ms must be positive")
-    if args.writer_lease_wait_timeout_ms and not args.writer_lease_instance_id:
+    if (
+        args.writer_lease_wait_timeout_ms
+        and not args.writer_lease_instance_id
+        and not args.raft_status_url
+    ):
         parser.error(
-            "--writer-lease-wait-timeout-ms requires --writer-lease-instance-id"
+            "--writer-lease-wait-timeout-ms requires --writer-lease-instance-id "
+            "or --raft-status-url"
         )
+    if args.raft_status_url and args.writer_lease_instance_id:
+        parser.error(
+            "configure only one of --writer-lease-instance-id or --raft-status-url"
+        )
+    if args.raft_status_url and not args.raft_node_id:
+        parser.error("--raft-status-url requires --raft-node-id")
+    if args.raft_node_id and not args.raft_status_url:
+        parser.error("--raft-node-id requires --raft-status-url")
+    if args.raft_status_url and not args.state_db:
+        parser.error("--raft-status-url requires --state-db")
+    if args.raft_writer_lease_wait_timeout_ms < 0:
+        parser.error("--raft-writer-lease-wait-timeout-ms must be non-negative")
+    if args.raft_writer_lease_retry_ms <= 0:
+        parser.error("--raft-writer-lease-retry-ms must be positive")
     return args
 
 

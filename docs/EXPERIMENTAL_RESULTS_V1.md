@@ -369,9 +369,25 @@ connect` does not restore a container's `--network-alias`, so a
 "reconnected" node could send but never receive RPCs until the alias was
 re-specified -- a one-way partition invisible from the outside.
 `quic_gateway_active_active_consensus_claim` stays correctly `false`: this
-is single-leader (active-passive) consensus, not multi-master, and the
-native core is a standalone module/probe, not yet wired into the actual
-QUIC gateway's writer-lease or storage path in place of etcd/PostgreSQL.
+is single-leader (active-passive) consensus, not multi-master.
+
+The native core is no longer standalone: `quic_gateway_consensus_leader_election_claim`
+and `quic_gateway_raft_backed_writer_lease_claim` are now `true`.
+`scripts/fleetrmw_quic_gateway_service.py` gained `--raft-status-url`/`--raft-node-id`,
+and `fleetqox/raft_writer_lease.py`'s `RaftLeaderLease` gates the real
+gateway's write eligibility on winning its own co-located Raft node's
+leadership, folding the current (strictly increasing) Raft term into the
+holder_id handed to the existing, unmodified SQL fencing path
+(`raft-{node_id}-term-{term}`) -- Raft decides who should write, the
+already-proven SQL store still enforces it. `scripts/run_rmw_docker_quic_gateway_raft_writer_lease_probe.py`
+proves this over a real QUIC v1/H3 connection, a real 3-node Raft cluster,
+and two real gateway processes sharing one SQLite store: a non-leader
+gateway fails closed immediately, the leader's gateway accepts a real
+durable write, killing the leader's Raft node triggers a genuine election
+among the two survivors (the winner is discovered by polling, not assumed
+-- either could legitimately win), and the next gateway -- pointed at
+whichever node actually won -- recovers the prior gateway's durable state
+with a strictly higher SQL fence_token. 3/3 runs.
 
 ## Evidence rules
 

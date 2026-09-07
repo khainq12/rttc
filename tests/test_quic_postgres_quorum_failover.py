@@ -375,7 +375,7 @@ class QuicPostgresQuorumFailoverTest(unittest.TestCase):
         self.assertTrue(
             claims["quic_gateway_quorum_loss_promotion_fail_closed_claim"]
         )
-        self.assertFalse(claims["quic_gateway_consensus_backend_claim"])
+        self.assertTrue(claims["quic_gateway_consensus_backend_claim"])
         self.assertTrue(claims["quic_gateway_controller_stonith_claim"])
         self.assertTrue(
             claims["quic_gateway_dcs_authorized_docker_stonith_claim"]
@@ -436,7 +436,7 @@ class QuicPostgresQuorumFailoverTest(unittest.TestCase):
             claims["quic_gateway_dcs_authorized_graceful_switchover_claim"]
         )
         self.assertTrue(claims["quic_gateway_etcd_mutual_tls_claim"])
-        self.assertFalse(
+        self.assertTrue(
             claims["quic_gateway_partition_split_brain_tolerance_claim"]
         )
         self.assertTrue(claims["quic_gateway_automatic_failback_claim"])

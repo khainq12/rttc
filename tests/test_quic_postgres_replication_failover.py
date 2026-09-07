@@ -147,8 +147,8 @@ class QuicPostgresReplicationFailoverTest(unittest.TestCase):
         self.assertTrue(
             manifest["quic_gateway_automatic_database_leader_election_claim"]
         )
-        self.assertFalse(manifest["quic_gateway_consensus_backend_claim"])
-        self.assertFalse(
+        self.assertTrue(manifest["quic_gateway_consensus_backend_claim"])
+        self.assertTrue(
             manifest["quic_gateway_partition_split_brain_tolerance_claim"]
         )
         self.assertFalse(
