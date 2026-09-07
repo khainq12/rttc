@@ -202,12 +202,25 @@ container load (`Cannot connect to the Docker daemon`, `EOF` mid-`docker run`
   Fixed by scoping the fan-out to routes whose topic/service-name/
   action-name and domain actually match the advertisement. Verified on the
   same 32-robot scenario: `graph_forwarded` dropped from 25317 to 311
-  (~80x), and the first two configs of a fresh sweep went from uniform
-  total failure to genuine 4/4 and 8/8 full admission with zero infra
-  crashes. Later configs in the same sweep still hit residual
-  `container ... is not running` errors -- a separate, likely more mundane
-  resource-cleanup issue across a long sequential sweep (not the quadratic
-  storm, which is confirmed fixed) -- still open.
+  (~80x), and the first configs of a fresh sweep went from uniform total
+  failure to genuine full admission (4/4, 8/8) with zero infra crashes.
+
+  A separate, lower-priority residual remains: later rows in the same
+  9-row (32-robot) sweep still intermittently hit `container ... is not
+  running`. Investigated two candidate causes and fixed both defensively:
+  `run_probe()`'s container/network names were built from `os.getpid()`
+  alone, constant across every row in one sweep process, so rows reused
+  identical names -- gave every row a unique per-call suffix instead. Also
+  added a short pause plus a prune of stopped containers/networks between
+  rows, in case some Docker/kernel resource (conntrack, veth/iptables,
+  ephemeral ports) wasn't released fast enough for 64+ container churn per
+  row. Effect across repeated trials was a real but inconsistent
+  improvement -- the first clean row count varied between 1 and 3 across
+  runs rather than landing on a fixed threshold, suggesting genuine
+  run-to-run resource variance on this host rather than a single
+  deterministic bug fully closed by either change. Both changes are safe,
+  low-risk, and kept; the residual flakiness itself is unrelated to the
+  O(N^2) storm (confirmed fixed) and remains open.
 
 Exit gate:
 
