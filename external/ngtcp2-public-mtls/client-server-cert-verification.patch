@@ -1,0 +1,107 @@
+diff --git a/examples/client.cc b/examples/client.cc
+index 2a2e2b33..d81e718f 100644
+--- a/examples/client.cc
++++ b/examples/client.cc
+@@ -2391,6 +2391,12 @@ Options:
+               Exit when all client initiated HTTP streams are closed.
+   --disable-early-data
+               Disable early data.
++  --verify-server-cert
++              Verify  the  server's  certificate  chain  against  the
++              client's trust store (see --cert/--key  for the client's
++              own   mTLS   identity;    this   is   a   separate   and
++              independent check of the server's identity). Upstream
++              gtlsclient never performs this check by default.
+   --cc=(cubic|reno|bbr|bbr2)
+               The name of congestion controller algorithm.
+               Default: )"
+@@ -2506,6 +2512,7 @@ int main(int argc, char **argv) {
+         {"no-pmtud", no_argument, &flag, 38},
+         {"preferred-versions", required_argument, &flag, 39},
+         {"ack-thresh", required_argument, &flag, 40},
++        {"verify-server-cert", no_argument, &flag, 41},
+         {nullptr, 0, nullptr, 0},
+     };
+ 
+@@ -2741,6 +2748,10 @@ int main(int argc, char **argv) {
+         // --disable-early-data
+         config.disable_early_data = true;
+         break;
++      case 41:
++        // --verify-server-cert
++        config.verify_server_cert = true;
++        break;
+       case 26:
+         // --qlog-dir
+         config.qlog_dir = optarg;
+diff --git a/examples/client_base.h b/examples/client_base.h
+index ef364ea6..c332a621 100644
+--- a/examples/client_base.h
++++ b/examples/client_base.h
+@@ -150,6 +150,10 @@ struct Config {
+   bool exit_on_all_streams_close;
+   // disable_early_data disables early data.
+   bool disable_early_data;
++  // verify_server_cert is true if the server's certificate chain must
++  // be verified against the client's trust store (FleetQoX addition;
++  // upstream gtlsclient never verifies the server's certificate at all).
++  bool verify_server_cert;
+   // static_secret is used to derive keying materials for Stateless
+   // Retry token.
+   std::array<uint8_t, 32> static_secret;
+diff --git a/examples/tls_client_context_gnutls.cc b/examples/tls_client_context_gnutls.cc
+index 1fa03a83..ed57a9f4 100644
+--- a/examples/tls_client_context_gnutls.cc
++++ b/examples/tls_client_context_gnutls.cc
+@@ -24,7 +24,9 @@
+  */
+ #include "tls_client_context_gnutls.h"
+ 
++#include <cstdio>
+ #include <iostream>
++#include <unistd.h>
+ 
+ #include <ngtcp2/ngtcp2_crypto_gnutls.h>
+ 
+@@ -35,6 +37,30 @@
+ 
+ extern Config config;
+ 
++namespace {
++
++// Upstream gtlsclient never verifies the server's certificate at all (no
++// gnutls_certificate_set_verify_function is ever registered on the client
++// side) -- it completes the TLS handshake and proceeds regardless of
++// whether the server's certificate chains to anything the client trusts.
++// This opt-in check (--verify-server-cert) adds that verification without
++// changing default behavior for any other probe that already relies on
++// the unverified default.
++int fleetqox_verify_server_certificate(gnutls_session_t session) {
++  unsigned int status = 0;
++  auto rv = gnutls_certificate_verify_peers3(session, nullptr, &status);
++  if (rv < 0 || status != 0) {
++    dprintf(STDERR_FILENO,
++            "FLEETQOX_PUBLIC_MTLS_CLIENT_SERVER_CERT_REJECTED status=%u\n",
++            status);
++    return GNUTLS_E_CERTIFICATE_ERROR;
++  }
++  dprintf(STDERR_FILENO, "FLEETQOX_PUBLIC_MTLS_CLIENT_SERVER_CERT_VERIFIED\n");
++  return 0;
++}
++
++} // namespace
++
+ TLSClientContext::TLSClientContext() : cred_{nullptr} {}
+ 
+ TLSClientContext::~TLSClientContext() {
+@@ -70,5 +96,10 @@ int TLSClientContext::init(const char *private_key_file,
+     }
+   }
+ 
++  if (config.verify_server_cert) {
++    gnutls_certificate_set_verify_function(cred_,
++                                           fleetqox_verify_server_certificate);
++  }
++
+   return 0;
+ }

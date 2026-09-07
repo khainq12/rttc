@@ -54,3 +54,19 @@ This second artifact proves history, deduplication, independent consumer
 cursors, publisher identity binding, invalid-frame status propagation, and
 multi-stream session reuse under Docker/netem. Native public path metrics and
 nonblocking backend I/O remain outside its claim.
+
+The image also builds a second binary, `fleetqox-public-mtls-client`, from
+the same patched source tree
+(`client-server-cert-verification.patch`). The distro-packaged `gtlsclient`
+used by every other probe in this family never verifies the server's
+certificate at all, so it cannot observe a server-certificate rotation;
+this client adds an opt-in `--verify-server-cert` flag that actually does,
+without changing `gtlsclient`'s own default (unverified) behavior for
+anything else. Run the online-rotation proofs:
+
+```bash
+python3 scripts/run_rmw_docker_ngtcp2_public_online_client_ca_rotation_probe.py \
+  --iterations 5
+python3 scripts/run_rmw_docker_ngtcp2_public_online_server_certificate_rotation_probe.py \
+  --iterations 5
+```

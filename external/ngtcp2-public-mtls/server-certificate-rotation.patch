@@ -1,0 +1,127 @@
+diff --git a/examples/tls_server_session_gnutls.cc b/examples/tls_server_session_gnutls.cc
+index 76a363e0..feb8e2ce 100644
+--- a/examples/tls_server_session_gnutls.cc
++++ b/examples/tls_server_session_gnutls.cc
+@@ -28,6 +28,10 @@
+ #include <iostream>
+ #include <fstream>
+ #include <array>
++#include <cstdlib>
++#include <cstdio>
++#include <string_view>
++#include <unistd.h>
+ 
+ #include <ngtcp2/ngtcp2_crypto_gnutls.h>
+ 
+@@ -43,6 +47,91 @@ extern Config config;
+ 
+ TLSServerSession::TLSServerSession() {}
+ 
++namespace {
++
++bool fleetqox_reload_server_certificate_enabled() {
++  const auto *value = std::getenv(
++      "FLEETQOX_GNUTLS_RELOAD_SERVER_CERTIFICATE_EACH_HANDSHAKE");
++  return value != nullptr && std::string_view{value} == "1";
++}
++
++// verify_client_certificate() in tls_server_context_gnutls.cc (see
++// public-mtls.patch) has internal linkage (anonymous namespace) and cannot
++// be called from this file, and gnutls_certificate_set_verify_function()
++// is a property of a *credentials object*, not global -- so a freshly
++// allocated object here starts with none set, and mTLS client-certificate
++// trust-chain verification would silently never run for any connection
++// using it. This is a deliberately minimal, local re-implementation of
++// just the chain-verification core (peer identity/URI-SAN enforcement is
++// independent: handshake_completed(), from identity-fairness.patch, is a
++// separate hook unrelated to which credentials object is bound).
++int fleetqox_verify_client_certificate_for_rotation(gnutls_session_t session) {
++  unsigned int status = 0;
++  auto rv = gnutls_certificate_verify_peers3(session, nullptr, &status);
++  if (rv < 0 || status != 0) {
++    dprintf(STDERR_FILENO,
++            "FLEETQOX_PUBLIC_MTLS_REJECT verify_result=%d verify_status=%u\n",
++            rv, status);
++    return GNUTLS_E_CERTIFICATE_ERROR;
++  }
++  dprintf(STDERR_FILENO, "FLEETQOX_PUBLIC_MTLS_VERIFIED\n");
++  return 0;
++}
++
++gnutls_certificate_credentials_t fleetqox_build_fresh_server_credentials() {
++  const auto *server_cert = std::getenv("FLEETQOX_GNUTLS_SERVER_CERT");
++  const auto *server_key = std::getenv("FLEETQOX_GNUTLS_SERVER_KEY");
++  if (server_cert == nullptr || server_cert[0] == 0 ||
++      server_key == nullptr || server_key[0] == 0) {
++    dprintf(STDERR_FILENO,
++            "FLEETQOX_PUBLIC_MTLS_SERVER_CERT_RELOAD_FAILED "
++            "reason=missing_path\n");
++    return nullptr;
++  }
++  gnutls_certificate_credentials_t fresh;
++  if (gnutls_certificate_allocate_credentials(&fresh) < 0) {
++    dprintf(STDERR_FILENO,
++            "FLEETQOX_PUBLIC_MTLS_SERVER_CERT_RELOAD_FAILED "
++            "reason=allocate_credentials_failed\n");
++    return nullptr;
++  }
++  if (gnutls_certificate_set_x509_key_file(
++        fresh, server_cert, server_key, GNUTLS_X509_FMT_PEM) != 0) {
++    dprintf(STDERR_FILENO,
++            "FLEETQOX_PUBLIC_MTLS_SERVER_CERT_RELOAD_FAILED "
++            "reason=invalid_key_or_cert\n");
++    gnutls_certificate_free_credentials(fresh);
++    return nullptr;
++  }
++  const auto *client_ca = std::getenv("FLEETQOX_GNUTLS_CLIENT_CA");
++  if (client_ca != nullptr && client_ca[0] != 0 &&
++      gnutls_certificate_set_x509_trust_file(
++        fresh, client_ca, GNUTLS_X509_FMT_PEM) <= 0) {
++    dprintf(STDERR_FILENO,
++            "FLEETQOX_PUBLIC_MTLS_SERVER_CERT_RELOAD_FAILED "
++            "reason=invalid_ca\n");
++    gnutls_certificate_free_credentials(fresh);
++    return nullptr;
++  }
++  const auto *client_crl = std::getenv("FLEETQOX_GNUTLS_CLIENT_CRL");
++  if (client_crl != nullptr && client_crl[0] != 0 &&
++      gnutls_certificate_set_x509_crl_file(
++        fresh, client_crl, GNUTLS_X509_FMT_PEM) <= 0) {
++    dprintf(STDERR_FILENO,
++            "FLEETQOX_PUBLIC_MTLS_SERVER_CERT_RELOAD_FAILED "
++            "reason=invalid_crl\n");
++    gnutls_certificate_free_credentials(fresh);
++    return nullptr;
++  }
++  gnutls_certificate_set_verify_function(
++      fresh, fleetqox_verify_client_certificate_for_rotation);
++  dprintf(STDERR_FILENO, "FLEETQOX_PUBLIC_MTLS_SERVER_CERT_RELOADED\n");
++  return fresh;
++}
++
++} // namespace
++
++
+ TLSServerSession::~TLSServerSession() {}
+ 
+ namespace {
+@@ -116,8 +205,18 @@ int TLSServerSession::init(const TLSServerContext &tls_ctx,
+ 
+   gnutls_session_set_ptr(session_, handler->conn_ref());
+ 
++  gnutls_certificate_credentials_t fleetqox_certificate_credentials =
++      tls_ctx.get_certificate_credentials();
++  if (fleetqox_reload_server_certificate_enabled()) {
++    if (auto fresh = fleetqox_build_fresh_server_credentials();
++        fresh != nullptr) {
++      fleetqox_certificate_credentials = fresh;
++    } else {
++      return -1;
++    }
++  }
+   if (auto rv = gnutls_credentials_set(session_, GNUTLS_CRD_CERTIFICATE,
+-                                       tls_ctx.get_certificate_credentials());
++                                       fleetqox_certificate_credentials);
+       rv != 0) {
+     std::cerr << "gnutls_credentials_set failed: " << gnutls_strerror(rv)
+               << std::endl;

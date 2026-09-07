@@ -11,7 +11,7 @@ Current checkpoint:
 - 510 supported capabilities;
 - 22 partially implemented capability groups;
 - 14 explicitly unsupported items;
-- 613 true and 44 false scoped claim boundaries;
+- 615 true and 43 false scoped claim boundaries;
 - 690 tests discovered in a clean checkout: 637 pass and 53 external Docker
   evidence tests skip until their ignored artifact bundle is regenerated;
 - 183/183 Docker integration probes pass in the latest full sequential run
