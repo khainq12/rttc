@@ -3985,6 +3985,15 @@ int main()
             "content_filter_sql_subset_repeated_claim",
             content_filter_sql_runner_source,
         )
+        self.assertIn(
+            "sql_reversed_comparison_operand_order_claim",
+            content_filter_sql_runner_source,
+        )
+        self.assertIn("%0 = robot_id AND %1 < sequence", content_filter_sql_probe_source)
+        self.assertIn("reversed_missing_field_rejected", content_filter_sql_probe_source)
+        rmw_pubsub_source = (PKG / "src" / "rmw_pubsub.cpp").read_text()
+        self.assertIn("parse_reversed_comparison_predicate", rmw_pubsub_source)
+        self.assertIn("reverse_comparison", rmw_pubsub_source)
         content_filter_typed_probe = (
             PKG / "src" / "content_filter_typed_probe.cpp"
         )
@@ -6265,6 +6274,9 @@ int main()
             claims["content_filter_invalid_expression_fail_closed_claim"]
         )
         self.assertTrue(claims["content_filter_sql_subset_repeated_claim"])
+        self.assertTrue(
+            claims["content_filter_sql_reversed_comparison_operand_order_claim"]
+        )
         self.assertTrue(claims["docker_content_filter_typed_reflection_5run_probe"])
         self.assertTrue(
             claims["content_filter_introspection_cpp_nested_fields_claim"]

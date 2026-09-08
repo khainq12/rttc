@@ -37,6 +37,7 @@ def probe_ok(row: dict[str, Any]) -> bool:
         and row.get("invalid_expression_fail_closed") is True
         and row.get("disable_after_invalid_expression") is True
         and row.get("content_filter_sql_subset_claim") is True
+        and row.get("sql_reversed_comparison_operand_order_claim") is True
         and row.get("clean_teardown") is True
         and int(row.get("advanced_evaluated", 0)) == 7
         and int(row.get("advanced_matched", 0)) == 2
@@ -44,7 +45,10 @@ def probe_ok(row: dict[str, Any]) -> bool:
         and int(row.get("precedence_evaluated", 0)) == 4
         and int(row.get("precedence_matched", 0)) == 2
         and int(row.get("precedence_dropped", 0)) == 2
-        and int(row.get("content_filters_set_delta", 0)) == 3
+        and int(row.get("reversed_evaluated", 0)) == 3
+        and int(row.get("reversed_matched", 0)) == 1
+        and int(row.get("reversed_dropped", 0)) == 2
+        and int(row.get("content_filters_set_delta", 0)) == 4
     )
 
 

@@ -156,10 +156,18 @@ Passing scoped evidence includes:
 - per-client service admission and fairness;
 - asynchronous service repair and cancelled-job cleanup;
 - bounded durable service replay after process replacement;
-- action frame/QoS paths and large status/service payload fragmentation.
+- action frame/QoS paths and large status/service payload fragmentation;
+- content-filter comparison predicates in DDS-SQL's standard reversed operand
+  order (a parameter or quoted literal on the left of `=`/`!=`/`<>`/`<`/
+  `<=`/`>`/`>=`, e.g. `%0 = robot_id` or `%1 < sequence`, not just
+  field-first), rebuilt clean under ASan/UBSan and passing 5/5 in
+  `docker_content_filter_sql_probe` alongside a malformed-reversed-form
+  (`%0 = %1`) negative control.
 
 Open boundaries include full remote graph/event production, full non-deadline
-QoS event semantics, full DDS content-filter dialect, full DDS writer-history
+QoS event semantics, full DDS content-filter dialect (arbitrary DDS SQL
+functions, vendor-specific semantics, and field-to-field comparisons where
+neither side is a parameter or literal), full DDS writer-history
 all-acknowledged behavior, and power-loss/exactly-once semantics.
 
 ## QUIC and gateway state

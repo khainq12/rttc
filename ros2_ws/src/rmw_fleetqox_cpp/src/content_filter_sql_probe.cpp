@@ -272,11 +272,31 @@ int main()
     precedence_payloads,
     precedence_expected);
 
+  const std::string reversed_expression = "%0 = robot_id AND %1 < sequence";
+  const std::vector<std::string> reversed_parameters = {"robot_a", "10"};
+  const std::vector<std::string> reversed_payloads = {
+    "robot_id=robot_a;sequence=11",
+    "robot_id=robot_a;sequence=9",
+    "robot_id=robot_b;sequence=99",
+  };
+  const std::vector<std::string> reversed_expected = {reversed_payloads[0]};
+  const ScenarioResult reversed = run_scenario(
+    publisher,
+    subscription,
+    &allocator,
+    reversed_expression,
+    reversed_parameters,
+    reversed_payloads,
+    reversed_expected);
+
   const char * one_parameter[] = {"robot_a"};
+  const char * two_parameters[] = {"a", "b"};
   const bool malformed_rejected = invalid_expression_rejected(
     subscription, &allocator, "robot_id =", 0, nullptr);
   const bool missing_parameter_rejected = invalid_expression_rejected(
     subscription, &allocator, "robot_id = %9", 1, one_parameter);
+  const bool reversed_missing_field_rejected = invalid_expression_rejected(
+    subscription, &allocator, "%0 = %1", 2, two_parameters);
 
   rmw_subscription_content_filter_options_t disabled =
     rmw_get_zero_initialized_content_filter_options();
@@ -288,11 +308,12 @@ int main()
   const rmw_ret_t subscription_ret = rmw_destroy_subscription(node, subscription);
   const rmw_ret_t node_ret = rmw_destroy_node(node);
   const bool context_ok = cleanup_context(&context, &options);
-  const bool invalid_ok = malformed_rejected && missing_parameter_rejected;
+  const bool invalid_ok = malformed_rejected && missing_parameter_rejected &&
+    reversed_missing_field_rejected;
   const bool cleanup_ok = publisher_ret == RMW_RET_OK &&
     subscription_ret == RMW_RET_OK && node_ret == RMW_RET_OK && context_ok;
-  const bool ok = advanced.ok && precedence.ok && invalid_ok && disabled_ok &&
-    set_delta == 3 && cleanup_ok;
+  const bool ok = advanced.ok && precedence.ok && reversed.ok && invalid_ok &&
+    disabled_ok && set_delta == 4 && cleanup_ok;
 
   std::cout << "{\"schema_version\":\"fleetrmw.content_filter_sql_probe.v1\","
             << "\"status\":\"" << (ok ? "ok" : "failed") << "\","
@@ -300,6 +321,8 @@ int main()
             << (advanced.ok ? "true" : "false") << ","
             << "\"sql_and_or_precedence_enforcement\":"
             << (precedence.ok ? "true" : "false") << ","
+            << "\"sql_reversed_comparison_operand_order_claim\":"
+            << (reversed.ok ? "true" : "false") << ","
             << "\"invalid_expression_fail_closed\":"
             << (invalid_ok ? "true" : "false") << ","
             << "\"disable_after_invalid_expression\":"
@@ -310,9 +333,12 @@ int main()
             << "\"precedence_evaluated\":" << precedence.evaluated << ","
             << "\"precedence_matched\":" << precedence.matched << ","
             << "\"precedence_dropped\":" << precedence.dropped << ","
+            << "\"reversed_evaluated\":" << reversed.evaluated << ","
+            << "\"reversed_matched\":" << reversed.matched << ","
+            << "\"reversed_dropped\":" << reversed.dropped << ","
             << "\"content_filters_set_delta\":" << set_delta << ","
             << "\"content_filter_sql_subset_claim\":"
-            << ((advanced.ok && precedence.ok) ? "true" : "false") << ","
+            << ((advanced.ok && precedence.ok && reversed.ok) ? "true" : "false") << ","
             << "\"clean_teardown\":" << (cleanup_ok ? "true" : "false") << "}"
             << std::endl;
   return ok ? 0 : 1;

@@ -592,6 +592,29 @@ Open semantic boundaries include full remote event production, full
 message-lost/liveliness/non-deadline QoS semantics, DDS filter-dialect parity,
 DDS-equivalent all-acknowledged behavior, deep preallocation, and zero-copy.
 
+Also **done**, closed this session: the content-filter comparison predicate
+(=, !=, <>, <, <=, >, >=) previously required the field name to always be on
+the left of the operator. OMG DDS-SQL's comparison predicate is symmetric
+(`Parameter RelOp Parameter`, where `Parameter` is a FieldName, Value, or
+Enumeration on either side), so `field = %0` worked but the reversed
+`%0 = field` or `%1 < field` did not parse as a field comparison at all.
+`ContentFilterExpressionParser::parse_predicate` in `rmw_pubsub.cpp` now
+special-cases a parameter or quoted-literal token in the first position,
+parses the trailing operand as a field reference, and re-evaluates the
+comparison with the operator direction flipped for the four ordering
+operators (equality/inequality are already symmetric). `BETWEEN`/`IN`/`LIKE`/
+`IS [NOT] NULL` are unchanged -- they keep requiring a field on the left,
+since testing a constant's membership/pattern/nullability is not a
+meaningful DDS-SQL predicate. Proven by a dedicated scenario
+(`%0 = robot_id AND %1 < sequence`) plus a malformed-reversed-form negative
+control (`%0 = %1`, no trailing field) added to
+`content_filter_sql_probe.cpp`, rebuilt clean under ASan/UBSan with zero
+diagnostics, and passing 5/5 in `docker_content_filter_sql_probe`. This is a
+genuine, bounded, standards-compliant expansion, not full DDS-SQL parity --
+the full dialect (arbitrary DDS SQL functions, vendor-specific semantics,
+and any FIELD-to-FIELD comparison where neither side is a bare parameter or
+literal) remains out of scope and is still a deliberate non-goal.
+
 Exit gate:
 
 - each capability either implemented and repeatedly probed or explicitly

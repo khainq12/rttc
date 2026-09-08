@@ -10710,8 +10710,68 @@ private:
     return operation == ContentFilterTokenKind::less_equal && *left <= *right;
   }
 
+  static ContentFilterTokenKind reverse_comparison(ContentFilterTokenKind operation)
+  {
+    switch (operation) {
+      case ContentFilterTokenKind::greater:
+        return ContentFilterTokenKind::less;
+      case ContentFilterTokenKind::greater_equal:
+        return ContentFilterTokenKind::less_equal;
+      case ContentFilterTokenKind::less:
+        return ContentFilterTokenKind::greater;
+      case ContentFilterTokenKind::less_equal:
+        return ContentFilterTokenKind::greater_equal;
+      default:
+        return operation;
+    }
+  }
+
+  ContentFilterTruth parse_reversed_comparison_predicate()
+  {
+    // OMG DDS-SQL's comparison predicate is symmetric (Parameter RelOp
+    // Parameter, where Parameter is a FieldName, Value, or Enumeration on
+    // EITHER side), so a parameter or quoted literal is also accepted on
+    // the left, provided a field name follows the operator on the right.
+    // IS/BETWEEN/IN/LIKE keep requiring a field on the left (unchanged
+    // below) since testing a constant's nullability/pattern/membership is
+    // not a meaningful DDS-SQL predicate.
+    const auto lhs_value = parse_value();
+    if (!lhs_value.has_value()) {
+      return ContentFilterTruth::unknown;
+    }
+    const ContentFilterTokenKind operation = current().kind;
+    if (operation != ContentFilterTokenKind::equal &&
+      operation != ContentFilterTokenKind::not_equal &&
+      operation != ContentFilterTokenKind::greater &&
+      operation != ContentFilterTokenKind::greater_equal &&
+      operation != ContentFilterTokenKind::less &&
+      operation != ContentFilterTokenKind::less_equal)
+    {
+      valid_ = false;
+      return ContentFilterTruth::unknown;
+    }
+    ++offset_;
+    if (current().kind != ContentFilterTokenKind::word) {
+      valid_ = false;
+      return ContentFilterTruth::unknown;
+    }
+    const std::string field_name = current().text;
+    ++offset_;
+    const auto rhs_field = fields_.find(field_name);
+    if (rhs_field == fields_.end()) {
+      return ContentFilterTruth::unknown;
+    }
+    return content_filter_truth(
+      compare(rhs_field->second, *lhs_value, reverse_comparison(operation)));
+  }
+
   ContentFilterTruth parse_predicate()
   {
+    if (current().kind == ContentFilterTokenKind::parameter ||
+      current().kind == ContentFilterTokenKind::string_value)
+    {
+      return parse_reversed_comparison_predicate();
+    }
     if (current().kind != ContentFilterTokenKind::word) {
       valid_ = false;
       return ContentFilterTruth::unknown;
