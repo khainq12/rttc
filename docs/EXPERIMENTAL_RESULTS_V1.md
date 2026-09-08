@@ -502,9 +502,24 @@ own Docker state; then promoting the standby, which accepts a new write.
 
 Between the two, every HA mechanism this project has now carries genuine
 multi-host evidence. Hardware STONITH already targets an out-of-band BMC
-path (no multi-host aspect to close) and PKI operational hardening (clock
-skew, CA rollover, expiry, crash-consistency) doesn't need multi-host --
-both remain open as separate items, not as multi-host gaps.
+path (no multi-host aspect to close).
+
+PKI operational hardening: CA rollover (both directions, including a
+genuine restore-and-reconfirm, not just rotate-once), CRL revocation and
+fail-closed refresh, and server/client-CA rotation were already proven;
+what no probe had generated was a certificate identical in CA, subject,
+and required URI SAN to the passing case, differing only in its temporal
+validity window. `docker_ngtcp2_public_certificate_temporal_validity_probe.py`
+closes that with `cryptography`'s `CertificateBuilder` setting an explicit
+expired and an explicit not-yet-valid window -- the same
+`now >= notBefore && now <= notAfter` check inside
+`gnutls_certificate_verify_peers3` any real clock-skew scenario ultimately
+exercises, proven this way specifically to avoid skewing the shared
+machine's actual wall clock. 5/5 runs
+(`certificate_expired_rejected_claim`,
+`certificate_not_yet_valid_rejected_claim`). Crash-consistency under a
+hard kill is the same evidence the Raft and etcd/PostgreSQL multi-host
+probes above already provide, not a separate gap.
 
 ## Evidence rules
 

@@ -1236,6 +1236,10 @@
     "reliability_key_instance_bound_claim": true,
     "docker_ngtcp2_public_active_session_revocation_5run_probe": true,
     "docker_ngtcp2_public_online_client_ca_rotation_5run_probe": true,
+    "docker_ngtcp2_public_certificate_temporal_validity_5run_probe": true,
+    "certificate_expired_rejected_claim": true,
+    "certificate_not_yet_valid_rejected_claim": true,
+    "certificate_temporal_validity_repeated_claim": true,
     "docker_ngtcp2_public_online_server_certificate_rotation_5run_probe": true
   }
 }
