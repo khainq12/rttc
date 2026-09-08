@@ -371,12 +371,22 @@ documented:
   neither of those is "recovery" in the stronger sense the name implies,
   and no dedicated three-region topology probe exists yet to earn a
   narrower version of the claim;
-- hardware-level STONITH, as opposed to the Docker-container fencing already
-  proven -- `quic_gateway_hardware_stonith_claim`;
+- hardware-level STONITH validated against a specific vendor's real BMC
+  firmware -- `quic_gateway_hardware_stonith_claim`,
+  `hardware_stonith_real_bmc_firmware_validated_claim`. What IS now proven
+  (see below) is the real DMTF Redfish protocol path itself, exercised
+  against a protocol-conformant simulator since no physical hardware is
+  available in this environment; firmware-specific validation against an
+  actual vendor BMC is what remains open, and it is an environment
+  limitation (no hardware to test against), not an unimplemented feature;
 - production certification of the automatic rejoin/failback paths, as
   opposed to the Docker/netem evidence already proven -- 
   `quic_gateway_production_automatic_rejoin_claim`,
-  `quic_gateway_production_automatic_failback_claim`.
+  `quic_gateway_production_automatic_failback_claim`. Production
+  certification is an organizational/deployment milestone (real workload
+  history, ops runbooks, possibly third-party audit), not something a
+  repository of code and Docker probes can produce on its own -- there is
+  no code gap here to close.
 
 Also **done**, closed this session: 0-RTT for the legacy ngtcp2/GnuTLS
 subprocess-backed QUIC gateway path (`quic_zero_rtt_claim` -- the
@@ -493,6 +503,36 @@ assumed, since either could legitimately win -- and the next gateway,
 pointed at whichever node really won, automatically recovers the prior
 gateway's durable state with a strictly higher SQL fence_token. 3/3 runs.
 
+Also **done**, closed this session, scoped precisely: the real Redfish
+hardware-fencing protocol path (`hardware_stonith_redfish_protocol_claim`).
+No physical server or BMC exists in this environment to fence -- but the
+protocol real hardware fencing depends on (DMTF Redfish: a standard
+HTTPS/JSON `ComputerSystem.Reset` action, not something vendor-specific)
+is well documented and testable without one. `scripts/fleetqox_redfish_bmc_simulator.py`
+is a minimal but protocol-conformant fake BMC (the same pattern OpenStack
+Ironic/Metal3 use in CI to test bare-metal power management without
+physical hardware), and `scripts/fleetqox_hardware_stonith_agent.py` is a
+real Redfish HTTPS client wired into this codebase's existing fence-agent
+pattern (same DCS-lease authorization, same mTLS client-identity binding
+on `/fence` as `fleetqox_postgres_fence_agent.py` -- just a genuine
+`POST .../Actions/ComputerSystem.Reset` in place of a Docker-socket
+SIGKILL). `scripts/run_rmw_docker_hardware_stonith_redfish_probe.py`
+proves, over real separate Docker containers: an unauthenticated fence
+request is rejected at the TLS layer with the BMC's power state untouched;
+a forged/non-existent DCS lease is rejected (403) with the power state
+untouched; and a request authorized by a real etcd-issued lease produces a
+genuine Redfish reset call that a *separate, independent* query to the BMC
+confirms actually transitioned power state from On to Off. 3/3 runs.
+
+Stated precisely: `quic_gateway_hardware_stonith_claim` and the new
+`hardware_stonith_real_bmc_firmware_validated_claim` stay `false` on
+purpose. What's proven is that this code speaks the real Redfish protocol
+correctly end to end; what remains open -- validation against a specific
+vendor's actual BMC firmware, which can carry quirks no simulator captures
+-- is an environment limitation (no physical hardware available to test
+against here), not an unimplemented feature or a claim inflated beyond its
+evidence.
+
 Exit gate:
 
 - public maintained APIs only -- **met**;
@@ -506,10 +546,12 @@ Exit gate:
 - leader election/consensus, split-brain fencing, rejoin/failback, regional
   recovery, and operational runbooks -- **rejoin/failback,
   quorum-gated/STONITH-fenced promotion, general split-brain tolerance, a
-  native (non-etcd) consensus/distributed-database core, and that core
-  actually gating the real gateway's writer lease all met; regional
-  recovery, active-active consensus, and production (non-Docker)
-  certification remain open**;
+  native (non-etcd) consensus/distributed-database core, that core
+  actually gating the real gateway's writer lease, and the real Redfish
+  hardware-fencing protocol path all met; regional recovery, active-active
+  consensus, real-BMC-firmware validation, and production (non-Docker)
+  certification remain open -- the last two are environment/organizational
+  limits, not code gaps (see above)**;
 - long multi-attacker soak -- open.
 
 ### B3: complete RMW semantics

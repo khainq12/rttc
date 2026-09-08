@@ -389,6 +389,26 @@ among the two survivors (the winner is discovered by polling, not assumed
 whichever node actually won -- recovers the prior gateway's durable state
 with a strictly higher SQL fence_token. 3/3 runs.
 
+`hardware_stonith_redfish_protocol_claim` is also now `true`, scoped
+precisely: no physical server or BMC exists in this environment, but the
+protocol real hardware fencing depends on (DMTF Redfish) is standard and
+testable without one, the same way OpenStack Ironic/Metal3 test bare-metal
+power management in CI. `scripts/fleetqox_redfish_bmc_simulator.py` is a
+minimal but protocol-conformant fake BMC; `scripts/fleetqox_hardware_stonith_agent.py`
+is a real Redfish HTTPS client wired into this codebase's existing
+fence-agent pattern (same DCS-lease authorization and mTLS client-identity
+binding as `fleetqox_postgres_fence_agent.py`, a genuine
+`POST .../Actions/ComputerSystem.Reset` in place of a Docker-socket
+SIGKILL). `scripts/run_rmw_docker_hardware_stonith_redfish_probe.py`
+proves an unauthenticated fence request is rejected at the TLS layer, a
+forged DCS lease is rejected (403), and a request authorized by a real
+etcd lease produces a genuine Redfish reset that a *separate, independent*
+BMC query confirms actually flipped power state from On to Off. 3/3 runs.
+`quic_gateway_hardware_stonith_claim` and the new
+`hardware_stonith_real_bmc_firmware_validated_claim` stay `false`:
+validation against a specific vendor's real BMC firmware is an environment
+limitation (no hardware available here), not an unimplemented feature.
+
 ## Evidence rules
 
 - Deterministic probes establish contracts, not broad performance claims.
