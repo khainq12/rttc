@@ -45,6 +45,12 @@ The probe proves, over the real inter-VM network link:
   5. Healing the partition afterward does not resurrect a second writer:
      the old primary container is dead (fenced), so there is only ever
      one write-accepting node -- no split-brain.
+  6. Failback: etcd1 on VM1 (only network-partitioned, never killed)
+     self-heals back to a healthy 3-member cluster once the partition
+     lifts, and a genuinely fresh PostgreSQL standby bootstrapped on VM1
+     -- replicating from the current primary (VM2's former standby, now
+     promoted) -- reaches synchronous streaming state, restoring full
+     2-host redundancy.
 """
 
 from __future__ import annotations
@@ -73,6 +79,9 @@ POSTGRES_IMAGE = "postgres:16-alpine"
 DATABASE_PASSWORD = "fleetqox-multihost-probe"
 REPLICATION_APPLICATION = "fleetqox_multihost_standby"
 REPLICATION_SLOT = "fleetqox_multihost_slot"
+FAILBACK_APPLICATION = "fleetqox_multihost_failback_standby"
+FAILBACK_SLOT = "fleetqox_multihost_failback_slot"
+FAILBACK_CONTAINER = "fleetrmw-mh-pg-failback-standby"
 CONTROLLER_ID = "controller-1"
 
 ETCD_MEMBERS = {
@@ -354,6 +363,60 @@ def start_postgres_cluster() -> dict[str, Any]:
     }
 
 
+def bootstrap_failback_standby() -> bool:
+    # The promoted node (fleetrmw-mh-pg-standby, now VM2's primary) was
+    # itself built via pg_basebackup from the original VM1 primary, so it
+    # already inherited that primary's replicator role and pg_hba.conf
+    # entry -- no need to recreate either here, only to configure this
+    # NEW replica's own synchronous_standby_names and give it a fresh
+    # replication slot (a physical slot lives on whichever server the
+    # standby connects to, not something basebackup carries over from a
+    # since-fenced grandparent).
+    configured = sql(
+        VM2_SSH_PORT, "fleetrmw-mh-pg-standby",
+        f"ALTER SYSTEM SET synchronous_standby_names = '{FAILBACK_APPLICATION}'",
+    )
+    reloaded = sql(VM2_SSH_PORT, "fleetrmw-mh-pg-standby", "SELECT pg_reload_conf()")
+    if configured.returncode != 0 or reloaded.returncode != 0:
+        return False
+    time.sleep(1.5)
+    bootstrap = (
+        'mkdir -p "$PGDATA" && '
+        "chown -R postgres:postgres /var/lib/postgresql/data && "
+        "gosu postgres pg_basebackup "
+        f'-d "host={VM2_IP} port=5432 user=replicator '
+        f"password={DATABASE_PASSWORD} application_name="
+        f'{FAILBACK_APPLICATION}" '
+        '-D "$PGDATA" -Fp -Xs -P -R '
+        f"-C -S {FAILBACK_SLOT} && "
+        'chmod 700 "$PGDATA" && '
+        'exec gosu postgres postgres -D "$PGDATA" -c hot_standby=on'
+    )
+    run_remote(VM1_SSH_PORT, f"sudo docker rm -f {FAILBACK_CONTAINER}", timeout=15.0)
+    standby_start = run_remote(
+        VM1_SSH_PORT,
+        f"sudo docker run -d --name {FAILBACK_CONTAINER} --network host "
+        "-e PGDATA=/var/lib/postgresql/data/pgdata "
+        f"-e PGPASSWORD={DATABASE_PASSWORD} "
+        f"--entrypoint sh {POSTGRES_IMAGE} -c '{bootstrap}'",
+        timeout=60.0,
+    )
+    if standby_start.returncode != 0 or not wait_postgres(VM1_SSH_PORT, FAILBACK_CONTAINER):
+        return False
+    deadline = time.monotonic() + 15.0
+    while time.monotonic() < deadline:
+        status = sql(
+            VM2_SSH_PORT, "fleetrmw-mh-pg-standby",
+            "SELECT application_name || '|' || state || '|' || sync_state "
+            "FROM pg_stat_replication WHERE application_name="
+            f"'{FAILBACK_APPLICATION}'",
+        )
+        if status.stdout.strip() == f"{FAILBACK_APPLICATION}|streaming|sync":
+            return True
+        time.sleep(0.5)
+    return False
+
+
 def start_fence_agent() -> bool:
     remote_command = (
         f"sudo docker run -d --name fleetrmw-mh-fence-agent --network host "
@@ -478,7 +541,7 @@ def primary_container_running_on_vm1() -> bool | None:
 def cleanup() -> None:
     for name in (
         "fleetrmw-mh-controller", "fleetrmw-mh-fence-agent",
-        "fleetrmw-mh-pg-primary", "fleetrmw-mh-etcd1",
+        "fleetrmw-mh-pg-primary", "fleetrmw-mh-etcd1", FAILBACK_CONTAINER,
     ):
         run_remote(VM1_SSH_PORT, f"sudo docker rm -f {name}", timeout=15.0)
     for name in (
@@ -583,6 +646,30 @@ def run_probe() -> dict[str, Any]:
 
         result["partition_healed"] = heal_partition()
 
+        # Failback: restore full 2-host redundancy, not just survive the
+        # loss. etcd1 on VM1 was only network-partitioned, never killed,
+        # so it should self-heal on its own once the partition lifts --
+        # verified directly rather than assumed. The old PostgreSQL
+        # primary, in contrast, really is dead (it was fenced), so
+        # restoring redundancy means bootstrapping a genuinely fresh
+        # standby on VM1 that replicates from the current primary (VM2's
+        # former standby, now promoted) -- the same pg_basebackup pattern
+        # used for the original topology, just with the roles the
+        # failover left in place, matching how this project's own
+        # single-host probe treats a rejoin-as-standby as the first stage
+        # of failback (a separate, later, policy-driven switchover back to
+        # the original primary is a further step this probe does not
+        # attempt).
+        etcd_resynced_ok = False
+        if result["partition_healed"]:
+            etcd_resynced_ok = etcd_healthy(timeout_s=30.0)
+        result["etcd_self_healed_after_partition_ok"] = etcd_resynced_ok
+
+        failback_standby_ok = False
+        if promoted_ok and result["partition_healed"]:
+            failback_standby_ok = bootstrap_failback_standby()
+        result["multi_host_failback_redundancy_restored_claim"] = failback_standby_ok
+
         ok = (
             result.get("etcd_multi_host_quorum_ok") is True
             and pg_result["status"] == "ok"
@@ -591,6 +678,8 @@ def run_probe() -> dict[str, Any]:
             and result.get("cross_host_fence_and_promote_ok") is True
             and result.get("primary_actually_dead_on_vm1") is True
             and result.get("post_promotion_write_ok") is True
+            and result.get("etcd_self_healed_after_partition_ok") is True
+            and result.get("multi_host_failback_redundancy_restored_claim") is True
         )
         result["status"] = "ok" if ok else "failed"
         result["multi_host_postgres_etcd_fencing_claim"] = ok

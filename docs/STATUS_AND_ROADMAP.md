@@ -629,8 +629,39 @@ trusting the controller's or fence agent's self-report); only then is the
 standby promoted, and the promoted standby accepts a new write. 5/5 runs.
 (`multi_host_postgres_etcd_fencing_claim`, `multi_host_cross_host_stonith_claim`).
 
+Also **done**, closed this session: multi-host **failback** for both HA
+mechanisms, not just failover -- the audit named both explicitly
+("failover/failback đa host"). For Raft: after the minority fail-closed
+check above, VM1 is relaunched (a real QEMU boot, not a container
+restart) via the same setup script used between probe repeats, and its
+two original nodes rejoin with completely empty in-memory state --
+having missed every entry -- alongside the one VM2 node killed for the
+minority test, restoring the full original 5-node topology. All 5 catch
+up to the same committed state purely through ordinary Raft log
+replication (no special rejoin procedure needed; ingesting a totally
+blank follower is exactly the "very stale follower" case
+`test_follower_log_conflict_is_truncated_not_merged` already covers) and
+the cluster again recognizes exactly one leader
+(`multi_host_failback_full_redundancy_restored_claim`). For etcd/
+PostgreSQL: etcd1 on VM1 was only network-partitioned during the fencing
+test, never killed, so it self-heals back to a healthy 3-member cluster
+on its own once the partition lifts -- verified directly, not assumed.
+The old PostgreSQL primary really is dead (it was fenced), so restoring
+redundancy means bootstrapping a genuinely fresh standby on VM1 that
+replicates from the current primary (VM2's former standby, now
+promoted); it inherits the replicator role and pg_hba entry from that
+primary's own basebackup lineage, needing only its own new replication
+slot and `synchronous_standby_names` entry, and reaches synchronous
+streaming state (`multi_host_failback_redundancy_restored_claim`). Both
+3/3 runs, on top of the already-5/5 failover-only evidence above. Scoped
+precisely: this restores 2-host redundancy with the roles the failover
+left in place; a further, later, policy-driven switchover back to
+making the *original* primary primary again (the single-host quorum
+probe's separate "planned failback" stage) was not attempted here.
+
 Between the two, every HA mechanism this project has (Raft-backed writer
-lease, and etcd/PostgreSQL/STONITH) now has genuine multi-host evidence.
+lease, and etcd/PostgreSQL/STONITH) now has genuine multi-host failover
+*and* failback evidence.
 
 Also **done**, closed this session: PKI operational hardening for the
 specific gap the audit named -- expired and not-yet-valid client
@@ -688,12 +719,16 @@ Exit gate:
   majority-region recovery, real-BMC-firmware validation, and production
   (non-Docker) certification remain open -- the last two are
   environment/organizational limits, not code gaps (see above)**;
-- multi-host (non-shared-kernel) failover -- **met for both HA mechanisms**
-  (native Raft writer-lease path, and etcd/PostgreSQL/STONITH, each proven
-  over two real KVM VMs, see above); hardware STONITH and PKI rotation
-  remain single-Docker-daemon-only (hardware STONITH has no multi-host
-  aspect to close -- it already targets an out-of-band BMC path; PKI
-  operational hardening doesn't need multi-host and is tracked separately);
+- multi-host (non-shared-kernel) failover and failback -- **met for both HA
+  mechanisms** (native Raft writer-lease path, and etcd/PostgreSQL/
+  STONITH, each proven over two real KVM VMs including a full rejoin/
+  redundancy-restore stage, see above; restoring the *original* primary
+  specifically via a policy-driven switchover, as opposed to redundancy
+  with the failover's roles left in place, was not attempted for the
+  multi-host case); hardware STONITH and PKI rotation remain
+  single-Docker-daemon-only (hardware STONITH has no multi-host aspect to
+  close -- it already targets an out-of-band BMC path; PKI operational
+  hardening doesn't need multi-host and is tracked separately);
 - long multi-attacker soak -- open.
 
 ### B3: complete RMW semantics

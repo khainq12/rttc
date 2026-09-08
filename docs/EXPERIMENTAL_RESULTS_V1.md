@@ -500,9 +500,27 @@ own Docker state; then promoting the standby, which accepts a new write.
 5/5 runs (`multi_host_postgres_etcd_fencing_claim`,
 `multi_host_cross_host_stonith_claim`).
 
+Both mechanisms also now prove **failback**, not just failover. Raft:
+after the minority test, VM1 is relaunched (a real QEMU boot) and its two
+nodes rejoin with completely empty state; all 5 nodes converge on the
+same committed values via ordinary log replication and the cluster again
+recognizes one leader
+(`multi_host_failback_full_redundancy_restored_claim`). etcd/PostgreSQL:
+etcd1 self-heals once the partition lifts (it was only partitioned, never
+killed); the dead primary's redundancy is restored by bootstrapping a
+genuinely fresh standby on VM1 replicating from the current primary
+(VM2's promoted former standby), inheriting its replicator role/pg_hba
+entry from that primary's own basebackup lineage and reaching
+synchronous streaming with only a new slot and `synchronous_standby_names`
+entry of its own
+(`multi_host_failback_redundancy_restored_claim`). Both 3/3, on top of
+the failover-only 5/5 above. Scoped precisely: this restores 2-host
+redundancy with the failover's roles left in place, not a policy-driven
+switchover back to the original primary specifically.
+
 Between the two, every HA mechanism this project has now carries genuine
-multi-host evidence. Hardware STONITH already targets an out-of-band BMC
-path (no multi-host aspect to close).
+multi-host failover *and* failback evidence. Hardware STONITH already
+targets an out-of-band BMC path (no multi-host aspect to close).
 
 PKI operational hardening: CA rollover (both directions, including a
 genuine restore-and-reconfirm, not just rotate-once), CRL revocation and

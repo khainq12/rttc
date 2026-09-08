@@ -25,6 +25,12 @@ on VM2. Proves, across the real VM boundary:
      drops the live set to 2 of the original 5 -- a minority -- and the
      cluster must correctly refuse new writes (fail-closed, no
      split-brain) rather than let the minority elect its own leader.
+  5. Failback: VM1 is relaunched (a real QEMU boot, not a container
+     restart) and its two nodes rejoin with completely empty in-memory
+     state, alongside the one VM2 node killed for step 4 -- restoring the
+     full original 5-node topology. All 5 catch up to the same committed
+     state via ordinary Raft log replication (no special rejoin
+     procedure) and the cluster again recognizes exactly one leader.
 
 Requires scripts/run_multihost_kvm_setup.sh to have already provisioned
 vm1/vm2 (see .multihost_vm/ for SSH keys and VM connection details).
@@ -310,6 +316,79 @@ def run_probe() -> dict[str, Any]:
             quorum_ok = minority_write_status != 200 and no_new_leader_at_higher_term
         result["minority_fail_closed_ok"] = quorum_ok
 
+        # Failback: bring the whole original topology back to full health,
+        # not just survive the loss. Relaunch VM1 (the actual QEMU process
+        # that was kill -9'd above) via the same setup script used between
+        # probe repeats, restart its two original nodes plus the one VM2
+        # node killed for the minority test, and confirm all 5 -- n1/n2
+        # rejoining with a completely empty in-memory log, having missed
+        # every entry -- catch up to the SAME committed state as the rest
+        # of the cluster via ordinary AppendEntries log replication (no
+        # special rejoin procedure; this is exactly what Raft's "a very
+        # stale follower" case already handles) and that the cluster still
+        # recognizes exactly one leader.
+        failback_ok = False
+        rejoin_setup = run_local(
+            ["bash", str(ROOT / "scripts" / "run_multihost_kvm_setup.sh")], timeout=120.0,
+        )
+        result["vm1_relaunch_ok"] = rejoin_setup.returncode == 0
+        # The setup script's own readiness check only requires SSH plus a
+        # successful ping to VM2 -- dockerd itself can still be a few
+        # seconds behind systemd bringing the rest of a fresh boot up,
+        # confirmed directly (the very next `docker rm` after a "ready"
+        # VM1 timed out entirely). Wait for the daemon itself to actually
+        # answer before touching it.
+        docker_ready = False
+        if result["vm1_relaunch_ok"]:
+            deadline = time.monotonic() + 60.0
+            while time.monotonic() < deadline:
+                try:
+                    probe = run_remote(
+                        VM1_SSH_PORT, "sudo docker info >/dev/null 2>&1", timeout=8.0,
+                    )
+                except subprocess.TimeoutExpired:
+                    time.sleep(1.0)
+                    continue
+                if probe.returncode == 0:
+                    docker_ready = True
+                    break
+                time.sleep(1.0)
+        result["vm1_docker_ready_ok"] = docker_ready
+        if result["vm1_relaunch_ok"] and docker_ready and quorum_ok:
+            try:
+                for node_id in VM1_NODES:
+                    # VM1's disk is persistent across the QEMU kill/
+                    # relaunch, so the old (now-stopped, from the unclean
+                    # VM kill) containers are still present under the same
+                    # names -- remove them first so `docker run --name`
+                    # doesn't fail on a name conflict, and so the
+                    # rejoining node genuinely starts from empty in-memory
+                    # state rather than whatever Docker happened to leave
+                    # on disk.
+                    run_remote(
+                        VM1_SSH_PORT, f"sudo docker rm -f {container_name(node_id)}", timeout=30.0,
+                    )
+                    start_node(node_id)
+                run_remote(
+                    VM2_SSH_PORT, f"sudo docker start {container_name(demoted)}", timeout=15.0,
+                )
+                rejoined_ready = wait_ready(list(ALL_NODES), timeout_s=20.0)
+                leader_3 = wait_single_leader(
+                    list(ALL_NODES), min_term=leader_2["term"], timeout_s=20.0,
+                )
+                caught_up = (
+                    rejoined_ready
+                    and leader_3 is not None
+                    and all(get_value(n, "k1") == "v1" for n in ALL_NODES)
+                    and all(get_value(n, "k2") == "v2" for n in ALL_NODES)
+                )
+                result["leader_3"] = leader_3
+                result["rejoined_nodes_caught_up_ok"] = caught_up
+                failback_ok = caught_up
+            except subprocess.TimeoutExpired as exc:
+                result["failback_stage_timeout"] = str(exc)
+        result["multi_host_failback_full_redundancy_restored_claim"] = failback_ok
+
         ok = (
             result["vm1_alive_before"]
             and write_1_ok and replication_1_ok
@@ -317,6 +396,7 @@ def run_probe() -> dict[str, Any]:
             and failover_ok and data_survived_ok
             and write_2_ok and replicated_2_ok
             and quorum_ok
+            and failback_ok
         )
         result["status"] = "ok" if ok else "failed"
         result["multi_host_kvm_raft_consensus_claim"] = ok
