@@ -637,6 +637,29 @@ application-message deserialization is unchanged. A full closure would need
 a binary (non-JSON) wire format and a pool allocator for the retransmit
 ledger -- a redesign, not a bounded addition -- and remains unclaimed.
 
+Also **done**, closed this session (bounded scope, not a full closure): the
+loaned-message buffer itself is now pooled per publisher/subscription
+instead of allocating a fresh block on every `borrow_loan()` call.
+`release_loan()` runs the type's `fini_function` (releasing any heap-owned
+sub-fields such as `std::string`/`vector` internal buffers) then returns the
+raw block to a capped per-owner pool (`g_loan_pool`, 8 buffers) instead of
+deallocating it; `borrow_loan()` checks that pool before falling back to a
+fresh allocation, and owner destruction (`release_owner_loans`) drains and
+frees any buffers left in the pool. A dedicated 5/5 Docker artifact
+(`docker_deep_preallocation_loaned_message_probe`) proves exactly one fresh
+allocation occurs across a subscription's entire lifetime of repeated
+take/return cycles (eight publishes, each polled via
+`rmw_take_loaned_message` until taken), with every other borrow/release
+cycle reusing the pool, rebuilt clean under ASan/UBSan with zero
+diagnostics; the existing `loaned_message_probe` (5/5) shows no regression.
+This intentionally does **not** close `zero_copy_loaned_message_claim`: it
+removes the allocation, not the deserialization. The wire format is
+JSON+base64 text and introspected ROS fields (`std::string`, sequences) own
+separately-allocated memory, so the loaned buffer can never alias the
+received network bytes directly -- true zero-copy would require a binary
+wire format matching the in-memory struct layout, which is a redesign, not
+a bounded addition, and remains unclaimed.
+
 Exit gate:
 
 - each capability either implemented and repeatedly probed or explicitly

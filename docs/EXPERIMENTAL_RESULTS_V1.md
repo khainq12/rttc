@@ -55,6 +55,18 @@ untouched to avoid risking the on-wire number format ~187 other probes
 depend on), and the reliability retransmit ledger still allocates per
 in-flight reliable message by design.
 
+The loaned-message buffer is now pooled per publisher/subscription instead
+of allocating a fresh block on every borrow; `fini_function` still runs on
+release (freeing any `std::string`/vector-owned sub-allocations) but the raw
+block returns to a capped 8-buffer pool instead of being deallocated.
+`docker_deep_preallocation_loaned_message_probe` proves exactly one fresh
+allocation across a subscription's whole lifetime of repeated
+take-loaned-message/return cycles, 5/5, rebuilt clean under ASan/UBSan, with
+no regression in the existing `loaned_message_probe`. This does not close
+"zero-copy": the JSON+base64 wire format and variable-length introspection
+fields mean the loaned buffer can never alias the received network bytes,
+so deserialization still runs on every take.
+
 ### A real, root-caused use-after-free (fixed)
 
 An intermittent SIGSEGV in Nav2 navigation probes is root-caused by

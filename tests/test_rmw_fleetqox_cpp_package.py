@@ -3212,6 +3212,37 @@ int main()
         self.assertIn("frame_base64_scratch", rmw_pubsub_source)
         data_frame_source = (PKG / "src" / "data_frame.cpp").read_text()
         self.assertIn("base64_encode_append", data_frame_source)
+        self.assertIn("g_loan_pool", rmw_pubsub_source)
+        self.assertIn("kMaxPooledLoansPerOwner", rmw_pubsub_source)
+        self.assertIn("rmw_fleetqox_cpp_test_loan_fresh_allocations", rmw_pubsub_source)
+        self.assertIn("rmw_fleetqox_cpp_test_loan_pool_reuses", rmw_pubsub_source)
+        deep_preallocation_loaned_message_probe = (
+            PKG / "src" / "deep_preallocation_loaned_message_probe.cpp"
+        )
+        self.assertTrue(deep_preallocation_loaned_message_probe.exists())
+        deep_preallocation_loaned_message_probe_source = (
+            deep_preallocation_loaned_message_probe.read_text()
+        )
+        self.assertIn(
+            "fleetrmw.deep_preallocation_loaned_message_probe.v1",
+            deep_preallocation_loaned_message_probe_source,
+        )
+        self.assertIn("loan_pool_reuse_ok", deep_preallocation_loaned_message_probe_source)
+        deep_preallocation_loaned_message_runner = (
+            ROOT / "scripts" / "run_rmw_docker_deep_preallocation_loaned_message_probe.py"
+        )
+        self.assertTrue(deep_preallocation_loaned_message_runner.exists())
+        deep_preallocation_loaned_message_runner_source = (
+            deep_preallocation_loaned_message_runner.read_text()
+        )
+        self.assertIn(
+            "fleetrmw.docker_deep_preallocation_loaned_message_probe.v1",
+            deep_preallocation_loaned_message_runner_source,
+        )
+        self.assertIn(
+            "deep_preallocation_loaned_message_pool_claim",
+            deep_preallocation_loaned_message_runner_source,
+        )
         security_options_probe = PKG / "src" / "security_options_probe.cpp"
         self.assertTrue(security_options_probe.exists())
         security_options_source = security_options_probe.read_text()

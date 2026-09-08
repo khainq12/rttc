@@ -384,6 +384,24 @@ std::atomic<std::uint64_t> g_sros2_permissions_xml_subscribe_denied{0};
 std::mutex g_loan_mutex;
 std::unordered_map<void *, LoanRecord> g_loans;
 
+// Reused across borrow_loan()/release_loan() calls for the same owner so a
+// steady borrow/use/return cycle (e.g. one subscription repeatedly calling
+// rmw_take_loaned_message) stops allocating a fresh block on every call --
+// see docker_deep_preallocation_loaned_message_probe. Capped per owner so a
+// caller that erratically borrows many concurrent, never-returned loans
+// does not grow this pool unbounded; buffers beyond the cap are freed
+// immediately in release_loan() instead of pooled.
+constexpr size_t kMaxPooledLoansPerOwner = 8;
+
+struct LoanPool
+{
+  rcutils_allocator_t allocator;
+  std::vector<void *> buffers;
+};
+std::unordered_map<const void *, LoanPool> g_loan_pool;
+std::atomic<std::uint64_t> g_loan_fresh_allocations{0};
+std::atomic<std::uint64_t> g_loan_pool_reuses{0};
+
 void enqueue_received_frame(const std::string & encoded_frame);
 bool apply_received_graph_advertisement(const std::string & encoded_frame);
 bool handle_ack_nack_feedback(const std::string & encoded_frame);
@@ -445,10 +463,24 @@ rmw_ret_t borrow_loan(
     RMW_SET_ERROR_MSG("loaned message requires introspection C/C++ or a sized type-erased descriptor");
     return RMW_RET_UNSUPPORTED;
   }
-  void * message = allocator.allocate(message_size, allocator.state);
-  if (message == nullptr) {
-    RMW_SET_ERROR_MSG("failed to allocate loaned message");
-    return RMW_RET_BAD_ALLOC;
+  void * message = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_loan_mutex);
+    const auto pool_it = g_loan_pool.find(owner);
+    if (pool_it != g_loan_pool.end() && !pool_it->second.buffers.empty()) {
+      message = pool_it->second.buffers.back();
+      pool_it->second.buffers.pop_back();
+    }
+  }
+  if (message != nullptr) {
+    g_loan_pool_reuses.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    message = allocator.allocate(message_size, allocator.state);
+    if (message == nullptr) {
+      RMW_SET_ERROR_MSG("failed to allocate loaned message");
+      return RMW_RET_BAD_ALLOC;
+    }
+    g_loan_fresh_allocations.fetch_add(1, std::memory_order_relaxed);
   }
   std::memset(message, 0, message_size);
   if (c_members != nullptr && c_members->init_function != nullptr) {
@@ -473,6 +505,7 @@ rmw_ret_t release_loan(const void * owner, LoanOwnerKind owner_kind, void * ros_
     return RMW_RET_INVALID_ARGUMENT;
   }
   LoanRecord record{};
+  bool pooled = false;
   {
     std::lock_guard<std::mutex> lock(g_loan_mutex);
     const auto found = g_loans.find(ros_message);
@@ -484,14 +517,33 @@ rmw_ret_t release_loan(const void * owner, LoanOwnerKind owner_kind, void * ros_
     }
     record = found->second;
     g_loans.erase(found);
+    auto & pool = g_loan_pool[owner];
+    if (pool.buffers.size() < kMaxPooledLoansPerOwner) {
+      pool.allocator = record.allocator;
+      pool.buffers.push_back(ros_message);
+      pooled = true;
+    }
   }
-  fini_loan(ros_message, record);
+  // fini_function releases any heap-owned sub-fields (std::string/vector
+  // internal buffers) regardless of whether the raw block is pooled for
+  // reuse or deallocated -- only the raw allocation itself is skipped when
+  // pooled, matching borrow_loan()'s pool-first lookup above.
+  if (record.c_members != nullptr && record.c_members->fini_function != nullptr) {
+    record.c_members->fini_function(ros_message);
+  } else if (record.cpp_members != nullptr && record.cpp_members->fini_function != nullptr) {
+    record.cpp_members->fini_function(ros_message);
+  }
+  if (!pooled) {
+    record.allocator.deallocate(ros_message, record.allocator.state);
+  }
   return RMW_RET_OK;
 }
 
 void release_owner_loans(const void * owner, LoanOwnerKind owner_kind)
 {
   std::vector<std::pair<void *, LoanRecord>> loans;
+  LoanPool pooled_buffers{};
+  bool has_pooled_buffers = false;
   {
     std::lock_guard<std::mutex> lock(g_loan_mutex);
     for (auto it = g_loans.begin(); it != g_loans.end();) {
@@ -502,9 +554,22 @@ void release_owner_loans(const void * owner, LoanOwnerKind owner_kind)
         ++it;
       }
     }
+    const auto pool_it = g_loan_pool.find(owner);
+    if (pool_it != g_loan_pool.end()) {
+      pooled_buffers = std::move(pool_it->second);
+      has_pooled_buffers = true;
+      g_loan_pool.erase(pool_it);
+    }
   }
   for (const auto & loan : loans) {
     fini_loan(loan.first, loan.second);
+  }
+  // Pooled buffers already had fini_function run when release_loan()
+  // returned them to the pool -- only the raw allocation remains here.
+  if (has_pooled_buffers) {
+    for (void * message : pooled_buffers.buffers) {
+      pooled_buffers.allocator.deallocate(message, pooled_buffers.allocator.state);
+    }
   }
 }
 
@@ -11053,6 +11118,19 @@ size_t rmw_fleetqox_cpp_test_publisher_frame_base64_scratch_capacity(
   }
   std::lock_guard<std::mutex> lock(data->publish_mutex);
   return data->frame_base64_scratch.capacity();
+}
+
+// White-box accessors for probing the loaned-message buffer pool (see
+// g_loan_pool, borrow_loan(), and release_loan()). Not part of the public
+// RMW API; test-only, like the counters above.
+std::uint64_t rmw_fleetqox_cpp_test_loan_fresh_allocations()
+{
+  return g_loan_fresh_allocations.load(std::memory_order_relaxed);
+}
+
+std::uint64_t rmw_fleetqox_cpp_test_loan_pool_reuses()
+{
+  return g_loan_pool_reuses.load(std::memory_order_relaxed);
 }
 
 }  // extern "C"
