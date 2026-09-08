@@ -533,6 +533,9 @@ std::string encode_data_frame(const DataFrame & frame, std::string & base64_scra
   if (!frame.partitions_csv.empty()) {
     out << "\"partitions\":\"" << json_escape(frame.partitions_csv) << "\",";
   }
+  if (frame.ownership_strength != 0) {
+    out << "\"ownership_strength\":" << frame.ownership_strength << ",";
+  }
   out << "\"route\":{\"robot_id\":\"" << json_escape(frame.robot_id) << "\",";
   out << "\"topic\":\"" << json_escape(frame.topic) << "\"";
   if (!frame.flow_class.empty()) {
@@ -645,7 +648,8 @@ std::optional<DataFrame> decode_data_frame(const std::string & payload)
     json_double_value(qox, "task_criticality").value_or(0.0),
     json_bool_value(repair, "requested"),
     json_uint_value(repair, "prior_attempts").value_or(0),
-    json_string_value(body, "partitions").value_or("")};
+    json_string_value(body, "partitions").value_or(""),
+    static_cast<std::int32_t>(json_uint_value(body, "ownership_strength").value_or(0))};
 }
 
 std::string encode_route_advertisement(const RouteAdvertisement & advertisement)

@@ -254,11 +254,24 @@ struct FleetQoxSubscriptionData
   bool presentation_coherent_access{false};
   bool presentation_ordered_access{false};
   std::string presentation_group_id{};
-  // Owner publisher_id currently "winning" EXCLUSIVE ownership arbitration
-  // on this subscription's topic (see ownership_kind above); empty when
-  // ownership_kind is kShared or no EXCLUSIVE publisher has matched yet.
-  std::string exclusive_owner_publisher_id{};
+  // Owner key ("robot_id|publisher_id", disambiguating same-numbered
+  // publisher_ids from different remote processes -- publisher_id alone is
+  // only unique within one process) currently "winning" EXCLUSIVE
+  // ownership arbitration on this subscription's topic (see ownership_kind
+  // above); empty when ownership_kind is kShared or no EXCLUSIVE publisher
+  // has matched yet.
+  std::string exclusive_owner_key{};
   std::int32_t exclusive_owner_strength{0};
+  // Last time a frame from the current owner was actually delivered. If
+  // this goes stale past kExclusiveOwnershipTimeoutNs, the owner is
+  // treated as gone (destroyed, crashed, or simply stopped publishing) and
+  // arbitration restarts from whichever publisher's frame arrives next --
+  // there is no separate hook into publisher-destroy/liveliness-loss
+  // machinery here, since a remote publisher's wire identity (robot_id +
+  // publisher_id, carried per DataFrame) and its graph-discovery identity
+  // (endpoint_id, carried per GraphAdvertisement) are not otherwise
+  // correlated anywhere in this codebase.
+  std::int64_t exclusive_owner_last_seen_ns{0};
 };
 
 struct ReliableRetransmitEntry
@@ -11428,7 +11441,8 @@ rmw_ret_t publish_payload(FleetQoxPublisherData * data, const std::vector<std::u
     0.0,
     false,
     std::uint64_t{0},
-    encode_partitions_csv(data->partitions)};
+    encode_partitions_csv(data->partitions),
+    data->ownership_strength};
   const std::string encoded_frame =
     rmw_fleetqox_cpp::encode_data_frame(frame, data->frame_base64_scratch);
   const bool reliable = data->qos.reliability == RMW_QOS_POLICY_RELIABILITY_RELIABLE;
@@ -12908,6 +12922,56 @@ void enqueue_frame_respecting_destination_order(
   subscription->frame_queue.insert(insert_before, encoded_frame);
 }
 
+// An EXCLUSIVE owner that has gone silent this long is treated as gone
+// (destroyed, crashed, or simply stopped publishing) and arbitration
+// restarts from whichever publisher's frame arrives next, regardless of
+// strength. There is no direct hook into publisher-destroy or
+// liveliness-loss machinery here: a remote publisher's wire identity
+// (robot_id + publisher_id, carried per DataFrame) and its graph-discovery
+// identity (endpoint_id, carried per GraphAdvertisement) are not otherwise
+// correlated anywhere in this codebase, so a timeout on the wire identity
+// itself is the simplest correct signal.
+constexpr std::int64_t kExclusiveOwnershipTimeoutNs = 1'500'000'000;
+
+// OWNERSHIP (FleetQoX extension; see qos_extensions.hpp), arbitrated at
+// TOPIC granularity rather than per DDS-keyed-instance -- ROS 2 message
+// types have no key fields exposed to rmw the way native DDS IDL does, so
+// there is no instance identifier to arbitrate on below the topic itself.
+// SHARED (the default) always admits delivery, unchanged from every prior
+// session's behavior. EXCLUSIVE admits only the highest-strength publisher
+// seen so far on this subscription: the current owner keeps winning ties
+// and re-delivers normally; a NEW publisher only takes over with STRICTLY
+// greater strength, or once the current owner has gone silent past
+// kExclusiveOwnershipTimeoutNs (see above); every other (lower-or-equal-
+// strength, non-owning, non-stale-owner) publisher's frames are silently
+// suppressed, exactly as DDS EXCLUSIVE ownership suppresses non-owning
+// writers.
+bool ownership_admits_delivery(
+  FleetQoxSubscriptionData * subscription,
+  const std::string & robot_id,
+  const std::string & publisher_id,
+  std::int32_t ownership_strength,
+  std::int64_t receive_ns)
+{
+  if (subscription->ownership_kind != rmw_fleetqox_cpp::OwnershipKind::kExclusive) {
+    return true;
+  }
+  const std::string owner_key = robot_id + "|" + publisher_id;
+  const bool owner_stale = !subscription->exclusive_owner_key.empty() &&
+    (receive_ns - subscription->exclusive_owner_last_seen_ns) > kExclusiveOwnershipTimeoutNs;
+  if (subscription->exclusive_owner_key.empty() ||
+    subscription->exclusive_owner_key == owner_key ||
+    ownership_strength > subscription->exclusive_owner_strength ||
+    owner_stale)
+  {
+    subscription->exclusive_owner_key = owner_key;
+    subscription->exclusive_owner_strength = ownership_strength;
+    subscription->exclusive_owner_last_seen_ns = receive_ns;
+    return true;
+  }
+  return false;
+}
+
 void enqueue_received_frame(const std::string & encoded_frame)
 {
   const auto decoded_frame = rmw_fleetqox_cpp::decode_data_frame(encoded_frame);
@@ -12932,6 +12996,12 @@ void enqueue_received_frame(const std::string & encoded_frame)
       {
         if (!subscribe_allowed_by_security_policy(
             subscription->topic_name, subscription->enclave, subscription->domain_id))
+        {
+          continue;
+        }
+        if (!ownership_admits_delivery(
+            subscription, decoded_frame->robot_id, decoded_frame->publisher_id,
+            decoded_frame->ownership_strength, receive_ns))
         {
           continue;
         }

@@ -40,7 +40,8 @@ struct DataFrame
     double task_criticality_value = 0.0,
     bool repair_requested_value = false,
     std::uint64_t prior_repair_attempts_value = 0,
-    std::string partitions_csv_value = {})
+    std::string partitions_csv_value = {},
+    std::int32_t ownership_strength_value = 0)
   : robot_id(std::move(robot_id_value)),
     topic(std::move(topic_value)),
     publisher_id(std::move(publisher_id_value)),
@@ -56,7 +57,8 @@ struct DataFrame
     task_criticality(task_criticality_value),
     repair_requested(repair_requested_value),
     prior_repair_attempts(prior_repair_attempts_value),
-    partitions_csv(std::move(partitions_csv_value))
+    partitions_csv(std::move(partitions_csv_value)),
+    ownership_strength(ownership_strength_value)
   {}
 
   std::string robot_id;
@@ -81,6 +83,11 @@ struct DataFrame
   // local subscription's own configured partitions -- it does not consult
   // the separate remote-endpoint registry that GraphAdvertisement feeds.
   std::string partitions_csv;
+  // FleetQoX OWNERSHIP extension (see qos_extensions.hpp): the publishing
+  // side's declared strength, used by an EXCLUSIVE-ownership subscription
+  // to arbitrate among multiple publishers on the same topic. Meaningless
+  // (and ignored) for a SHARED-ownership subscription, the default.
+  std::int32_t ownership_strength = 0;
 };
 
 struct TimedMissingSequenceRange
