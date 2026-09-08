@@ -364,6 +364,25 @@ std::vector<FleetQoxSubscriptionData *> g_subscriptions;
 std::vector<rmw_subscription_t *> g_subscription_handles;
 std::unordered_map<std::string, ReliableRetransmitEntry> g_retransmit_ledger;
 std::unordered_map<std::string, RemotePubSubEndpoint> g_remote_pubsub_endpoints;
+// FleetQoX PRESENTATION extension (see qos_extensions.hpp). Guarded by
+// g_bus_mutex like every other cross-entity structure above.
+// presentation_group_id -> groups currently between a begin/end_coherent_
+// changes call, i.e. still buffering rather than sending immediately.
+std::unordered_set<std::string> g_coherent_active_groups;
+// presentation_group_id -> frames published while that group was active,
+// waiting for end_coherent_changes to assign them a shared coherent_set_id
+// and flush them as one atomic burst. A raw DataFrame plus the issuing
+// publisher's QoS profile (needed for socket_transport().send_data_frame),
+// not a FleetQoxPublisherData*, so a publisher destroyed mid-coherent-set
+// can't leave a dangling pointer here.
+std::unordered_map<
+  std::string, std::vector<std::pair<rmw_fleetqox_cpp::DataFrame, rmw_qos_profile_t>>>
+  g_coherent_publish_pending;
+// coherent_set_id -> frames of that set received so far, waiting for
+// coherent_set_total of them before being released to subscribers together.
+std::unordered_map<std::string, std::vector<std::pair<rmw_fleetqox_cpp::DataFrame, std::string>>>
+  g_coherent_receive_buffers;
+std::atomic<std::uint64_t> g_coherent_set_sequence{0};
 std::atomic<std::uint64_t> g_next_publisher_id{1};
 std::atomic<std::uint64_t> g_next_subscription_id{1};
 std::atomic<bool> g_pubsub_graph_renewal_started{false};
@@ -11522,12 +11541,89 @@ rmw_ret_t publish_payload(FleetQoxPublisherData * data, const std::vector<std::u
     send_publisher_graph_advertisement(data, "liveliness_assert");
   }
   maybe_renew_publisher_graph(data);
+  // FleetQoX PRESENTATION extension (see qos_extensions.hpp): a publisher
+  // currently inside a begin/end_coherent_changes span buffers its frames
+  // here instead of sending immediately -- end_coherent_changes assigns
+  // them a shared coherent_set_id and sends the whole burst. Every other
+  // bookkeeping step above (retransmit ledger, deadline/liveliness
+  // tracking, graph renewal) still runs at the original call site,
+  // unaffected by whether the wire send itself is deferred.
+  if (data->presentation_coherent_access && !data->presentation_group_id.empty()) {
+    std::lock_guard<std::mutex> lock(g_bus_mutex);
+    if (g_coherent_active_groups.count(data->presentation_group_id) != 0) {
+      g_coherent_publish_pending[data->presentation_group_id].emplace_back(frame, data->qos);
+      return RMW_RET_OK;
+    }
+  }
   const rmw_ret_t send_ret =
     socket_transport().send_data_frame(encoded_frame, data->qos);
   if (send_ret != RMW_RET_OK) {
     record_fragment_async_send_failed(encoded_frame);
   }
   return send_ret;
+}
+
+// FleetQoX PRESENTATION extension (see qos_extensions.hpp): begins a
+// GROUP-scope coherent set on every publisher sharing `publisher`'s
+// presentation_group_id. Subsequent rmw_publish calls on any of those
+// publishers buffer their frames (see publish_payload above) instead of
+// sending, until a matching rmw_fleetqox_cpp_end_coherent_changes flushes
+// the whole set as one atomic burst that a coherent_access subscriber
+// buffers and releases together -- proving GROUP scope actually spans
+// multiple topics under one shared Publisher, not just one DataWriter,
+// which rmw's own per-topic API has no equivalent for.
+extern "C" rmw_ret_t rmw_fleetqox_cpp_begin_coherent_changes(const rmw_publisher_t * publisher)
+{
+  if (publisher == nullptr || publisher->data == nullptr) {
+    RMW_SET_ERROR_MSG("publisher is null");
+    return RMW_RET_INVALID_ARGUMENT;
+  }
+  auto * data = static_cast<FleetQoxPublisherData *>(publisher->data);
+  if (data->presentation_group_id.empty()) {
+    RMW_SET_ERROR_MSG("publisher has no FleetQoX presentation_group_id configured");
+    return RMW_RET_UNSUPPORTED;
+  }
+  std::lock_guard<std::mutex> lock(g_bus_mutex);
+  g_coherent_active_groups.insert(data->presentation_group_id);
+  return RMW_RET_OK;
+}
+
+extern "C" rmw_ret_t rmw_fleetqox_cpp_end_coherent_changes(const rmw_publisher_t * publisher)
+{
+  if (publisher == nullptr || publisher->data == nullptr) {
+    RMW_SET_ERROR_MSG("publisher is null");
+    return RMW_RET_INVALID_ARGUMENT;
+  }
+  auto * data = static_cast<FleetQoxPublisherData *>(publisher->data);
+  std::vector<std::pair<rmw_fleetqox_cpp::DataFrame, rmw_qos_profile_t>> pending;
+  {
+    std::lock_guard<std::mutex> lock(g_bus_mutex);
+    g_coherent_active_groups.erase(data->presentation_group_id);
+    auto it = g_coherent_publish_pending.find(data->presentation_group_id);
+    if (it != g_coherent_publish_pending.end()) {
+      pending = std::move(it->second);
+      g_coherent_publish_pending.erase(it);
+    }
+  }
+  if (pending.empty()) {
+    return RMW_RET_OK;
+  }
+  const std::string coherent_set_id = local_robot_id() + "|" + data->presentation_group_id + "|" +
+    std::to_string(g_coherent_set_sequence.fetch_add(1, std::memory_order_relaxed));
+  rmw_ret_t overall_ret = RMW_RET_OK;
+  for (size_t index = 0; index < pending.size(); ++index) {
+    rmw_fleetqox_cpp::DataFrame & frame = pending[index].first;
+    frame.coherent_set_id = coherent_set_id;
+    frame.coherent_set_total = static_cast<std::uint32_t>(pending.size());
+    frame.coherent_set_index = static_cast<std::uint32_t>(index);
+    const std::string encoded_frame = rmw_fleetqox_cpp::encode_data_frame(frame);
+    const rmw_ret_t send_ret = socket_transport().send_data_frame(encoded_frame, pending[index].second);
+    if (send_ret != RMW_RET_OK) {
+      record_fragment_async_send_failed(encoded_frame);
+      overall_ret = send_ret;
+    }
+  }
+  return overall_ret;
 }
 
 int reliable_ack_timeout_ms()
@@ -12972,20 +13068,25 @@ bool ownership_admits_delivery(
   return false;
 }
 
-void enqueue_received_frame(const std::string & encoded_frame)
+// Delivers one already-decoded frame to every matching subscription. Must
+// be called with g_bus_mutex already held. Factored out of
+// enqueue_received_frame so a FleetQoX PRESENTATION (see qos_extensions.hpp)
+// coherent set can run every one of its member frames through this same
+// per-frame logic back-to-back inside ONE lock acquisition -- the property
+// that actually proves atomicity: no rmw_take can observe one member of a
+// coherent set without every other member already sitting in its
+// subscription's frame_queue too, since nothing can interleave between
+// these calls while the lock is held.
+void deliver_decoded_frame_to_subscriptions_locked(
+  const rmw_fleetqox_cpp::DataFrame & decoded_frame_ref,
+  const std::string & encoded_frame,
+  std::int64_t receive_ns,
+  std::vector<EventCallbackNotification> & callbacks,
+  std::vector<EventCallbackNotification> & event_callbacks,
+  std::vector<std::pair<std::string, int>> & ack_nack_payloads,
+  size_t & matched_subscriptions)
 {
-  const auto decoded_frame = rmw_fleetqox_cpp::decode_data_frame(encoded_frame);
-  if (!decoded_frame) {
-    return;
-  }
-
-  std::vector<EventCallbackNotification> callbacks;
-  std::vector<EventCallbackNotification> event_callbacks;
-  std::vector<std::pair<std::string, int>> ack_nack_payloads;
-  size_t matched_subscriptions = 0;
-  const std::int64_t receive_ns = monotonic_timestamp_ns();
-  {
-    std::lock_guard<std::mutex> lock(g_bus_mutex);
+    const rmw_fleetqox_cpp::DataFrame * decoded_frame = &decoded_frame_ref;
     for (FleetQoxSubscriptionData * subscription : g_subscriptions) {
       if (subscription != nullptr && subscription->domain_id == decoded_frame->domain_id &&
         subscription->topic_name == decoded_frame->topic &&
@@ -13076,7 +13177,56 @@ void enqueue_received_frame(const std::string & encoded_frame)
         }
       }
     }
+}
+
+void enqueue_received_frame(const std::string & encoded_frame)
+{
+  const auto decoded_frame = rmw_fleetqox_cpp::decode_data_frame(encoded_frame);
+  if (!decoded_frame) {
+    return;
   }
+
+  std::vector<EventCallbackNotification> callbacks;
+  std::vector<EventCallbackNotification> event_callbacks;
+  std::vector<std::pair<std::string, int>> ack_nack_payloads;
+  size_t matched_subscriptions = 0;
+  const std::int64_t receive_ns = monotonic_timestamp_ns();
+
+  if (decoded_frame->coherent_set_id.empty()) {
+    std::lock_guard<std::mutex> lock(g_bus_mutex);
+    deliver_decoded_frame_to_subscriptions_locked(
+      *decoded_frame, encoded_frame, receive_ns, callbacks, event_callbacks,
+      ack_nack_payloads, matched_subscriptions);
+  } else {
+    // FleetQoX PRESENTATION extension (see qos_extensions.hpp): buffer
+    // every member of this coherent set until they've all arrived, then
+    // deliver them as one atomic burst, ordered by coherent_set_index so
+    // an ordered_access reader sees them in original publish order
+    // regardless of UDP reordering.
+    std::vector<std::pair<rmw_fleetqox_cpp::DataFrame, std::string>> ready_set;
+    {
+      std::lock_guard<std::mutex> lock(g_bus_mutex);
+      auto & pending = g_coherent_receive_buffers[decoded_frame->coherent_set_id];
+      pending.emplace_back(*decoded_frame, encoded_frame);
+      if (pending.size() < std::max<std::uint32_t>(decoded_frame->coherent_set_total, 1)) {
+        return;
+      }
+      ready_set = std::move(pending);
+      g_coherent_receive_buffers.erase(decoded_frame->coherent_set_id);
+    }
+    std::sort(
+      ready_set.begin(), ready_set.end(),
+      [](const auto & lhs, const auto & rhs) {
+        return lhs.first.coherent_set_index < rhs.first.coherent_set_index;
+      });
+    std::lock_guard<std::mutex> lock(g_bus_mutex);
+    for (const auto & member : ready_set) {
+      deliver_decoded_frame_to_subscriptions_locked(
+        member.first, member.second, receive_ns, callbacks, event_callbacks,
+        ack_nack_payloads, matched_subscriptions);
+    }
+  }
+
   for (const auto & payload : ack_nack_payloads) {
     if (payload.second > 0) {
       std::thread(

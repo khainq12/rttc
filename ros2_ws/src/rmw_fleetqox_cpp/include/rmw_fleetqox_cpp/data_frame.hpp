@@ -41,7 +41,10 @@ struct DataFrame
     bool repair_requested_value = false,
     std::uint64_t prior_repair_attempts_value = 0,
     std::string partitions_csv_value = {},
-    std::int32_t ownership_strength_value = 0)
+    std::int32_t ownership_strength_value = 0,
+    std::string coherent_set_id_value = {},
+    std::uint32_t coherent_set_total_value = 0,
+    std::uint32_t coherent_set_index_value = 0)
   : robot_id(std::move(robot_id_value)),
     topic(std::move(topic_value)),
     publisher_id(std::move(publisher_id_value)),
@@ -58,7 +61,10 @@ struct DataFrame
     repair_requested(repair_requested_value),
     prior_repair_attempts(prior_repair_attempts_value),
     partitions_csv(std::move(partitions_csv_value)),
-    ownership_strength(ownership_strength_value)
+    ownership_strength(ownership_strength_value),
+    coherent_set_id(std::move(coherent_set_id_value)),
+    coherent_set_total(coherent_set_total_value),
+    coherent_set_index(coherent_set_index_value)
   {}
 
   std::string robot_id;
@@ -88,6 +94,18 @@ struct DataFrame
   // to arbitrate among multiple publishers on the same topic. Meaningless
   // (and ignored) for a SHARED-ownership subscription, the default.
   std::int32_t ownership_strength = 0;
+  // FleetQoX PRESENTATION extension (see qos_extensions.hpp): non-empty
+  // when this frame is one member of a GROUP-scope coherent set flushed by
+  // rmw_fleetqox_cpp_end_coherent_changes(). All frames sharing one
+  // coherent_set_id (which may span multiple topics, since PRESENTATION at
+  // GROUP scope spans an entire Publisher, not one DataWriter) must be
+  // buffered by a coherent_access subscriber and released to
+  // rmw_take-visible state together, only once coherent_set_total of them
+  // have arrived; coherent_set_index gives their original publish order
+  // for a coherent+ordered_access release.
+  std::string coherent_set_id;
+  std::uint32_t coherent_set_total = 0;
+  std::uint32_t coherent_set_index = 0;
 };
 
 struct TimedMissingSequenceRange

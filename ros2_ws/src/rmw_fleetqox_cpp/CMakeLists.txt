@@ -1176,6 +1176,19 @@ ament_target_dependencies(fleetrmw_ownership_probe
   rclcpp
   std_msgs
 )
+
+add_executable(fleetrmw_presentation_probe
+  src/presentation_probe.cpp
+)
+target_include_directories(fleetrmw_presentation_probe PRIVATE include)
+target_compile_features(fleetrmw_presentation_probe PRIVATE cxx_std_17)
+target_link_libraries(fleetrmw_presentation_probe
+  ${PROJECT_NAME}
+)
+ament_target_dependencies(fleetrmw_presentation_probe
+  rcutils
+  rmw
+)
 target_compile_features(fleetrmw_cpp_typesupport_probe PRIVATE cxx_std_17)
 target_link_libraries(fleetrmw_cpp_typesupport_probe
   ${PROJECT_NAME}
@@ -1502,6 +1515,7 @@ install(
     fleetrmw_destination_order_probe
     fleetrmw_partition_probe
     fleetrmw_ownership_probe
+    fleetrmw_presentation_probe
     fleetrmw_remote_deadline_event_probe
     fleetrmw_content_filter_probe
     fleetrmw_content_filter_sql_probe

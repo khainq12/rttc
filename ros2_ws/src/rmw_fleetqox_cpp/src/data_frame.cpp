@@ -536,6 +536,11 @@ std::string encode_data_frame(const DataFrame & frame, std::string & base64_scra
   if (frame.ownership_strength != 0) {
     out << "\"ownership_strength\":" << frame.ownership_strength << ",";
   }
+  if (!frame.coherent_set_id.empty()) {
+    out << "\"coherent_set_id\":\"" << json_escape(frame.coherent_set_id) << "\",";
+    out << "\"coherent_set_total\":" << frame.coherent_set_total << ",";
+    out << "\"coherent_set_index\":" << frame.coherent_set_index << ",";
+  }
   out << "\"route\":{\"robot_id\":\"" << json_escape(frame.robot_id) << "\",";
   out << "\"topic\":\"" << json_escape(frame.topic) << "\"";
   if (!frame.flow_class.empty()) {
@@ -649,7 +654,10 @@ std::optional<DataFrame> decode_data_frame(const std::string & payload)
     json_bool_value(repair, "requested"),
     json_uint_value(repair, "prior_attempts").value_or(0),
     json_string_value(body, "partitions").value_or(""),
-    static_cast<std::int32_t>(json_uint_value(body, "ownership_strength").value_or(0))};
+    static_cast<std::int32_t>(json_uint_value(body, "ownership_strength").value_or(0)),
+    json_string_value(body, "coherent_set_id").value_or(""),
+    static_cast<std::uint32_t>(json_uint_value(body, "coherent_set_total").value_or(0)),
+    static_cast<std::uint32_t>(json_uint_value(body, "coherent_set_index").value_or(0))};
 }
 
 std::string encode_route_advertisement(const RouteAdvertisement & advertisement)
