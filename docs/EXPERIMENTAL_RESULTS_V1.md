@@ -67,6 +67,32 @@ no regression in the existing `loaned_message_probe`. This does not close
 fields mean the loaned buffer can never alias the received network bytes,
 so deserialization still runs on every take.
 
+Remote liveliness-incompatible QoS event production is now proven over a
+real two-process/UDP wire. The detection code
+(`incompatible_qos_policy_kind()`) was already shared verbatim between local
+match-checking and remote-endpoint discovery, but no existing test exercised
+it for LIVELINESS specifically across a real wire boundary: the local
+probe (`qos_liveliness_incompatible_event_probe.cpp`) creates both endpoints
+in one process, and the existing remote-graph probe
+(`remote_event_probe.cpp`) covers reliability/durability/deadline but not
+liveliness. A new dedicated two-container probe
+(`remote_liveliness_incompatible_event_probe.cpp` +
+`run_rmw_docker_remote_liveliness_incompatible_event_probe.py`) proves both
+liveliness-incompatibility causes -- AUTOMATIC-vs-MANUAL_BY_TOPIC kind
+mismatch and slow-vs-fast lease-duration mismatch -- in both directions (a
+local publisher against a remote-learned subscription, and a local
+subscription against a remote-learned publisher), 5/5 across real Docker
+containers with `netem delay 5ms 1ms`, rebuilt clean under ASan/UBSan. Full
+DDS message-lost/resource-limit semantics and the full QoS/type
+compatibility matrix remain architecturally bounded, not pending effort:
+upstream `rmw_qos_profile_t` has no resource_limits fields and upstream
+`rmw_qos_policy_kind_t` has no enum values for OWNERSHIP/PRESENTATION/
+PARTITION/DESTINATION_ORDER, so neither can close without forking `rmw`
+itself. Deprecated participant-wide MANUAL_BY_NODE liveliness semantics
+remain deliberately fail-closed, and remote type compatibility remains
+plain string equality rather than structural/RIHS type-hash comparison, a
+genuinely open-ended undertaking rather than a bounded fix.
+
 ### A real, root-caused use-after-free (fixed)
 
 An intermittent SIGSEGV in Nav2 navigation probes is root-caused by

@@ -805,6 +805,39 @@ received network bytes directly -- true zero-copy would require a binary
 wire format matching the in-memory struct layout, which is a redesign, not
 a bounded addition, and remains unclaimed.
 
+Also **done**, closed this session: remote liveliness-incompatible QoS event
+production, proven end to end across a real two-process/UDP wire. The
+underlying detection code (`incompatible_qos_policy_kind()` in
+`rmw_pubsub.cpp`) was already shared verbatim between local match-checking
+and remote-endpoint discovery, but had no dedicated test exercising it for
+LIVELINESS specifically over the wire -- every existing liveliness-
+incompatible test ran both endpoints in one process
+(`qos_liveliness_incompatible_event_probe.cpp`), and every existing remote-
+graph incompatible-QoS probe (`remote_event_probe.cpp`) covered reliability/
+durability/deadline but never liveliness. A new, dedicated two-container
+probe (`remote_liveliness_incompatible_event_probe.cpp`, orchestrated by
+`run_rmw_docker_remote_liveliness_incompatible_event_probe.py`, modeled on
+`remote_event_probe.cpp`'s advertiser/observer split rather than extending
+that file's already-passing hardcoded endpoint-count totals) proves both
+liveliness incompatibility causes -- AUTOMATIC-vs-MANUAL_BY_TOPIC kind
+mismatch and slow-vs-fast lease-duration mismatch -- in both directions (a
+local publisher against a remote-learned subscription, and a local
+subscription against a remote-learned publisher), asserting
+`last_policy_kind == RMW_QOS_POLICY_LIVELINESS` on every one of the four
+scenarios. Rebuilt clean under ASan/UBSan with zero diagnostics, 5/5 across
+real Docker containers with `netem delay 5ms 1ms` on both sides. This
+closes the one concrete, bounded sub-gap under `full_liveliness_event_
+production_claim`/`full_remote_graph_event_production_claim`; those two
+claims stay `false` because most of what they'd need (deprecated
+MANUAL_BY_NODE semantics, structural/RIHS remote type-hash comparison) is
+genuinely open-ended, not because more bounded coverage remains. The other
+two related `false` claims -- `full_message_lost_event_production_claim`
+and `full_non_deadline_qos_event_production_claim` -- are architecturally
+bounded rather than pending effort: upstream `rmw_qos_profile_t` has no
+resource_limits fields, and upstream `rmw_qos_policy_kind_t` has no enum
+values for OWNERSHIP/PRESENTATION/PARTITION/DESTINATION_ORDER, so neither
+can be closed without forking `rmw` itself.
+
 Exit gate:
 
 - each capability either implemented and repeatedly probed or explicitly
