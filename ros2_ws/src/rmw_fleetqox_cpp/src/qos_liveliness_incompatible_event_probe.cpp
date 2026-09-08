@@ -274,8 +274,13 @@ int main()
   const rmw_subscription_options_t subscription_options =
     rmw_get_default_subscription_options();
 
+  // Referenced numerically rather than the deprecated
+  // RMW_QOS_POLICY_LIVELINESS_MANUAL_BY_NODE symbol to avoid a
+  // -Wdeprecated-declarations warning, matching the rest of this codebase.
+  constexpr auto kManualByNode = static_cast<rmw_qos_liveliness_policy_t>(2);
   const rmw_qos_profile_t automatic_100 = liveliness_qos(
     RMW_QOS_POLICY_LIVELINESS_AUTOMATIC, 100);
+  const rmw_qos_profile_t manual_node_100 = liveliness_qos(kManualByNode, 100);
   const rmw_qos_profile_t manual_100 = liveliness_qos(
     RMW_QOS_POLICY_LIVELINESS_MANUAL_BY_TOPIC, 100);
   const rmw_qos_profile_t manual_500 = liveliness_qos(
@@ -289,6 +294,25 @@ int main()
   const ScenarioResult kind_requested = run_incompatible_scenario(
     &context, node, &type_support, &publisher_options, &subscription_options,
     "/fleetqox/qos_liveliness_kind_requested", automatic_100, manual_100, false);
+  // Strictness ordering is AUTOMATIC(1) < MANUAL_BY_NODE(2) <
+  // MANUAL_BY_TOPIC(3); these two scenarios cover the middle-rank pairs the
+  // original single AUTOMATIC-vs-MANUAL_BY_TOPIC check missed.
+  const ScenarioResult kind_automatic_vs_manual_node_offered = run_incompatible_scenario(
+    &context, node, &type_support, &publisher_options, &subscription_options,
+    "/fleetqox/qos_liveliness_kind_automatic_vs_manual_node_offered",
+    automatic_100, manual_node_100, true);
+  const ScenarioResult kind_automatic_vs_manual_node_requested = run_incompatible_scenario(
+    &context, node, &type_support, &publisher_options, &subscription_options,
+    "/fleetqox/qos_liveliness_kind_automatic_vs_manual_node_requested",
+    automatic_100, manual_node_100, false);
+  const ScenarioResult kind_manual_node_vs_manual_topic_offered = run_incompatible_scenario(
+    &context, node, &type_support, &publisher_options, &subscription_options,
+    "/fleetqox/qos_liveliness_kind_manual_node_vs_manual_topic_offered",
+    manual_node_100, manual_100, true);
+  const ScenarioResult kind_manual_node_vs_manual_topic_requested = run_incompatible_scenario(
+    &context, node, &type_support, &publisher_options, &subscription_options,
+    "/fleetqox/qos_liveliness_kind_manual_node_vs_manual_topic_requested",
+    manual_node_100, manual_100, false);
   const ScenarioResult slow_lease_offered = run_incompatible_scenario(
     &context, node, &type_support, &publisher_options, &subscription_options,
     "/fleetqox/qos_liveliness_slow_lease_offered", manual_500, manual_100, true);
@@ -311,10 +335,17 @@ int main()
   const bool clean_teardown = node_ret == RMW_RET_OK && shutdown_ret == RMW_RET_OK &&
     context_ret == RMW_RET_OK && options_ret == RMW_RET_OK;
   const bool ok = node != nullptr && kind_offered.ok && kind_requested.ok &&
+    kind_automatic_vs_manual_node_offered.ok && kind_automatic_vs_manual_node_requested.ok &&
+    kind_manual_node_vs_manual_topic_offered.ok &&
+    kind_manual_node_vs_manual_topic_requested.ok &&
     slow_lease_offered.ok && slow_lease_requested.ok && missing_lease_offered.ok &&
     missing_lease_requested.ok && compatible_control && clean_teardown;
   const std::uint64_t callback_events = kind_offered.callback_events +
-    kind_requested.callback_events + slow_lease_offered.callback_events +
+    kind_requested.callback_events + kind_automatic_vs_manual_node_offered.callback_events +
+    kind_automatic_vs_manual_node_requested.callback_events +
+    kind_manual_node_vs_manual_topic_offered.callback_events +
+    kind_manual_node_vs_manual_topic_requested.callback_events +
+    slow_lease_offered.callback_events +
     slow_lease_requested.callback_events + missing_lease_offered.callback_events +
     missing_lease_requested.callback_events;
 
@@ -325,6 +356,14 @@ int main()
             << (kind_offered.ok ? "true" : "false") << ","
             << "\"liveliness_kind_requested_event_claim\":"
             << (kind_requested.ok ? "true" : "false") << ","
+            << "\"liveliness_kind_automatic_vs_manual_node_offered_claim\":"
+            << (kind_automatic_vs_manual_node_offered.ok ? "true" : "false") << ","
+            << "\"liveliness_kind_automatic_vs_manual_node_requested_claim\":"
+            << (kind_automatic_vs_manual_node_requested.ok ? "true" : "false") << ","
+            << "\"liveliness_kind_manual_node_vs_manual_topic_offered_claim\":"
+            << (kind_manual_node_vs_manual_topic_offered.ok ? "true" : "false") << ","
+            << "\"liveliness_kind_manual_node_vs_manual_topic_requested_claim\":"
+            << (kind_manual_node_vs_manual_topic_requested.ok ? "true" : "false") << ","
             << "\"liveliness_slow_lease_offered_event_claim\":"
             << (slow_lease_offered.ok ? "true" : "false") << ","
             << "\"liveliness_slow_lease_requested_event_claim\":"
@@ -335,8 +374,8 @@ int main()
             << (missing_lease_requested.ok ? "true" : "false") << ","
             << "\"liveliness_compatible_control_claim\":"
             << (compatible_control ? "true" : "false") << ","
-            << "\"scenario_count\":7,"
-            << "\"incompatible_event_count\":6,"
+            << "\"scenario_count\":11,"
+            << "\"incompatible_event_count\":10,"
             << "\"last_policy_kind\":" << RMW_QOS_POLICY_LIVELINESS << ","
             << "\"callback_events\":" << callback_events << ","
             << "\"clean_teardown\":" << (clean_teardown ? "true" : "false") << "}"

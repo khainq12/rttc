@@ -904,6 +904,28 @@ generator used has been renamed to `manual_by_node_infinite_lease_
 lifecycle_claim` throughout (source, capabilities.json, tests, and the
 report generator) since the old name no longer describes what happens.
 
+Also **fixed**, closed this session: a leftover bug in `liveliness_qos_
+incompatible()` from the MANUAL_BY_NODE closure above. DDS liveliness-kind
+compatibility is a strictness ordering -- AUTOMATIC(1) < MANUAL_BY_NODE(2)
+< MANUAL_BY_TOPIC(3), a requester is incompatible with anything offering a
+strictly weaker kind -- but the function only ever special-cased the single
+AUTOMATIC-vs-MANUAL_BY_TOPIC endpoint pair, written back when MANUAL_BY_NODE
+was still rejected at creation and therefore could never reach this check.
+Once this session made MANUAL_BY_NODE a creatable kind, two genuinely
+incompatible pairs became silently treated as compatible:
+AUTOMATIC-offered-vs-MANUAL_BY_NODE-requested, and
+MANUAL_BY_NODE-offered-vs-MANUAL_BY_TOPIC-requested. Replaced the hardcoded
+pair with a `liveliness_strictness_rank()` helper and a rank comparison,
+correct for all three kinds by construction. Since this function is shared
+verbatim by local matching and both remote directions,
+`qos_liveliness_incompatible_event_probe.cpp` gained 4 new scenarios (both
+missing pairs, both offered/requested directions) and
+`remote_liveliness_incompatible_event_probe.cpp` gained 2 new scenarios
+(both missing pairs, offered direction -- the requested direction exercises
+the identical rank comparison, already proven bidirectional by the existing
+scenarios), all passing 5/5 on real Docker/netem, rebuilt clean under
+ASan/UBSan.
+
 Exit gate:
 
 - each capability either implemented and repeatedly probed or explicitly

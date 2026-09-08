@@ -8199,13 +8199,35 @@ bool deadline_qos_incompatible(
   return requested_ns > 0 && (offered_ns <= 0 || offered_ns > requested_ns);
 }
 
+// DDS liveliness-kind compatibility is a strictness ordering, not a single
+// AUTOMATIC-vs-MANUAL_BY_TOPIC special case: AUTOMATIC (upstream value 1,
+// DDS-equivalent AUTOMATIC) < MANUAL_BY_NODE (value 2, DDS-equivalent
+// MANUAL_BY_PARTICIPANT) < MANUAL_BY_TOPIC (value 3). A requester is
+// incompatible with anything offering a STRICTLY WEAKER kind. SYSTEM_DEFAULT
+// and BEST_AVAILABLE are treated at the same (weakest) rank as AUTOMATIC,
+// matching qos_liveliness_automatic()'s existing equivalence elsewhere in
+// this file; any other/invalid value defaults to that same weakest rank
+// since malformed liveliness kinds are already rejected at endpoint
+// creation and cannot reach here in practice.
+int liveliness_strictness_rank(rmw_qos_liveliness_policy_t kind)
+{
+  constexpr auto kManualByNode = static_cast<rmw_qos_liveliness_policy_t>(2);
+  if (kind == RMW_QOS_POLICY_LIVELINESS_MANUAL_BY_TOPIC) {
+    return 3;
+  }
+  if (kind == kManualByNode) {
+    return 2;
+  }
+  return 1;
+}
+
 bool liveliness_qos_incompatible(
   const rmw_qos_profile_t & offered,
   const rmw_qos_profile_t & requested)
 {
   const bool kind_incompatible =
-    offered.liveliness == RMW_QOS_POLICY_LIVELINESS_AUTOMATIC &&
-    requested.liveliness == RMW_QOS_POLICY_LIVELINESS_MANUAL_BY_TOPIC;
+    liveliness_strictness_rank(offered.liveliness) <
+    liveliness_strictness_rank(requested.liveliness);
   const std::int64_t offered_lease_ns =
     qos_duration_ns(offered.liveliness_lease_duration);
   const std::int64_t requested_lease_ns =

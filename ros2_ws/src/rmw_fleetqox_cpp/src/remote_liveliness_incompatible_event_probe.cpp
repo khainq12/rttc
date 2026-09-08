@@ -40,6 +40,20 @@ constexpr const char * kLeaseOfferedTopic =
   "/fleetqox/remote_liveliness_incompatible/lease_offered";
 constexpr const char * kLeaseRequestedTopic =
   "/fleetqox/remote_liveliness_incompatible/lease_requested";
+// Strictness ordering is AUTOMATIC(1) < MANUAL_BY_NODE(2) <
+// MANUAL_BY_TOPIC(3); these two cover the middle-rank pairs a prior bug in
+// liveliness_qos_incompatible() missed (it only special-cased the
+// AUTOMATIC-vs-MANUAL_BY_TOPIC pair above). Offered direction only -- the
+// requested direction exercises the same rank comparison, already proven
+// bidirectionally by kKindOfferedTopic/kKindRequestedTopic above.
+constexpr const char * kMidKindAutomaticVsManualNodeTopic =
+  "/fleetqox/remote_liveliness_incompatible/mid_kind_automatic_vs_manual_node";
+constexpr const char * kMidKindManualNodeVsManualTopicTopic =
+  "/fleetqox/remote_liveliness_incompatible/mid_kind_manual_node_vs_manual_topic";
+// Referenced numerically rather than the deprecated
+// RMW_QOS_POLICY_LIVELINESS_MANUAL_BY_NODE symbol to avoid a
+// -Wdeprecated-declarations warning, matching the rest of this codebase.
+constexpr auto kManualByNode = static_cast<rmw_qos_liveliness_policy_t>(2);
 
 struct ProbeConfig
 {
@@ -140,6 +154,7 @@ int run_advertiser(const ProbeConfig & config)
     liveliness_qos(RMW_QOS_POLICY_LIVELINESS_MANUAL_BY_TOPIC, 100);
   const rmw_qos_profile_t manual_500 =
     liveliness_qos(RMW_QOS_POLICY_LIVELINESS_MANUAL_BY_TOPIC, 500);
+  const rmw_qos_profile_t manual_node_100 = liveliness_qos(kManualByNode, 100);
   const rmw_publisher_options_t publisher_options = rmw_get_default_publisher_options();
   const rmw_subscription_options_t subscription_options =
     rmw_get_default_subscription_options();
@@ -170,10 +185,24 @@ int run_advertiser(const ProbeConfig & config)
   // the observer's local publisher there only offers a slow 500ms lease.
   rmw_subscription_t * lease_requested_subscription = rmw_create_subscription(
     node, &type_support, kLeaseOfferedTopic, &manual_100, &subscription_options);
+  // Remote subscription requires MANUAL_BY_NODE (rank 2); the observer's
+  // local publisher there only offers AUTOMATIC (rank 1).
+  rmw_subscription_t * mid_kind_automatic_vs_manual_node_subscription =
+    rmw_create_subscription(
+    node, &type_support, kMidKindAutomaticVsManualNodeTopic, &manual_node_100,
+    &subscription_options);
+  // Remote subscription requires MANUAL_BY_TOPIC (rank 3); the observer's
+  // local publisher there only offers MANUAL_BY_NODE (rank 2).
+  rmw_subscription_t * mid_kind_manual_node_vs_manual_topic_subscription =
+    rmw_create_subscription(
+    node, &type_support, kMidKindManualNodeVsManualTopicTopic, &manual_100,
+    &subscription_options);
 
   const bool created = kind_offered_publisher != nullptr &&
     kind_requested_subscription != nullptr &&
-    lease_offered_publisher != nullptr && lease_requested_subscription != nullptr;
+    lease_offered_publisher != nullptr && lease_requested_subscription != nullptr &&
+    mid_kind_automatic_vs_manual_node_subscription != nullptr &&
+    mid_kind_manual_node_vs_manual_topic_subscription != nullptr;
   std::cout << "{\"schema_version\":\"fleetrmw.remote_liveliness_incompatible_event_probe.v1\","
             << "\"mode\":\"advertiser\",\"phase\":\"ready\","
             << "\"created\":" << (created ? "true" : "false") << "}" << std::endl;
@@ -183,6 +212,14 @@ int run_advertiser(const ProbeConfig & config)
   }
 
   bool cleanup_ok = true;
+  if (mid_kind_manual_node_vs_manual_topic_subscription != nullptr) {
+    cleanup_ok = rmw_destroy_subscription(
+      node, mid_kind_manual_node_vs_manual_topic_subscription) == RMW_RET_OK && cleanup_ok;
+  }
+  if (mid_kind_automatic_vs_manual_node_subscription != nullptr) {
+    cleanup_ok = rmw_destroy_subscription(
+      node, mid_kind_automatic_vs_manual_node_subscription) == RMW_RET_OK && cleanup_ok;
+  }
   if (lease_requested_subscription != nullptr) {
     cleanup_ok = rmw_destroy_subscription(node, lease_requested_subscription) == RMW_RET_OK &&
       cleanup_ok;
@@ -229,6 +266,7 @@ int run_observer(const ProbeConfig & config)
     liveliness_qos(RMW_QOS_POLICY_LIVELINESS_MANUAL_BY_TOPIC, 100);
   const rmw_qos_profile_t manual_500 =
     liveliness_qos(RMW_QOS_POLICY_LIVELINESS_MANUAL_BY_TOPIC, 500);
+  const rmw_qos_profile_t manual_node_100 = liveliness_qos(kManualByNode, 100);
   const rmw_publisher_options_t publisher_options = rmw_get_default_publisher_options();
   const rmw_subscription_options_t subscription_options =
     rmw_get_default_subscription_options();
@@ -250,15 +288,31 @@ int run_observer(const ProbeConfig & config)
   // publisher offer on kLeaseRequestedTopic -> REQUESTED_QOS_INCOMPATIBLE.
   rmw_subscription_t * lease_requested_subscription = rmw_create_subscription(
     node, &type_support, kLeaseRequestedTopic, &manual_100, &subscription_options);
+  // Weak AUTOMATIC offer; paired against the remote's MANUAL_BY_NODE
+  // subscription request on kMidKindAutomaticVsManualNodeTopic ->
+  // OFFERED_QOS_INCOMPATIBLE.
+  rmw_publisher_t * mid_kind_automatic_vs_manual_node_publisher = rmw_create_publisher(
+    node, &type_support, kMidKindAutomaticVsManualNodeTopic, &automatic_100,
+    &publisher_options);
+  // MANUAL_BY_NODE offer; paired against the remote's stricter
+  // MANUAL_BY_TOPIC subscription request on
+  // kMidKindManualNodeVsManualTopicTopic -> OFFERED_QOS_INCOMPATIBLE.
+  rmw_publisher_t * mid_kind_manual_node_vs_manual_topic_publisher = rmw_create_publisher(
+    node, &type_support, kMidKindManualNodeVsManualTopicTopic, &manual_node_100,
+    &publisher_options);
 
   rmw_event_t kind_offered_event = rmw_get_zero_initialized_event();
   rmw_event_t kind_requested_event = rmw_get_zero_initialized_event();
   rmw_event_t lease_offered_event = rmw_get_zero_initialized_event();
   rmw_event_t lease_requested_event = rmw_get_zero_initialized_event();
+  rmw_event_t mid_kind_automatic_vs_manual_node_event = rmw_get_zero_initialized_event();
+  rmw_event_t mid_kind_manual_node_vs_manual_topic_event = rmw_get_zero_initialized_event();
 
   bool initialized = kind_offered_publisher != nullptr &&
     kind_requested_subscription != nullptr && lease_offered_publisher != nullptr &&
-    lease_requested_subscription != nullptr;
+    lease_requested_subscription != nullptr &&
+    mid_kind_automatic_vs_manual_node_publisher != nullptr &&
+    mid_kind_manual_node_vs_manual_topic_publisher != nullptr;
   initialized = initialized && rmw_publisher_event_init(
     &kind_offered_event, kind_offered_publisher, RMW_EVENT_OFFERED_QOS_INCOMPATIBLE) ==
     RMW_RET_OK;
@@ -271,6 +325,13 @@ int run_observer(const ProbeConfig & config)
   initialized = initialized && rmw_subscription_event_init(
     &lease_requested_event, lease_requested_subscription,
     RMW_EVENT_REQUESTED_QOS_INCOMPATIBLE) == RMW_RET_OK;
+  initialized = initialized && rmw_publisher_event_init(
+    &mid_kind_automatic_vs_manual_node_event, mid_kind_automatic_vs_manual_node_publisher,
+    RMW_EVENT_OFFERED_QOS_INCOMPATIBLE) == RMW_RET_OK;
+  initialized = initialized && rmw_publisher_event_init(
+    &mid_kind_manual_node_vs_manual_topic_event,
+    mid_kind_manual_node_vs_manual_topic_publisher,
+    RMW_EVENT_OFFERED_QOS_INCOMPATIBLE) == RMW_RET_OK;
 
   std::cout << "{\"schema_version\":\"fleetrmw.remote_liveliness_incompatible_event_probe.v1\","
             << "\"mode\":\"observer\",\"phase\":\"ready\","
@@ -290,6 +351,16 @@ int run_observer(const ProbeConfig & config)
     wait_take_event(&lease_offered_event, &lease_offered_status, deadline);
   const bool lease_requested_taken = initialized &&
     wait_take_event(&lease_requested_event, &lease_requested_status, deadline);
+  rmw_offered_qos_incompatible_event_status_t mid_kind_automatic_vs_manual_node_status{};
+  rmw_offered_qos_incompatible_event_status_t mid_kind_manual_node_vs_manual_topic_status{};
+  const bool mid_kind_automatic_vs_manual_node_taken = initialized &&
+    wait_take_event(
+    &mid_kind_automatic_vs_manual_node_event, &mid_kind_automatic_vs_manual_node_status,
+    deadline);
+  const bool mid_kind_manual_node_vs_manual_topic_taken = initialized &&
+    wait_take_event(
+    &mid_kind_manual_node_vs_manual_topic_event,
+    &mid_kind_manual_node_vs_manual_topic_status, deadline);
 
   const bool kind_ok =
     kind_offered_taken && kind_offered_status.total_count == 1 &&
@@ -305,27 +376,55 @@ int run_observer(const ProbeConfig & config)
     lease_requested_taken && lease_requested_status.total_count == 1 &&
     lease_requested_status.total_count_change == 1 &&
     lease_requested_status.last_policy_kind == RMW_QOS_POLICY_LIVELINESS;
-  const bool ok = initialized && kind_ok && lease_ok;
+  const bool mid_kind_ok =
+    mid_kind_automatic_vs_manual_node_taken &&
+    mid_kind_automatic_vs_manual_node_status.total_count == 1 &&
+    mid_kind_automatic_vs_manual_node_status.total_count_change == 1 &&
+    mid_kind_automatic_vs_manual_node_status.last_policy_kind == RMW_QOS_POLICY_LIVELINESS &&
+    mid_kind_manual_node_vs_manual_topic_taken &&
+    mid_kind_manual_node_vs_manual_topic_status.total_count == 1 &&
+    mid_kind_manual_node_vs_manual_topic_status.total_count_change == 1 &&
+    mid_kind_manual_node_vs_manual_topic_status.last_policy_kind == RMW_QOS_POLICY_LIVELINESS;
+  const bool ok = initialized && kind_ok && lease_ok && mid_kind_ok;
 
   std::cout << "{\"schema_version\":\"fleetrmw.remote_liveliness_incompatible_event_probe.v1\","
             << "\"mode\":\"observer\",\"status\":\"" << (ok ? "ok" : "failed") << "\","
             << "\"kind_ok\":" << (kind_ok ? "true" : "false") << ","
             << "\"lease_ok\":" << (lease_ok ? "true" : "false") << ","
+            << "\"mid_kind_ok\":" << (mid_kind_ok ? "true" : "false") << ","
             << "\"kind_offered_last_policy_kind\":" << kind_offered_status.last_policy_kind << ","
             << "\"kind_requested_last_policy_kind\":" << kind_requested_status.last_policy_kind
             << ",\"lease_offered_last_policy_kind\":" << lease_offered_status.last_policy_kind
             << ",\"lease_requested_last_policy_kind\":" << lease_requested_status.last_policy_kind
+            << ",\"mid_kind_automatic_vs_manual_node_last_policy_kind\":"
+            << mid_kind_automatic_vs_manual_node_status.last_policy_kind
+            << ",\"mid_kind_manual_node_vs_manual_topic_last_policy_kind\":"
+            << mid_kind_manual_node_vs_manual_topic_status.last_policy_kind
             << "}" << std::endl;
 
   const rmw_ret_t kind_offered_fini = rmw_event_fini(&kind_offered_event);
   const rmw_ret_t kind_requested_fini = rmw_event_fini(&kind_requested_event);
   const rmw_ret_t lease_offered_fini = rmw_event_fini(&lease_offered_event);
   const rmw_ret_t lease_requested_fini = rmw_event_fini(&lease_requested_event);
+  const rmw_ret_t mid_kind_automatic_vs_manual_node_fini =
+    rmw_event_fini(&mid_kind_automatic_vs_manual_node_event);
+  const rmw_ret_t mid_kind_manual_node_vs_manual_topic_fini =
+    rmw_event_fini(&mid_kind_manual_node_vs_manual_topic_event);
   (void)kind_offered_fini;
   (void)kind_requested_fini;
   (void)lease_offered_fini;
   (void)lease_requested_fini;
+  (void)mid_kind_automatic_vs_manual_node_fini;
+  (void)mid_kind_manual_node_vs_manual_topic_fini;
   bool cleanup_ok = true;
+  if (mid_kind_manual_node_vs_manual_topic_publisher != nullptr) {
+    cleanup_ok = rmw_destroy_publisher(node, mid_kind_manual_node_vs_manual_topic_publisher) ==
+      RMW_RET_OK && cleanup_ok;
+  }
+  if (mid_kind_automatic_vs_manual_node_publisher != nullptr) {
+    cleanup_ok = rmw_destroy_publisher(node, mid_kind_automatic_vs_manual_node_publisher) ==
+      RMW_RET_OK && cleanup_ok;
+  }
   if (lease_requested_subscription != nullptr) {
     cleanup_ok = rmw_destroy_subscription(node, lease_requested_subscription) == RMW_RET_OK &&
       cleanup_ok;

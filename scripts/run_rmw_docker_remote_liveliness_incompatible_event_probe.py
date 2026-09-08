@@ -47,10 +47,13 @@ def observer_ok(probe: dict[str, Any]) -> bool:
         probe.get("status") == "ok"
         and probe.get("kind_ok") is True
         and probe.get("lease_ok") is True
+        and probe.get("mid_kind_ok") is True
         and probe.get("kind_offered_last_policy_kind") == 8
         and probe.get("kind_requested_last_policy_kind") == 8
         and probe.get("lease_offered_last_policy_kind") == 8
         and probe.get("lease_requested_last_policy_kind") == 8
+        and probe.get("mid_kind_automatic_vs_manual_node_last_policy_kind") == 8
+        and probe.get("mid_kind_manual_node_vs_manual_topic_last_policy_kind") == 8
     )
 
 

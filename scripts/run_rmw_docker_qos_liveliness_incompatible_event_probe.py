@@ -41,14 +41,18 @@ def probe_ok(probe: dict[str, Any]) -> bool:
         probe.get("status") == "ok"
         and probe.get("liveliness_kind_offered_event_claim") is True
         and probe.get("liveliness_kind_requested_event_claim") is True
+        and probe.get("liveliness_kind_automatic_vs_manual_node_offered_claim") is True
+        and probe.get("liveliness_kind_automatic_vs_manual_node_requested_claim") is True
+        and probe.get("liveliness_kind_manual_node_vs_manual_topic_offered_claim") is True
+        and probe.get("liveliness_kind_manual_node_vs_manual_topic_requested_claim") is True
         and probe.get("liveliness_slow_lease_offered_event_claim") is True
         and probe.get("liveliness_slow_lease_requested_event_claim") is True
         and probe.get("liveliness_missing_lease_offered_event_claim") is True
         and probe.get("liveliness_missing_lease_requested_event_claim") is True
         and probe.get("liveliness_compatible_control_claim") is True
-        and probe.get("scenario_count") == 7
-        and probe.get("incompatible_event_count") == 6
-        and int(probe.get("callback_events", 0)) >= 6
+        and probe.get("scenario_count") == 11
+        and probe.get("incompatible_event_count") == 10
+        and int(probe.get("callback_events", 0)) >= 10
         and probe.get("clean_teardown") is True
     )
 
@@ -109,6 +113,18 @@ def run_probe(*, image: str, iterations: int) -> dict[str, Any]:
         ),
         "liveliness_kind_requested_event_claim": probe.get(
             "liveliness_kind_requested_event_claim"
+        ),
+        "liveliness_kind_automatic_vs_manual_node_offered_claim": probe.get(
+            "liveliness_kind_automatic_vs_manual_node_offered_claim"
+        ),
+        "liveliness_kind_automatic_vs_manual_node_requested_claim": probe.get(
+            "liveliness_kind_automatic_vs_manual_node_requested_claim"
+        ),
+        "liveliness_kind_manual_node_vs_manual_topic_offered_claim": probe.get(
+            "liveliness_kind_manual_node_vs_manual_topic_offered_claim"
+        ),
+        "liveliness_kind_manual_node_vs_manual_topic_requested_claim": probe.get(
+            "liveliness_kind_manual_node_vs_manual_topic_requested_claim"
         ),
         "liveliness_slow_lease_offered_event_claim": probe.get(
             "liveliness_slow_lease_offered_event_claim"

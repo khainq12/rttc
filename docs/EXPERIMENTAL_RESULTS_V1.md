@@ -128,6 +128,19 @@ and that sharing does not leak across a node boundary. A two-container
 UDP/netem 5/5 artifact proves the same sharing and expiry over the real
 wire.
 
+A leftover bug from that same MANUAL_BY_NODE work is now fixed:
+`liveliness_qos_incompatible()` implements DDS's liveliness-kind
+compatibility as a strictness ordering (AUTOMATIC(1) < MANUAL_BY_NODE(2) <
+MANUAL_BY_TOPIC(3), incompatible when offered rank < requested rank), but
+had only ever special-cased the single AUTOMATIC-vs-MANUAL_BY_TOPIC pair --
+written before MANUAL_BY_NODE was a creatable kind. Once MANUAL_BY_NODE
+became creatable this session, two genuinely incompatible pairs
+(AUTOMATIC-vs-MANUAL_BY_NODE, MANUAL_BY_NODE-vs-MANUAL_BY_TOPIC) were
+silently treated as compatible. Since this function is shared by local
+matching and both remote directions, the fix is proven by 4 new local
+scenarios and 2 new remote (two-container UDP/netem) scenarios, all 5/5,
+rebuilt clean under ASan/UBSan.
+
 ### A real, root-caused use-after-free (fixed)
 
 An intermittent SIGSEGV in Nav2 navigation probes is root-caused by
