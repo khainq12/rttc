@@ -1146,6 +1146,16 @@ ament_target_dependencies(fleetrmw_rclcpp_interprocess_probe
   rclcpp
   std_srvs
 )
+
+add_executable(fleetrmw_destination_order_probe
+  src/destination_order_probe.cpp
+)
+target_include_directories(fleetrmw_destination_order_probe PRIVATE include)
+target_compile_features(fleetrmw_destination_order_probe PRIVATE cxx_std_17)
+ament_target_dependencies(fleetrmw_destination_order_probe
+  rclcpp
+  std_msgs
+)
 target_compile_features(fleetrmw_cpp_typesupport_probe PRIVATE cxx_std_17)
 target_link_libraries(fleetrmw_cpp_typesupport_probe
   ${PROJECT_NAME}
@@ -1469,6 +1479,7 @@ install(
     fleetrmw_remote_manual_by_node_liveliness_probe
     fleetrmw_lifespan_message_lost_probe
     fleetrmw_remote_qos_best_available_probe
+    fleetrmw_destination_order_probe
     fleetrmw_remote_deadline_event_probe
     fleetrmw_content_filter_probe
     fleetrmw_content_filter_sql_probe

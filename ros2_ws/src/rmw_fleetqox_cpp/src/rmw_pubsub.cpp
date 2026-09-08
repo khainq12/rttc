@@ -13,6 +13,7 @@
 #include <cerrno>
 #include <fstream>
 #include <iomanip>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -51,6 +52,7 @@
 
 #include "rmw_fleetqox_cpp/data_frame.hpp"
 #include "rmw_fleetqox_cpp/message_allocation.hpp"
+#include "rmw_fleetqox_cpp/qos_extensions.hpp"
 #include "rmw_fleetqox_cpp/quic_gateway_transport.hpp"
 #include "rmw_fleetqox_cpp/shared_memory_transport.hpp"
 
@@ -169,6 +171,17 @@ struct FleetQoxPublisherData
   // so the payload's base64 encoding stops reallocating once it has grown
   // to this publisher's steady-state payload size.
   std::string frame_base64_scratch{};
+  // FleetQoX QoS extensions (OWNERSHIP/PARTITION/PRESENTATION), populated
+  // from rmw_specific_publisher_payload at creation if present; see
+  // qos_extensions.hpp. Not part of the standard rmw_qos_profile_t.
+  rmw_fleetqox_cpp::OwnershipKind ownership_kind{rmw_fleetqox_cpp::OwnershipKind::kShared};
+  std::int32_t ownership_strength{0};
+  std::vector<std::string> partitions{};
+  rmw_fleetqox_cpp::PresentationAccessScope presentation_access_scope{
+    rmw_fleetqox_cpp::PresentationAccessScope::kTopic};
+  bool presentation_coherent_access{false};
+  bool presentation_ordered_access{false};
+  std::string presentation_group_id{};
 };
 
 struct FleetQoxSubscriptionData
@@ -228,6 +241,24 @@ struct FleetQoxSubscriptionData
   bool destroying{false};
   size_t inflight_callbacks{0};
   std::recursive_mutex take_mutex{};
+  // FleetQoX QoS extensions (OWNERSHIP/PARTITION/DESTINATION_ORDER/
+  // PRESENTATION), populated from rmw_specific_subscription_payload at
+  // creation if present; see qos_extensions.hpp. Not part of the standard
+  // rmw_qos_profile_t.
+  rmw_fleetqox_cpp::OwnershipKind ownership_kind{rmw_fleetqox_cpp::OwnershipKind::kShared};
+  std::vector<std::string> partitions{};
+  rmw_fleetqox_cpp::DestinationOrderKind destination_order{
+    rmw_fleetqox_cpp::DestinationOrderKind::kByReceptionTimestamp};
+  rmw_fleetqox_cpp::PresentationAccessScope presentation_access_scope{
+    rmw_fleetqox_cpp::PresentationAccessScope::kTopic};
+  bool presentation_coherent_access{false};
+  bool presentation_ordered_access{false};
+  std::string presentation_group_id{};
+  // Owner publisher_id currently "winning" EXCLUSIVE ownership arbitration
+  // on this subscription's topic (see ownership_kind above); empty when
+  // ownership_kind is kShared or no EXCLUSIVE publisher has matched yet.
+  std::string exclusive_owner_publisher_id{};
+  std::int32_t exclusive_owner_strength{0};
 };
 
 struct ReliableRetransmitEntry
@@ -12754,6 +12785,38 @@ int test_ack_delay_ms_for_subscription(const FleetQoxSubscriptionData * subscrip
   return parse_nonnegative_int_env("FLEETQOX_RMW_TEST_ACK_DELAY_MS", 0, 10000);
 }
 
+// DESTINATION_ORDER (FleetQoX extension; see qos_extensions.hpp). Default
+// is BY_RECEPTION_TIMESTAMP, i.e. plain FIFO arrival order (push_back).
+// BY_SOURCE_TIMESTAMP instead inserts each frame into its sorted position
+// by decoded_frame->source_timestamp_ns, so take()/on_new_message observe
+// frames in publish order even when they arrive out of order (e.g. one
+// frame takes a slower network path than a later one). frame_queue stores
+// encoded (string) frames, so this decodes each existing queued frame once
+// per insert to find the correct position -- O(n) per insert, acceptable
+// given this project's typical queue depths (single digits to tens).
+void enqueue_frame_respecting_destination_order(
+  FleetQoxSubscriptionData * subscription,
+  const std::string & encoded_frame,
+  std::int64_t source_timestamp_ns)
+{
+  if (subscription->destination_order !=
+    rmw_fleetqox_cpp::DestinationOrderKind::kBySourceTimestamp)
+  {
+    subscription->frame_queue.push_back(encoded_frame);
+    return;
+  }
+  auto insert_before = subscription->frame_queue.end();
+  while (insert_before != subscription->frame_queue.begin()) {
+    auto candidate = std::prev(insert_before);
+    const auto candidate_frame = rmw_fleetqox_cpp::decode_data_frame(*candidate);
+    if (candidate_frame && candidate_frame->source_timestamp_ns <= source_timestamp_ns) {
+      break;
+    }
+    insert_before = candidate;
+  }
+  subscription->frame_queue.insert(insert_before, encoded_frame);
+}
+
 void enqueue_received_frame(const std::string & encoded_frame)
 {
   const auto decoded_frame = rmw_fleetqox_cpp::decode_data_frame(encoded_frame);
@@ -12834,7 +12897,8 @@ void enqueue_received_frame(const std::string & encoded_frame)
           continue;
         }
         ++matched_subscriptions;
-        subscription->frame_queue.push_back(encoded_frame);
+        enqueue_frame_respecting_destination_order(
+          subscription, encoded_frame, decoded_frame->source_timestamp_ns);
         enforce_subscription_depth_locked(subscription, &event_callbacks);
         if (!subscription->destroying &&
           subscription->on_new_message_callback != nullptr)
@@ -14260,6 +14324,60 @@ bool rmw_fleetqox_cpp_publisher_gid(const rmw_publisher_t * publisher, rmw_gid_t
   return true;
 }
 
+// rmw_specific_publisher_payload/rmw_specific_subscription_payload are raw
+// `void *` with no type information at the C API level; the magic+version
+// check is the only defense against misinterpreting an unrelated non-null
+// pointer as a FleetQoxExtendedQosPayload. Returns nullptr (rather than
+// asserting/erroring) on any mismatch, so a payload meant for a different
+// rmw implementation -- or simply absent -- is silently ignored, matching
+// how every other unset rmw option behaves.
+const rmw_fleetqox_cpp::FleetQoxExtendedQosPayload * extended_qos_payload(const void * raw)
+{
+  if (raw == nullptr) {
+    return nullptr;
+  }
+  const auto * payload =
+    static_cast<const rmw_fleetqox_cpp::FleetQoxExtendedQosPayload *>(raw);
+  if (payload->magic != rmw_fleetqox_cpp::kFleetQoxExtendedQosPayloadMagic ||
+    payload->version != rmw_fleetqox_cpp::kFleetQoxExtendedQosPayloadVersion)
+  {
+    return nullptr;
+  }
+  return payload;
+}
+
+void apply_extended_publisher_qos_payload(
+  const rmw_fleetqox_cpp::FleetQoxExtendedQosPayload * payload,
+  FleetQoxPublisherData * data)
+{
+  if (payload == nullptr || data == nullptr) {
+    return;
+  }
+  data->ownership_kind = payload->ownership_kind;
+  data->ownership_strength = payload->ownership_strength;
+  data->partitions = payload->partitions;
+  data->presentation_access_scope = payload->presentation_access_scope;
+  data->presentation_coherent_access = payload->presentation_coherent_access;
+  data->presentation_ordered_access = payload->presentation_ordered_access;
+  data->presentation_group_id = payload->presentation_group_id;
+}
+
+void apply_extended_subscription_qos_payload(
+  const rmw_fleetqox_cpp::FleetQoxExtendedQosPayload * payload,
+  FleetQoxSubscriptionData * data)
+{
+  if (payload == nullptr || data == nullptr) {
+    return;
+  }
+  data->ownership_kind = payload->ownership_kind;
+  data->partitions = payload->partitions;
+  data->destination_order = payload->destination_order;
+  data->presentation_access_scope = payload->presentation_access_scope;
+  data->presentation_coherent_access = payload->presentation_coherent_access;
+  data->presentation_ordered_access = payload->presentation_ordered_access;
+  data->presentation_group_id = payload->presentation_group_id;
+}
+
 rmw_publisher_t * rmw_create_publisher(
   const rmw_node_t * node,
   const rosidl_message_type_support_t * type_support,
@@ -14364,6 +14482,8 @@ rmw_publisher_t * rmw_create_publisher(
     RMW_SET_ERROR_MSG("failed to allocate publisher data");
     return nullptr;
   }
+  apply_extended_publisher_qos_payload(
+    extended_qos_payload(publisher_options->rmw_specific_publisher_payload), data);
 
   publisher->implementation_identifier = kIdentifier;
   publisher->data = data;
@@ -14597,6 +14717,8 @@ rmw_subscription_t * rmw_create_subscription(
     RMW_SET_ERROR_MSG("failed to allocate subscription data");
     return nullptr;
   }
+  apply_extended_subscription_qos_payload(
+    extended_qos_payload(subscription_options->rmw_specific_subscription_payload), data);
 
   subscription->implementation_identifier = kIdentifier;
   subscription->data = data;
