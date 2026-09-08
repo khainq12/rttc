@@ -561,6 +561,36 @@ vendor's actual BMC firmware, which can carry quirks no simulator captures
 against here), not an unimplemented feature or a claim inflated beyond its
 evidence.
 
+Also **done**, closed this session: every split-brain/failover probe above
+ran as multiple Docker containers on ONE Docker daemon on ONE machine --
+correct as far as it goes, but unable to exclude a shared-kernel confound
+(an administrative review of this codebase explicitly flagged this: "tách
+failure domain khỏi single Docker daemon"). `scripts/
+run_multihost_kvm_raft_consensus_probe.py` closes this for the native Raft
+core specifically, over two REAL, independent hosts: two KVM virtual
+machines (`scripts/run_multihost_kvm_setup.sh`), each with its own kernel
+and its own separate Docker daemon, connected only by a real virtio-net
+link between them (no shared bridge, no host-visible tap the two share).
+The 5-node Raft cluster splits 2 nodes on VM1, 3 on VM2; VM1's election
+timeout is tuned shorter so the initial leader deterministically lands on
+VM1 (making the next step a genuine forced failover, not a lucky
+continuity case). The probe then kills VM1's entire QEMU process from the
+host side -- outside either guest's own OS, the closest thing to a real
+power-loss/hardware failure this environment can produce -- and proves:
+the write from before the kill is intact and replicated on VM2 alone; the
+3 surviving VM2 nodes elect a new leader at a strictly higher term purely
+by noticing VM1's absence over the network; a new write commits and
+replicates across the survivors; and killing one more of VM2's three
+nodes (now 2 of the original 5 -- a minority) correctly fails closed --
+no new leader at a higher term, no accepted write -- rather than let the
+minority form a second, divergent leader. 5/5 runs, each with a fresh
+VM1 boot and a genuinely re-randomized leader election.
+(`multi_host_kvm_raft_consensus_claim`, `multi_host_no_split_brain_claim`).
+This closes the multi-host gap specifically for the Raft-backed writer
+lease path introduced earlier this session; the etcd/PostgreSQL path,
+hardware STONITH, and PKI rotation above are still only proven on a single
+Docker daemon and remain open for the same multi-host treatment.
+
 Exit gate:
 
 - public maintained APIs only -- **met**;
@@ -584,6 +614,10 @@ Exit gate:
   majority-region recovery, real-BMC-firmware validation, and production
   (non-Docker) certification remain open -- the last two are
   environment/organizational limits, not code gaps (see above)**;
+- multi-host (non-shared-kernel) failover -- **met for the native Raft
+  writer-lease path** (two real KVM VMs, see above); open for the
+  etcd/PostgreSQL path, hardware STONITH, and PKI rotation, which remain
+  single-Docker-daemon-only;
 - long multi-attacker soak -- open.
 
 ### B3: complete RMW semantics

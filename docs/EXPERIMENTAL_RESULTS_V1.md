@@ -459,6 +459,25 @@ BMC query confirms actually flipped power state from On to Off. 3/3 runs.
 validation against a specific vendor's real BMC firmware is an environment
 limitation (no hardware available here), not an unimplemented feature.
 
+Every split-brain/failover result above ran as containers on one Docker
+daemon on one machine, which cannot exclude a shared-kernel confound.
+`scripts/run_multihost_kvm_raft_consensus_probe.py` closes this for the
+native Raft path over two real KVM VMs (separate kernels, separate Docker
+daemons, connected only by a real virtio-net link): a 5-node cluster split
+2 nodes on VM1 / 3 on VM2, VM1 tuned to win the initial election
+deterministically, then VM1's whole QEMU process is killed from the host
+side (outside either guest's OS). Across 5/5 runs with a fresh VM1 boot
+and a genuinely re-randomized election each time: the pre-kill write
+survives intact on VM2 alone; VM2's 3 survivors elect a new leader at a
+strictly higher term purely by noticing VM1's absence over the network; a
+post-failover write commits and replicates; and killing one more of VM2's
+three nodes (2 of the original 5, a minority) correctly fails closed --
+no new leader, no accepted write
+(`multi_host_kvm_raft_consensus_claim`, `multi_host_no_split_brain_claim`).
+Scoped precisely: this closes the multi-host gap for the Raft-backed
+writer-lease path specifically; the etcd/PostgreSQL path, hardware
+STONITH, and PKI rotation above remain single-Docker-daemon-only.
+
 ## Evidence rules
 
 - Deterministic probes establish contracts, not broad performance claims.
