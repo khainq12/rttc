@@ -12572,6 +12572,17 @@ rmw_ret_t take_payload(
       return RMW_RET_ERROR;
     }
     if (frame_exceeds_lifespan(data->qos, decoded_frame->source_timestamp_ns)) {
+      // This frame's sequence was already observe_frame()'d at enqueue
+      // time (it wasn't yet expired then); it only became stale sitting in
+      // the queue. Report the loss here too, mirroring the enqueue-time
+      // lifespan drop below -- otherwise a subscriber that calls take too
+      // slowly loses data with no signal at all.
+      std::vector<EventCallbackNotification> lifespan_callbacks;
+      {
+        std::lock_guard<std::mutex> lock(g_bus_mutex);
+        record_subscription_message_lost_locked(data, 1, &lifespan_callbacks);
+      }
+      notify_event_callbacks(lifespan_callbacks);
       continue;
     }
     {
@@ -12768,9 +12779,6 @@ void enqueue_received_frame(const std::string & encoded_frame)
         {
           continue;
         }
-        if (frame_exceeds_lifespan(subscription->qos, decoded_frame->source_timestamp_ns)) {
-          continue;
-        }
         record_requested_deadline_miss_locked(
           subscription,
           receive_ns,
@@ -12813,6 +12821,17 @@ void enqueue_received_frame(const std::string & encoded_frame)
             continue;
           }
           g_content_filters_matched.fetch_add(1, std::memory_order_relaxed);
+        }
+        // Checked here, after observe_frame() has already recorded this
+        // frame's sequence number, rather than before -- doing it earlier
+        // left this frame's sequence permanently unobserved, so a
+        // lifespan-expired frame with no later, non-expired frame on the
+        // same stream to reveal the gap was silently invisible to every
+        // loss-detection path (message_lost_total_count never incremented,
+        // no callback, nothing for rmw_take_event to report).
+        if (frame_exceeds_lifespan(subscription->qos, decoded_frame->source_timestamp_ns)) {
+          record_subscription_message_lost_locked(subscription, 1, &event_callbacks);
+          continue;
         }
         ++matched_subscriptions;
         subscription->frame_queue.push_back(encoded_frame);

@@ -1831,6 +1831,7 @@ CLAIM_BOUNDARY_KEYS = (
     "terminal_repair_clean_teardown_claim",
     "terminal_repair_controls_repeated_claim",
     "qos_best_effort_no_repair_request_claim",
+    "qos_message_lost_lifespan_tail_loss_claim",
     "full_message_lost_event_production_claim",
     "docker_qos_liveliness_event_production",
     "docker_qos_liveliness_event_5run_probe",

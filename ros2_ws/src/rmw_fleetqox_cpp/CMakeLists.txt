@@ -422,6 +422,18 @@ ament_target_dependencies(fleetrmw_remote_manual_by_node_liveliness_probe
   rmw
 )
 
+add_executable(fleetrmw_lifespan_message_lost_probe
+  src/lifespan_message_lost_probe.cpp
+)
+target_compile_features(fleetrmw_lifespan_message_lost_probe PRIVATE cxx_std_17)
+target_link_libraries(fleetrmw_lifespan_message_lost_probe
+  ${PROJECT_NAME}
+)
+ament_target_dependencies(fleetrmw_lifespan_message_lost_probe
+  rcutils
+  rmw
+)
+
 add_executable(fleetrmw_remote_deadline_event_probe
   src/remote_deadline_event_probe.cpp
 )
@@ -1443,6 +1455,7 @@ install(
     fleetrmw_liveliness_default_lease_probe
     fleetrmw_manual_by_node_liveliness_probe
     fleetrmw_remote_manual_by_node_liveliness_probe
+    fleetrmw_lifespan_message_lost_probe
     fleetrmw_remote_deadline_event_probe
     fleetrmw_content_filter_probe
     fleetrmw_content_filter_sql_probe

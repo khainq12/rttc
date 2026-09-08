@@ -926,6 +926,31 @@ the identical rank comparison, already proven bidirectional by the existing
 scenarios), all passing 5/5 on real Docker/netem, rebuilt clean under
 ASan/UBSan.
 
+Also **fixed**, closed this session: a silent message-lost blind spot under
+`full_message_lost_event_production_claim`, unrelated to the upstream
+`resource_limits` gap that claim's `false` value is otherwise about.
+`frame_exceeds_lifespan()` in `enqueue_received_frame()` was checked
+**before** `observe_frame()` recorded the frame's sequence number, so a
+LIFESPAN-expired frame's sequence never advanced tracking state and never
+created a detectable gap for the existing repair/loss-detection machinery
+to catch. If no later, non-expired frame ever arrived on the same stream to
+reveal the hole via ordinary out-of-order detection, the loss was 100%
+invisible: `message_lost_total_count` never incremented, no callback fired,
+`rmw_take_event(RMW_EVENT_MESSAGE_LOST)` had nothing to report. Fixed by
+moving the check to after `observe_frame()` and explicitly calling
+`record_subscription_message_lost_locked()` when it fires; the analogous
+take-path drop (a frame not yet expired at arrival but stale by the time
+the application calls take) got the same treatment for the same reason. A
+new dedicated two-container UDP/netem artifact
+(`lifespan_message_lost_probe.cpp` +
+`run_rmw_docker_lifespan_message_lost_probe.py`) publishes exactly one
+frame and nothing else, so it can only pass if this specific tail-loss case
+is now visible; 5/5 real runs, rebuilt clean under ASan/UBSan. As an extra
+verification step (not just trusting the diff), the fix was temporarily
+reverted and the same probe was re-run against the pre-fix build,
+confirming it fails exactly as expected (`message_lost_total_count`
+staying `0`) before the fix was restored.
+
 Exit gate:
 
 - each capability either implemented and repeatedly probed or explicitly

@@ -141,6 +141,20 @@ matching and both remote directions, the fix is proven by 4 new local
 scenarios and 2 new remote (two-container UDP/netem) scenarios, all 5/5,
 rebuilt clean under ASan/UBSan.
 
+Also fixed: a silent message-lost blind spot, unrelated to the upstream
+`resource_limits` gap that keeps `full_message_lost_event_production_claim`
+`false`. `frame_exceeds_lifespan()` was checked before `observe_frame()`
+recorded a frame's sequence number, so a LIFESPAN-expired frame's sequence
+never advanced tracking state -- if no later frame ever arrived on the same
+stream to reveal the gap, the loss was 100% invisible, with
+`message_lost_total_count` never incrementing and no callback ever firing.
+Fixed by observing the sequence first and explicitly recording the loss;
+the analogous take-path drop (expired while queued, not at arrival) got the
+same fix. A new two-container UDP/netem artifact publishes exactly one
+frame and nothing else, so it can only pass if this exact tail-loss case is
+now visible -- 5/5 real runs, rebuilt clean under ASan/UBSan, and verified
+to genuinely fail against the pre-fix code before the fix was restored.
+
 ### A real, root-caused use-after-free (fixed)
 
 An intermittent SIGSEGV in Nav2 navigation probes is root-caused by
