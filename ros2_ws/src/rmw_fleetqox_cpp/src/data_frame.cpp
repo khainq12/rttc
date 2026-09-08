@@ -703,7 +703,8 @@ std::string encode_graph_advertisement(const GraphAdvertisement & advertisement)
   out << "\"endpoint_gid\":\"" << json_escape(advertisement.endpoint_gid) << "\",";
   encode_graph_qos(out, advertisement.qos);
   out << ",";
-  out << "\"lease_ms\":" << advertisement.lease_ms;
+  out << "\"lease_ms\":" << advertisement.lease_ms << ",";
+  out << "\"type_hash\":\"" << json_escape(advertisement.type_hash_hex) << "\"";
   out << "}";
   return out.str();
 }
@@ -739,6 +740,7 @@ std::optional<GraphAdvertisement> decode_graph_advertisement(const std::string &
   }
   advertisement.lease_ms = json_uint_value(body, "lease_ms").value_or(0);
   advertisement.domain_id = json_uint_value(body, "domain_id").value_or(0);
+  advertisement.type_hash_hex = json_string_value(body, "type_hash").value_or("");
   return advertisement;
 }
 

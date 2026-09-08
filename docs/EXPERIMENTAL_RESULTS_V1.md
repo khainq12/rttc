@@ -88,10 +88,29 @@ compatibility matrix remain architecturally bounded, not pending effort:
 upstream `rmw_qos_profile_t` has no resource_limits fields and upstream
 `rmw_qos_policy_kind_t` has no enum values for OWNERSHIP/PRESENTATION/
 PARTITION/DESTINATION_ORDER, so neither can close without forking `rmw`
-itself. Deprecated participant-wide MANUAL_BY_NODE liveliness semantics
-remain deliberately fail-closed, and remote type compatibility remains
-plain string equality rather than structural/RIHS type-hash comparison, a
-genuinely open-ended undertaking rather than a bounded fix.
+itself.
+
+Remote type-incompatible-event detection now uses each side's RIHS
+structural type hash (`rosidl_type_hash_t`, via `get_type_hash_func`) as
+the authoritative check when both a local and a remote-learned endpoint
+carry a valid one, instead of only the `type_name` string. The hash was
+already computed locally for `rmw_get_publishers/subscriptions_info_by_
+topic` but never sent to peers; `GraphAdvertisement` now carries an
+optional hex-encoded hash, with a fallback to the prior `type_name`
+comparison whenever either side lacks a valid one (every hand-built probe
+type support elsewhere in this suite has no `get_type_hash_func`, so this
+fallback is what keeps that existing coverage passing unmodified). A
+dedicated two-container probe
+(`remote_type_hash_incompatible_event_probe.cpp` +
+`run_rmw_docker_remote_type_hash_incompatible_event_probe.py`) proves a
+same-type-name/different-hash pair is detected as incompatible in both
+directions (the case plain string equality would miss), a same-hash pair
+stays compatible, and a no-valid-hash pair falls back to compatible
+type_name matching, 5/5 across real Docker containers with
+`netem delay 5ms 1ms`, rebuilt clean under ASan/UBSan. This closes the
+remote structural type-hash gap for event production only; actual
+message routing/matching remains `type_name`-based, a separate, larger
+change not attempted here.
 
 ### A real, root-caused use-after-free (fixed)
 

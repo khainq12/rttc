@@ -266,6 +266,18 @@ ament_target_dependencies(fleetrmw_remote_liveliness_incompatible_event_probe
   rmw
 )
 
+add_executable(fleetrmw_remote_type_hash_incompatible_event_probe
+  src/remote_type_hash_incompatible_event_probe.cpp
+)
+target_compile_features(fleetrmw_remote_type_hash_incompatible_event_probe PRIVATE cxx_std_17)
+target_link_libraries(fleetrmw_remote_type_hash_incompatible_event_probe
+  ${PROJECT_NAME}
+)
+ament_target_dependencies(fleetrmw_remote_type_hash_incompatible_event_probe
+  rcutils
+  rmw
+)
+
 add_executable(fleetrmw_type_incompatible_event_probe
   src/type_incompatible_event_probe.cpp
 )
@@ -1394,6 +1406,7 @@ install(
     fleetrmw_qos_deadline_incompatible_event_probe
     fleetrmw_qos_liveliness_incompatible_event_probe
     fleetrmw_remote_liveliness_incompatible_event_probe
+    fleetrmw_remote_type_hash_incompatible_event_probe
     fleetrmw_type_incompatible_event_probe
     fleetrmw_message_lost_event_probe
     fleetrmw_message_lost_interprocess_probe

@@ -826,17 +826,48 @@ subscription against a remote-learned publisher), asserting
 `last_policy_kind == RMW_QOS_POLICY_LIVELINESS` on every one of the four
 scenarios. Rebuilt clean under ASan/UBSan with zero diagnostics, 5/5 across
 real Docker containers with `netem delay 5ms 1ms` on both sides. This
-closes the one concrete, bounded sub-gap under `full_liveliness_event_
-production_claim`/`full_remote_graph_event_production_claim`; those two
-claims stay `false` because most of what they'd need (deprecated
-MANUAL_BY_NODE semantics, structural/RIHS remote type-hash comparison) is
-genuinely open-ended, not because more bounded coverage remains. The other
+closes one concrete, bounded sub-gap under `full_liveliness_event_
+production_claim`/`full_remote_graph_event_production_claim`. The other
 two related `false` claims -- `full_message_lost_event_production_claim`
 and `full_non_deadline_qos_event_production_claim` -- are architecturally
 bounded rather than pending effort: upstream `rmw_qos_profile_t` has no
 resource_limits fields, and upstream `rmw_qos_policy_kind_t` has no enum
 values for OWNERSHIP/PRESENTATION/PARTITION/DESTINATION_ORDER, so neither
 can be closed without forking `rmw` itself.
+
+Also **done**, closed this session: remote type-incompatible-event
+detection now uses each side's RIHS structural type hash as the
+authoritative check, instead of only the type name string. Every local
+publisher/subscription already computed its own `rosidl_type_hash_t` via
+`get_type_hash_func` for `rmw_get_publishers/subscriptions_info_by_topic`
+(prior session), but that hash was never sent to remote peers -- the wire
+`GraphAdvertisement` only carried `type_name`, so a same-declared-name-but-
+different-structure mismatch (e.g. two incompatible revisions of the same
+`.msg` file) was undetectable remotely. `GraphAdvertisement` now carries an
+optional hex-encoded `type_hash`; `record_remote_endpoint_discovered_locked`
+and the symmetric new-local-endpoint-vs-existing-remote-endpoint paths use
+hash equality when both the local and remote-learned endpoint have a valid
+one, falling back to the prior `type_name` comparison when either side
+lacks one (every hand-built probe type support elsewhere in this suite has
+no `get_type_hash_func`, so this fallback is what keeps all ~180 of them
+passing unmodified). A new dedicated two-container probe
+(`remote_type_hash_incompatible_event_probe.cpp` +
+`run_rmw_docker_remote_type_hash_incompatible_event_probe.py`) proves: a
+same-type-name/different-hash pair is detected as incompatible in both
+offered and requested directions (the case string equality would miss); a
+same-type-name/same-hash pair stays compatible (positive control); and a
+same-type-name/no-valid-hash-either-side pair stays compatible (fallback
+regression control). 5/5 across real Docker containers with
+`netem delay 5ms 1ms`, rebuilt clean under ASan/UBSan. This closes the
+remote structural type-hash gap for *event production*; it intentionally
+does not change how the transport actually matches/routes messages for
+delivery, which remains `type_name`-based -- extending routing itself to
+hash-based matching is a separate, larger change not attempted here.
+`full_remote_graph_event_production_claim` and `full_liveliness_event_
+production_claim` stay `false`: what remains under them beyond this and the
+liveliness-incompatible closure above is genuinely open-ended vendor/DDS-
+specific event parity, not another bounded sub-gap of the same shape as
+these two.
 
 Exit gate:
 

@@ -171,6 +171,10 @@ struct GraphAdvertisement
   GraphQosProfile qos;
   std::uint64_t lease_ms = 0;
   std::uint64_t domain_id = 0;
+  // Hex-encoded RIHS rosidl_type_hash_t (1 version byte + 32 hash bytes ==
+  // 66 hex chars), empty when the local type support has no
+  // get_type_hash_func (e.g. a hand-built probe type support).
+  std::string type_hash_hex;
 };
 
 struct ServiceFrame

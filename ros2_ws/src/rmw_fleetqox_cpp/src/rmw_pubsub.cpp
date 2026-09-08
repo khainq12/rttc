@@ -270,6 +270,8 @@ struct RemotePubSubEndpoint
   std::int64_t expires_at_ns{0};
   std::int64_t last_liveliness_assert_ns{0};
   bool liveliness_alive{false};
+  rosidl_type_hash_t type_hash{};
+  bool type_hash_valid{false};
 };
 
 struct FleetQoxTypeErasedMessageDescriptor
@@ -424,6 +426,10 @@ const rosidl_typesupport_introspection_cpp::MessageMembers * introspection_cpp_m
 const rosidl_message_type_support_t * resolve_effective_type_support(
   const rosidl_message_type_support_t * type_support);
 std::string type_name_from_type_support(const rosidl_message_type_support_t * type_support);
+bool remote_type_incompatible(
+  const rosidl_message_type_support_t * local_type_support,
+  const std::string & local_type_name,
+  const RemotePubSubEndpoint & endpoint);
 
 void fini_loan(void * message, const LoanRecord & record)
 {
@@ -3328,7 +3334,8 @@ public:
     const std::string & endpoint_id,
     const std::array<std::uint8_t, RMW_GID_STORAGE_SIZE> & endpoint_gid,
     const rmw_qos_profile_t & qos,
-    std::size_t domain_id)
+    std::size_t domain_id,
+    const std::string & type_hash_hex = std::string())
   {
     if (peer_addresses_.empty()) {
       return RMW_RET_OK;
@@ -3344,7 +3351,8 @@ public:
       hex_encode_bytes(endpoint_gid.data(), endpoint_gid.size()),
       graph_qos_from_rmw(qos),
       5000u,
-      domain_id};
+      domain_id,
+      type_hash_hex};
     return send_to_peers(rmw_fleetqox_cpp::encode_graph_advertisement(advertisement));
   }
 
@@ -8771,7 +8779,7 @@ void record_type_incompatibilities_for_new_publisher_locked(
     if (subscription.publisher ||
       subscription.domain_id != publisher->domain_id ||
       subscription.topic_name != publisher->topic_name ||
-      subscription.type_name == publisher->type_name)
+      !remote_type_incompatible(publisher->type_support, publisher->type_name, subscription))
     {
       continue;
     }
@@ -8802,7 +8810,7 @@ void record_type_incompatibilities_for_new_subscription_locked(
     if (!publisher.publisher ||
       publisher.domain_id != subscription->domain_id ||
       publisher.topic_name != subscription->topic_name ||
-      publisher.type_name == subscription->type_name)
+      !remote_type_incompatible(subscription->type_support, subscription->type_name, publisher))
     {
       continue;
     }
@@ -8970,6 +8978,43 @@ bool compute_message_type_hash(
   }
   *out = *hash;
   return true;
+}
+
+// Wire encoding for a type hash advertised to remote peers: 1 version byte
+// followed by the 32 RIHS hash bytes, hex-encoded (66 chars). Empty string
+// means the sender had no valid hash (e.g. a hand-built probe type
+// support), which decode_type_hash_hex reports back as !valid.
+std::string encode_type_hash_hex(const rosidl_type_hash_t & hash)
+{
+  std::string encoded = hex_encode_bytes(&hash.version, 1);
+  encoded += hex_encode_bytes(hash.value, ROSIDL_TYPE_HASH_SIZE);
+  return encoded;
+}
+
+bool decode_type_hash_hex(const std::string & encoded, rosidl_type_hash_t * out)
+{
+  constexpr size_t kExpectedHexChars = (1 + ROSIDL_TYPE_HASH_SIZE) * 2;
+  if (out == nullptr || encoded.size() != kExpectedHexChars) {
+    return false;
+  }
+  std::vector<std::uint8_t> bytes(1 + ROSIDL_TYPE_HASH_SIZE);
+  for (size_t i = 0; i < bytes.size(); ++i) {
+    const int high = hex_nibble(encoded[i * 2]);
+    const int low = hex_nibble(encoded[i * 2 + 1]);
+    if (high < 0 || low < 0) {
+      return false;
+    }
+    bytes[i] = static_cast<std::uint8_t>((high << 4) | low);
+  }
+  out->version = bytes[0];
+  std::memcpy(out->value, bytes.data() + 1, ROSIDL_TYPE_HASH_SIZE);
+  return out->version != ROSIDL_TYPE_HASH_VERSION_UNSET;
+}
+
+bool type_hash_equal(const rosidl_type_hash_t & left, const rosidl_type_hash_t & right)
+{
+  return left.version == right.version &&
+    std::memcmp(left.value, right.value, ROSIDL_TYPE_HASH_SIZE) == 0;
 }
 
 std::string type_name_from_type_support(const rosidl_message_type_support_t * type_support)
@@ -11901,6 +11946,26 @@ std::int64_t remote_graph_endpoint_expiry_ns(
   return now_ns + static_cast<std::int64_t>(effective_lease_ms * 1000000u);
 }
 
+// RIHS structural type-hash comparison is authoritative when both the
+// local endpoint and the remote-learned one carry a valid hash: it catches
+// same-name-different-definition mismatches (e.g. two incompatible
+// revisions of a .msg file) that plain type_name equality cannot. When
+// either side lacks a valid hash -- e.g. a hand-built probe type support
+// with no get_type_hash_func, as used throughout this repository's own
+// test suite -- this falls back to the existing type_name comparison so
+// none of that coverage regresses.
+bool remote_type_incompatible(
+  const rosidl_message_type_support_t * local_type_support,
+  const std::string & local_type_name,
+  const RemotePubSubEndpoint & endpoint)
+{
+  rosidl_type_hash_t local_hash{};
+  if (compute_message_type_hash(local_type_support, &local_hash) && endpoint.type_hash_valid) {
+    return !type_hash_equal(local_hash, endpoint.type_hash);
+  }
+  return local_type_name != endpoint.type_name;
+}
+
 void record_remote_endpoint_discovered_locked(
   const RemotePubSubEndpoint & endpoint,
   std::vector<EventCallbackNotification> * callbacks)
@@ -11920,7 +11985,9 @@ void record_remote_endpoint_discovered_locked(
       if (policy_kind != RMW_QOS_POLICY_INVALID) {
         record_requested_qos_incompatible_locked(subscription, policy_kind, callbacks);
       }
-      if (subscription->type_name != endpoint.type_name) {
+      if (remote_type_incompatible(
+          subscription->type_support, subscription->type_name, endpoint))
+      {
         record_subscription_incompatible_type_locked(subscription, callbacks);
       }
       if (qos_liveliness_enabled(endpoint.qos) &&
@@ -11945,7 +12012,7 @@ void record_remote_endpoint_discovered_locked(
       if (policy_kind != RMW_QOS_POLICY_INVALID) {
         record_offered_qos_incompatible_locked(publisher, policy_kind, callbacks);
       }
-      if (publisher->type_name != endpoint.type_name) {
+      if (remote_type_incompatible(publisher->type_support, publisher->type_name, endpoint)) {
         record_publisher_incompatible_type_locked(publisher, callbacks);
       }
     }
@@ -12088,6 +12155,8 @@ bool apply_remote_pubsub_event_advertisement(
         remote_graph_endpoint_expiry_ns(now_ns, advertisement.lease_ms)};
       incoming.last_liveliness_assert_ns = now_ns;
       incoming.liveliness_alive = is_publisher && qos_liveliness_enabled(qos);
+      incoming.type_hash_valid =
+        decode_type_hash_hex(advertisement.type_hash_hex, &incoming.type_hash);
       if (found != g_remote_pubsub_endpoints.end() &&
         remote_endpoint_descriptor_equal(found->second, incoming))
       {
@@ -12447,6 +12516,8 @@ void send_publisher_graph_advertisement(const FleetQoxPublisherData * data, cons
   if (data == nullptr || action == nullptr) {
     return;
   }
+  rosidl_type_hash_t type_hash{};
+  const bool type_hash_valid = compute_message_type_hash(data->type_support, &type_hash);
   const rmw_ret_t graph_advertisement_ret =
     socket_transport().send_graph_advertisement(
       action,
@@ -12458,7 +12529,8 @@ void send_publisher_graph_advertisement(const FleetQoxPublisherData * data, cons
       data->endpoint_id,
       data->endpoint_gid,
       data->qos,
-      data->domain_id);
+      data->domain_id,
+      type_hash_valid ? encode_type_hash_hex(type_hash) : std::string());
   (void)graph_advertisement_ret;
 }
 
@@ -12467,6 +12539,8 @@ void send_subscription_graph_advertisement(const FleetQoxSubscriptionData * data
   if (data == nullptr || action == nullptr) {
     return;
   }
+  rosidl_type_hash_t type_hash{};
+  const bool type_hash_valid = compute_message_type_hash(data->type_support, &type_hash);
   const rmw_ret_t graph_advertisement_ret =
     socket_transport().send_graph_advertisement(
       action,
@@ -12478,7 +12552,8 @@ void send_subscription_graph_advertisement(const FleetQoxSubscriptionData * data
       data->endpoint_id,
       data->endpoint_gid,
       data->qos,
-      data->domain_id);
+      data->domain_id,
+      type_hash_valid ? encode_type_hash_hex(type_hash) : std::string());
   (void)graph_advertisement_ret;
   if (std::strcmp(action, "add") == 0) {
     const rmw_ret_t advertisement_ret =
