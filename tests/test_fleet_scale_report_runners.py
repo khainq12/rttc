@@ -767,7 +767,7 @@ class FleetScaleReportRunnersTest(unittest.TestCase):
                             "manual_infinite_lease_lifecycle_claim": True,
                             "best_available_infinite_lease_lifecycle_claim": True,
                             "unknown_liveliness_fail_closed_claim": True,
-                            "deprecated_manual_by_node_fail_closed_claim": True,
+                            "manual_by_node_infinite_lease_lifecycle_claim": True,
                             "qos_liveliness_incompatible_event_production_claim": True,
                             "qos_liveliness_incompatible_event_repeated_claim": True,
                             "liveliness_kind_offered_event_claim": True,
@@ -2669,7 +2669,7 @@ class FleetScaleReportRunnersTest(unittest.TestCase):
                         "manual_infinite_lease_lifecycle_claim": True,
                         "best_available_infinite_lease_lifecycle_claim": True,
                         "unknown_liveliness_fail_closed_claim": True,
-                        "deprecated_manual_by_node_fail_closed_claim": True,
+                        "manual_by_node_infinite_lease_lifecycle_claim": True,
                         "scenario_count": 6,
                         "clean_teardown": True,
                     }
@@ -5503,7 +5503,7 @@ class FleetScaleReportRunnersTest(unittest.TestCase):
             )
             self.assertTrue(
                 liveliness_default_lease_artifact["metrics"][
-                    "deprecated_manual_by_node_fail_closed_claim"
+                    "manual_by_node_infinite_lease_lifecycle_claim"
                 ]
             )
             allocation_artifact = next(

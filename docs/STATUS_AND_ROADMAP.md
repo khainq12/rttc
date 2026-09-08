@@ -864,10 +864,45 @@ does not change how the transport actually matches/routes messages for
 delivery, which remains `type_name`-based -- extending routing itself to
 hash-based matching is a separate, larger change not attempted here.
 `full_remote_graph_event_production_claim` and `full_liveliness_event_
-production_claim` stay `false`: what remains under them beyond this and the
-liveliness-incompatible closure above is genuinely open-ended vendor/DDS-
-specific event parity, not another bounded sub-gap of the same shape as
-these two.
+production_claim` stay `false`: what remains under them beyond this, the
+liveliness-incompatible closure, and the MANUAL_BY_NODE closure below is
+genuinely open-ended vendor/DDS-specific event parity, not another bounded
+sub-gap of the same shape as these two.
+
+Also **done**, closed this session: MANUAL_BY_NODE liveliness (upstream
+`rmw/types.h` value 2, deprecated in favor of MANUAL_BY_TOPIC) is now
+supported rather than fail-closed. It was previously rejected at
+`rmw_create_publisher`/`rmw_create_subscription` alongside the genuinely
+invalid `UNKNOWN` policy -- but MANUAL_BY_NODE is not invalid, it is a
+deprecated-but-well-defined DDS liveliness kind (DDS's equivalent
+MANUAL_BY_PARTICIPANT) that rclcpp/rmw still accept from applications that
+have not migrated to MANUAL_BY_TOPIC, so failing it closed was stricter
+than the policy actually requires. Its distinguishing semantic -- one
+liveliness assertion is shared by every MANUAL_BY_NODE publisher owned by
+the same node/participant, unlike MANUAL_BY_TOPIC where each publisher
+asserts independently -- is now implemented: `record_liveliness_assert_
+locked` fans an assertion out to every sibling local publisher on the same
+`owner_node`, and the remote wire path (`apply_remote_pubsub_event_
+advertisement`) mirrors this by grouping remote MANUAL_BY_NODE publishers
+on `domain_id` + `node_name` + `node_namespace`, both of which already
+travel in every `GraphAdvertisement`. A local 5/5 artifact
+(`manual_by_node_liveliness_probe.cpp`) proves a silent sibling publisher
+is kept alive by another publisher's asserts on the same node, that the
+shared lease still expires normally once every publisher on that node goes
+idle (sharing renews the lease, it does not disable expiry), and that
+sharing does not leak across a node boundary (a publisher on a *different*
+node still expires on schedule despite the other node's continuous
+asserting). A two-container UDP/netem 5/5 artifact
+(`remote_manual_by_node_liveliness_probe.cpp` +
+`run_rmw_docker_remote_manual_by_node_liveliness_probe.py`) proves the same
+sharing and expiry over the real wire. `liveliness_default_lease_probe.cpp`
+was updated to replace its old "MANUAL_BY_NODE is rejected" scenario with a
+baseline non-expiring-lease lifecycle scenario for the now-supported kind,
+matching every other supported liveliness kind it already covers; the
+`deprecated_manual_by_node_fail_closed_claim` key it and the report
+generator used has been renamed to `manual_by_node_infinite_lease_
+lifecycle_claim` throughout (source, capabilities.json, tests, and the
+report generator) since the old name no longer describes what happens.
 
 Exit gate:
 

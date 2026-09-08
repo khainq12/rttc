@@ -246,16 +246,26 @@ int main()
     RMW_QOS_POLICY_LIVELINESS_BEST_AVAILABLE,
     RMW_QOS_POLICY_LIVELINESS_AUTOMATIC,
     false);
+  // Value 2 is the deprecated RMW_QOS_POLICY_LIVELINESS_MANUAL_BY_NODE,
+  // referenced numerically to avoid a -Wdeprecated-declarations warning.
+  // It is supported (not fail-closed): its distinguishing node-wide
+  // assertion-sharing behavior is covered separately by
+  // manual_by_node_liveliness_probe.cpp; this scenario only proves the
+  // baseline single-publisher non-expiring-lease lifecycle matches every
+  // other supported kind.
+  const ScenarioResult manual_by_node = run_non_expiring_scenario(
+    &context,
+    node,
+    &type_support,
+    "/fleetqox/liveliness_default_lease/manual_by_node",
+    static_cast<rmw_qos_liveliness_policy_t>(2),
+    static_cast<rmw_qos_liveliness_policy_t>(2),
+    true);
   const bool unknown_rejected = rejected_policy(
     node,
     &type_support,
     "/fleetqox/liveliness_default_lease/unknown",
     RMW_QOS_POLICY_LIVELINESS_UNKNOWN);
-  const bool deprecated_rejected = rejected_policy(
-    node,
-    &type_support,
-    "/fleetqox/liveliness_default_lease/deprecated",
-    static_cast<rmw_qos_liveliness_policy_t>(2));
 
   const rmw_ret_t node_ret = node == nullptr ? RMW_RET_ERROR : rmw_destroy_node(node);
   const rmw_ret_t shutdown_ret = rmw_shutdown(&context);
@@ -264,9 +274,8 @@ int main()
   const bool teardown_ok = node_ret == RMW_RET_OK && shutdown_ret == RMW_RET_OK &&
     context_ret == RMW_RET_OK && options_ret == RMW_RET_OK;
   const bool lifecycle_ok = system_default.ok && automatic.ok && manual.ok &&
-    best_available.ok;
-  const bool ok = node != nullptr && lifecycle_ok && unknown_rejected &&
-    deprecated_rejected && teardown_ok;
+    best_available.ok && manual_by_node.ok;
+  const bool ok = node != nullptr && lifecycle_ok && unknown_rejected && teardown_ok;
   std::cout <<
     "{\"schema_version\":\"fleetrmw.liveliness_default_lease_probe.v1\","
             << "\"status\":\"" << (ok ? "ok" : "failed") << "\","
@@ -280,10 +289,10 @@ int main()
             << (manual.ok ? "true" : "false") << ","
             << "\"best_available_infinite_lease_lifecycle_claim\":"
             << (best_available.ok ? "true" : "false") << ","
+            << "\"manual_by_node_infinite_lease_lifecycle_claim\":"
+            << (manual_by_node.ok ? "true" : "false") << ","
             << "\"unknown_liveliness_fail_closed_claim\":"
             << (unknown_rejected ? "true" : "false") << ","
-            << "\"deprecated_manual_by_node_fail_closed_claim\":"
-            << (deprecated_rejected ? "true" : "false") << ","
             << "\"scenario_count\":6,"
             << "\"clean_teardown\":" << (teardown_ok ? "true" : "false") << "}"
             << std::endl;

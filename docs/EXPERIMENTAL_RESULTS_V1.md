@@ -112,6 +112,22 @@ remote structural type-hash gap for event production only; actual
 message routing/matching remains `type_name`-based, a separate, larger
 change not attempted here.
 
+MANUAL_BY_NODE liveliness (upstream value 2, deprecated in favor of
+MANUAL_BY_TOPIC) is now supported instead of fail-closed. It was previously
+rejected at publisher/subscription creation alongside the genuinely invalid
+UNKNOWN policy, but it is a deprecated-but-well-defined DDS kind (DDS's
+MANUAL_BY_PARTICIPANT) still accepted by rclcpp/rmw, so fail-closed was
+stricter than required. Its distinguishing behavior -- one assertion shared
+by every MANUAL_BY_NODE publisher on the same node -- is now implemented
+locally (fan-out to every sibling publisher on the same `owner_node`) and
+remotely (grouped by `domain_id` + `node_name` + `node_namespace`, already
+carried in every graph advertisement). A local 5/5 artifact proves a silent
+sibling publisher is kept alive by another publisher's asserts on the same
+node, that the shared lease still expires once the whole node goes idle,
+and that sharing does not leak across a node boundary. A two-container
+UDP/netem 5/5 artifact proves the same sharing and expiry over the real
+wire.
+
 ### A real, root-caused use-after-free (fixed)
 
 An intermittent SIGSEGV in Nav2 navigation probes is root-caused by

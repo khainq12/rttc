@@ -3915,7 +3915,7 @@ int main()
             liveliness_default_lease_probe_source,
         )
         self.assertIn(
-            "deprecated_manual_by_node_fail_closed_claim",
+            "manual_by_node_infinite_lease_lifecycle_claim",
             liveliness_default_lease_probe_source,
         )
         liveliness_default_lease_runner = (
@@ -6291,7 +6291,7 @@ int main()
         self.assertTrue(claims["manual_infinite_lease_lifecycle_claim"])
         self.assertTrue(claims["best_available_infinite_lease_lifecycle_claim"])
         self.assertTrue(claims["unknown_liveliness_fail_closed_claim"])
-        self.assertTrue(claims["deprecated_manual_by_node_fail_closed_claim"])
+        self.assertTrue(claims["manual_by_node_infinite_lease_lifecycle_claim"])
         self.assertTrue(
             claims["qos_liveliness_incompatible_event_production_claim"]
         )

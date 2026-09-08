@@ -398,6 +398,30 @@ ament_target_dependencies(fleetrmw_liveliness_default_lease_probe
   rmw
 )
 
+add_executable(fleetrmw_manual_by_node_liveliness_probe
+  src/manual_by_node_liveliness_probe.cpp
+)
+target_compile_features(fleetrmw_manual_by_node_liveliness_probe PRIVATE cxx_std_17)
+target_link_libraries(fleetrmw_manual_by_node_liveliness_probe
+  ${PROJECT_NAME}
+)
+ament_target_dependencies(fleetrmw_manual_by_node_liveliness_probe
+  rcutils
+  rmw
+)
+
+add_executable(fleetrmw_remote_manual_by_node_liveliness_probe
+  src/remote_manual_by_node_liveliness_probe.cpp
+)
+target_compile_features(fleetrmw_remote_manual_by_node_liveliness_probe PRIVATE cxx_std_17)
+target_link_libraries(fleetrmw_remote_manual_by_node_liveliness_probe
+  ${PROJECT_NAME}
+)
+ament_target_dependencies(fleetrmw_remote_manual_by_node_liveliness_probe
+  rcutils
+  rmw
+)
+
 add_executable(fleetrmw_remote_deadline_event_probe
   src/remote_deadline_event_probe.cpp
 )
@@ -1417,6 +1441,8 @@ install(
     fleetrmw_liveliness_scale_probe
     fleetrmw_remote_liveliness_scale_probe
     fleetrmw_liveliness_default_lease_probe
+    fleetrmw_manual_by_node_liveliness_probe
+    fleetrmw_remote_manual_by_node_liveliness_probe
     fleetrmw_remote_deadline_event_probe
     fleetrmw_content_filter_probe
     fleetrmw_content_filter_sql_probe

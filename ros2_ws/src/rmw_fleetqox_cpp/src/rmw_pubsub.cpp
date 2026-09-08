@@ -272,6 +272,11 @@ struct RemotePubSubEndpoint
   bool liveliness_alive{false};
   rosidl_type_hash_t type_hash{};
   bool type_hash_valid{false};
+  // Populated from GraphAdvertisement so MANUAL_BY_NODE liveliness
+  // assertions can be shared across every remote publisher owned by the
+  // same remote node, mirroring the local same-process fan-out.
+  std::string node_name;
+  std::string node_namespace;
 };
 
 struct FleetQoxTypeErasedMessageDescriptor
@@ -11719,9 +11724,14 @@ bool qos_deadline_enabled(const rmw_qos_profile_t & qos)
 
 bool qos_liveliness_policy_supported(rmw_qos_liveliness_policy_t policy)
 {
+  // Referenced by numeric value rather than the deprecated
+  // RMW_QOS_POLICY_LIVELINESS_MANUAL_BY_NODE symbol to avoid a
+  // -Wdeprecated-declarations warning at every use site.
+  constexpr auto kManualByNode = static_cast<rmw_qos_liveliness_policy_t>(2);
   return policy == RMW_QOS_POLICY_LIVELINESS_SYSTEM_DEFAULT ||
          policy == RMW_QOS_POLICY_LIVELINESS_AUTOMATIC ||
-         policy == RMW_QOS_POLICY_LIVELINESS_MANUAL_BY_TOPIC;
+         policy == RMW_QOS_POLICY_LIVELINESS_MANUAL_BY_TOPIC ||
+         policy == kManualByNode;
 }
 
 bool qos_liveliness_enabled(const rmw_qos_profile_t & qos)
@@ -11741,6 +11751,20 @@ bool qos_liveliness_automatic(const rmw_qos_profile_t & qos)
 bool qos_liveliness_manual_by_topic(const rmw_qos_profile_t & qos)
 {
   return qos.liveliness == RMW_QOS_POLICY_LIVELINESS_MANUAL_BY_TOPIC;
+}
+
+// MANUAL_BY_NODE (upstream rmw/types.h value 2, deprecated in favor of
+// MANUAL_BY_TOPIC) shares a single liveliness assertion across every
+// MANUAL_BY_NODE publisher owned by the same node/participant, unlike
+// MANUAL_BY_TOPIC where each publisher asserts independently. Supported
+// here (rather than left fail-closed) because rclcpp/rmw still accept it
+// from applications that have not migrated off the deprecated value, and
+// its semantics are well-defined by the DDS spec's equivalent
+// MANUAL_BY_PARTICIPANT kind.
+bool qos_liveliness_manual_by_node(const rmw_qos_profile_t & qos)
+{
+  constexpr auto kManualByNode = static_cast<rmw_qos_liveliness_policy_t>(2);
+  return qos.liveliness == kManualByNode;
 }
 
 size_t liveliness_changed_pending_count(
@@ -11876,13 +11900,40 @@ void record_liveliness_assert_locked(
   const bool was_alive = publisher->liveliness_alive;
   publisher->last_liveliness_assert_ns = now_ns;
   publisher->liveliness_alive = true;
-  if (was_alive) {
+  if (!was_alive) {
+    for (FleetQoxSubscriptionData * subscription : g_subscriptions) {
+      if (local_pubsub_match_compatible(publisher, subscription)) {
+        record_subscription_liveliness_change_locked(
+          subscription, publisher->publisher_id, true, callbacks);
+      }
+    }
+  }
+  if (!qos_liveliness_manual_by_node(publisher->qos)) {
     return;
   }
-  for (FleetQoxSubscriptionData * subscription : g_subscriptions) {
-    if (local_pubsub_match_compatible(publisher, subscription)) {
-      record_subscription_liveliness_change_locked(
-        subscription, publisher->publisher_id, true, callbacks);
+  // MANUAL_BY_NODE: this assertion is shared by every other MANUAL_BY_NODE
+  // publisher on the same local node, matching DDS MANUAL_BY_PARTICIPANT
+  // semantics. Renew each sibling's own lease timestamp (so the deadline
+  // monitor's per-publisher lease-expiry check does not fire on a quiet
+  // sibling) and notify its matched subscriptions if it transitions alive.
+  for (FleetQoxPublisherData * sibling : g_publishers) {
+    if (sibling == nullptr || sibling == publisher ||
+      sibling->owner_node != publisher->owner_node ||
+      !qos_liveliness_manual_by_node(sibling->qos))
+    {
+      continue;
+    }
+    const bool sibling_was_alive = sibling->liveliness_alive;
+    sibling->last_liveliness_assert_ns = now_ns;
+    sibling->liveliness_alive = true;
+    if (sibling_was_alive) {
+      continue;
+    }
+    for (FleetQoxSubscriptionData * subscription : g_subscriptions) {
+      if (local_pubsub_match_compatible(sibling, subscription)) {
+        record_subscription_liveliness_change_locked(
+          subscription, sibling->publisher_id, true, callbacks);
+      }
     }
   }
 }
@@ -12067,7 +12118,8 @@ void expire_remote_manual_liveliness_locked(
   for (auto & item : g_remote_pubsub_endpoints) {
     RemotePubSubEndpoint & endpoint = item.second;
     if (!endpoint.publisher || !endpoint.liveliness_alive ||
-      !qos_liveliness_manual_by_topic(endpoint.qos) ||
+      (!qos_liveliness_manual_by_topic(endpoint.qos) &&
+      !qos_liveliness_manual_by_node(endpoint.qos)) ||
       endpoint.last_liveliness_assert_ns <= 0)
     {
       continue;
@@ -12121,7 +12173,8 @@ bool apply_remote_pubsub_event_advertisement(
     return false;
   }
   if (is_liveliness_assert &&
-    (!is_publisher || !qos_liveliness_manual_by_topic(qos)))
+    (!is_publisher ||
+    (!qos_liveliness_manual_by_topic(qos) && !qos_liveliness_manual_by_node(qos))))
   {
     return false;
   }
@@ -12157,6 +12210,8 @@ bool apply_remote_pubsub_event_advertisement(
       incoming.liveliness_alive = is_publisher && qos_liveliness_enabled(qos);
       incoming.type_hash_valid =
         decode_type_hash_hex(advertisement.type_hash_hex, &incoming.type_hash);
+      incoming.node_name = advertisement.node_name;
+      incoming.node_namespace = advertisement.node_namespace;
       if (found != g_remote_pubsub_endpoints.end() &&
         remote_endpoint_descriptor_equal(found->second, incoming))
       {
@@ -12171,6 +12226,24 @@ bool apply_remote_pubsub_event_advertisement(
           if (!was_alive && found->second.liveliness_alive) {
             g_remote_manual_liveliness_reassertions.fetch_add(
               1, std::memory_order_relaxed);
+          }
+          if (qos_liveliness_manual_by_node(found->second.qos)) {
+            // Mirrors the local same-process fan-out: this assertion is
+            // shared by every other remote MANUAL_BY_NODE publisher owned
+            // by the same remote node.
+            for (auto & sibling_item : g_remote_pubsub_endpoints) {
+              RemotePubSubEndpoint & sibling = sibling_item.second;
+              if (!sibling.publisher || sibling.endpoint_id == found->second.endpoint_id ||
+                sibling.domain_id != found->second.domain_id ||
+                sibling.node_name != found->second.node_name ||
+                sibling.node_namespace != found->second.node_namespace ||
+                !qos_liveliness_manual_by_node(sibling.qos))
+              {
+                continue;
+              }
+              sibling.last_liveliness_assert_ns = now_ns;
+              record_remote_publisher_liveliness_state_locked(&sibling, true, &callbacks);
+            }
           }
         } else {
           if (qos_liveliness_automatic(found->second.qos)) {
@@ -15158,7 +15231,7 @@ rmw_ret_t rmw_fleetqox_cpp_assert_publisher_liveliness(
     record_liveliness_assert_locked(data, monotonic_timestamp_ns(), &callbacks);
   }
   notify_event_callbacks(callbacks);
-  if (qos_liveliness_manual_by_topic(data->qos)) {
+  if (qos_liveliness_manual_by_topic(data->qos) || qos_liveliness_manual_by_node(data->qos)) {
     send_publisher_graph_advertisement(data, "liveliness_assert");
   }
   return RMW_RET_OK;
