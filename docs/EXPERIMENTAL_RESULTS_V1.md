@@ -43,6 +43,18 @@ The C++ ROS 2 Jazzy package has executable probes for:
 The exported-symbol audit and probes demonstrate broad ABI coverage. Full
 DDS/vendor semantics, deep preallocation, and zero-copy remain unclaimed.
 
+The publish hot path's frame encoding now reuses a persistent per-publisher
+buffer for the payload's base64 text across repeated publishes instead of
+allocating a fresh string every call; `docker_deep_preallocation_probe`
+proves the buffer's capacity grows once on the first of eight same-size
+publishes and stays exactly stable for the rest, 5/5, rebuilt clean under
+ASan/UBSan. This is a genuine but bounded reduction, not a closure of "deep
+preallocation": the JSON frame body is still built via a fresh
+`std::ostringstream` per publish (its floating-point formatting was left
+untouched to avoid risking the on-wire number format ~187 other probes
+depend on), and the reliability retransmit ledger still allocates per
+in-flight reliable message by design.
+
 ### A real, root-caused use-after-free (fixed)
 
 An intermittent SIGSEGV in Nav2 navigation probes is root-caused by

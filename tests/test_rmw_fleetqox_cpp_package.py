@@ -3188,6 +3188,30 @@ int main()
         self.assertIn("payload_scratch_total_capacity_growths", allocation_runner_source)
         self.assertIn("deep_preallocation", allocation_runner_source)
         self.assertIn("allocation_repeated_lifecycle_claim", allocation_runner_source)
+        deep_preallocation_probe = PKG / "src" / "deep_preallocation_probe.cpp"
+        self.assertTrue(deep_preallocation_probe.exists())
+        deep_preallocation_probe_source = deep_preallocation_probe.read_text()
+        self.assertIn("fleetrmw.deep_preallocation_probe.v1", deep_preallocation_probe_source)
+        self.assertIn(
+            "rmw_fleetqox_cpp_test_publisher_frame_base64_scratch_capacity",
+            deep_preallocation_probe_source,
+        )
+        self.assertIn("base64_scratch_reuse_ok", deep_preallocation_probe_source)
+        deep_preallocation_runner = (
+            ROOT / "scripts" / "run_rmw_docker_deep_preallocation_probe.py"
+        )
+        self.assertTrue(deep_preallocation_runner.exists())
+        deep_preallocation_runner_source = deep_preallocation_runner.read_text()
+        self.assertIn(
+            "fleetrmw.docker_deep_preallocation_probe.v1", deep_preallocation_runner_source
+        )
+        self.assertIn(
+            "deep_preallocation_frame_base64_scratch_claim", deep_preallocation_runner_source
+        )
+        rmw_pubsub_source = (PKG / "src" / "rmw_pubsub.cpp").read_text()
+        self.assertIn("frame_base64_scratch", rmw_pubsub_source)
+        data_frame_source = (PKG / "src" / "data_frame.cpp").read_text()
+        self.assertIn("base64_encode_append", data_frame_source)
         security_options_probe = PKG / "src" / "security_options_probe.cpp"
         self.assertTrue(security_options_probe.exists())
         security_options_source = security_options_probe.read_text()

@@ -209,6 +209,12 @@ std::string stream_key(const DataFrame & frame);
 
 std::string encode_data_frame(const DataFrame & frame);
 
+// Reuses `base64_scratch` for the payload's base64 text instead of
+// allocating a fresh string on every call; pass a persistent buffer owned
+// by the caller (e.g. one per publisher) to avoid a new heap allocation
+// per publish once the buffer has grown to the steady-state payload size.
+std::string encode_data_frame(const DataFrame & frame, std::string & base64_scratch);
+
 std::optional<DataFrame> decode_data_frame(const std::string & payload);
 
 std::string encode_route_advertisement(const RouteAdvertisement & advertisement);

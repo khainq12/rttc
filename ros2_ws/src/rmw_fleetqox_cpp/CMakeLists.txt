@@ -939,6 +939,18 @@ ament_target_dependencies(fleetrmw_allocation_probe
   rmw
 )
 
+add_executable(fleetrmw_deep_preallocation_probe
+  src/deep_preallocation_probe.cpp
+)
+target_compile_features(fleetrmw_deep_preallocation_probe PRIVATE cxx_std_17)
+target_link_libraries(fleetrmw_deep_preallocation_probe
+  ${PROJECT_NAME}
+)
+ament_target_dependencies(fleetrmw_deep_preallocation_probe
+  rcutils
+  rmw
+)
+
 add_executable(fleetrmw_security_options_probe
   src/security_options_probe.cpp
 )
@@ -1413,6 +1425,7 @@ install(
     fleetrmw_cpp_typesupport_probe
     fleetrmw_loaned_message_probe
     fleetrmw_allocation_probe
+    fleetrmw_deep_preallocation_probe
     fleetrmw_security_options_probe
     fleetrmw_security_policy_probe
     fleetrmw_sros2_permissions_probe

@@ -615,6 +615,28 @@ the full dialect (arbitrary DDS SQL functions, vendor-specific semantics,
 and any FIELD-to-FIELD comparison where neither side is a bare parameter or
 literal) remains out of scope and is still a deliberate non-goal.
 
+Also **done**, closed this session (bounded scope, not a full closure): the
+publish hot path's frame encoding now reuses a persistent per-publisher
+buffer (`FleetQoxPublisherData::frame_base64_scratch`) for the serialized
+payload's base64 text across repeated publishes, via a new
+`encode_data_frame(frame, base64_scratch)` overload and a
+`base64_encode_append` helper that writes into a caller-owned string instead
+of allocating a fresh one every call. A dedicated 5/5 Docker artifact
+(`docker_deep_preallocation_probe`) publishes eight same-size payloads per
+process and proves the buffer's capacity grows once on the first publish
+then stays exactly stable for the remaining seven, rebuilt clean under
+ASan/UBSan with zero diagnostics. This intentionally does **not** close
+`deep_preallocation_claim`: the JSON frame body is still built through a
+fresh `std::ostringstream` per publish (its floating-point field formatting
+was deliberately left untouched -- rewriting it risks silently changing
+on-wire number formatting roughly 187 other probes depend on), the
+reliability retransmit ledger still allocates a new entry per in-flight
+reliable message by design (it is an unbounded, QoS-depth-driven
+store-and-forward buffer, not incidental inefficiency), and
+application-message deserialization is unchanged. A full closure would need
+a binary (non-JSON) wire format and a pool allocator for the retransmit
+ledger -- a redesign, not a bounded addition -- and remains unclaimed.
+
 Exit gate:
 
 - each capability either implemented and repeatedly probed or explicitly

@@ -165,6 +165,10 @@ struct FleetQoxPublisherData
   bool destroying{false};
   size_t inflight_callbacks{0};
   std::mutex publish_mutex{};
+  // Reused across publish_payload() calls (guarded by publish_mutex above)
+  // so the payload's base64 encoding stops reallocating once it has grown
+  // to this publisher's steady-state payload size.
+  std::string frame_base64_scratch{};
 };
 
 struct FleetQoxSubscriptionData
@@ -11036,6 +11040,21 @@ size_t rmw_fleetqox_cpp_test_retransmit_ledger_max_entries_per_instance_for_publ
   return max_count;
 }
 
+// White-box accessor for probing the reusable frame-encode base64 scratch
+// buffer (see FleetQoxPublisherData::frame_base64_scratch and
+// encode_data_frame's two-argument overload). Not part of the public RMW
+// API; test-only, like the counters above.
+size_t rmw_fleetqox_cpp_test_publisher_frame_base64_scratch_capacity(
+  const rmw_publisher_t * publisher)
+{
+  FleetQoxPublisherData * data = publisher_data(publisher);
+  if (data == nullptr) {
+    return 0;
+  }
+  std::lock_guard<std::mutex> lock(data->publish_mutex);
+  return data->frame_base64_scratch.capacity();
+}
+
 }  // extern "C"
 
 namespace
@@ -11143,7 +11162,8 @@ rmw_ret_t publish_payload(FleetQoxPublisherData * data, const std::vector<std::u
     payload,
     data->domain_id,
     data->type_name};
-  const std::string encoded_frame = rmw_fleetqox_cpp::encode_data_frame(frame);
+  const std::string encoded_frame =
+    rmw_fleetqox_cpp::encode_data_frame(frame, data->frame_base64_scratch);
   const bool reliable = data->qos.reliability == RMW_QOS_POLICY_RELIABILITY_RELIABLE;
   const std::vector<std::string> matched_subscription_ids = reliable ?
     rmw_fleetqox_cpp_graph_matched_subscription_endpoint_ids(

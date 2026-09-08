@@ -297,40 +297,52 @@ std::optional<std::vector<std::uint8_t>> hex_decode(const std::string & encoded)
 // (see FLEETQOX_RMW_LOSS_RESILIENT_FRAGMENT_CHUNK_BYTES), that difference
 // directly determines how many concurrent large-payload flows fit through
 // a bandwidth-constrained link before fragment loss sets in.
-std::string base64_encode(const std::vector<std::uint8_t> & bytes)
+// Writes into `out` in place (clearing prior contents but retaining its
+// capacity) rather than returning a freshly allocated string, so a caller
+// that holds a persistent scratch buffer across repeated calls with
+// similarly sized payloads (e.g. one publisher's steady-state publish rate)
+// only pays for the underlying reallocation on capacity growth, not on
+// every single call once the buffer has warmed up to the working size.
+void base64_encode_append(const std::vector<std::uint8_t> & bytes, std::string & out)
 {
   static constexpr char kAlphabet[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  std::string encoded;
-  encoded.reserve(((bytes.size() + 2) / 3) * 4);
+  out.clear();
+  out.reserve(((bytes.size() + 2) / 3) * 4);
   std::size_t i = 0;
   while (i + 3 <= bytes.size()) {
     const std::uint32_t chunk =
       (static_cast<std::uint32_t>(bytes[i]) << 16) |
       (static_cast<std::uint32_t>(bytes[i + 1]) << 8) |
       static_cast<std::uint32_t>(bytes[i + 2]);
-    encoded.push_back(kAlphabet[(chunk >> 18) & 0x3F]);
-    encoded.push_back(kAlphabet[(chunk >> 12) & 0x3F]);
-    encoded.push_back(kAlphabet[(chunk >> 6) & 0x3F]);
-    encoded.push_back(kAlphabet[chunk & 0x3F]);
+    out.push_back(kAlphabet[(chunk >> 18) & 0x3F]);
+    out.push_back(kAlphabet[(chunk >> 12) & 0x3F]);
+    out.push_back(kAlphabet[(chunk >> 6) & 0x3F]);
+    out.push_back(kAlphabet[chunk & 0x3F]);
     i += 3;
   }
   const std::size_t remaining = bytes.size() - i;
   if (remaining == 1) {
     const std::uint32_t chunk = static_cast<std::uint32_t>(bytes[i]) << 16;
-    encoded.push_back(kAlphabet[(chunk >> 18) & 0x3F]);
-    encoded.push_back(kAlphabet[(chunk >> 12) & 0x3F]);
-    encoded.push_back('=');
-    encoded.push_back('=');
+    out.push_back(kAlphabet[(chunk >> 18) & 0x3F]);
+    out.push_back(kAlphabet[(chunk >> 12) & 0x3F]);
+    out.push_back('=');
+    out.push_back('=');
   } else if (remaining == 2) {
     const std::uint32_t chunk =
       (static_cast<std::uint32_t>(bytes[i]) << 16) |
       (static_cast<std::uint32_t>(bytes[i + 1]) << 8);
-    encoded.push_back(kAlphabet[(chunk >> 18) & 0x3F]);
-    encoded.push_back(kAlphabet[(chunk >> 12) & 0x3F]);
-    encoded.push_back(kAlphabet[(chunk >> 6) & 0x3F]);
-    encoded.push_back('=');
+    out.push_back(kAlphabet[(chunk >> 18) & 0x3F]);
+    out.push_back(kAlphabet[(chunk >> 12) & 0x3F]);
+    out.push_back(kAlphabet[(chunk >> 6) & 0x3F]);
+    out.push_back('=');
   }
+}
+
+std::string base64_encode(const std::vector<std::uint8_t> & bytes)
+{
+  std::string encoded;
+  base64_encode_append(bytes, encoded);
   return encoded;
 }
 
@@ -502,7 +514,13 @@ std::string stream_key(const DataFrame & frame)
   return frame.robot_id + "|" + frame.topic + "|" + frame.publisher_id;
 }
 
-std::string encode_data_frame(const DataFrame & frame)
+// `base64_scratch` is caller-owned and reused verbatim (see
+// base64_encode_append) so a hot-path caller that holds one persistent
+// buffer across repeated publishes -- see FleetQoxPublisherData::
+// frame_base64_scratch -- only reallocates it on genuine capacity growth,
+// not on every single publish once it has warmed up to the steady-state
+// payload size.
+std::string encode_data_frame(const DataFrame & frame, std::string & base64_scratch)
 {
   std::ostringstream out;
   out << kDataFrameMagic;
@@ -526,10 +544,11 @@ std::string encode_data_frame(const DataFrame & frame)
   out << "\"source_timestamp_ns\":" << frame.source_timestamp_ns;
   out << "}";
   if (!frame.serialized_payload.empty()) {
+    base64_encode_append(frame.serialized_payload, base64_scratch);
     out << ",\"serialized_payload\":{";
     out << "\"encoding\":\"base64\",";
     out << "\"size\":" << frame.serialized_payload.size() << ",";
-    out << "\"data\":\"" << base64_encode(frame.serialized_payload) << "\"}";
+    out << "\"data\":\"" << base64_scratch << "\"}";
   }
   if (frame.deadline_ms > 0.0) {
     out << ",\"delivery\":{\"deadline_ms\":" << frame.deadline_ms << "}";
@@ -548,6 +567,12 @@ std::string encode_data_frame(const DataFrame & frame)
   }
   out << "}";
   return out.str();
+}
+
+std::string encode_data_frame(const DataFrame & frame)
+{
+  std::string base64_scratch;
+  return encode_data_frame(frame, base64_scratch);
 }
 
 std::optional<DataFrame> decode_data_frame(const std::string & payload)
