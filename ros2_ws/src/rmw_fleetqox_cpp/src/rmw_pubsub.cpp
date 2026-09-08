@@ -308,6 +308,9 @@ struct RemotePubSubEndpoint
   // same remote node, mirroring the local same-process fan-out.
   std::string node_name;
   std::string node_namespace;
+  // FleetQoX PARTITION extension (see qos_extensions.hpp); empty means the
+  // default partition, exactly like the local-side field it mirrors.
+  std::vector<std::string> partitions;
 };
 
 struct FleetQoxTypeErasedMessageDescriptor
@@ -3371,7 +3374,8 @@ public:
     const std::array<std::uint8_t, RMW_GID_STORAGE_SIZE> & endpoint_gid,
     const rmw_qos_profile_t & qos,
     std::size_t domain_id,
-    const std::string & type_hash_hex = std::string())
+    const std::string & type_hash_hex = std::string(),
+    const std::string & partitions_csv = std::string())
   {
     if (peer_addresses_.empty()) {
       return RMW_RET_OK;
@@ -3388,7 +3392,8 @@ public:
       graph_qos_from_rmw(qos),
       5000u,
       domain_id,
-      type_hash_hex};
+      type_hash_hex,
+      partitions_csv};
     return send_to_peers(rmw_fleetqox_cpp::encode_graph_advertisement(advertisement));
   }
 
@@ -8287,6 +8292,68 @@ rmw_qos_policy_kind_t incompatible_qos_policy_kind(
   return RMW_QOS_POLICY_INVALID;
 }
 
+// PARTITION (FleetQoX extension; see qos_extensions.hpp). An empty list is
+// DDS's own "default partition" -- equivalent to a list containing a
+// single empty string -- so two unpartitioned endpoints (the overwhelming
+// common case, and the only case before this extension existed) still
+// match each other exactly as before. A mismatch here means the two
+// endpoints simply do not see each other at all, the same as if they were
+// on different topics -- not an "incompatible QoS" condition -- so every
+// matching AND incompatible-event-detection call site must gate on this
+// identically to how they already gate on topic_name, not treat it as a
+// new incompatibility reason.
+std::string encode_partitions_csv(const std::vector<std::string> & partitions)
+{
+  std::string csv;
+  for (size_t i = 0; i < partitions.size(); ++i) {
+    if (i > 0) {
+      csv += ",";
+    }
+    csv += partitions[i];
+  }
+  return csv;
+}
+
+std::vector<std::string> decode_partitions_csv(const std::string & csv)
+{
+  std::vector<std::string> partitions;
+  if (csv.empty()) {
+    return partitions;
+  }
+  size_t start = 0;
+  while (start <= csv.size()) {
+    const size_t comma = csv.find(',', start);
+    if (comma == std::string::npos) {
+      partitions.push_back(csv.substr(start));
+      break;
+    }
+    partitions.push_back(csv.substr(start, comma - start));
+    start = comma + 1;
+  }
+  return partitions;
+}
+
+bool partitions_intersect(
+  const std::vector<std::string> & left,
+  const std::vector<std::string> & right)
+{
+  if (left.empty() && right.empty()) {
+    return true;
+  }
+  if (left.empty()) {
+    return std::find(right.begin(), right.end(), std::string()) != right.end();
+  }
+  if (right.empty()) {
+    return std::find(left.begin(), left.end(), std::string()) != left.end();
+  }
+  for (const std::string & partition : left) {
+    if (std::find(right.begin(), right.end(), partition) != right.end()) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool local_pubsub_match_compatible(
   const FleetQoxPublisherData * publisher,
   const FleetQoxSubscriptionData * subscription)
@@ -8296,6 +8363,7 @@ bool local_pubsub_match_compatible(
          publisher->domain_id == subscription->domain_id &&
          publisher->topic_name == subscription->topic_name &&
          publisher->type_name == subscription->type_name &&
+         partitions_intersect(publisher->partitions, subscription->partitions) &&
          incompatible_qos_policy_kind(publisher->qos, subscription->qos) ==
          RMW_QOS_POLICY_INVALID;
 }
@@ -8353,6 +8421,7 @@ bool remote_subscription_match_compatible(
          publisher->domain_id == subscription.domain_id &&
          publisher->topic_name == subscription.topic_name &&
          publisher->type_name == subscription.type_name &&
+         partitions_intersect(publisher->partitions, subscription.partitions) &&
          incompatible_qos_policy_kind(publisher->qos, subscription.qos) ==
          RMW_QOS_POLICY_INVALID;
 }
@@ -8366,6 +8435,7 @@ bool remote_publisher_match_compatible(
          publisher.domain_id == subscription->domain_id &&
          publisher.topic_name == subscription->topic_name &&
          publisher.type_name == subscription->type_name &&
+         partitions_intersect(publisher.partitions, subscription->partitions) &&
          incompatible_qos_policy_kind(publisher.qos, subscription->qos) ==
          RMW_QOS_POLICY_INVALID;
 }
@@ -8753,7 +8823,8 @@ void record_qos_incompatibilities_for_new_publisher_locked(
   }
   for (FleetQoxSubscriptionData * subscription : g_subscriptions) {
     if (subscription == nullptr || subscription->domain_id != publisher->domain_id ||
-      subscription->topic_name != publisher->topic_name)
+      subscription->topic_name != publisher->topic_name ||
+      !partitions_intersect(publisher->partitions, subscription->partitions))
     {
       continue;
     }
@@ -8767,7 +8838,8 @@ void record_qos_incompatibilities_for_new_publisher_locked(
   for (const auto & item : g_remote_pubsub_endpoints) {
     const RemotePubSubEndpoint & subscription = item.second;
     if (subscription.publisher || subscription.domain_id != publisher->domain_id ||
-      subscription.topic_name != publisher->topic_name)
+      subscription.topic_name != publisher->topic_name ||
+      !partitions_intersect(publisher->partitions, subscription.partitions))
     {
       continue;
     }
@@ -8788,7 +8860,8 @@ void record_qos_incompatibilities_for_new_subscription_locked(
   }
   for (FleetQoxPublisherData * publisher : g_publishers) {
     if (publisher == nullptr || publisher->domain_id != subscription->domain_id ||
-      publisher->topic_name != subscription->topic_name)
+      publisher->topic_name != subscription->topic_name ||
+      !partitions_intersect(publisher->partitions, subscription->partitions))
     {
       continue;
     }
@@ -8802,7 +8875,8 @@ void record_qos_incompatibilities_for_new_subscription_locked(
   for (const auto & item : g_remote_pubsub_endpoints) {
     const RemotePubSubEndpoint & publisher = item.second;
     if (!publisher.publisher || publisher.domain_id != subscription->domain_id ||
-      publisher.topic_name != subscription->topic_name)
+      publisher.topic_name != subscription->topic_name ||
+      !partitions_intersect(publisher.partitions, subscription->partitions))
     {
       continue;
     }
@@ -8825,6 +8899,7 @@ void record_type_incompatibilities_for_new_publisher_locked(
     if (subscription == nullptr ||
       subscription->domain_id != publisher->domain_id ||
       subscription->topic_name != publisher->topic_name ||
+      !partitions_intersect(publisher->partitions, subscription->partitions) ||
       subscription->type_name == publisher->type_name)
     {
       continue;
@@ -8837,6 +8912,7 @@ void record_type_incompatibilities_for_new_publisher_locked(
     if (subscription.publisher ||
       subscription.domain_id != publisher->domain_id ||
       subscription.topic_name != publisher->topic_name ||
+      !partitions_intersect(publisher->partitions, subscription.partitions) ||
       !remote_type_incompatible(publisher->type_support, publisher->type_name, subscription))
     {
       continue;
@@ -8856,6 +8932,7 @@ void record_type_incompatibilities_for_new_subscription_locked(
     if (publisher == nullptr ||
       publisher->domain_id != subscription->domain_id ||
       publisher->topic_name != subscription->topic_name ||
+      !partitions_intersect(publisher->partitions, subscription->partitions) ||
       publisher->type_name == subscription->type_name)
     {
       continue;
@@ -8868,6 +8945,7 @@ void record_type_incompatibilities_for_new_subscription_locked(
     if (!publisher.publisher ||
       publisher.domain_id != subscription->domain_id ||
       publisher.topic_name != subscription->topic_name ||
+      !partitions_intersect(publisher.partitions, subscription->partitions) ||
       !remote_type_incompatible(subscription->type_support, subscription->type_name, publisher))
     {
       continue;
@@ -11342,7 +11420,15 @@ rmw_ret_t publish_payload(FleetQoxPublisherData * data, const std::vector<std::u
     now_ns,
     payload,
     data->domain_id,
-    data->type_name};
+    data->type_name,
+    std::string{},
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    false,
+    std::uint64_t{0},
+    encode_partitions_csv(data->partitions)};
   const std::string encoded_frame =
     rmw_fleetqox_cpp::encode_data_frame(frame, data->frame_base64_scratch);
   const bool reliable = data->qos.reliability == RMW_QOS_POLICY_RELIABILITY_RELIABLE;
@@ -12080,7 +12166,8 @@ void record_remote_endpoint_discovered_locked(
   if (endpoint.publisher) {
     for (FleetQoxSubscriptionData * subscription : g_subscriptions) {
       if (subscription == nullptr || subscription->domain_id != endpoint.domain_id ||
-        subscription->topic_name != endpoint.topic_name)
+        subscription->topic_name != endpoint.topic_name ||
+        !partitions_intersect(subscription->partitions, endpoint.partitions))
       {
         continue;
       }
@@ -12107,7 +12194,8 @@ void record_remote_endpoint_discovered_locked(
   } else {
     for (FleetQoxPublisherData * publisher : g_publishers) {
       if (publisher == nullptr || publisher->domain_id != endpoint.domain_id ||
-        publisher->topic_name != endpoint.topic_name)
+        publisher->topic_name != endpoint.topic_name ||
+        !partitions_intersect(publisher->partitions, endpoint.partitions))
       {
         continue;
       }
@@ -12265,6 +12353,7 @@ bool apply_remote_pubsub_event_advertisement(
         decode_type_hash_hex(advertisement.type_hash_hex, &incoming.type_hash);
       incoming.node_name = advertisement.node_name;
       incoming.node_namespace = advertisement.node_namespace;
+      incoming.partitions = decode_partitions_csv(advertisement.partitions_csv);
       if (found != g_remote_pubsub_endpoints.end() &&
         remote_endpoint_descriptor_equal(found->second, incoming))
       {
@@ -12667,7 +12756,8 @@ void send_publisher_graph_advertisement(const FleetQoxPublisherData * data, cons
       data->endpoint_gid,
       data->qos,
       data->domain_id,
-      type_hash_valid ? encode_type_hash_hex(type_hash) : std::string());
+      type_hash_valid ? encode_type_hash_hex(type_hash) : std::string(),
+      encode_partitions_csv(data->partitions));
   (void)graph_advertisement_ret;
 }
 
@@ -12690,7 +12780,8 @@ void send_subscription_graph_advertisement(const FleetQoxSubscriptionData * data
       data->endpoint_gid,
       data->qos,
       data->domain_id,
-      type_hash_valid ? encode_type_hash_hex(type_hash) : std::string());
+      type_hash_valid ? encode_type_hash_hex(type_hash) : std::string(),
+      encode_partitions_csv(data->partitions));
   (void)graph_advertisement_ret;
   if (std::strcmp(action, "add") == 0) {
     const rmw_ret_t advertisement_ret =
@@ -12835,7 +12926,9 @@ void enqueue_received_frame(const std::string & encoded_frame)
       if (subscription != nullptr && subscription->domain_id == decoded_frame->domain_id &&
         subscription->topic_name == decoded_frame->topic &&
         (decoded_frame->type_name.empty() ||
-        subscription->type_name == decoded_frame->type_name))
+        subscription->type_name == decoded_frame->type_name) &&
+        partitions_intersect(
+          subscription->partitions, decode_partitions_csv(decoded_frame->partitions_csv)))
       {
         if (!subscribe_allowed_by_security_policy(
             subscription->topic_name, subscription->enclave, subscription->domain_id))

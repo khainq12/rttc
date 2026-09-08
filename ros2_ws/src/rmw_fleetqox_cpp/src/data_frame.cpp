@@ -530,6 +530,9 @@ std::string encode_data_frame(const DataFrame & frame, std::string & base64_scra
   if (!frame.type_name.empty()) {
     out << "\"type_name\":\"" << json_escape(frame.type_name) << "\",";
   }
+  if (!frame.partitions_csv.empty()) {
+    out << "\"partitions\":\"" << json_escape(frame.partitions_csv) << "\",";
+  }
   out << "\"route\":{\"robot_id\":\"" << json_escape(frame.robot_id) << "\",";
   out << "\"topic\":\"" << json_escape(frame.topic) << "\"";
   if (!frame.flow_class.empty()) {
@@ -641,7 +644,8 @@ std::optional<DataFrame> decode_data_frame(const std::string & payload)
     json_double_value(qox, "qoe_debt").value_or(0.0),
     json_double_value(qox, "task_criticality").value_or(0.0),
     json_bool_value(repair, "requested"),
-    json_uint_value(repair, "prior_attempts").value_or(0)};
+    json_uint_value(repair, "prior_attempts").value_or(0),
+    json_string_value(body, "partitions").value_or("")};
 }
 
 std::string encode_route_advertisement(const RouteAdvertisement & advertisement)
@@ -704,7 +708,8 @@ std::string encode_graph_advertisement(const GraphAdvertisement & advertisement)
   encode_graph_qos(out, advertisement.qos);
   out << ",";
   out << "\"lease_ms\":" << advertisement.lease_ms << ",";
-  out << "\"type_hash\":\"" << json_escape(advertisement.type_hash_hex) << "\"";
+  out << "\"type_hash\":\"" << json_escape(advertisement.type_hash_hex) << "\",";
+  out << "\"partitions\":\"" << json_escape(advertisement.partitions_csv) << "\"";
   out << "}";
   return out.str();
 }
@@ -741,6 +746,7 @@ std::optional<GraphAdvertisement> decode_graph_advertisement(const std::string &
   advertisement.lease_ms = json_uint_value(body, "lease_ms").value_or(0);
   advertisement.domain_id = json_uint_value(body, "domain_id").value_or(0);
   advertisement.type_hash_hex = json_string_value(body, "type_hash").value_or("");
+  advertisement.partitions_csv = json_string_value(body, "partitions").value_or("");
   return advertisement;
 }
 

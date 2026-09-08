@@ -39,7 +39,8 @@ struct DataFrame
     double qoe_debt_value = 0.0,
     double task_criticality_value = 0.0,
     bool repair_requested_value = false,
-    std::uint64_t prior_repair_attempts_value = 0)
+    std::uint64_t prior_repair_attempts_value = 0,
+    std::string partitions_csv_value = {})
   : robot_id(std::move(robot_id_value)),
     topic(std::move(topic_value)),
     publisher_id(std::move(publisher_id_value)),
@@ -54,7 +55,8 @@ struct DataFrame
     qoe_debt(qoe_debt_value),
     task_criticality(task_criticality_value),
     repair_requested(repair_requested_value),
-    prior_repair_attempts(prior_repair_attempts_value)
+    prior_repair_attempts(prior_repair_attempts_value),
+    partitions_csv(std::move(partitions_csv_value))
   {}
 
   std::string robot_id;
@@ -72,6 +74,13 @@ struct DataFrame
   double task_criticality = 0.0;
   bool repair_requested = false;
   std::uint64_t prior_repair_attempts = 0;
+  // FleetQoX PARTITION extension (see qos_extensions.hpp), comma-joined,
+  // mirroring GraphAdvertisement::partitions_csv. Carried per-frame (like
+  // type_name above) because the actual delivery gate in
+  // enqueue_received_frame() only has the frame itself to check against a
+  // local subscription's own configured partitions -- it does not consult
+  // the separate remote-endpoint registry that GraphAdvertisement feeds.
+  std::string partitions_csv;
 };
 
 struct TimedMissingSequenceRange
@@ -175,6 +184,10 @@ struct GraphAdvertisement
   // 66 hex chars), empty when the local type support has no
   // get_type_hash_func (e.g. a hand-built probe type support).
   std::string type_hash_hex;
+  // FleetQoX PARTITION extension (see qos_extensions.hpp), comma-joined;
+  // partition names containing a comma are not supported. Empty means the
+  // default partition.
+  std::string partitions_csv;
 };
 
 struct ServiceFrame
