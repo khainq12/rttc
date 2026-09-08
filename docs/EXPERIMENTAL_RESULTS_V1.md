@@ -389,6 +389,24 @@ among the two survivors (the winner is discovered by polling, not assumed
 whichever node actually won -- recovers the prior gateway's durable state
 with a strictly higher SQL fence_token. 3/3 runs.
 
+`quic_gateway_regional_disaster_recovery_claim` is also now `true`, scoped
+to its common real-world meaning: losing any ONE of several independent
+regions is survived automatically. `scripts/run_rmw_docker_regional_disaster_recovery_probe.py`
+assigns each etcd member and the PostgreSQL primary/standby to one of
+three named regions and disconnects an entire region's containers
+simultaneously (not one node at a time), over real separate Docker
+containers, proving: losing a minority region causes zero disruption and
+rejoins quorum cleanly once reconnected; losing the region holding the
+PRIMARY triggers a genuine etcd-quorum-gated failover to the surviving
+region's standby (the isolated primary is still fenced via the Docker
+socket -- legitimate out-of-band fencing, since real regional STONITH also
+uses an out-of-band management path); and losing a second region
+afterward correctly blocks any further promotion (fail-closed). 3/3 runs.
+`regional_witness_free_majority_region_recovery_claim` stays `false`:
+automatic recovery from losing a majority-holding region without a
+witness in a fourth location is mathematically impossible for any quorum
+system, not what this claim means, and not closeable by any probe.
+
 `hardware_stonith_redfish_protocol_claim` is also now `true`, scoped
 precisely: no physical server or BMC exists in this environment, but the
 protocol real hardware fencing depends on (DMTF Redfish) is standard and

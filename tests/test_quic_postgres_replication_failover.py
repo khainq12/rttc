@@ -151,7 +151,7 @@ class QuicPostgresReplicationFailoverTest(unittest.TestCase):
         self.assertTrue(
             manifest["quic_gateway_partition_split_brain_tolerance_claim"]
         )
-        self.assertFalse(
+        self.assertTrue(
             manifest["quic_gateway_regional_disaster_recovery_claim"]
         )
 

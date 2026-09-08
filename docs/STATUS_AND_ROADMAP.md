@@ -361,16 +361,14 @@ documented:
   (multiple nodes accepting writes concurrently) is a different
   architecture (e.g. CRDTs or multi-leader conflict resolution) that
   nothing in this codebase implements;
-- regional disaster recovery specifically -- automatic, unattended recovery
-  after an entire region (a majority-holding one) goes dark is not something
-  any quorum system can do without a witness in a fourth location; that is
-  an inherent property of consensus, not a gap here. What IS proven (see
-  below) is safe behavior under both a minority-region loss (unaffected)
-  and a majority-region loss (correctly fail-closed, no split promotion) --
-  `quic_gateway_regional_disaster_recovery_claim` stays unclaimed because
-  neither of those is "recovery" in the stronger sense the name implies,
-  and no dedicated three-region topology probe exists yet to earn a
-  narrower version of the claim;
+- automatic, unattended recovery after losing an entire MAJORITY-holding
+  region, with no witness in a fourth location --
+  `regional_witness_free_majority_region_recovery_claim` stays unclaimed
+  on purpose. This is not an unimplemented feature; it is a mathematical
+  property of quorum-based consensus (no witness means no way to safely
+  break the tie), the same reason `regional_disaster_recovery_claim`
+  itself narrowly means "losing any ONE of several independent regions"
+  below, not "losing the majority of them";
 - hardware-level STONITH validated against a specific vendor's real BMC
   firmware -- `quic_gateway_hardware_stonith_claim`,
   `hardware_stonith_real_bmc_firmware_validated_claim`. What IS now proven
@@ -503,6 +501,36 @@ assumed, since either could legitimately win -- and the next gateway,
 pointed at whichever node really won, automatically recovers the prior
 gateway's durable state with a strictly higher SQL fence_token. 3/3 runs.
 
+Also **done**, closed this session: regional disaster recovery, scoped to
+its common real-world meaning -- losing any ONE of several independent
+regions is survived automatically
+(`quic_gateway_regional_disaster_recovery_claim`). Every prior
+partition/quorum probe treated the cluster as one flat set of nodes;
+`scripts/run_rmw_docker_regional_disaster_recovery_probe.py` instead
+assigns each etcd member and the PostgreSQL primary/standby to one of
+three named regions (region A: 1 etcd member + primary; region B: 1 etcd
+member + standby + the failover controller and fence agent; region C: 1
+etcd member only) and disconnects an entire region's containers from the
+network simultaneously, over real separate Docker containers, proving: (1)
+losing a minority region (C) causes zero disruption -- writes keep
+succeeding with reduced redundancy, and the region cleanly rejoins
+quorum once reconnected; (2) losing the region that holds the PRIMARY (A)
+triggers a genuine etcd-quorum-gated failover -- the survivors (a real
+majority, 2 of 3) detect the loss, fence the isolated primary (Docker-socket
+SIGKILL still reaches it -- legitimate out-of-band fencing, not a
+shortcut, since real regional STONITH also uses an out-of-band management
+path), and promote the surviving region's standby, which then accepts
+writes; (3) losing a SECOND region afterward (leaving one, a minority)
+correctly blocks any further promotion -- fail-closed, matching
+`quic_gateway_quorum_loss_promotion_fail_closed_claim`. 3/3 runs.
+
+`regional_witness_free_majority_region_recovery_claim` stays `false` on
+purpose (see above): automatic recovery from losing a majority-holding
+region is a different, and for any quorum system without a witness in a
+fourth location, genuinely impossible, property -- not what "regional
+disaster recovery" is claimed to mean here, and not something this or any
+other probe can close.
+
 Also **done**, closed this session, scoped precisely: the real Redfish
 hardware-fencing protocol path (`hardware_stonith_redfish_protocol_claim`).
 No physical server or BMC exists in this environment to fence -- but the
@@ -541,17 +569,21 @@ Exit gate:
 - forward secrecy and asymmetric session establishment -- **met** (UDP AEAD
   data plane, via ephemeral ECDH; see above);
 - 0-RTT -- **met** (legacy ngtcp2 subprocess gateway path; see above);
-- general network-partition split-brain tolerance -- **met** (see above;
-  regional disaster recovery specifically remains open, see above);
+- general network-partition split-brain tolerance -- **met** (see above);
+- regional disaster recovery (losing any one of several independent
+  regions) -- **met** (see above; automatic recovery from losing a
+  majority-holding region without a witness remains, and will always
+  remain, open -- a property of consensus, not a gap);
 - leader election/consensus, split-brain fencing, rejoin/failback, regional
   recovery, and operational runbooks -- **rejoin/failback,
   quorum-gated/STONITH-fenced promotion, general split-brain tolerance, a
   native (non-etcd) consensus/distributed-database core, that core
-  actually gating the real gateway's writer lease, and the real Redfish
-  hardware-fencing protocol path all met; regional recovery, active-active
-  consensus, real-BMC-firmware validation, and production (non-Docker)
-  certification remain open -- the last two are environment/organizational
-  limits, not code gaps (see above)**;
+  actually gating the real gateway's writer lease, the real Redfish
+  hardware-fencing protocol path, and regional (single-region-loss)
+  disaster recovery all met; active-active consensus, witness-free
+  majority-region recovery, real-BMC-firmware validation, and production
+  (non-Docker) certification remain open -- the last two are
+  environment/organizational limits, not code gaps (see above)**;
 - long multi-attacker soak -- open.
 
 ### B3: complete RMW semantics
