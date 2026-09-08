@@ -975,6 +975,83 @@ discovery margin was measurably flaky for exactly this reason (confirmed
 directly: the same probe binary reliably failed at 1000ms and reliably
 passed at 3000ms); the shipped probe and its default margin use 3000ms.
 
+Also **closed**, this session: OWNERSHIP, PARTITION, DESTINATION_ORDER, and
+PRESENTATION -- the four DDS QoS policies named just above as architecturally
+unreachable through `rmw_qos_profile_t`/`rmw_qos_policy_kind_t`. That
+boundary is real and permanent for the *standard, portable* path (confirmed
+against the live `ros2/rmw` `rolling` branch, not stale local headers), but
+`rmw` itself already provides an extension point for exactly this situation
+that this RMW had never used: `rmw_publisher_options_t::
+rmw_specific_publisher_payload` / `rmw_subscription_options_t::
+rmw_specific_subscription_payload` (both `void *`, both upstream), which
+rclcpp exposes to applications via `rclcpp::PublisherOptions::
+rmw_implementation_payload` / `...SubscriptionOptions::...` (see
+`qos_extensions.hpp`, `rclcpp_qos_extensions.hpp`). This is a genuine,
+additional, FleetQoX-specific capability -- an application must deliberately
+opt in, and it has no effect at all under a different rmw -- so
+`full_non_deadline_qos_event_production_claim` correctly stays `false`
+throughout; it was never a claim about what a vendor extension could do.
+
+OWNERSHIP and PARTITION are arbitrated at TOPIC granularity, not per DDS-
+keyed instance (ROS 2 message types expose no key fields to `rmw` the way
+native DDS IDL does, a documented scope boundary rather than an oversight).
+`FleetQoxSubscriptionData::ownership_admits_delivery()` admits only the
+highest-strength publisher seen so far; a first version had no way to
+detect a departed owner and would suppress every other publisher forever
+once a stronger one had claimed the topic, fixed with an
+`exclusive_owner_last_seen_ns` timeout that lets arbitration restart once
+the current owner goes stale. PARTITION's `partitions_intersect()` follows
+DDS's own default-partition convention (an empty list is its own singleton
+partition, matching only other unpartitioned endpoints); a first version
+correctly wired it into every match-compatible/incompatible-event predicate
+but missed the actual delivery gate in `enqueue_received_frame()`, which
+checks the `DataFrame` wire struct directly rather than the discovery-only
+`GraphAdvertisement` registry -- caught by the probe's own mismatch case
+before being fixed. DESTINATION_ORDER (subscription-side BY_SOURCE_TIMESTAMP
+vs. the default BY_RECEPTION_TIMESTAMP) sorts the local frame queue by
+`source_timestamp_ns` on insert; a dedicated three-container artifact uses
+genuine asymmetric `netem` delay (a "slow" publisher with a 450ms head start
+still arrives after a "fast" one publishing 100ms later) to construct a real
+out-of-arrival-order scenario, rather than any test-only reordering path.
+PRESENTATION at GROUP scope was the most architecturally novel of the four:
+real DDS GROUP scope is a property of the Publisher/Subscriber entity
+spanning many topics, and `rmw` has no equivalent entity above a single
+publisher/subscription, so unlike the other three there was no existing
+per-publish/per-frame path to extend. Closed by introducing a genuinely new
+control surface, `rmw_fleetqox_cpp_begin/end_coherent_changes`
+(`presentation_group.hpp`), callable only by linking directly against
+`rmw_fleetqox_cpp` (the way `fleetrmw_cpp_typesupport_probe` already did,
+not through rclcpp, which has no coherent-changes concept to wrap): every
+publish between begin/end, across every publisher sharing one
+`presentation_group_id` regardless of topic, buffers in `publish_payload()`
+instead of sending; end assigns the whole batch a shared `coherent_set_id`
+and flushes it as one burst. `enqueue_received_frame()`'s per-frame delivery
+logic was factored into `deliver_decoded_frame_to_subscriptions_locked()` so
+every member of a completed coherent set runs through it back-to-back inside
+one `g_bus_mutex` acquisition -- the actual atomicity guarantee: no
+`rmw_take` can observe one topic's new value from a coherent set without
+every other member already sitting in its own subscription's queue.
+
+Each of the four has a dedicated probe (`ownership_probe.cpp`,
+`partition_probe.cpp`, `destination_order_probe.cpp`,
+`presentation_probe.cpp`) exercised through the real, documented rclcpp
+application-facing path (`rmw_implementation_payload`), not just the raw
+`rmw` struct -- except PRESENTATION, which necessarily uses the raw `rmw` C
+API directly (rclcpp has nothing to call into for begin/end_coherent_changes)
+and runs over this RMW's own same-process loopback transport rather than
+multiple Docker containers, since the property under test -- does begin/end
+actually defer and then atomically flush -- is RMW-instance-local, not a
+distributed-systems one; a second host or container would prove nothing
+additional. OWNERSHIP, PARTITION, and DESTINATION_ORDER each pass 5/5 real
+two/three-container Docker/netem runs; PRESENTATION passes ASan/UBSan-clean
+with all four of its claims (immediate delivery outside any span, zero
+visibility from either topic through a real 500ms hold, atomic joint
+delivery of both topics right after flush, and ordered_access preserving
+publish order across an interleaved cross-topic publish). No regressions in
+any of the other three when re-run after each subsequent one landed, and the
+full pytest suite stayed at 700/707 (the same 7 pre-existing unrelated
+`ngtcp2_public_*` stale-artifact failures throughout).
+
 Exit gate:
 
 - each capability either implemented and repeatedly probed or explicitly

@@ -170,6 +170,44 @@ discovered first or resolution silently defaults as if it didn't exist. A
 1000ms discovery margin measured flaky; 3000ms did not (confirmed directly
 against the same probe binary).
 
+OWNERSHIP, PARTITION, DESTINATION_ORDER, and PRESENTATION -- the four DDS
+QoS policies named above as architecturally unreachable through
+`rmw_qos_profile_t`/`rmw_qos_policy_kind_t` -- are now closed as FleetQoX-
+specific extensions, not through the standard path (which stays permanently
+bounded, so `full_non_deadline_qos_event_production_claim` correctly stays
+`false`). `rmw` already provides `rmw_specific_publisher_payload`/
+`rmw_specific_subscription_payload` (both upstream `void *`) for exactly
+this situation; rclcpp exposes it via `rmw_implementation_payload`
+(`qos_extensions.hpp`, `rclcpp_qos_extensions.hpp`). OWNERSHIP and PARTITION
+arbitrate/match at TOPIC granularity (no DDS-keyed-instance concept exists
+in `rmw`); a first version of OWNERSHIP's strength-based arbitration had no
+way to detect a departed exclusive owner and would suppress every other
+publisher forever, fixed with a last-seen timeout; a first version of
+PARTITION correctly wired matching into every compatibility/event predicate
+but missed the actual `DataFrame`-level delivery gate, caught by its own
+probe's mismatch case. DESTINATION_ORDER sorts the local frame queue by
+`source_timestamp_ns`, proven with genuine asymmetric `netem` delay across
+three containers (a "slow" publisher's head start is overtaken by a "fast"
+one, constructing a real out-of-arrival-order scenario). PRESENTATION at
+GROUP scope required a genuinely new control surface --
+`rmw_fleetqox_cpp_begin/end_coherent_changes` (`presentation_group.hpp`),
+callable only via direct linkage against `rmw_fleetqox_cpp` since neither
+rclcpp nor standard `rmw` has a coherent-changes concept -- because GROUP
+scope spans multiple topics under one Publisher entity that `rmw` has no
+equivalent for; publishes between begin/end buffer instead of sending, and
+end flushes the whole cross-topic batch as one atomic burst, delivered
+through a single `g_bus_mutex` critical section so no `rmw_take` can ever
+observe one topic's new value without every other member already queued.
+OWNERSHIP, PARTITION, and DESTINATION_ORDER each pass 5/5 real Docker/netem
+runs through the real rclcpp `rmw_implementation_payload` path; PRESENTATION
+passes ASan/UBSan-clean over this RMW's own same-process loopback transport
+(the property under test is RMW-instance-local, not distributed, so a
+second container proves nothing extra), all four of its claims holding:
+immediate delivery outside any span, zero visibility through a real 500ms
+hold, atomic joint delivery of both topics right after flush, and
+ordered_access preserving publish order across an interleaved cross-topic
+publish.
+
 ### A real, root-caused use-after-free (fixed)
 
 An intermittent SIGSEGV in Nav2 navigation probes is root-caused by
