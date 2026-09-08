@@ -587,9 +587,53 @@ minority form a second, divergent leader. 5/5 runs, each with a fresh
 VM1 boot and a genuinely re-randomized leader election.
 (`multi_host_kvm_raft_consensus_claim`, `multi_host_no_split_brain_claim`).
 This closes the multi-host gap specifically for the Raft-backed writer
-lease path introduced earlier this session; the etcd/PostgreSQL path,
-hardware STONITH, and PKI rotation above are still only proven on a single
-Docker daemon and remain open for the same multi-host treatment.
+lease path introduced earlier this session.
+
+Also **done**, closed this session: the SAME multi-host closure for the
+project's older, originally-named HA path -- etcd DCS + PostgreSQL
+streaming replication + Docker-socket STONITH
+(`scripts/run_multihost_kvm_postgres_etcd_fencing_probe.py`). This one was
+materially harder than the Raft case: the existing fence agent
+(`fleetqox_postgres_fence_agent.py`) fenced a container by calling the
+Docker Engine API over the *local* Unix socket, which cannot reach a
+container on a different host's Docker daemon. `docker_connection()` in
+that file now dispatches to either a Unix socket (unchanged default,
+same-host fencing) or a `tcp://host:port` Docker Engine API URL
+(cross-host fencing) -- a genuine, additive capability, not a probe-only
+shim.
+
+Topology: VM1 runs etcd1 and the PostgreSQL primary; VM2 runs etcd2+etcd3
+(a real majority), the PostgreSQL standby, the failover controller, and
+the fence agent. Getting real inter-VM traffic right took two fixes worth
+recording: (1) Docker-published container ports are reached via DNAT into
+the FORWARD chain, not INPUT/OUTPUT, so `iptables -A INPUT/OUTPUT DROP`
+silently does nothing to them; (2) two etcd members that both live on VM2
+but talk to each other via VM2's own *published* host port get hairpin-NAT
+rewritten to the docker0 bridge address, which fails etcd's peer TLS check
+-- invisible right up until an election is actually needed. Fixed by
+running every fenceable service with `--network host` (binding the VM's
+real interface directly, no bridge/NAT at all) and partitioning at the
+plain INPUT/OUTPUT layer with an explicit ACCEPT carved out for port 2375
+(the Docker Engine API) ahead of the blanket DROP.
+
+The probe partitions VM1 from VM2 at the network layer (VM1 stays up and
+its primary keeps running -- the actual "still alive but unreachable"
+hazard STONITH exists for, not a clean host crash) and proves, over the
+real inter-VM link: a 3-member etcd cluster reaches quorum split across
+two hosts; PostgreSQL streaming replication works primary-on-one-host,
+standby-on-the-other; the controller on VM2 detects the primary as
+unreachable, acquires the DCS lease, and fences it with a genuine
+cross-host Docker kill reaching a host that is still up and running,
+independently confirmed by directly inspecting VM1's own Docker state (not
+trusting the controller's or fence agent's self-report); only then is the
+standby promoted, and the promoted standby accepts a new write. 5/5 runs.
+(`multi_host_postgres_etcd_fencing_claim`, `multi_host_cross_host_stonith_claim`).
+
+Between the two, every HA mechanism this project has (Raft-backed writer
+lease, and etcd/PostgreSQL/STONITH) now has genuine multi-host evidence.
+PKI operational hardening (clock skew, CA rollover, expiry edge cases,
+crash-consistency under power loss) does not need multi-host and remains
+open as its own item.
 
 Exit gate:
 
@@ -614,10 +658,12 @@ Exit gate:
   majority-region recovery, real-BMC-firmware validation, and production
   (non-Docker) certification remain open -- the last two are
   environment/organizational limits, not code gaps (see above)**;
-- multi-host (non-shared-kernel) failover -- **met for the native Raft
-  writer-lease path** (two real KVM VMs, see above); open for the
-  etcd/PostgreSQL path, hardware STONITH, and PKI rotation, which remain
-  single-Docker-daemon-only;
+- multi-host (non-shared-kernel) failover -- **met for both HA mechanisms**
+  (native Raft writer-lease path, and etcd/PostgreSQL/STONITH, each proven
+  over two real KVM VMs, see above); hardware STONITH and PKI rotation
+  remain single-Docker-daemon-only (hardware STONITH has no multi-host
+  aspect to close -- it already targets an out-of-band BMC path; PKI
+  operational hardening doesn't need multi-host and is tracked separately);
 - long multi-attacker soak -- open.
 
 ### B3: complete RMW semantics

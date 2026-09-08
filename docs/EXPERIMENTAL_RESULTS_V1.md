@@ -474,9 +474,37 @@ post-failover write commits and replicates; and killing one more of VM2's
 three nodes (2 of the original 5, a minority) correctly fails closed --
 no new leader, no accepted write
 (`multi_host_kvm_raft_consensus_claim`, `multi_host_no_split_brain_claim`).
-Scoped precisely: this closes the multi-host gap for the Raft-backed
-writer-lease path specifically; the etcd/PostgreSQL path, hardware
-STONITH, and PKI rotation above remain single-Docker-daemon-only.
+
+The same multi-host closure now also covers the project's other HA path:
+etcd DCS + PostgreSQL streaming replication + Docker-socket STONITH.
+`docker_connection()` in `fleetqox_postgres_fence_agent.py` now dispatches
+to either a Unix socket (unchanged default) or a `tcp://host:port` Docker
+Engine API URL, so the fence agent can reach into a DIFFERENT host's
+Docker daemon. Two real networking gotchas surfaced getting this right:
+Docker-published ports are reached via DNAT into FORWARD, invisible to
+plain INPUT/OUTPUT rules; and two etcd members on the same VM talking via
+each other's *published* host port get hairpin-NAT'd to the bridge
+address, failing etcd's peer TLS check (invisible until an election is
+actually needed). Fixed with `--network host` for every fenceable service
+plus an explicit port-2375 ACCEPT ahead of the partition's blanket DROP.
+
+Topology: VM1 runs etcd1 + PostgreSQL primary; VM2 runs etcd2+etcd3 (a
+real majority) + standby + controller + fence agent. The probe partitions
+VM1 from VM2 at the network layer (VM1 stays up, its primary keeps
+running -- the actual hazard STONITH exists for) and proves: 3-member etcd
+quorum split across two hosts; cross-host streaming replication; the
+controller on VM2 detecting the primary as unreachable, acquiring the DCS
+lease, and fencing it with a genuine cross-host Docker kill reaching a
+still-running host, independently confirmed by directly inspecting VM1's
+own Docker state; then promoting the standby, which accepts a new write.
+5/5 runs (`multi_host_postgres_etcd_fencing_claim`,
+`multi_host_cross_host_stonith_claim`).
+
+Between the two, every HA mechanism this project has now carries genuine
+multi-host evidence. Hardware STONITH already targets an out-of-band BMC
+path (no multi-host aspect to close) and PKI operational hardening (clock
+skew, CA rollover, expiry, crash-consistency) doesn't need multi-host --
+both remain open as separate items, not as multi-host gaps.
 
 ## Evidence rules
 

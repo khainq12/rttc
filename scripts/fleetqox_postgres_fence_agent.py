@@ -29,10 +29,24 @@ class UnixHttpConnection(http.client.HTTPConnection):
         self.sock.connect(self.socket_path)
 
 
+def docker_connection(target: str) -> http.client.HTTPConnection:
+    # `target` is either a Unix socket path (default
+    # /var/run/docker.sock, the original and still-default behavior for
+    # same-host fencing) or a tcp://host:port URL for a remote Docker
+    # Engine API -- e.g. the primary being fenced runs on a different
+    # host/VM than this fence agent, so the local Docker socket cannot
+    # reach it. Same authorization/DCS-lease checks either way; only the
+    # transport to the Docker daemon differs.
+    if target.startswith("tcp://"):
+        host, _, port = target[len("tcp://"):].partition(":")
+        return http.client.HTTPConnection(host, int(port) if port else 2375)
+    return UnixHttpConnection(target)
+
+
 def docker_call(
     socket_path: str, method: str, path: str
 ) -> tuple[int, dict[str, Any]]:
-    connection = UnixHttpConnection(socket_path)
+    connection = docker_connection(socket_path)
     try:
         connection.request(method, path)
         response = connection.getresponse()
@@ -159,7 +173,11 @@ def main() -> int:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=4510)
     parser.add_argument("--target-container", required=True)
-    parser.add_argument("--docker-socket", default="/var/run/docker.sock")
+    parser.add_argument(
+        "--docker-socket", default="/var/run/docker.sock",
+        help="Unix socket path (same-host fencing, default) or a "
+             "tcp://host:port Docker Engine API URL (cross-host fencing)",
+    )
     parser.add_argument("--tls-ca", required=True)
     parser.add_argument("--tls-cert", required=True)
     parser.add_argument("--tls-key", required=True)
