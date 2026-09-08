@@ -951,6 +951,30 @@ reverted and the same probe was re-run against the pre-fix build,
 confirming it fails exactly as expected (`message_lost_total_count`
 staying `0`) before the fix was restored.
 
+Also **closed**, verified this session: BEST_AVAILABLE liveliness
+resolution against a real remote endpoint. `rmw_create_publisher`/
+`rmw_create_subscription` resolve BEST_AVAILABLE via `rmw_dds_common::
+qos_profile_get_best_available_for_topic_publisher/subscription`, sourced
+from `rmw_get_publishers/subscriptions_info_by_topic` -- which already
+merges UDP-learned remote endpoints with local ones -- but
+`qos_best_available_probe.cpp`, the only existing coverage for this policy,
+only ever paired a BEST_AVAILABLE endpoint against a local, same-process
+one. A new dedicated two-container UDP/netem artifact
+(`remote_qos_best_available_probe.cpp` +
+`run_rmw_docker_remote_qos_best_available_probe.py`) proves a BEST_AVAILABLE
+publisher correctly resolves to a remote MANUAL_BY_TOPIC subscription's
+kind and lease, and a BEST_AVAILABLE subscription correctly resolves to a
+remote AUTOMATIC publisher's kind and lease -- 5/5 real runs, rebuilt clean
+under ASan/UBSan. The underlying mechanism turned out to be correct; what
+this work surfaced instead is a genuine, real timing consideration worth
+recording: because resolution happens exactly once, synchronously, at
+creation time, the remote endpoint's graph advertisement must have already
+been received and applied first, or resolution silently falls back to
+as-if no endpoint existed. A first version of this probe using a 1000ms
+discovery margin was measurably flaky for exactly this reason (confirmed
+directly: the same probe binary reliably failed at 1000ms and reliably
+passed at 3000ms); the shipped probe and its default margin use 3000ms.
+
 Exit gate:
 
 - each capability either implemented and repeatedly probed or explicitly

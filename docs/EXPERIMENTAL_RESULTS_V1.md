@@ -155,6 +155,21 @@ frame and nothing else, so it can only pass if this exact tail-loss case is
 now visible -- 5/5 real runs, rebuilt clean under ASan/UBSan, and verified
 to genuinely fail against the pre-fix code before the fix was restored.
 
+BEST_AVAILABLE liveliness resolution is now also proven against a real
+remote endpoint (previously only tested locally, same-process). The
+resolution mechanism (`rmw_dds_common::qos_profile_get_best_available_for_
+topic_publisher/subscription`, sourced from `rmw_get_publishers/
+subscriptions_info_by_topic`, which already merges remote endpoints) turned
+out to be correct: a new two-container UDP/netem artifact proves a
+BEST_AVAILABLE publisher resolves to a remote MANUAL_BY_TOPIC
+subscription's kind/lease and a BEST_AVAILABLE subscription resolves to a
+remote AUTOMATIC publisher's kind/lease, 5/5, ASan/UBSan clean. What this
+work did surface is a real timing consideration: resolution happens once,
+synchronously, at creation time, so the remote endpoint must already be
+discovered first or resolution silently defaults as if it didn't exist. A
+1000ms discovery margin measured flaky; 3000ms did not (confirmed directly
+against the same probe binary).
+
 ### A real, root-caused use-after-free (fixed)
 
 An intermittent SIGSEGV in Nav2 navigation probes is root-caused by
