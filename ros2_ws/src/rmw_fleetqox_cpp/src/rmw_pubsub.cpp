@@ -42,6 +42,7 @@
 #include <tinyxml2.h>
 
 #include <openssl/bio.h>
+#include <openssl/bn.h>
 #include <openssl/buffer.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
@@ -50,6 +51,7 @@
 #include <openssl/pem.h>
 #include <openssl/rand.h>
 #include <openssl/x509.h>
+#include <openssl/x509_vfy.h>
 
 #include "rmw_fleetqox_cpp/data_frame.hpp"
 #include "rmw_fleetqox_cpp/message_allocation.hpp"
@@ -4042,10 +4044,33 @@ private:
     }
     udp_peer_auth_identity_ca_path_ = credentials.identity_ca_path;
     udp_peer_auth_trust_store_ = X509_STORE_new();
-    if (udp_peer_auth_trust_store_ == nullptr ||
-      X509_STORE_load_locations(
-        udp_peer_auth_trust_store_, credentials.identity_ca_path.c_str(), nullptr) != 1)
-    {
+    // See the matching comment in maybe_reload_udp_peer_auth_crl() for why
+    // this parses the CA file directly with X509_STORE_add_cert instead of
+    // X509_STORE_load_locations: this is the *first* store this process
+    // ever builds, and if X509_STORE_load_locations's by-name lookup
+    // caching (suspected, not yet upstream-confirmed) is keyed at the
+    // process level rather than per-X509_STORE, this initial call is where
+    // that state would first get seeded.
+    bool udp_peer_auth_ca_load_ok = udp_peer_auth_trust_store_ != nullptr;
+    if (udp_peer_auth_ca_load_ok) {
+      BIO * initial_ca_bio = BIO_new_file(credentials.identity_ca_path.c_str(), "rb");
+      udp_peer_auth_ca_load_ok = initial_ca_bio != nullptr;
+      if (udp_peer_auth_ca_load_ok) {
+        size_t initial_certs_loaded = 0;
+        X509 * initial_ca_certificate = nullptr;
+        while ((initial_ca_certificate =
+          PEM_read_bio_X509(initial_ca_bio, nullptr, nullptr, nullptr)) != nullptr)
+        {
+          if (X509_STORE_add_cert(udp_peer_auth_trust_store_, initial_ca_certificate) == 1) {
+            ++initial_certs_loaded;
+          }
+          X509_free(initial_ca_certificate);
+        }
+        BIO_free(initial_ca_bio);
+        udp_peer_auth_ca_load_ok = initial_certs_loaded > 0;
+      }
+    }
+    if (!udp_peer_auth_ca_load_ok) {
       init_error_ = openssl_error_text("udp_peer_auth_identity_ca_load_failed");
       return false;
     }
@@ -4575,10 +4600,36 @@ private:
       return;
     }
     X509_STORE * fresh_store = X509_STORE_new();
-    if (fresh_store == nullptr ||
-      X509_STORE_load_locations(
-        fresh_store, udp_peer_auth_identity_ca_path_.c_str(), nullptr) != 1)
-    {
+    // X509_STORE_load_locations (the "CAfile" convenience API) reproducibly
+    // produced a store that rejected a validly-signed cert from a *new* CA
+    // sharing its predecessor's exact Subject Name (X509_V_ERR_CERT_
+    // SIGNATURE_FAILURE -- "issuer found by name, wrong key") on rotation,
+    // even though a same-CA CRL-only reload through the identical code
+    // path worked correctly; ros2 security create_keystore always names
+    // its CA "sros2CA", so two independently-generated CAs colliding on
+    // name is the normal case here, not a corner case. Parsing the PEM
+    // file directly and adding each certificate object with
+    // X509_STORE_add_cert avoids whatever name-keyed state
+    // X509_STORE_load_locations's OpenSSL "by_file" lookup carries across
+    // X509_STORE instances within one process.
+    bool ca_load_ok = fresh_store != nullptr;
+    if (ca_load_ok) {
+      BIO * ca_bio = BIO_new_file(udp_peer_auth_identity_ca_path_.c_str(), "rb");
+      ca_load_ok = ca_bio != nullptr;
+      if (ca_load_ok) {
+        size_t certs_loaded = 0;
+        X509 * ca_certificate = nullptr;
+        while ((ca_certificate = PEM_read_bio_X509(ca_bio, nullptr, nullptr, nullptr)) != nullptr) {
+          if (X509_STORE_add_cert(fresh_store, ca_certificate) == 1) {
+            ++certs_loaded;
+          }
+          X509_free(ca_certificate);
+        }
+        BIO_free(ca_bio);
+        ca_load_ok = certs_loaded > 0;
+      }
+    }
+    if (!ca_load_ok) {
       if (fresh_store != nullptr) {
         X509_STORE_free(fresh_store);
       }
@@ -4666,6 +4717,42 @@ private:
         X509_STORE_CTX_get_error(verify_context) : X509_V_ERR_UNSPECIFIED;
     }
     X509_STORE_CTX_free(verify_context);
+    // Opt-in only: the OpenSSL verify_error code is otherwise invisible
+    // from outside this process (only aggregate pass/fail/revoked counters
+    // are exported), which made a live CA-rotation regression on a real
+    // cross-host link (see run_multihost_kvm_udp_peer_auth_crl_reload_probe.py)
+    // take far longer to root-cause than it should have.
+    if (std::getenv("FLEETQOX_RMW_DEBUG_PEER_AUTH_VERIFY") != nullptr) {
+      char peer_serial_hex[256] = {0};
+      ASN1_INTEGER * peer_serial = X509_get_serialNumber(peer_certificate);
+      BIGNUM * peer_serial_bn = peer_serial != nullptr ? ASN1_INTEGER_to_BN(peer_serial, nullptr) : nullptr;
+      char * peer_serial_str = peer_serial_bn != nullptr ? BN_bn2hex(peer_serial_bn) : nullptr;
+      if (peer_serial_str != nullptr) {
+        std::snprintf(peer_serial_hex, sizeof(peer_serial_hex), "%s", peer_serial_str);
+        OPENSSL_free(peer_serial_str);
+      }
+      BN_free(peer_serial_bn);
+      char store_summary[512] = {0};
+      STACK_OF(X509_OBJECT) * store_objects =
+        X509_STORE_get0_objects(udp_peer_auth_trust_store_);
+      const int store_object_count =
+        store_objects != nullptr ? sk_X509_OBJECT_num(store_objects) : -1;
+      int store_cert_count = 0;
+      for (int i = 0; store_objects != nullptr && i < store_object_count; ++i) {
+        if (X509_OBJECT_get_type(sk_X509_OBJECT_value(store_objects, i)) == X509_LU_X509) {
+          ++store_cert_count;
+        }
+      }
+      std::snprintf(
+        store_summary, sizeof(store_summary),
+        "store_objects=%d store_certs=%d", store_object_count, store_cert_count);
+      std::fprintf(
+        stderr,
+        "PEER_AUTH_VERIFY chain_valid=%d verify_error=%d (%s) "
+        "peer_serial=%s %s\n",
+        chain_valid ? 1 : 0, verify_error, X509_verify_cert_error_string(verify_error),
+        peer_serial_hex, store_summary);
+    }
     if (!chain_valid) {
       X509_free(peer_certificate);
       udp_peer_auth_failures_.fetch_add(1, std::memory_order_relaxed);

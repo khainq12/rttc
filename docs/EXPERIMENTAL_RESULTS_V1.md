@@ -709,6 +709,36 @@ machine's actual wall clock. 5/5 runs
 hard kill is the same evidence the Raft and etcd/PostgreSQL multi-host
 probes above already provide, not a separate gap.
 
+PKI cert/CA rotation, re-verified multi-host:
+`run_multihost_kvm_udp_peer_auth_crl_reload_probe.py` re-runs both the
+CRL-revocation claim and CA rotation itself across two real KVM VMs
+instead of same-host Docker containers. A long-lived verifier on one VM:
+accepts a CA-A-signed sender; has that sender's certificate revoked via a
+live CRL rewrite on its own host and rejects it without restarting; then
+has its trusted CA itself swapped from CA-A to an independently-generated
+CA-B (fresh CA file plus a fresh CRL issued under CA-B, same on-disk
+paths); accepts a CA-B-signed sender with the identical identity name;
+and rejects the original CA-A-signed sender outright -- a genuine
+rotation, not an additive trust grant, with the verifier process never
+restarted. 4/4 rounds pass.
+
+This surfaced and fixed two real defects, not just re-confirmed behavior:
+the reload path's use of OpenSSL's `X509_STORE_load_locations` produced
+`X509_V_ERR_CERT_SIGNATURE_FAILURE` against a validly CA-B-signed
+certificate after rotation, because `ros2 security create_keystore`
+always names its CA `sros2CA` -- two independently-generated CAs sharing
+that exact Subject Name is the normal case here, and something in that
+API's lookup path did not handle it; switched to direct PEM parsing plus
+`X509_STORE_add_cert`. A new `FLEETQOX_RMW_DEBUG_PEER_AUTH_VERIFY`
+diagnostic (peer certificate serial, live trust-store certificate count,
+OpenSSL verify-error string) then made the actual remaining blocker
+visible: reusing one UDP source port across rounds made this RMW's own
+sequence-level duplicate suppression silently drop a later round's
+genuinely-valid, newly-CA-authenticated samples as a continuation of an
+earlier round's already-complete stream, with every peer-auth counter
+reporting clean -- unrelated to CRL/CA logic once traced. A fresh source
+port per round was the actual fix.
+
 ## Evidence rules
 
 - Deterministic probes establish contracts, not broad performance claims.

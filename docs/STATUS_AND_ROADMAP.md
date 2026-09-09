@@ -750,6 +750,54 @@ independently verifying no double-applied writes and no divergent
 leader) -- treated here as the same evidence, not duplicated under a
 different name.
 
+Also **done**, closed this session: PKI cert/CA rotation re-verified across
+two REAL, separate hosts (`run_multihost_kvm_udp_peer_auth_crl_reload_probe.py`),
+closing the specific gap this section previously called out --
+"PKI operational hardening doesn't need multi-host" turned out to be an
+assumption worth actually testing, not a settled conclusion, since a live
+CRL/CA reload touches on-disk state per host and a real cross-host clock
+and filesystem boundary that same-host Docker containers sharing one
+kernel cannot exercise. A long-lived verifier process on one VM accepts a
+sender's CA-A-signed certificate; that certificate is then revoked via a
+live CRL rewrite on the verifier's own host (rejected without a restart,
+the same claim as the single-host `docker_udp_peer_auth_crl_reload_probe`
+above, now over a real network boundary); the verifier's trusted CA is
+then rotated outright from CA-A to an independently-generated CA-B
+(overwriting the on-disk CA file plus a fresh CRL issued under CA-B onto
+the same path); a CA-B-signed sender with the identical identity name is
+then accepted, and the original CA-A-signed sender is rejected outright --
+a genuine rotation, not an additive trust grant, since neither restart nor
+identity change happened, only the trust anchor did.
+
+That investigation found and fixed two real defects, not just re-confirmed
+existing behavior:
+
+1. The reload path built its trust store via OpenSSL's
+   `X509_STORE_load_locations` "CAfile" convenience API. After a CA
+   rotation, verifying a certificate genuinely signed by the *new* CA
+   intermittently failed with `X509_V_ERR_CERT_SIGNATURE_FAILURE` --
+   OpenSSL matched an issuer by Subject Name but the signature check
+   against that issuer's key failed. `ros2 security create_keystore`
+   always names its generated CA `sros2CA`, so two independently-created
+   CAs colliding on that exact name is the *normal* case for this kind of
+   test, not an edge case. Replaced with direct PEM parsing and
+   `X509_STORE_add_cert` per certificate, avoiding whatever name-keyed
+   state `X509_STORE_load_locations`'s underlying lookup carries across
+   `X509_STORE` instances within one process.
+2. A new opt-in diagnostic, `FLEETQOX_RMW_DEBUG_PEER_AUTH_VERIFY`
+   (prints the peer certificate's serial number, the live trust store's
+   certificate count, and the OpenSSL verify-error string), made the
+   *actual* remaining blocker directly observable after fix #1: reusing
+   one UDP source port across two rounds made this RMW's own
+   sequence-level duplicate-suppression treat the second round's
+   genuinely-valid, newly-CA-authenticated samples as a continuation of
+   the first round's already-fully-received stream and silently drop
+   them, with every peer-auth counter (chain failures, identity denials,
+   revocation drops) reporting clean the whole time. A fresh source port
+   per round was the fix -- nothing in the CRL/CA path itself was wrong
+   by that point, and the earlier symptom (samples reaching taken=5 and
+   never advancing) had nothing to do with certificates at all.
+
 Exit gate:
 
 - public maintained APIs only -- **met**;
@@ -779,10 +827,11 @@ Exit gate:
   redundancy-restore stage, see above; restoring the *original* primary
   specifically via a policy-driven switchover, as opposed to redundancy
   with the failover's roles left in place, was not attempted for the
-  multi-host case); hardware STONITH and PKI rotation remain
-  single-Docker-daemon-only (hardware STONITH has no multi-host aspect to
-  close -- it already targets an out-of-band BMC path; PKI operational
-  hardening doesn't need multi-host and is tracked separately);
+  multi-host case); PKI cert/CA rotation is now **also met** for the same
+  reason (see above: CRL revocation and CA rotation both re-verified over
+  two real KVM VMs, not just same-host Docker containers); hardware
+  STONITH remains single-Docker-daemon-only, but has no multi-host aspect
+  to close -- it already targets an out-of-band BMC path;
 - long multi-attacker soak -- open.
 
 ### B3: complete RMW semantics
