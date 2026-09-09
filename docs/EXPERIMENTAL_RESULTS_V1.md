@@ -300,6 +300,35 @@ fleet_scale_selective_fragment_repair_claim=true
 production_large_sample_reliability_claim=true
 ```
 
+### Fleet frontier addendum: delivery ratio alone was not proof of ACK convergence
+
+The 9/9 100%-delivery result above was re-audited against the RMW's own
+`publisher.ack_wait_complete` / `relay.downstream_ack_wait_complete` flags,
+not just `min_topic_delivery_ratio`, and several of those same runs failed
+that stricter check despite 100% delivery. Root cause: `rmw_publisher_
+wait_for_all_acked` could prune a still-alive subscriber from a publisher's
+pending-ack set on a single graph snapshot where it wasn't reported as
+currently matched, with no grace period -- one missed graph-advertisement
+renewal was enough to falsely converge the wait and let the harness's
+publisher process exit while the relay was still mid-repair (one run's
+publisher reported zero matched subscriptions across all 32 topics within
+under a millisecond of publishing). Fixed with a grace period requiring
+continuous absence longer than one graph-advertisement lease window before
+pruning (`FLEETQOX_RMW_WAIT_FOR_ALL_ACKED_INACTIVE_SUBSCRIBER_GRACE_MS`),
+plus two smaller scale-dependent fixes surfaced once that dominant cause was
+gone: fragment-NACK retry backoff now grows past its old 8x-interval cap so
+a long-struggling assembly's retries stop competing with themselves for
+bandwidth (`FLEETQOX_RMW_FRAGMENT_NACK_BACKOFF_MAX_SHIFT`), and the generic
+serialized relay's executor switched from single- to multi-threaded so it
+no longer falls behind message-callback delivery across many concurrent
+routes at fleet scale (64 routes at 32 robots).
+
+Re-run against the complete criterion (`publisher.ack_wait_complete AND
+relay.downstream_ack_wait_complete AND min_topic_delivery_ratio == 1.0`):
+**9/9 (100%)** across 8/16/32 robots x seeds 7/13/29, every run with a
+genuine multi-second (not sub-millisecond) publisher ACK convergence and
+zero stuck fragment assemblies at teardown.
+
 ## Memory safety
 
 The callback-owner quiescence gate passes 20 fresh processes with eight

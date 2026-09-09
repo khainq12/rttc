@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -24,8 +25,13 @@ struct RelayRoute
   std::string destination;
   std::shared_ptr<rclcpp::GenericPublisher> publisher;
   std::shared_ptr<rclcpp::GenericSubscription> subscription;
-  std::uint64_t count{0};
-  std::uint64_t serialized_bytes{0};
+  // Written by whichever executor thread services this route's
+  // subscription callback, read from the main thread's polling loops
+  // (all_samples_relayed, the final tally) -- atomic because the executor
+  // below is multi-threaded so a different route's callback can run
+  // concurrently with these reads.
+  std::atomic<std::uint64_t> count{0};
+  std::atomic<std::uint64_t> serialized_bytes{0};
 };
 
 std::string json_escape(const std::string & value)
@@ -217,7 +223,20 @@ int main(int argc, char ** argv)
     return 1;
   }
 
-  rclcpp::executors::SingleThreadedExecutor executor;
+  // MultiThreaded, not SingleThreaded: at fleet scale (e.g. 32 robots -> 64
+  // generic-subscription routes on one relay node), a single executor
+  // thread services every route's callback strictly one at a time. Under
+  // heavy concurrent fragment-repair traffic each route's callback can
+  // take long enough that the single thread falls behind arrival rate
+  // across 64 routes combined, so some routes' final samples are still
+  // sitting fully-reassembled-and-acked at the transport layer (already
+  // real hop-1 successes) but never reach here to increment route->count
+  // before the polling loop below times out -- observed directly as
+  // relayed_count < expected_count with zero stuck fragment assemblies.
+  // Each route's own subscription still serializes its own callbacks (the
+  // default mutually-exclusive callback group), so this only adds
+  // cross-route concurrency, not per-route reentrancy.
+  rclcpp::executors::MultiThreadedExecutor executor;
   executor.add_node(node);
   const auto discovery_deadline =
     std::chrono::steady_clock::now() + std::chrono::seconds(8);
@@ -273,11 +292,11 @@ int main(int argc, char ** argv)
 
   std::uint64_t relayed_count = 0;
   std::uint64_t serialized_bytes = 0;
-  std::uint64_t min_source_count = routes.front()->count;
+  std::uint64_t min_source_count = routes.front()->count.load();
   for (const auto & route : routes) {
-    relayed_count += route->count;
-    serialized_bytes += route->serialized_bytes;
-    min_source_count = std::min(min_source_count, route->count);
+    relayed_count += route->count.load();
+    serialized_bytes += route->serialized_bytes.load();
+    min_source_count = std::min(min_source_count, route->count.load());
   }
   const bool downstream_reliability_complete =
     !downstream_ack_wait_supported || downstream_ack_wait_complete;
@@ -448,7 +467,12 @@ int main(int argc, char ** argv)
     "rmw_fleetqox_cpp_socket_fragment_whole_fallback_pacing_deferrals",
     nullptr) << ",";
   std::cout << "\"nack_retransmissions\":" << fleetqox_metric(
-    "rmw_fleetqox_cpp_socket_nack_retransmissions", nullptr) << "},";
+    "rmw_fleetqox_cpp_socket_nack_retransmissions", nullptr) << ",";
+  std::cout << "\"wait_for_all_acked_inactive_subscriber_prunes\":" << fleetqox_metric(
+    "rmw_fleetqox_cpp_socket_wait_for_all_acked_inactive_subscriber_prunes", nullptr) << ",";
+  std::cout << "\"wait_for_all_acked_inactive_subscriber_grace_deferrals\":" << fleetqox_metric(
+    "rmw_fleetqox_cpp_socket_wait_for_all_acked_inactive_subscriber_grace_deferrals",
+    nullptr) << "},";
   std::cout << "\"per_source_count\":{";
   for (std::size_t index = 0; index < routes.size(); ++index) {
     if (index > 0) {

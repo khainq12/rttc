@@ -299,6 +299,60 @@ Exit gate (met):
   repair-capacity sweep is avoided by construction (multiplexing) rather
   than merely worked around.**
 
+#### B1 addendum: the exit gate above was checking the wrong signal
+
+A later audit against the acceptance report re-read this gate's own raw JSON
+and found `min_topic_delivery_ratio: 1.0` was not, by itself, proof of full
+reliable delivery: several of the same 9 grid runs also carried
+`publisher.ack_wait_complete: false` -- the RMW's own reliable-QoS
+convergence signal disagreeing with the delivery-ratio tally that had been
+treated as the exit criterion. Root-causing that disagreement (not just
+re-running the same check) found three independent defects, one dominant:
+
+1. **`rmw_publisher_wait_for_all_acked` could report success prematurely.**
+   Its per-poll cleanup dropped a still-alive subscriber from a publisher's
+   pending-ack set the first time a graph snapshot didn't report it as
+   currently matched, with no grace period -- a single missed
+   graph-advertisement renewal (observed directly: one run's publisher
+   reported zero matched subscriptions across all 32 topics within under a
+   millisecond of publishing) was enough to falsely clear every pending ack.
+   The test harness's publisher process then exited immediately, while the
+   relay was still mid-repair -- orphaning that repair for the rest of the
+   run (in one case, only 134 of 1662 outgoing repair requests ever reached
+   a process that was still there to answer). Fixed with a grace period
+   requiring continuous absence longer than one full graph-advertisement
+   lease window (`FLEETQOX_RMW_WAIT_FOR_ALL_ACKED_INACTIVE_SUBSCRIBER_GRACE_MS`,
+   default 8000ms, floor 5000ms) before pruning, plus new
+   `wait_for_all_acked_inactive_subscriber_{prunes,grace_deferrals}` counters
+   so the mechanism is directly auditable rather than inferred.
+2. **A single struggling assembly could compete with itself for bandwidth.**
+   Fragment-NACK retry backoff capped at 8x the base interval regardless of
+   how long an assembly had been retrying, so a genuinely-unlucky assembly
+   kept resending at a fixed, relatively fast rate indefinitely -- adding to
+   the congestion it was itself waiting out. `FLEETQOX_RMW_FRAGMENT_NACK_
+   BACKOFF_MAX_SHIFT` lets backoff keep growing so a long-struggling
+   assembly's retries space out to minutes rather than plateau.
+3. **The relay's own executor fell behind at fleet scale.** The generic
+   serialized relay probe served every route (64 of them at 32 robots) off
+   one `SingleThreadedExecutor`; under heavy concurrent repair traffic this
+   could fall behind arrival rate even for messages the protocol had
+   already fully delivered and acknowledged, undercounting relayed samples
+   from callback-servicing lag alone (`relayed_count: 292/320` observed
+   with zero stuck fragment assemblies -- the data was already there).
+   Switched to `MultiThreadedExecutor` (each route's own subscription still
+   serializes its own callbacks, so this only adds cross-route concurrency).
+
+With all three fixed, the 9-cell grid (8/16/32 robots x seeds 7/13/29, same
+roaming/32-KiB/scale-0.25 profile) was re-run against the *complete*
+criterion this time -- `publisher.ack_wait_complete AND
+relay.downstream_ack_wait_complete AND min_topic_delivery_ratio == 1.0` --
+and reaches **9/9 (100%)**, every cell with a genuine multi-second (not
+sub-millisecond) publisher ACK convergence and zero stuck fragment
+assemblies at teardown. This still stands on 3 seeds per scale point, no
+sustained-duration soak, and no scale beyond 32 robots -- the exit-gate
+checklist above holds, now checked against the signal it was meant to
+check.
+
 ### B2: production QUIC and PKI
 
 This section was stale: it previously read "server-certificate rotation, CA

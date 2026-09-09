@@ -12,6 +12,7 @@
 #include <deque>
 #include <cerrno>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iterator>
 #include <limits>
@@ -289,6 +290,14 @@ struct ReliableRetransmitEntry
   size_t expected_acknowledgments{0};
   size_t acknowledgments_observed{0};
   std::unordered_set<std::string> pending_subscriber_ids{};
+  // First monotonic time each still-pending subscriber id was observed
+  // missing from the graph's current matched-subscriber set, inside
+  // wait_for_all_acked_impl. That absence is only ever a point-in-time
+  // snapshot of graph-advertisement state, not proof the subscriber is
+  // actually gone -- see the grace-period comment at the pruning site for
+  // why treating a single missing snapshot as "gone" is wrong. Cleared
+  // as soon as the id is seen active again.
+  std::unordered_map<std::string, std::int64_t> pending_subscriber_missing_since_ns{};
   bool fragment_observed_by_reader{false};
   bool fragment_timeout_suppression_recorded{false};
   size_t fragment_initial_send_batches_pending{0};
@@ -391,15 +400,20 @@ std::atomic<bool> g_reliable_retransmit_started{false};
 std::atomic<bool> g_reliable_retransmit_running{false};
 std::atomic<bool> g_qos_deadline_monitor_started{false};
 std::atomic<bool> g_qos_deadline_monitor_running{false};
+std::atomic<bool> g_ack_nack_resend_started{false};
+std::atomic<bool> g_ack_nack_resend_running{false};
 std::mutex g_reliable_retransmit_lifecycle_mutex;
 std::mutex g_qos_deadline_monitor_lifecycle_mutex;
 std::mutex g_pubsub_graph_renewal_lifecycle_mutex;
+std::mutex g_ack_nack_resend_lifecycle_mutex;
 std::thread g_reliable_retransmit_thread;
 std::thread g_qos_deadline_monitor_thread;
 std::thread g_pubsub_graph_renewal_thread;
+std::thread g_ack_nack_resend_thread;
 std::once_flag g_reliable_retransmit_atexit_once;
 std::once_flag g_qos_deadline_monitor_atexit_once;
 std::once_flag g_pubsub_graph_renewal_atexit_once;
+std::once_flag g_ack_nack_resend_atexit_once;
 // See g_remote_graph_lease_monitor_shutting_down in rmw_graph.cpp for why
 // these exist: each stop_*_thread() below runs via a std::atexit callback
 // that fires at most once, so once it has run, the matching ensure_*_thread()
@@ -411,6 +425,25 @@ std::once_flag g_pubsub_graph_renewal_atexit_once;
 bool g_reliable_retransmit_shutting_down = false;
 bool g_qos_deadline_monitor_shutting_down = false;
 bool g_pubsub_graph_renewal_shutting_down = false;
+bool g_ack_nack_resend_shutting_down = false;
+
+// Queue of ack-nack UDP payloads waiting for their scheduled resend time,
+// drained by a single background thread (ack_nack_resend_loop) rather than
+// one detached std::thread per redundant copy -- see the comment on
+// ack_nack_redundant_resend_count() for why redundant copies exist at all.
+// A raw per-copy thread that just sleeps and sends does work fine at small
+// scale, but redundant copies now span up to tens of seconds (to survive
+// netem's bursty/correlated loss, which can outlast a short retry window
+// entirely) and are generated per delivered frame per subscription, so a
+// long-running test can have thousands of these in flight concurrently --
+// one shared queue keeps that at O(1) threads regardless of scale.
+struct PendingAckNackResend
+{
+  std::string payload;
+  std::int64_t due_ns{0};
+};
+std::mutex g_ack_nack_resend_queue_mutex;
+std::vector<PendingAckNackResend> g_ack_nack_resend_queue;
 
 std::mutex g_last_take_mutex;
 std::string g_last_take_topic;
@@ -434,6 +467,8 @@ std::atomic<std::uint64_t> g_wait_for_all_acked_successes{0};
 std::atomic<std::uint64_t> g_wait_for_all_acked_timeouts{0};
 std::atomic<std::uint64_t> g_last_wait_for_all_acked_expected{0};
 std::atomic<std::uint64_t> g_last_wait_for_all_acked_observed{0};
+std::atomic<std::uint64_t> g_wait_for_all_acked_inactive_subscriber_prunes{0};
+std::atomic<std::uint64_t> g_wait_for_all_acked_inactive_subscriber_grace_deferrals{0};
 std::atomic<std::uint64_t> g_remote_graph_event_advertisements_received{0};
 std::atomic<std::uint64_t> g_remote_graph_event_endpoint_adds{0};
 std::atomic<std::uint64_t> g_remote_graph_event_endpoint_renewals{0};
@@ -3462,6 +3497,20 @@ private:
     std::string fragment_id;
     bool repair_capable{false};
     bool sender_complete_observed{false};
+    // Deterministic per-assembly stagger in [0, 1), derived from fragment_id
+    // at creation so it never changes for this assembly's lifetime. Applied
+    // as an ADDITIVE spread on top of retry_interval_ns in the NACK
+    // scheduling loop below. Without this, many assemblies created around
+    // the same moment (a burst publish across many topics hitting the same
+    // netem loss event) share near-identical last_update_ns/last_nack_ns
+    // timestamps and the SAME deterministic backoff formula, so they all
+    // become NACK-eligible again within the same few milliseconds --
+    // "thundering herd" congestion on the very link the NACKs are trying to
+    // repair. Confirmed in this session: one run had 29 of 32 topics'
+    // assemblies simultaneously stuck (15,633 NACK packets sent), not
+    // independent bad luck (which would almost never produce 29/32
+    // together) but synchronized retries competing for bandwidth.
+    double retry_stagger{0.0};
   };
 
   struct FragmentRepairHistory
@@ -6325,7 +6374,26 @@ private:
       parse_nonnegative_int_env(
         "FLEETQOX_RMW_FRAGMENT_NACK_INTERVAL_MS", 50, 1000));
     fragment_nack_max_requests_ = parse_nonnegative_int_env(
-      "FLEETQOX_RMW_FRAGMENT_NACK_MAX_REQUESTS", 6, 100);
+      "FLEETQOX_RMW_FRAGMENT_NACK_MAX_REQUESTS", 6, 5000);
+    // Old default (3) caps backoff at 2^3 = 8x the base interval (400ms at
+    // the 50ms default) forever, however many times an assembly retries.
+    // Measured under the "roaming" profile at 16-robot/32-KiB scale: a
+    // single unlucky assembly's repeated requests can arrive at the
+    // sender with a far worse loss rate than the nominal per-packet
+    // figure (134/1662 observed in one run, ~8% vs. the profile's nominal
+    // ~7% *loss* i.e. ~93% expected arrival) -- consistent with that
+    // assembly's own retry traffic competing for the same throttled,
+    // shared link its repair needs to cross. Once wait_for_all_acked no
+    // longer lets the publisher exit early (see the grace-period fix
+    // above), a stuck assembly has the *time* (now realistically
+    // hundreds of seconds, not milliseconds) to eventually get through if
+    // it backs off far enough to stop drowning itself out; a higher
+    // default shift lets later retries space out to minutes apart rather
+    // than plateauing at 400ms.
+    fragment_nack_backoff_max_shift_ = std::max(
+      0,
+      parse_nonnegative_int_env(
+        "FLEETQOX_RMW_FRAGMENT_NACK_BACKOFF_MAX_SHIFT", 8, 20));
     fragment_nack_max_indexes_per_request_ = std::max(
       1,
       parse_nonnegative_int_env(
@@ -6858,9 +6926,19 @@ private:
       candidates.reserve(fragment_assemblies_.size());
       for (auto & item : fragment_assemblies_) {
         FragmentAssembly & assembly = item.second;
-        const size_t backoff_shift = std::min<size_t>(assembly.nack_count, 3);
-        const std::int64_t retry_interval_ns =
+        const size_t backoff_shift = std::min<size_t>(
+          assembly.nack_count, static_cast<size_t>(fragment_nack_backoff_max_shift_));
+        const std::int64_t base_retry_interval_ns =
           interval_ns * static_cast<std::int64_t>(1u << backoff_shift);
+        // Stagger this assembly's effective interval across
+        // [base, 2*base) using its fixed-at-creation retry_stagger -- see
+        // that field's declaration for why. A burst of loss hitting many
+        // topics at the same moment now produces retries spread over a
+        // full extra interval-width instead of firing within the same few
+        // milliseconds of each other.
+        const std::int64_t retry_interval_ns = base_retry_interval_ns +
+          static_cast<std::int64_t>(
+          static_cast<double>(base_retry_interval_ns) * assembly.retry_stagger);
         const bool progress_since_previous_nack =
           assembly.nack_count > 0 &&
           assembly.last_update_ns > assembly.last_nack_ns;
@@ -6874,6 +6952,26 @@ private:
           progress_since_previous_nack &&
           now_ns - assembly.last_update_ns < interval_ns &&
           now_ns - assembly.last_nack_ns < retry_interval_ns + interval_ns;
+        // REVERTED: an earlier version of this condition removed the
+        // nack_count cap entirely, reasoning that cleanup_stale_fragment_
+        // assemblies_locked() (above, same lock scope) already reaps
+        // anything past fragment_assembly_ttl_ms_, so the TTL alone
+        // should be a sufficient, more principled bound than an arbitrary
+        // request count. Measured effect under the "roaming" netem
+        // profile (16 robots, 32 KiB, real -- not scripted -- loss): WORSE
+        // delivery (0.6-0.8 vs. the 1.0 this cap-based version already
+        // achieves most runs), not better. With every assembly now
+        // eligible to keep retrying indefinitely instead of some giving
+        // up, aggregate repair-request/retransmission traffic competing
+        // for the same loss-profile-constrained bandwidth increased
+        // enough to make the loss worse for the assemblies that WOULD
+        // otherwise have recovered -- a self-inflicted congestion
+        // response, not a fix. A bounded retry count that eventually lets
+        // a truly-stuck assembly stop competing for bandwidth is
+        // correct, not just expedient; the real gap this session's
+        // testing found was that the OLD default (6) was too small for
+        // this profile/scale, not that a cap should not exist at all --
+        // see fragment_nack_max_requests_'s existing env-var tunability.
         if (!assembly.repair_capable || !assembly.source_available ||
           assembly.received_count >= assembly.fragment_count ||
           assembly.nack_count >= static_cast<size_t>(fragment_nack_max_requests_) ||
@@ -7195,6 +7293,13 @@ private:
         request_target_scope =
           fragment_repair_target_scope_key(found->second.targets);
       }
+      // REVERTED (see the matching receiver-side comment above for the
+      // measured reason): removing this per-target serve budget, relying
+      // solely on kFragmentHistoryTtlNs, measurably made delivery worse
+      // under the "roaming" netem profile at 16-robot/32-KiB scale, not
+      // better -- unconditionally serving every still-retrying reader
+      // increases aggregate repair traffic competing for the same
+      // loss-profile-constrained bandwidth. Restoring the bounded budget.
       const auto target_count =
         found->second.request_count_by_target.find(request_target_scope);
       const size_t current_target_count =
@@ -7361,6 +7466,12 @@ private:
       assembly.first_update_ns = now_ns;
       assembly.fragment_id = fragment_id;
       assembly.repair_capable = prefix == kRepairFragmentPrefix;
+      // See retry_stagger's declaration: spread this assembly's NACK
+      // retry timing away from every other assembly's, deterministically,
+      // so a loss burst hitting many topics at once doesn't make them all
+      // retry in lockstep.
+      assembly.retry_stagger = static_cast<double>(
+        std::hash<std::string>{}(fragment_id) % 1000000ull) / 1000000.0;
     }
     if (assembly.fragment_count != fragment_count || assembly.total_size != total_size) {
       fragment_assembly_metadata_mismatch_drops_.fetch_add(
@@ -7703,6 +7814,7 @@ private:
   int loss_resilient_fragment_chunk_bytes_{0};
   int fragment_nack_interval_ms_{50};
   int fragment_nack_max_requests_{6};
+  int fragment_nack_backoff_max_shift_{3};
   int fragment_nack_max_indexes_per_request_{8};
   int fragment_tail_guard_ms_{1000};
   int fragment_history_limit_{1024};
@@ -11640,6 +11752,42 @@ int reliable_max_timeout_retransmissions()
   return max_retransmissions;
 }
 
+// Ack-nack feedback frames (socket_transport().send_ack_nack()) are plain
+// fire-and-forget UDP sends with no retry of their own, unlike DATA frames.
+// Under sustained loss, the ack-nack confirming a subscriber's receipt of
+// a stream's LAST message can itself be dropped -- and once an assembly
+// has no missing fragments left, nothing ever asks for it again (no more
+// fragment NACKs, since nothing is missing; no whole-frame retransmission
+// either, since fragment_observed_by_reader permanently suppresses that
+// once fragment-level repair has started for this entry, to avoid
+// competing with it). With both of this RMW's own retry paths correctly
+// backed off, an application's rmw_publisher_wait_for_all_acked() could
+// then never converge, no matter how long it waited, even though the
+// message was fully and successfully delivered. Rather than resurrecting
+// either of those (much heavier) retry paths, the fix is to make the
+// tiny ack-nack send itself redundant -- see
+// ack_nack_redundant_resend_count()/_delay_ms() below, applied in
+// deliver_decoded_frame_to_subscriptions_locked.
+int ack_nack_redundant_resend_count()
+{
+  // 2 was measurably insufficient against the "roaming" netem stress
+  // profile's 28% loss at 16-robot/32-KiB scale: 3 total attempts (1
+  // immediate + 2 redundant) still left 2/32 topics permanently unacked
+  // even after a full 20s wait, consistent with netem's loss being
+  // correlated/bursty rather than purely independent per-packet. 5 gives
+  // 6 total attempts.
+  static const int count = parse_nonnegative_int_env(
+    "FLEETQOX_RMW_ACK_NACK_REDUNDANT_RESEND_COUNT", 10, 20);
+  return count;
+}
+
+int ack_nack_redundant_resend_delay_ms()
+{
+  static const int delay_ms = parse_nonnegative_int_env(
+    "FLEETQOX_RMW_ACK_NACK_REDUNDANT_RESEND_DELAY_MS", 200, 10000);
+  return delay_ms;
+}
+
 int loss_resilient_fragment_chunk_bytes()
 {
   static const int chunk_bytes = parse_nonnegative_int_env(
@@ -11811,6 +11959,98 @@ void ensure_reliable_retransmit_thread()
   std::call_once(g_reliable_retransmit_atexit_once, []() {
     std::atexit(stop_reliable_retransmit_thread);
   });
+}
+
+int ack_nack_redundant_resend_backoff_cap_shift()
+{
+  // Each successive redundant copy's delay doubles relative to the base
+  // delay (ack_nack_redundant_resend_delay_ms()) until this shift caps the
+  // growth, so e.g. a 200ms base with the default cap of 8 spans
+  // 200ms, 400ms, ..., up to 200ms * 2^8 = 51.2s for the last copies.
+  // That range is deliberate: short delays catch ordinary transient loss
+  // quickly, while the long tail survives netem loss bursts lasting many
+  // seconds (bursty/correlated loss, not independent per-packet loss) that
+  // a tight few-second window cannot.
+  static const int cap_shift = parse_nonnegative_int_env(
+    "FLEETQOX_RMW_ACK_NACK_REDUNDANT_RESEND_BACKOFF_CAP_SHIFT", 8, 16);
+  return cap_shift;
+}
+
+void ack_nack_resend_loop()
+{
+  const auto poll_interval = std::chrono::milliseconds(20);
+  while (g_ack_nack_resend_running.load(std::memory_order_acquire)) {
+    std::this_thread::sleep_for(poll_interval);
+    if (!g_ack_nack_resend_running.load(std::memory_order_acquire)) {
+      break;
+    }
+    const std::int64_t now = monotonic_timestamp_ns();
+    std::vector<std::string> due;
+    {
+      std::lock_guard<std::mutex> lock(g_ack_nack_resend_queue_mutex);
+      auto it = g_ack_nack_resend_queue.begin();
+      while (it != g_ack_nack_resend_queue.end()) {
+        if (it->due_ns <= now) {
+          due.push_back(std::move(it->payload));
+          it = g_ack_nack_resend_queue.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
+    for (const auto & payload : due) {
+      const rmw_ret_t ret = socket_transport().send_ack_nack(payload);
+      (void)ret;
+    }
+  }
+}
+
+void stop_ack_nack_resend_thread()
+{
+  std::lock_guard<std::mutex> lifecycle_lock(g_ack_nack_resend_lifecycle_mutex);
+  g_ack_nack_resend_shutting_down = true;
+  g_ack_nack_resend_running.store(false, std::memory_order_release);
+  if (g_ack_nack_resend_thread.joinable()) {
+    g_ack_nack_resend_thread.join();
+  }
+  g_ack_nack_resend_started.store(false, std::memory_order_release);
+  std::lock_guard<std::mutex> queue_lock(g_ack_nack_resend_queue_mutex);
+  g_ack_nack_resend_queue.clear();
+}
+
+void ensure_ack_nack_resend_thread()
+{
+  std::lock_guard<std::mutex> lifecycle_lock(g_ack_nack_resend_lifecycle_mutex);
+  if (g_ack_nack_resend_shutting_down) {
+    return;
+  }
+  if (g_ack_nack_resend_started.load(std::memory_order_acquire)) {
+    return;
+  }
+  if (g_ack_nack_resend_thread.joinable()) {
+    g_ack_nack_resend_thread.join();
+  }
+  g_ack_nack_resend_running.store(true, std::memory_order_release);
+  g_ack_nack_resend_started.store(true, std::memory_order_release);
+  g_ack_nack_resend_thread = std::thread(ack_nack_resend_loop);
+  std::call_once(g_ack_nack_resend_atexit_once, []() {
+    std::atexit(stop_ack_nack_resend_thread);
+  });
+}
+
+void schedule_ack_nack_resend(std::string payload, int delay_ms)
+{
+  if (delay_ms <= 0) {
+    const rmw_ret_t ret = socket_transport().send_ack_nack(payload);
+    (void)ret;
+    return;
+  }
+  ensure_ack_nack_resend_thread();
+  const std::int64_t due_ns = monotonic_timestamp_ns() +
+    static_cast<std::int64_t>(delay_ms) * 1000000ll;
+  std::lock_guard<std::mutex> lock(g_ack_nack_resend_queue_mutex);
+  g_ack_nack_resend_queue.push_back(
+    PendingAckNackResend{std::move(payload), due_ns});
 }
 
 int qos_deadline_monitor_interval_ms()
@@ -13126,10 +13366,40 @@ void deliver_decoded_frame_to_subscriptions_locked(
         if (subscription->qos.reliability == RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT) {
           track_best_effort_sequence_gaps_locked(&sequence_state, feedback, receive_ns);
         } else {
+          const std::string ack_nack_payload = rmw_fleetqox_cpp::encode_ack_nack(
+            *decoded_frame, feedback, subscription->endpoint_id);
           ack_nack_payloads.emplace_back(
-            rmw_fleetqox_cpp::encode_ack_nack(
-              *decoded_frame, feedback, subscription->endpoint_id),
-            test_ack_delay_ms_for_subscription(subscription));
+            ack_nack_payload, test_ack_delay_ms_for_subscription(subscription));
+          // Redundant, exponentially-spread-out resends of this same
+          // ack-nack: it is a tiny fire-and-forget UDP send with no retry
+          // of its own (see ack_nack_redundant_resend_count() above), so
+          // under sustained loss the one confirming a stream's last message
+          // can be dropped with nothing left afterward to prompt a fresh
+          // one -- neither fragment-level NACK repair (nothing is missing
+          // once assembly completes) nor whole-frame retransmission
+          // (permanently suppressed by fragment_observed_by_reader once
+          // fragment repair has started for this entry) will ever ask
+          // again. Processing the same ack-nack more than once is a safe
+          // no-op (handle_ack_nack_feedback erases an already-erased
+          // subscriber id as a no-op), so duplicates cost only a handful of
+          // extra tiny UDP sends. Delays double each copy (capped by
+          // ack_nack_redundant_resend_backoff_cap_shift()) rather than
+          // growing linearly: linear spacing crammed the whole redundancy
+          // budget into a short multi-second window, which measurably
+          // still lost every copy under netem's bursty/correlated loss
+          // (loss events that outlast the window, not independent
+          // per-packet drops) -- the doubling spread survives bursts an
+          // order of magnitude longer for the same packet count.
+          const int redundant_count = ack_nack_redundant_resend_count();
+          const int redundant_delay_ms = ack_nack_redundant_resend_delay_ms();
+          const int cap_shift = ack_nack_redundant_resend_backoff_cap_shift();
+          for (int copy = 1; copy <= redundant_count; ++copy) {
+            const int shift = std::min(copy - 1, cap_shift);
+            const std::int64_t delay_ms = static_cast<std::int64_t>(redundant_delay_ms) *
+              (1ll << shift);
+            ack_nack_payloads.emplace_back(
+              ack_nack_payload, static_cast<int>(std::min<std::int64_t>(delay_ms, INT32_MAX)));
+          }
         }
         if (feedback.out_of_order) {
           g_out_of_order_data_frames_observed.fetch_add(1, std::memory_order_relaxed);
@@ -13228,17 +13498,7 @@ void enqueue_received_frame(const std::string & encoded_frame)
   }
 
   for (const auto & payload : ack_nack_payloads) {
-    if (payload.second > 0) {
-      std::thread(
-        [encoded = payload.first, delay_ms = payload.second]() {
-          std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
-          const rmw_ret_t delayed_ret = socket_transport().send_ack_nack(encoded);
-          (void)delayed_ret;
-        }).detach();
-      continue;
-    }
-    const rmw_ret_t ret = socket_transport().send_ack_nack(payload.first);
-    (void)ret;
+    schedule_ack_nack_resend(payload.first, payload.second);
   }
   if (trace_take_enabled()) {
     std::fprintf(
@@ -13288,6 +13548,26 @@ bool apply_received_graph_advertisement(const std::string & encoded_frame)
     ensure_qos_deadline_monitor_thread();
   }
   return true;
+}
+
+int wait_for_all_acked_inactive_subscriber_grace_ms()
+{
+  // rmw_fleetqox_cpp_graph_matched_subscription_endpoint_ids() is a
+  // point-in-time snapshot of graph-advertisement state, refreshed only
+  // as often as pubsub_graph_renewal_loop() re-sends (default every
+  // 500ms) and expiring only after a lease (default kDefaultLeaseMs =
+  // 5000ms) with no renewal at all. A single missing snapshot is *not*
+  // proof the subscriber is gone: under sustained loss (exactly the
+  // condition this RMW's whole fragment-repair system exists for), a
+  // renewal packet can be delayed or dropped without the subscriber
+  // actually being gone. This grace period must exceed one full lease
+  // window with margin, or the pruning below just reintroduces the same
+  // false-positive on a slower clock.
+  static const int grace_ms = std::max(
+    5000,
+    parse_nonnegative_int_env(
+      "FLEETQOX_RMW_WAIT_FOR_ALL_ACKED_INACTIVE_SUBSCRIBER_GRACE_MS", 8000, 120000));
+  return grace_ms;
 }
 
 rmw_ret_t wait_for_all_acked_impl(
@@ -13344,6 +13624,8 @@ rmw_ret_t wait_for_all_acked_impl(
     }
   }
   constexpr auto graph_refresh_interval = std::chrono::milliseconds(10);
+  const std::int64_t inactive_subscriber_grace_ns =
+    static_cast<std::int64_t>(wait_for_all_acked_inactive_subscriber_grace_ms()) * 1000000ll;
 
   while (true) {
     const std::vector<std::string> active_vector =
@@ -13351,6 +13633,7 @@ rmw_ret_t wait_for_all_acked_impl(
         data->domain_id, data->topic_name, data->type_name, data->qos);
     const std::unordered_set<std::string> active_subscribers(
       active_vector.begin(), active_vector.end());
+    const std::int64_t poll_now_ns = monotonic_timestamp_ns();
     std::unique_lock<std::mutex> lock(g_bus_mutex);
     bool pending = false;
     size_t observed = target_expected;
@@ -13365,8 +13648,29 @@ rmw_ret_t wait_for_all_acked_impl(
         it != entry.pending_subscriber_ids.end();)
       {
         if (active_subscribers.find(*it) == active_subscribers.end()) {
+          // Not seen in this snapshot -- but that alone doesn't mean the
+          // subscriber is gone (see wait_for_all_acked_inactive_subscriber_
+          // grace_ms()). Only actually drop it once it has been missing
+          // continuously for the full grace window; a single or
+          // intermittent missing snapshot just keeps waiting.
+          const auto missing_it = entry.pending_subscriber_missing_since_ns.find(*it);
+          if (missing_it == entry.pending_subscriber_missing_since_ns.end()) {
+            entry.pending_subscriber_missing_since_ns.emplace(*it, poll_now_ns);
+            ++it;
+            continue;
+          }
+          if (poll_now_ns - missing_it->second < inactive_subscriber_grace_ns) {
+            g_wait_for_all_acked_inactive_subscriber_grace_deferrals.fetch_add(
+              1, std::memory_order_relaxed);
+            ++it;
+            continue;
+          }
+          entry.pending_subscriber_missing_since_ns.erase(missing_it);
+          g_wait_for_all_acked_inactive_subscriber_prunes.fetch_add(
+            1, std::memory_order_relaxed);
           it = entry.pending_subscriber_ids.erase(it);
         } else {
+          entry.pending_subscriber_missing_since_ns.erase(*it);
           ++it;
         }
       }
@@ -13466,6 +13770,16 @@ std::uint64_t rmw_fleetqox_cpp_last_wait_for_all_acked_expected()
 std::uint64_t rmw_fleetqox_cpp_last_wait_for_all_acked_observed()
 {
   return g_last_wait_for_all_acked_observed.load(std::memory_order_relaxed);
+}
+
+std::uint64_t rmw_fleetqox_cpp_socket_wait_for_all_acked_inactive_subscriber_prunes()
+{
+  return g_wait_for_all_acked_inactive_subscriber_prunes.load(std::memory_order_relaxed);
+}
+
+std::uint64_t rmw_fleetqox_cpp_socket_wait_for_all_acked_inactive_subscriber_grace_deferrals()
+{
+  return g_wait_for_all_acked_inactive_subscriber_grace_deferrals.load(std::memory_order_relaxed);
 }
 
 std::uint64_t rmw_fleetqox_cpp_remote_graph_event_advertisements_received()
@@ -14446,6 +14760,7 @@ void rmw_fleetqox_cpp_shutdown_pubsub_runtime()
   stop_pubsub_graph_renewal_thread();
   stop_reliable_retransmit_thread();
   stop_qos_deadline_monitor_thread();
+  stop_ack_nack_resend_thread();
   rmw_fleetqox_cpp_stop_remote_graph_lease_monitor_thread();
   rmw_fleetqox_cpp_stop_service_graph_renewal_thread();
   rmw_fleetqox_cpp_stop_service_request_repair_worker();
@@ -14911,6 +15226,7 @@ rmw_ret_t rmw_destroy_publisher(rmw_node_t * node, rmw_publisher_t * publisher)
   }
   if (stop_deadline_monitor) {
     stop_qos_deadline_monitor_thread();
+    stop_ack_nack_resend_thread();
   }
   release_owner_loans(publisher, LoanOwnerKind::Publisher);
   deallocate_data(data);
@@ -15136,6 +15452,7 @@ rmw_ret_t rmw_destroy_subscription(rmw_node_t * node, rmw_subscription_t * subsc
   }
   if (stop_deadline_monitor) {
     stop_qos_deadline_monitor_thread();
+    stop_ack_nack_resend_thread();
   }
   release_owner_loans(subscription, LoanOwnerKind::Subscription);
   deallocate_data(data);

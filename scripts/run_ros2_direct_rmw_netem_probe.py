@@ -856,6 +856,8 @@ def fleetqox_transport_metrics():
         "fragment_observed_timeout_retransmissions_suppressed",
         "fragment_whole_fallback_pacing_deferrals",
         "nack_retransmissions",
+        "wait_for_all_acked_inactive_subscriber_prunes",
+        "wait_for_all_acked_inactive_subscriber_grace_deferrals",
     )
     metrics = {"available": True}
     for name in names:
@@ -1078,6 +1080,8 @@ def fleetqox_transport_metrics():
         "fragment_whole_fallback_pacing_deferrals",
         "nack_retransmissions",
         "reliable_timeout_retransmissions",
+        "wait_for_all_acked_inactive_subscriber_prunes",
+        "wait_for_all_acked_inactive_subscriber_grace_deferrals",
     )
     metrics = {"available": True}
     for name in names:

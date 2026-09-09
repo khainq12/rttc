@@ -378,9 +378,9 @@ def run_probe(
         raise ValueError(
             "fleetqox_fragment_nack_interval_ms is outside 10..1000"
         )
-    if not 0 <= fleetqox_fragment_nack_max_requests <= 100:
+    if not 0 <= fleetqox_fragment_nack_max_requests <= 5000:
         raise ValueError(
-            "fleetqox_fragment_nack_max_requests is outside 0..100"
+            "fleetqox_fragment_nack_max_requests is outside 0..5000"
         )
     if not 1 <= fleetqox_fragment_nack_max_indexes_per_request <= 64:
         raise ValueError(
@@ -1178,7 +1178,7 @@ def main() -> int:
             10,
         ),
         fleetqox_fragment_nack_max_requests=max(
-            min(args.fleetqox_fragment_nack_max_requests, 100),
+            min(args.fleetqox_fragment_nack_max_requests, 5000),
             0,
         ),
         fleetqox_fragment_nack_max_indexes_per_request=max(
