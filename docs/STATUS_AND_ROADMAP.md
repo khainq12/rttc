@@ -863,6 +863,37 @@ the full dialect (arbitrary DDS SQL functions, vendor-specific semantics,
 and any FIELD-to-FIELD comparison where neither side is a bare parameter or
 literal) remains out of scope and is still a deliberate non-goal.
 
+Also **done**, closed in the content-filter dialect scope-closure task: `LIKE`
+now accepts the DDS-SQL `ESCAPE` clause (`value LIKE %0 ESCAPE %1`), so a
+pattern's own `%`/`_` characters can be matched literally instead of always
+being treated as wildcards. `ContentFilterTokenKind` gained an `escape`
+keyword token, the `LIKE` predicate parser optionally consumes a trailing
+`ESCAPE <value>` and validates it is exactly one character (fail-closed at
+`rmw_subscription_set_content_filter` time otherwise, consistent with every
+other malformed-expression path), and `content_filter_like()` now pre-resolves
+the pattern against the chosen escape character before wildcard matching.
+Proven by a dedicated escape-match/escape-literal/no-escape-needed scenario
+(`escape_evaluated=3`, `escape_matched=1`, `escape_dropped=2`) plus a
+multi-character-escape-value negative control (`multi_char_escape_rejected`)
+added to `content_filter_sql_probe.cpp`, rebuilt clean and passing 3/3 in
+`run_rmw_docker_content_filter_sql_probe.py`.
+
+This closes the content-filter dialect scope decision (task #42): the
+supported subset is now AND/OR/NOT with parentheses, all seven comparison
+operators in either operand order, `LIKE` with optional `ESCAPE`, `BETWEEN`,
+`IN`/`NOT IN`, and `IS [NOT] NULL`, over parameterized/quoted-literal
+operands, evaluated against key-value text, `std_msgs/String`-style
+payloads, and typed ROSIDL introspection reflection (WSTRING and C++
+sequence/array paths included). This is declared final, not an intermediate
+waypoint: arbitrary DDS SQL functions, vendor-specific extensions, and the
+remainder of the OMG DDS-SQL grammar are permanently out of scope for this
+RMW -- no known consumer needs them, and a content-filter expression is
+attacker-reachable parsed input evaluated on every received sample, so
+growing the grammar further would grow that attack surface without a
+matching benefit. `full_dds_content_filter_expression_dialect` in
+`capabilities.json`'s `unsupported` list reflects this as a permanent
+boundary, not a to-do.
+
 Also **done**, closed this session (bounded scope, not a full closure): the
 publish hot path's frame encoding now reuses a persistent per-publisher
 buffer (`FleetQoxPublisherData::frame_base64_scratch`) for the serialized

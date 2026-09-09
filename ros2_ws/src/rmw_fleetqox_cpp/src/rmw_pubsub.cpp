@@ -10820,6 +10820,7 @@ enum class ContentFilterTokenKind
   between,
   is,
   null_value,
+  escape,
   end,
   invalid,
 };
@@ -10976,6 +10977,8 @@ std::vector<ContentFilterToken> tokenize_content_filter_expression(
       kind = ContentFilterTokenKind::is;
     } else if (keyword == "NULL") {
       kind = ContentFilterTokenKind::null_value;
+    } else if (keyword == "ESCAPE") {
+      kind = ContentFilterTokenKind::escape;
     }
     tokens.push_back({kind, word});
   }
@@ -10983,19 +10986,48 @@ std::vector<ContentFilterToken> tokenize_content_filter_expression(
   return tokens;
 }
 
-bool content_filter_like(const std::string & value, const std::string & pattern)
+// escape_char, if non-nul, makes escape_char immediately followed by '%',
+// '_', or escape_char itself match that character literally instead of as
+// a wildcard -- the DDS-SQL LIKE ... ESCAPE clause, needed to filter on
+// literal '%'/'_' bytes in a field (e.g. "50% off") that would otherwise
+// always be treated as wildcards. A pattern is scanned once up front to
+// resolve each character's role (literal-via-escape vs. wildcard vs.
+// plain literal) so the matcher below doesn't need escape lookahead of
+// its own.
+bool content_filter_like(
+  const std::string & value, const std::string & pattern, char escape_char = '\0')
 {
+  std::string resolved_pattern;
+  std::string is_wildcard;
+  resolved_pattern.reserve(pattern.size());
+  is_wildcard.reserve(pattern.size());
+  for (size_t i = 0; i < pattern.size(); ++i) {
+    if (escape_char != '\0' && pattern[i] == escape_char && i + 1 < pattern.size() &&
+      (pattern[i + 1] == '%' || pattern[i + 1] == '_' || pattern[i + 1] == escape_char))
+    {
+      resolved_pattern.push_back(pattern[++i]);
+      is_wildcard.push_back('\0');
+    } else {
+      resolved_pattern.push_back(pattern[i]);
+      is_wildcard.push_back(
+        (pattern[i] == '%' || pattern[i] == '_') ? pattern[i] : '\0');
+    }
+  }
   size_t value_offset = 0;
   size_t pattern_offset = 0;
   size_t wildcard_offset = std::string::npos;
   size_t wildcard_value_offset = 0;
   while (value_offset < value.size()) {
-    if (pattern_offset < pattern.size() &&
-      (pattern[pattern_offset] == '_' || pattern[pattern_offset] == value[value_offset]))
+    const bool at_underscore = pattern_offset < resolved_pattern.size() &&
+      is_wildcard[pattern_offset] == '_';
+    const bool at_percent = pattern_offset < resolved_pattern.size() &&
+      is_wildcard[pattern_offset] == '%';
+    if (pattern_offset < resolved_pattern.size() &&
+      (at_underscore || resolved_pattern[pattern_offset] == value[value_offset]))
     {
       ++value_offset;
       ++pattern_offset;
-    } else if (pattern_offset < pattern.size() && pattern[pattern_offset] == '%') {
+    } else if (at_percent) {
       wildcard_offset = pattern_offset++;
       wildcard_value_offset = value_offset;
     } else if (wildcard_offset != std::string::npos) {
@@ -11005,10 +11037,10 @@ bool content_filter_like(const std::string & value, const std::string & pattern)
       return false;
     }
   }
-  while (pattern_offset < pattern.size() && pattern[pattern_offset] == '%') {
+  while (pattern_offset < resolved_pattern.size() && is_wildcard[pattern_offset] == '%') {
     ++pattern_offset;
   }
-  return pattern_offset == pattern.size();
+  return pattern_offset == resolved_pattern.size();
 }
 
 enum class ContentFilterTruth
@@ -11317,11 +11349,23 @@ private:
       if (!pattern.has_value()) {
         return ContentFilterTruth::unknown;
       }
+      char escape_char = '\0';
+      if (match(ContentFilterTokenKind::escape)) {
+        const auto escape_value = parse_value();
+        if (!escape_value.has_value() || escape_value->size() != 1) {
+          // DDS-SQL requires the ESCAPE argument to be exactly one
+          // character; anything else is a malformed expression, same
+          // fail-closed treatment as every other parse error here.
+          valid_ = false;
+          return ContentFilterTruth::unknown;
+        }
+        escape_char = (*escape_value)[0];
+      }
       if (found == fields_.end()) {
         return ContentFilterTruth::unknown;
       }
       const ContentFilterTruth truth = content_filter_truth(
-        content_filter_like(found->second, *pattern));
+        content_filter_like(found->second, *pattern, escape_char));
       return negate ? content_filter_not(truth) : truth;
     }
     if (negate) {

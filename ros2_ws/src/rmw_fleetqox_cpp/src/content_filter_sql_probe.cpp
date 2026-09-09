@@ -289,14 +289,43 @@ int main()
     reversed_payloads,
     reversed_expected);
 
+  // LIKE ... ESCAPE: without it, '%' and '_' inside a pattern are always
+  // wildcards, so a field containing a *literal* '%' (e.g. "50%") can
+  // never be matched exactly. The escaped pattern "50\%" (parameter
+  // string, not re-parsed as a quoted SQL literal) must match only the
+  // literal three-character value "50%", not "50X" or "5000" -- which a
+  // no-escape "50%" pattern would treat as "50" followed by anything.
+  const std::string escape_expression = "value LIKE %0 ESCAPE %1";
+  const std::vector<std::string> escape_parameters = {"50\\%", "\\"};
+  const std::vector<std::string> escape_payloads = {
+    "value=50%",
+    "value=50X",
+    "value=5000",
+  };
+  const std::vector<std::string> escape_expected = {escape_payloads[0]};
+  const ScenarioResult escape_scenario = run_scenario(
+    publisher,
+    subscription,
+    &allocator,
+    escape_expression,
+    escape_parameters,
+    escape_payloads,
+    escape_expected);
+
   const char * one_parameter[] = {"robot_a"};
   const char * two_parameters[] = {"a", "b"};
+  const char * multi_char_escape_parameters[] = {"x", "ab"};
   const bool malformed_rejected = invalid_expression_rejected(
     subscription, &allocator, "robot_id =", 0, nullptr);
   const bool missing_parameter_rejected = invalid_expression_rejected(
     subscription, &allocator, "robot_id = %9", 1, one_parameter);
   const bool reversed_missing_field_rejected = invalid_expression_rejected(
     subscription, &allocator, "%0 = %1", 2, two_parameters);
+  // DDS-SQL requires exactly one character as the ESCAPE argument; a
+  // multi-character argument is malformed, same fail-closed treatment as
+  // every other parse error this probe already covers.
+  const bool multi_char_escape_rejected = invalid_expression_rejected(
+    subscription, &allocator, "value LIKE %0 ESCAPE %1", 2, multi_char_escape_parameters);
 
   rmw_subscription_content_filter_options_t disabled =
     rmw_get_zero_initialized_content_filter_options();
@@ -309,11 +338,11 @@ int main()
   const rmw_ret_t node_ret = rmw_destroy_node(node);
   const bool context_ok = cleanup_context(&context, &options);
   const bool invalid_ok = malformed_rejected && missing_parameter_rejected &&
-    reversed_missing_field_rejected;
+    reversed_missing_field_rejected && multi_char_escape_rejected;
   const bool cleanup_ok = publisher_ret == RMW_RET_OK &&
     subscription_ret == RMW_RET_OK && node_ret == RMW_RET_OK && context_ok;
-  const bool ok = advanced.ok && precedence.ok && reversed.ok && invalid_ok &&
-    disabled_ok && set_delta == 4 && cleanup_ok;
+  const bool ok = advanced.ok && precedence.ok && reversed.ok && escape_scenario.ok &&
+    invalid_ok && disabled_ok && set_delta == 5 && cleanup_ok;
 
   std::cout << "{\"schema_version\":\"fleetrmw.content_filter_sql_probe.v1\","
             << "\"status\":\"" << (ok ? "ok" : "failed") << "\","
@@ -336,9 +365,16 @@ int main()
             << "\"reversed_evaluated\":" << reversed.evaluated << ","
             << "\"reversed_matched\":" << reversed.matched << ","
             << "\"reversed_dropped\":" << reversed.dropped << ","
+            << "\"sql_like_escape_claim\":" << (escape_scenario.ok ? "true" : "false") << ","
+            << "\"escape_evaluated\":" << escape_scenario.evaluated << ","
+            << "\"escape_matched\":" << escape_scenario.matched << ","
+            << "\"escape_dropped\":" << escape_scenario.dropped << ","
+            << "\"multi_char_escape_rejected\":"
+            << (multi_char_escape_rejected ? "true" : "false") << ","
             << "\"content_filters_set_delta\":" << set_delta << ","
             << "\"content_filter_sql_subset_claim\":"
-            << ((advanced.ok && precedence.ok && reversed.ok) ? "true" : "false") << ","
+            << ((advanced.ok && precedence.ok && reversed.ok && escape_scenario.ok) ?
+              "true" : "false") << ","
             << "\"clean_teardown\":" << (cleanup_ok ? "true" : "false") << "}"
             << std::endl;
   return ok ? 0 : 1;

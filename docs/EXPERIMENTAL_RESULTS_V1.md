@@ -356,7 +356,16 @@ Passing scoped evidence includes:
   `<=`/`>`/`>=`, e.g. `%0 = robot_id` or `%1 < sequence`, not just
   field-first), rebuilt clean under ASan/UBSan and passing 5/5 in
   `docker_content_filter_sql_probe` alongside a malformed-reversed-form
-  (`%0 = %1`) negative control.
+  (`%0 = %1`) negative control;
+- content-filter `LIKE ... ESCAPE` (e.g. `value LIKE %0 ESCAPE %1`), letting
+  a pattern's own `%`/`_` be matched literally via a caller-chosen
+  single-character escape; a malformed multi-character escape value fails
+  closed at `set_content_filter` time. Rebuilt clean and passing 3/3 in
+  `run_rmw_docker_content_filter_sql_probe.py`
+  (`escape_evaluated=3`/`escape_matched=1`/`escape_dropped=2`,
+  `multi_char_escape_rejected=true`). This is the final content-filter
+  dialect scope decision: arbitrary DDS SQL functions and vendor-specific
+  extensions are a permanent non-goal, not a pending gap.
 
 Open boundaries include full remote graph/event production, full non-deadline
 QoS event semantics, full DDS content-filter dialect (arbitrary DDS SQL

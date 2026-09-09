@@ -48,7 +48,12 @@ def probe_ok(row: dict[str, Any]) -> bool:
         and int(row.get("reversed_evaluated", 0)) == 3
         and int(row.get("reversed_matched", 0)) == 1
         and int(row.get("reversed_dropped", 0)) == 2
-        and int(row.get("content_filters_set_delta", 0)) == 4
+        and row.get("sql_like_escape_claim") is True
+        and int(row.get("escape_evaluated", 0)) == 3
+        and int(row.get("escape_matched", 0)) == 1
+        and int(row.get("escape_dropped", 0)) == 2
+        and row.get("multi_char_escape_rejected") is True
+        and int(row.get("content_filters_set_delta", 0)) == 5
     )
 
 
