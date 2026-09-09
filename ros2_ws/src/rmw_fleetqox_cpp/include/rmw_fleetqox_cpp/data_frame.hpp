@@ -257,6 +257,15 @@ std::string encode_data_frame(const DataFrame & frame);
 // per publish once the buffer has grown to the steady-state payload size.
 std::string encode_data_frame(const DataFrame & frame, std::string & base64_scratch);
 
+// Same encoding as encode_data_frame(frame, base64_scratch), but appends
+// directly into caller-owned `json_scratch` instead of returning a freshly
+// allocated std::string. Pass persistent per-publisher buffers for both
+// (e.g. FleetQoxPublisherData::frame_base64_scratch/frame_json_scratch) to
+// avoid any heap allocation on the hot publish path once both buffers have
+// grown to the steady-state frame size.
+void encode_data_frame_append(
+  const DataFrame & frame, std::string & base64_scratch, std::string & json_scratch);
+
 std::optional<DataFrame> decode_data_frame(const std::string & payload);
 
 std::string encode_route_advertisement(const RouteAdvertisement & advertisement);

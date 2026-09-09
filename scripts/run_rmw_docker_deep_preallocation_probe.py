@@ -34,6 +34,8 @@ def probe_ok(row: dict[str, Any]) -> bool:
         row.get("status") == "ok"
         and row.get("publish_take_ok") is True
         and row.get("base64_scratch_reuse_ok") is True
+        and row.get("json_scratch_reuse_ok") is True
+        and row.get("retransmit_entry_pool_reuse_ok") is True
         and row.get("cleanup_ok") is True
         and int(row.get("operation_count", 0)) == 8
         and int(row.get("completed_operations", 0)) == 8
@@ -41,6 +43,14 @@ def probe_ok(row: dict[str, Any]) -> bool:
         and int(row.get("scratch_capacity_after_first_publish", 0)) >= 256
         and row.get("scratch_capacity_after_last_publish")
         == row.get("scratch_capacity_after_first_publish")
+        and int(row.get("json_scratch_capacity_after_first_publish", 0)) >
+        int(row.get("json_scratch_capacity_before_any_publish", 0))
+        and row.get("json_scratch_capacity_after_last_publish")
+        == row.get("json_scratch_capacity_after_first_publish")
+        and int(row.get("reliable_operation_count", 0)) == 8
+        and int(row.get("reliable_completed_operations", 0)) == 8
+        and int(row.get("retransmit_pool_hits_after", 0)) >
+        int(row.get("retransmit_pool_hits_before", 0))
     )
 
 
@@ -100,9 +110,19 @@ def run_probe(*, root: Path, image: str, iterations: int) -> dict[str, Any]:
         "ok_run_count": ok_run_count,
         "deep_preallocation_frame_base64_scratch_claim": ok,
         "deep_preallocation_frame_base64_scratch_repeated_claim": ok and run_count >= 5,
+        "deep_preallocation_frame_json_scratch_claim": ok,
+        "deep_preallocation_retransmit_entry_pool_claim": ok,
         "scratch_capacity_before_any_publish": last.get("scratch_capacity_before_any_publish"),
         "scratch_capacity_after_first_publish": last.get("scratch_capacity_after_first_publish"),
         "scratch_capacity_after_last_publish": last.get("scratch_capacity_after_last_publish"),
+        "json_scratch_capacity_before_any_publish": last.get(
+            "json_scratch_capacity_before_any_publish"),
+        "json_scratch_capacity_after_first_publish": last.get(
+            "json_scratch_capacity_after_first_publish"),
+        "json_scratch_capacity_after_last_publish": last.get(
+            "json_scratch_capacity_after_last_publish"),
+        "retransmit_pool_hits_before": last.get("retransmit_pool_hits_before"),
+        "retransmit_pool_hits_after": last.get("retransmit_pool_hits_after"),
         "runs": rows,
         "stdout": completed.stdout,
         "stderr": completed.stderr,

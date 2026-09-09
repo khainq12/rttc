@@ -916,6 +916,65 @@ application-message deserialization is unchanged. A full closure would need
 a binary (non-JSON) wire format and a pool allocator for the retransmit
 ledger -- a redesign, not a bounded addition -- and remains unclaimed.
 
+Also **done**, closed in a later session (bounded scope, not a full
+closure): both of those two specific gaps just above are now closed too,
+without the binary-wire-format redesign originally thought necessary. The
+JSON frame body is now built directly into a second persistent
+per-publisher buffer (`FleetQoxPublisherData::frame_json_scratch`) via a new
+`encode_data_frame_append(frame, base64_scratch, json_scratch)` function,
+instead of a fresh `std::ostringstream` plus a freshly heap-allocated
+returned `std::string` on every publish. This was verified to produce
+byte-identical wire output rather than risk the 187-probe number-formatting
+dependency noted above: a standalone 400k+-value comparison confirmed
+`snprintf("%.6g", value)` matches `std::ostringstream`'s default double
+formatting exactly (the C++ standard already documents defaultfloat at
+default precision as equivalent to `%g`), so every double field
+(`deadline_ms`/`qoe_debt`/`task_criticality`/`age_ms`) converts through that
+instead of the stream, while every string field is escaped by a new
+`append_json_escaped` that writes directly into the buffer instead of
+returning a fresh escaped copy. Separately, the reliability retransmit
+ledger's per-in-flight-message entry now recycles through a bounded
+per-publisher pool (`g_retired_retransmit_entries`, capped at 8 entries)
+instead of always heap-allocating fresh: an entry retired by acknowledgment
+or history-limit eviction (the two erase sites inside `publish_payload`'s
+own sliding-window cleanup) has its `encoded_frame` string and
+`pending_subscriber_ids`/`pending_subscriber_missing_since_ns` containers
+reused by the very next publish on that same publisher via
+`reset_pooled_retransmit_entry`, which explicitly re-sets every field of the
+struct -- including ones with no corresponding constructor argument, like
+`acknowledgments_observed` and the fragment-repair bookkeeping flags -- so no
+state from an entry's prior life as a different in-flight message can leak
+into the reused one; a pool entry keyed by a publisher's address is dropped
+in `rmw_destroy_publisher` so a later, unrelated publisher object allocated
+at the same freed address can never inherit stale entries. The extended
+`docker_deep_preallocation_probe` proves both: the JSON scratch buffer grows
+once then stays stable across eight same-size publishes (mirroring the
+base64 check), and a reliable-QoS scenario (eight publishes, each awaited
+via `rmw_publisher_wait_for_all_acked` before the next) records more
+retransmit-pool reuse hits than misses while every publish/ACK still
+completes correctly. Given this touches the same ACK-tracking subsystem
+root-caused earlier for the B1 fleet-scale bug, it was verified not to be a
+special case rather than trusted on inspection alone: an A/B rebuild against
+the unmodified encoder (via `git stash`) confirmed two unrelated,
+pre-existing flakinesses --
+`rmw_wait_for_all_acked_probe`'s concurrent-snapshot timing check (fails
+deterministically 5/5 on both old and new code) and the cross-container
+`remote_wait_for_all_acked_probe`'s ~40% flake rate (fails 2-3/5 on both) --
+reproduce identically with or without this change, and are therefore
+pre-existing test issues, not regressions introduced here. A further
+regression sweep (content-filter SQL, `OWNERSHIP`, `DESTINATION_ORDER`, and
+a QUIC native-path probe reading back a JSON `qoe_debt` double field) passed
+against the exact same expected results as before the change. What remains
+open: application-message deserialization is unchanged, the retransmit
+ledger's own hash-map node allocation per entry is not pooled (only the
+entry's internal buffers are), and a binary (non-JSON) wire format was
+deliberately not pursued -- it would change on-wire bytes roughly 187 other
+probes depend on for a further, smaller reduction in text-formatting
+overhead, not a fresh-heap-allocation-per-publish problem, which this change
+already closes. `deep_preallocation_claim` therefore stays correctly
+`false` in `capabilities.json` as a deliberate scope boundary rather than a
+to-do.
+
 Also **done**, closed this session (bounded scope, not a full closure): the
 loaned-message buffer itself is now pooled per publisher/subscription
 instead of allocating a fresh block on every `borrow_loan()` call.

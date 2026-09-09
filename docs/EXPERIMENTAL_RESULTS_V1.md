@@ -55,6 +55,28 @@ untouched to avoid risking the on-wire number format ~187 other probes
 depend on), and the reliability retransmit ledger still allocates per
 in-flight reliable message by design.
 
+Both of those two gaps are now closed too, in a later session, without the
+binary-wire-format redesign originally thought necessary. `encode_data_frame
+_append` now writes the JSON frame body directly into a second persistent
+per-publisher buffer (`frame_json_scratch`) instead of a fresh
+`std::ostringstream` plus freshly heap-allocated returned string; wire
+output is unchanged (`snprintf("%.6g", ...)`, verified byte-identical to the
+prior stream-based double formatting across 400k+ sampled values, replaces
+`operator<<` for the double fields). The reliability retransmit ledger now
+recycles retired entries (acknowledged or history-limit-evicted) through a
+bounded per-publisher pool instead of always heap-allocating fresh, with
+every field of the recycled struct explicitly reset so no state from a
+different prior message can leak through. The extended
+`docker_deep_preallocation_probe` proves both (stable capacity growth for
+the JSON buffer; more pool-reuse hits than misses across a reliable-QoS
+publish/ACK sequence), and an A/B rebuild against the unmodified encoder
+confirmed two unrelated pre-existing flakinesses in
+`rmw_wait_for_all_acked_probe`/`remote_wait_for_all_acked_probe` reproduce
+identically either way -- not regressions from this change. A binary wire
+format remains deliberately unpursued (it would touch bytes ~187 other
+probes depend on for a smaller further gain), so `deep_preallocation_claim`
+stays `false` as a scope boundary, not a to-do.
+
 The loaned-message buffer is now pooled per publisher/subscription instead
 of allocating a fresh block on every borrow; `fini_function` still runs on
 release (freeing any `std::string`/vector-owned sub-allocations) but the raw

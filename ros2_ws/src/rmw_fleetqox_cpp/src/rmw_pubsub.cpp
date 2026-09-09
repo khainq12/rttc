@@ -174,6 +174,12 @@ struct FleetQoxPublisherData
   // so the payload's base64 encoding stops reallocating once it has grown
   // to this publisher's steady-state payload size.
   std::string frame_base64_scratch{};
+  // Reused across publish_payload() calls the same way as
+  // frame_base64_scratch above, but for the whole encoded JSON frame body
+  // (see encode_data_frame_append): stops reallocating once it has grown
+  // to this publisher's steady-state frame size instead of a fresh
+  // std::string being heap-allocated on every single publish.
+  std::string frame_json_scratch{};
   // FleetQoX QoS extensions (OWNERSHIP/PARTITION/PRESENTATION), populated
   // from rmw_specific_publisher_payload at creation if present; see
   // qos_extensions.hpp. Not part of the standard rmw_qos_profile_t.
@@ -374,6 +380,102 @@ std::vector<FleetQoxPublisherData *> g_publishers;
 std::vector<FleetQoxSubscriptionData *> g_subscriptions;
 std::vector<rmw_subscription_t *> g_subscription_handles;
 std::unordered_map<std::string, ReliableRetransmitEntry> g_retransmit_ledger;
+// Bounded per-publisher pool of retired ReliableRetransmitEntry objects,
+// keyed by the owning FleetQoxPublisherData's address. When a publish
+// erases an acked/expired/history-limit-evicted entry belonging to that
+// publisher, the entry's buffers (encoded_frame string capacity,
+// pending_subscriber_ids/pending_subscriber_missing_since_ns bucket
+// arrays) are retired here instead of being freed outright, then the very
+// next publish on that same publisher reuses one via
+// reset_pooled_retransmit_entry() instead of default-constructing (and
+// therefore heap-allocating) a fresh entry -- this is the steady-state
+// churn pattern for any reliable publisher with a bounded QoS depth.
+// Guarded by g_bus_mutex, the same lock already held around every
+// g_retransmit_ledger access below. Erased for a publisher's address in
+// rmw_destroy_publisher so a later, unrelated publisher object that
+// happens to be allocated at the same address never inherits stale
+// entries.
+constexpr size_t kRetiredRetransmitEntryPoolCap = 8;
+std::unordered_map<const void *, std::vector<ReliableRetransmitEntry>>
+  g_retired_retransmit_entries;
+std::atomic<std::uint64_t> g_retransmit_entry_pool_hits{0};
+std::atomic<std::uint64_t> g_retransmit_entry_pool_misses{0};
+
+// Retires `entry` into `data`'s pool (bounded by kRetiredRetransmitEntryPoolCap)
+// instead of letting it fall out of scope and be destroyed outright. Caller
+// must hold g_bus_mutex.
+void retire_retransmit_entry_locked(const void * data, ReliableRetransmitEntry && entry)
+{
+  std::vector<ReliableRetransmitEntry> & pool = g_retired_retransmit_entries[data];
+  if (pool.size() < kRetiredRetransmitEntryPoolCap) {
+    pool.push_back(std::move(entry));
+  }
+}
+
+// Pops a pooled entry for `data` if one is available (returns true and
+// leaves it in `out`, with all buffer capacity intact for reuse), else
+// leaves `out` default-constructed and returns false. Caller must hold
+// g_bus_mutex.
+bool take_pooled_retransmit_entry_locked(const void * data, ReliableRetransmitEntry & out)
+{
+  const auto found = g_retired_retransmit_entries.find(data);
+  if (found == g_retired_retransmit_entries.end() || found->second.empty()) {
+    g_retransmit_entry_pool_misses.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  out = std::move(found->second.back());
+  found->second.pop_back();
+  g_retransmit_entry_pool_hits.fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
+// Resets every field of a (possibly reused) ReliableRetransmitEntry to
+// exactly the values a fresh brace-initialized entry would have, but via
+// assign()/clear() so existing string/container capacity is retained
+// instead of being freed and reallocated. Every field of the struct is
+// listed explicitly here (matching the original construction site in
+// publish_payload field-for-field) so a stale value from this entry's
+// prior life as a *different* in-flight message can never leak through --
+// that would be a correctness bug in ACK tracking, not just a missed
+// allocation-reuse opportunity.
+void reset_pooled_retransmit_entry(
+  ReliableRetransmitEntry & entry,
+  const std::string & encoded_frame,
+  const rmw_qos_profile_t & qos,
+  const std::string & publisher_id,
+  std::size_t domain_id,
+  std::uint64_t source_sequence_number,
+  std::int64_t source_timestamp_ns,
+  bool reliable,
+  const std::string & instance_key,
+  const std::vector<std::string> & matched_subscription_ids)
+{
+  entry.encoded_frame.assign(encoded_frame);
+  entry.qos = qos;
+  entry.publisher_id.assign(publisher_id);
+  entry.domain_id = domain_id;
+  entry.source_sequence_number = source_sequence_number;
+  entry.source_timestamp_ns = source_timestamp_ns;
+  entry.last_send_ns = source_timestamp_ns;
+  entry.timeout_retransmissions = 0;
+  entry.reliable = reliable;
+  // See the identical comment at the original construction site: not
+  // marking this acknowledged=true just because no subscriber is matched
+  // yet would let it be evicted before a delayed match/NACK could use it.
+  entry.acknowledged = !reliable;
+  entry.expected_acknowledgments = matched_subscription_ids.size();
+  entry.acknowledgments_observed = 0;
+  entry.pending_subscriber_ids.clear();
+  entry.pending_subscriber_ids.insert(
+    matched_subscription_ids.begin(), matched_subscription_ids.end());
+  entry.pending_subscriber_missing_since_ns.clear();
+  entry.fragment_observed_by_reader = false;
+  entry.fragment_timeout_suppression_recorded = false;
+  entry.fragment_initial_send_batches_pending = 0;
+  entry.fragment_initial_pending_suppression_recorded = false;
+  entry.fragment_fallback_grace_deferral_recorded = false;
+  entry.instance_key.assign(instance_key);
+}
 std::unordered_map<std::string, RemotePubSubEndpoint> g_remote_pubsub_endpoints;
 // FleetQoX PRESENTATION extension (see qos_extensions.hpp). Guarded by
 // g_bus_mutex like every other cross-entity structure above.
@@ -11576,6 +11678,34 @@ size_t rmw_fleetqox_cpp_test_publisher_frame_base64_scratch_capacity(
   return data->frame_base64_scratch.capacity();
 }
 
+// White-box accessor for probing the reusable frame-encode JSON scratch
+// buffer (see FleetQoxPublisherData::frame_json_scratch and
+// encode_data_frame_append). Not part of the public RMW API; test-only,
+// like the accessor just above.
+size_t rmw_fleetqox_cpp_test_publisher_frame_json_scratch_capacity(
+  const rmw_publisher_t * publisher)
+{
+  FleetQoxPublisherData * data = publisher_data(publisher);
+  if (data == nullptr) {
+    return 0;
+  }
+  std::lock_guard<std::mutex> lock(data->publish_mutex);
+  return data->frame_json_scratch.capacity();
+}
+
+// White-box accessors for probing ReliableRetransmitEntry pool reuse (see
+// g_retired_retransmit_entries/reset_pooled_retransmit_entry). Not part of
+// the public RMW API; test-only, like the accessors above.
+std::uint64_t rmw_fleetqox_cpp_socket_retransmit_entry_pool_hits()
+{
+  return g_retransmit_entry_pool_hits.load(std::memory_order_relaxed);
+}
+
+std::uint64_t rmw_fleetqox_cpp_socket_retransmit_entry_pool_misses()
+{
+  return g_retransmit_entry_pool_misses.load(std::memory_order_relaxed);
+}
+
 // White-box accessors for probing the loaned-message buffer pool (see
 // g_loan_pool, borrow_loan(), and release_loan()). Not part of the public
 // RMW API; test-only, like the counters above.
@@ -11705,8 +11835,9 @@ rmw_ret_t publish_payload(FleetQoxPublisherData * data, const std::vector<std::u
     std::uint64_t{0},
     encode_partitions_csv(data->partitions),
     data->ownership_strength};
-  const std::string encoded_frame =
-    rmw_fleetqox_cpp::encode_data_frame(frame, data->frame_base64_scratch);
+  rmw_fleetqox_cpp::encode_data_frame_append(
+    frame, data->frame_base64_scratch, data->frame_json_scratch);
+  const std::string & encoded_frame = data->frame_json_scratch;
   const bool reliable = data->qos.reliability == RMW_QOS_POLICY_RELIABILITY_RELIABLE;
   const std::vector<std::string> matched_subscription_ids = reliable ?
     rmw_fleetqox_cpp_graph_matched_subscription_endpoint_ids(
@@ -11730,6 +11861,7 @@ rmw_ret_t publish_payload(FleetQoxPublisherData * data, const std::vector<std::u
         continue;
       }
       if (entry.acknowledged || frame_exceeds_lifespan(entry.qos, entry.source_timestamp_ns)) {
+        retire_retransmit_entry_locked(data, std::move(it->second));
         it = g_retransmit_ledger.erase(it);
         continue;
       }
@@ -11750,32 +11882,29 @@ rmw_ret_t publish_payload(FleetQoxPublisherData * data, const std::vector<std::u
       if (oldest == g_retransmit_ledger.end()) {
         break;
       }
+      retire_retransmit_entry_locked(data, std::move(oldest->second));
       g_retransmit_ledger.erase(oldest);
       --publisher_history_size;
     }
-    ReliableRetransmitEntry retransmit_entry{
+    // Reuses a retired entry's buffer capacity from this same publisher's
+    // pool when available (see retire_retransmit_entry_locked above),
+    // instead of always default-constructing (and therefore freshly
+    // heap-allocating encoded_frame/pending_subscriber_ids) a brand new
+    // entry -- see reset_pooled_retransmit_entry for why every field is
+    // still explicitly set either way.
+    ReliableRetransmitEntry retransmit_entry;
+    take_pooled_retransmit_entry_locked(data, retransmit_entry);
+    reset_pooled_retransmit_entry(
+      retransmit_entry,
       encoded_frame,
       data->qos,
       data->publisher_id,
       data->domain_id,
       source_sequence,
       frame.source_timestamp_ns,
-      frame.source_timestamp_ns,
-      0,
       reliable,
-      // Not marking this acknowledged=true just because no subscriber is
-      // matched *yet*: graph advertisement relay can lag publish by a
-      // nontrivial amount (more so at higher peer counts), and marking the
-      // entry acknowledged makes it eviction-eligible on this publisher's
-      // very next send -- long before a delayed subscriber match or a
-      // NACK-triggered repair retransmission could ever use it. A truly
-      // subscriber-less reliable publisher still bounds fine via the
-      // existing history_limit eviction just below.
-      !reliable};
-    retransmit_entry.instance_key = publish_instance_key;
-    retransmit_entry.expected_acknowledgments = matched_subscription_ids.size();
-    retransmit_entry.pending_subscriber_ids.insert(
-      matched_subscription_ids.begin(), matched_subscription_ids.end());
+      publish_instance_key,
+      matched_subscription_ids);
     g_retransmit_ledger[retransmit_ledger_key(data->publisher_id, source_sequence)] =
       std::move(retransmit_entry);
   }
@@ -15327,6 +15456,11 @@ rmw_ret_t rmw_destroy_publisher(rmw_node_t * node, rmw_publisher_t * publisher)
           ++it;
         }
       }
+      // Drop this publisher's retired-entry pool now rather than leaving it
+      // keyed by a dangling pointer: if a later, unrelated publisher object
+      // is ever allocated at this same freed address, it must not silently
+      // inherit stale ReliableRetransmitEntry buffers.
+      g_retired_retransmit_entries.erase(data);
     }
     for (FleetQoxSubscriptionData * subscription_data_item : g_subscriptions) {
       if (local_pubsub_match_compatible(data, subscription_data_item)) {
