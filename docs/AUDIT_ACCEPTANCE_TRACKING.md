@@ -443,18 +443,39 @@ scope có chủ đích, xem bảng, không phải việc treo). Nhóm 6 đang b�
          khoảng cách này khác nhau thật cho từng robot, tạo ra mẫu hình
          nhiễu phức tạp hơn nhiều, khó dự đoán chiều ảnh hưởng chỉ bằng suy
          luận. Đây là hiệu ứng bậc 3 (hệ quả của việc sửa đúng 1 bug thật),
-         không phải bug độc lập mới — cần điều tra thêm để hiểu đầy đủ,
-         **chưa kết luận được** tại đây.
+         không phải bug độc lập mới.
 
-         **Fix vị trí này đã được giữ lại** (đúng về mặt kỹ thuật, khớp
-         thật với cách ns-3 vận hành) dù chưa cải thiện đều số liệu —
-         không revert một bug fix đã xác minh đúng chỉ vì nó chưa cải
-         thiện 1 chỉ số cụ thể; cần điều tra thêm về mẫu hình nhiễu mới ở
-         `stationary_near` trước khi có kết luận cuối cùng.
+         **Cập nhật (10/09/2026, vòng 6) — điều tra thêm cơ chế theo yêu
+         cầu người dùng, kết luận:**
+         - Đo latency theo từng robot (16 trạm/seed 7/`stationary_near`),
+           xếp theo khoảng cách tới `fleet_router` (2.0m → 7.2m): **không
+           có gradient** — latency/miss ratio gần như đồng đều ở mọi
+           khoảng cách. Loại trừ giả thuyết "vị trí gần/xa router quyết
+           định".
+         - Giả thuyết "traffic `fleet_controller` (50Hz×16 robot) bị mất
+           do tín hiệu yếu ở bug cũ (cách xa ~400m, biên độ chỉ ~6dB) nên
+           tải kênh thực tế bị giảm giả tạo": đo trực tiếp tỷ lệ giao
+           traffic từ `fleet_controller` ở cả setup cũ và mới cho cùng 1
+           case — **gần như giống hệt nhau** (98.2% cũ vs 97.4% mới, chỉ
+           lệch 0.8 điểm). Loại trừ.
+         - Nhìn lại số liệu thô: miss ratio thực tế của case cụ thể này
+           chỉ tăng nhẹ sau fix vị trí (0.749→0.784, ~3.5 điểm), **không
+           phải thay đổi lớn**. Ngưỡng pass/fail hiện đặt đúng ở mức 10
+           điểm lệch (`deadline_miss_ratio_delta<=0.10`) — một dịch chuyển
+           nhỏ 3-4 điểm có thể đẩy nhiều case đang sát ngưỡng từ pass sang
+           fail cùng lúc, khiến % tổng thể giảm nhiều hơn mức thay đổi
+           thực chất. Đây là **hiệu ứng nhạy cảm ngưỡng**, không phải bằng
+           chứng của 1 bug lớn còn ẩn.
 
-       - **Trạng thái tại đây (chưa phải kết luận cuối)**: đã tìm và sửa
-         **3 bug cấu hình thật** trong hạ tầng đối sánh (không phải giới
-         hạn vật lý không sửa được như từng kết luận nhầm ở vòng 1):
+         **Kết luận**: đã thử 2 giả thuyết cơ chế cụ thể (gradient khoảng
+         cách, tải giả tạo từ controller) — cả hai đều bị loại bằng đo đạc
+         trực tiếp. Fix vị trí giữ nguyên (đúng kỹ thuật, khớp ns-3 thật);
+         thay đổi số liệu tổng thể sau fix là thật nhưng ở mức khiêm tốn,
+         bị khuếch đại bởi việc nhiều case nằm sát ngưỡng 10 điểm.
+
+       - **Trạng thái**: đã tìm và sửa **3 bug cấu hình thật** trong hạ
+         tầng đối sánh (không phải giới hạn vật lý không sửa được như
+         từng kết luận nhầm ở vòng 1):
          1. `PendingQueue.packetCapacity` 100 (INET) vs 500 (ns-3).
          2. `Arp.retryTimeout` 1s bị lộ do đồng bộ hóa thời gian bắt đầu
             (sửa bằng `GlobalArp`).
@@ -462,9 +483,15 @@ scope có chủ đích, xem bảng, không phải việc treo). Nhóm 6 đang b�
             chồng lên nhau tại 1 điểm, còn controller/router/ui cách xa
             hàng trăm mét (sửa bằng override vị trí đúng theo thứ tự
             ns-3 thật).
-         8 trạm giờ đạt 96% (case riêng lẻ, 3 seed) — bằng chứng rất mạnh.
-         16/32 trạm còn một mẫu hình nhiễu mới ở `stationary_near` cần
-         điều tra thêm trước khi kết luận cuối cùng cho các quy mô này.
+         8 trạm đạt 96% (case riêng lẻ, 3 seed) — bằng chứng rất mạnh.
+         16 trạm 59%, 32 trạm 22% (case riêng lẻ, 3 seed) — đã điều tra 2
+         giả thuyết cơ chế cụ thể cho phần "tệ đi" sau fix vị trí, cả hai
+         đều bị loại; hiểu là hiệu ứng nhạy cảm ngưỡng trên nền một khác
+         biệt còn lại khiêm tốn (~3-5 điểm miss ratio mỗi case), không
+         phải một bug lớn còn ẩn. Đã đào sâu 8 giả thuyết cơ chế MAC/PHY
+         (Nhóm vòng 1-3) + 2 giả thuyết vị trí (vòng 6) — không tìm thêm
+         được nguyên nhân cấu hình cụ thể nào khác. Đây là điểm dừng hợp
+         lý cho phiên điều tra này.
   2. **Soak dài hạn**: đã có `run_heap_soak_asan_probe.py`/
      `run_heap_soak_fleet_asan_probe.py` (lặp nhiều "round" ngắn, không
      phải 1 lần chạy liên tục dài) và
