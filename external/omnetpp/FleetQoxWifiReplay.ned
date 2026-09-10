@@ -44,6 +44,7 @@ network FleetQoxWifiReplay
             mobility.initialY = parent.gridWidth * parent.stationSpacing / 2;
             wlan[*].mgmt.typename = "Ieee80211MgmtApSimplified";
             wlan[*].bitrate = parent.wlanBitrate;
+            wlan[*].opMode = "g(erp)";
             @display("p=400,60");
         }
         controller: WirelessHost {
@@ -59,6 +60,7 @@ network FleetQoxWifiReplay
             mobility.speed = parent.mobilitySpeed;
             mobility.initialMovementHeading = 0deg;
             wlan[*].bitrate = parent.wlanBitrate;
+            wlan[*].opMode = "g(erp)";
             wlan[*].mgmt.typename = "Ieee80211MgmtStaSimplified";
             wlan[*].agent.typename = "";
             @display("p=250,300");
@@ -75,6 +77,7 @@ network FleetQoxWifiReplay
             mobility.speed = parent.mobilitySpeed;
             mobility.initialMovementHeading = 180deg;
             wlan[*].bitrate = parent.wlanBitrate;
+            wlan[*].opMode = "g(erp)";
             wlan[*].mgmt.typename = "Ieee80211MgmtStaSimplified";
             wlan[*].agent.typename = "";
             @display("p=400,300");
@@ -91,6 +94,7 @@ network FleetQoxWifiReplay
             mobility.speed = parent.mobilitySpeed;
             mobility.initialMovementHeading = 0deg;
             wlan[*].bitrate = parent.wlanBitrate;
+            wlan[*].opMode = "g(erp)";
             wlan[*].mgmt.typename = "Ieee80211MgmtStaSimplified";
             wlan[*].agent.typename = "";
             @display("p=550,300");
@@ -107,6 +111,7 @@ network FleetQoxWifiReplay
             mobility.speed = parent.mobilitySpeed;
             mobility.initialMovementHeading = (index % 2 == 0) ? 0deg : 180deg;
             wlan[*].bitrate = parent.wlanBitrate;
+            wlan[*].opMode = "g(erp)";
             wlan[*].mgmt.typename = "Ieee80211MgmtStaSimplified";
             wlan[*].agent.typename = "";
             @display("p=70+index*80,520");

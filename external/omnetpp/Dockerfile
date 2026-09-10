@@ -27,9 +27,15 @@ RUN apt-get update \
         zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
-RUN git init /opt/omnetpp \
+RUN git config --global http.version HTTP/1.1 \
+    && git config --global http.postBuffer 1048576000 \
+    && git init /opt/omnetpp \
     && git -C /opt/omnetpp remote add origin https://github.com/omnetpp/omnetpp.git \
-    && git -C /opt/omnetpp fetch --depth 1 origin "${OMNETPP_COMMIT}" \
+    && for attempt in 1 2 3 4 5; do \
+        git -C /opt/omnetpp fetch --depth 1 origin "${OMNETPP_COMMIT}" && break; \
+        echo "omnetpp fetch attempt ${attempt} failed, retrying..."; \
+        sleep 5; \
+    done \
     && git -C /opt/omnetpp checkout --detach FETCH_HEAD \
     && test "$(git -C /opt/omnetpp rev-parse HEAD)" = "${OMNETPP_COMMIT}"
 
@@ -48,7 +54,11 @@ RUN cp configure.user.dist configure.user \
 
 RUN git init /opt/inet \
     && git -C /opt/inet remote add origin https://github.com/inet-framework/inet.git \
-    && git -C /opt/inet fetch --depth 1 origin "${INET_COMMIT}" \
+    && for attempt in 1 2 3 4 5; do \
+        git -C /opt/inet fetch --depth 1 origin "${INET_COMMIT}" && break; \
+        echo "inet fetch attempt ${attempt} failed, retrying..."; \
+        sleep 5; \
+    done \
     && git -C /opt/inet checkout --detach FETCH_HEAD \
     && test "$(git -C /opt/inet rev-parse HEAD)" = "${INET_COMMIT}"
 
@@ -57,7 +67,7 @@ RUN bash -lc '. /opt/omnetpp/setenv -q \
         && . ./setenv -q \
         && opp_featuretool disable all \
         && opp_featuretool enable --with-required \
-            Ipv4 Loopback Ppp Queueing Udp Ieee80211 Mobility \
+            Ipv4 Loopback Ppp Queueing Udp Ieee80211 Mobility Ethernet \
         && make makefiles \
         && make MODE=release -j"$(nproc)"' \
     && cp -L /opt/inet/src/libINET.so /tmp/libINET.so \

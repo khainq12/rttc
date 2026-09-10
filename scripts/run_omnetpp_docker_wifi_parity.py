@@ -73,7 +73,7 @@ def compile_ns3_wifi(image: str, build_dir: Path) -> subprocess.CompletedProcess
         "g++ -std=c++17 external/ns3/fleetqox_trace_replay.cc "
         f"-o {shlex.quote(binary)} "
         "$(pkg-config --cflags --libs ns3-applications ns3-bridge ns3-core ns3-csma "
-        "ns3-internet ns3-network ns3-wifi ns3-mobility) && "
+        "ns3-internet ns3-network ns3-point-to-point ns3-wifi ns3-mobility) && "
         "printf 'FLEETQOX_NS3_VERSION=' && pkg-config --modversion ns3-core"
     )
     return docker_run(image, command, timeout=900)
