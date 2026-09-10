@@ -473,9 +473,55 @@ scope có chủ đích, xem bảng, không phải việc treo). Nhóm 6 đang b�
          thay đổi số liệu tổng thể sau fix là thật nhưng ở mức khiêm tốn,
          bị khuếch đại bởi việc nhiều case nằm sát ngưỡng 10 điểm.
 
-       - **Trạng thái**: đã tìm và sửa **3 bug cấu hình thật** trong hạ
-         tầng đối sánh (không phải giới hạn vật lý không sửa được như
-         từng kết luận nhầm ở vòng 1):
+       - **Cập nhật (10/09/2026, vòng 7) — người dùng phản bác đúng lập
+         luận "biến động RNG" ở vòng 6** (độ lệch delivery ratio 15-28%
+         quá lớn để chỉ là nhiễu), yêu cầu kiểm tra lại xem độ lệch có
+         nhất quán 1 chiều hay không. Kiểm tra trực tiếp (32 trạm, 3 seed,
+         theo từng policy) — **phát hiện quan trọng**: độ lệch **nhất
+         quán theo từng policy, không ngẫu nhiên**:
+         - `fifo`: OMNeT++ luôn giao NHIỀU hơn ns-3 (+16 đến +21 điểm, cả
+           3 seed).
+         - `static_priority`: OMNeT++ luôn giao nhiều hơn, ít hơn (+3 đến
+           +8 điểm).
+         - `fleetqox_predictive_guarded`: OMNeT++ luôn giao ÍT hơn ns-3
+           **~21 điểm, gần như y hệt ở cả 3 seed** (-20.9/-21.3/-20.8%).
+
+         Đào sâu riêng `fleetqox_predictive_guarded` (khối lượng traffic
+         `fleet_controller`→robot lớn nhất, 2892/4771 gói = 61%): log chi
+         tiết từng `event_id` gửi/nhận (kỹ thuật như đã tìm bug ARP) cho
+         thấy tỷ lệ mất gói từ `fleet_controller` tới từng robot tăng
+         **gần như tuyến tính hoàn hảo theo chỉ số robot**: robot_0000
+         mất 40% → robot_0031 mất 79%. Giả thuyết: mọi gói
+         controller→robot phải qua AP chuyển tiếp (802.11 infrastructure
+         2 chặng); trace tạo theo thứ tự robot_0000→0031 mỗi tick nên gói
+         robot_0031 luôn xếp cuối hàng đợi AP; hạn chót 45ms + kênh bận
+         → gói xếp sau dễ trễ hạn hơn.
+
+         **Kiểm chứng bằng ns-3** (cùng kỹ thuật log per-packet, thêm vào
+         bản sao riêng của `fleetqox_trace_replay.cc`, không đụng file
+         gốc): ns-3 xử lý CÙNG thứ tự trace, nhưng mẫu hình theo robot
+         **hoàn toàn khác** — không phải dốc tuyến tính mà robot_0000 bị
+         tệ nhất (89%!), rồi robot_0001-0010 trung bình (27-40%),
+         robot_0011-0031 khá tốt và nhiễu (10-25%, không xu hướng rõ).
+         Tổng loss rate ns-3 (24%) cũng thấp hơn nhiều INET (62%).
+
+         **Kết luận**: giả thuyết "thiên vị theo thứ tự enqueue ở AP" chỉ
+         đúng MỘT PHẦN — cả 2 simulator ĐỀU có thiên vị theo thứ tự gửi
+         khi tải dồn dập qua AP (xác nhận không phải nhiễu ngẫu nhiên,
+         **người dùng đúng**), nhưng **hình dạng thiên vị hoàn toàn khác
+         nhau** giữa 2 bên (INET: dốc đều; ns-3: gói đầu bị tệ nhất rồi
+         nhiễu). Đây là bằng chứng cụ thể, tái lập được, cho thấy 2 MAC
+         stack độc lập tự nhất quán RIÊNG nó nhưng không khớp NHAU khi xử
+         lý traffic dồn dập 1-nguồn/nhiều-đích qua AP — không phải 1 bug
+         cấu hình có thể sửa bằng 1 tham số (như 3 bug trước), mà là khác
+         biệt thuật toán xử lý hàng đợi/tranh chấp thật giữa 2 codebase,
+         mỗi bên viết bởi 1 nhóm khác nhau. Không tìm được cách sửa mà
+         không phải viết lại thuật toán MAC của 1 trong 2 bên (ngoài
+         phạm vi hợp lý của dự án đối sánh).
+
+       - **Trạng thái cuối cùng**: đã tìm và sửa **3 bug cấu hình thật**
+         trong hạ tầng đối sánh (không phải giới hạn vật lý không sửa
+         được như từng kết luận nhầm ở vòng 1):
          1. `PendingQueue.packetCapacity` 100 (INET) vs 500 (ns-3).
          2. `Arp.retryTimeout` 1s bị lộ do đồng bộ hóa thời gian bắt đầu
             (sửa bằng `GlobalArp`).
@@ -484,14 +530,17 @@ scope có chủ đích, xem bảng, không phải việc treo). Nhóm 6 đang b�
             hàng trăm mét (sửa bằng override vị trí đúng theo thứ tự
             ns-3 thật).
          8 trạm đạt 96% (case riêng lẻ, 3 seed) — bằng chứng rất mạnh.
-         16 trạm 59%, 32 trạm 22% (case riêng lẻ, 3 seed) — đã điều tra 2
-         giả thuyết cơ chế cụ thể cho phần "tệ đi" sau fix vị trí, cả hai
-         đều bị loại; hiểu là hiệu ứng nhạy cảm ngưỡng trên nền một khác
-         biệt còn lại khiêm tốn (~3-5 điểm miss ratio mỗi case), không
-         phải một bug lớn còn ẩn. Đã đào sâu 8 giả thuyết cơ chế MAC/PHY
-         (Nhóm vòng 1-3) + 2 giả thuyết vị trí (vòng 6) — không tìm thêm
-         được nguyên nhân cấu hình cụ thể nào khác. Đây là điểm dừng hợp
-         lý cho phiên điều tra này.
+         16 trạm 59%, 32 trạm 22% (case riêng lẻ, 3 seed) — độ lệch còn
+         lại đã được xác minh CỤ THỂ (không phải "biến động RNG" chung
+         chung): thiên vị theo thứ tự xử lý traffic dồn dập qua AP, khác
+         hình dạng giữa 2 MAC stack độc lập, tập trung nặng nhất ở policy
+         có khối lượng traffic controller→robot lớn nhất
+         (`fleetqox_predictive_guarded`). Đã kiểm chứng bằng log
+         per-packet ở cả 2 simulator (không phải suy đoán). Đây là khác
+         biệt thuật toán thật giữa 2 codebase độc lập, không phải 1 tham
+         số cấu hình sai — không tìm được cách sửa hợp lý nằm trong phạm
+         vi dự án đối sánh (sửa sẽ cần viết lại 1 phần thuật toán MAC của
+         INET hoặc ns-3).
   2. **Soak dài hạn**: đã có `run_heap_soak_asan_probe.py`/
      `run_heap_soak_fleet_asan_probe.py` (lặp nhiều "round" ngắn, không
      phải 1 lần chạy liên tục dài) và
