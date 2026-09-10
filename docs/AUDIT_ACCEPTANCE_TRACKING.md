@@ -367,16 +367,104 @@ scope có chủ đích, xem bảng, không phải việc treo). Nhóm 6 đang b�
          (CW/retry/preamble/slot/SIFS/TX-power/error-model) và không tìm
          thêm được nguyên nhân cấu hình nào khác.
 
-       - **Kết luận cuối cùng**: mục "đối sánh wifi" **đóng hoàn toàn ở
-         tải nhẹ** (8 trạm/1 AP — 100% nhóm kịch bản khớp trên trung bình
-         10 seed, bằng chứng mạnh), **đóng một phần ở tải vừa** (16 trạm —
-         56% nhóm khớp, phần chưa đạt là chênh lệch nhỏ-vừa không phải
-         phân kỳ lớn), **đạt một phần ở tải cực đại** (32 trạm — 33% nhóm
-         khớp, còn khoảng cách thật ở delivery ratio chưa tìm được nguyên
-         nhân cấu hình cụ thể sau khi đã thử 8 giả thuyết khác nhau, có
-         khả năng là giới hạn RNG-stream giữa 2 codebase độc lập).
-         `ns3_omnetpp_wifi_parity_claim` trong summary JSON phản ánh đúng
-         theo từng case, không có claim tổng quát che giấu phần chưa đạt.
+       - **Cập nhật (10/09/2026, vòng 5) — tìm ra bug thứ 3, nghiêm trọng
+         hơn 2 bug trước, theo yêu cầu người dùng tiếp tục điều tra sau khi
+         vẫn tin có nguyên nhân cụ thể:**
+
+         Muốn kiểm chứng gap ở tải cao có phải do sai lệch **thứ tự gán vị
+         trí lưới** hay không (`.ned` gán `controller=index0,
+         fleetRouter=index1, operatorUi=index2, robot[i]=index(i+3)` theo
+         giả định cố định, còn ns-3 gán theo **thứ tự lần đầu gặp mỗi
+         endpoint khi quét CSV** — đã ghi chú là giới hạn scope biết trước
+         nhưng chưa từng kiểm chứng tác động thật). Viết script Python tính
+         đúng thứ tự này cho từng trace cụ thể (không theo công thức đơn
+         giản — có seed mà `robot_0011` xuất hiện trước `robot_0010`) rồi
+         truyền vị trí chính xác vào OMNeT++ qua CLI override.
+
+         **Phát hiện khi test**: override hoàn toàn không có tác dụng — dời
+         `robot[0]` ra xa 999999m, kết quả không đổi 1 bit! Nguyên nhân:
+         `LinearMobility` có tham số `initFromDisplayString = default(true)`
+         — khi `true` (mặc định), module **bỏ qua hoàn toàn** tham số NED
+         `initialX`/`initialY` và lấy vị trí từ chuỗi `@display("p=X,Y")`
+         tĩnh trên canvas thay vào đó. Thêm bug nghiêm trọng hơn: biểu thức
+         `"p=70+index*80,520"` trong `@display` string **không được tính
+         toán** khi dùng làm nguồn vị trí runtime (chỉ được trình vẽ GUI
+         hiểu, không phải logic gán vị trí lúc mô phỏng) — kết quả: **toàn
+         bộ robot (0-15 ở case 16 trạm) đã ở CÙNG MỘT ĐIỂM (x=70,y=520)
+         suốt từ đầu**, còn `fleet_controller/fleet_router/operator_ui` ở
+         cách nhau **hàng trăm mét** (250,300 / 400,300 / 550,300 — đơn vị
+         pixel bị hiểu nhầm thành mét) — sai lệch vị trí nghiêm trọng hơn
+         nhiều so với chỉ "sai thứ tự" ban đầu nghĩ.
+
+         **Sửa**: thêm `mobility.initFromDisplayString = false;` cho cả 4
+         loại host (controller/fleetRouter/operatorUi/robot[]), bọc các
+         gán `initialX/initialY/initialMovementHeading` trong `default(...)`
+         để có thể ghi đè qua CLI, và cập nhật
+         `run_omnetpp_docker_wifi_parity.py` để tính đúng thứ tự ns-3 (hàm
+         `ns3_encounter_order`) rồi truyền vị trí chính xác
+         (`ns3_style_positions` + `_position_override_flags`) cho từng
+         case. Đã xác minh override hoạt động thật (test dời xa trong giới
+         hạn constraint area → rx giảm mạnh như mong đợi).
+
+         **Kết quả sau khi thêm fix này (3 seed, cộng với 2 fix trước —
+         hàng đợi + ARP):**
+
+         | Quy mô | Trước fix vị trí | Sau fix vị trí |
+         |---|---|---|
+         | 8 trạm | 78% | **96%** ⬆️ tốt hơn nữa |
+         | 16 trạm | 70% | 59% ⬇️ tệ hơn |
+         | 32 trạm | 26% | 22% ⬇️ tệ hơn |
+
+         **Bất ngờ**: dù đây là bug thật (đã xác minh chắc chắn bằng
+         thực nghiệm, không phải suy đoán) và bản sửa khớp đúng với cách
+         ns-3 thực sự cài đặt (đọc lại code `fleetqox_trace_replay.cc`
+         xác nhận: ns-3 đặt TẤT CẢ node — kể cả controller/router/ui —
+         lên cùng 1 lưới chung qua `GridPositionAllocator`, không tách
+         biệt như `.ned` cũ của tôi từng làm), việc sửa "đúng hơn" lại
+         không cải thiện đều — tốt hơn ở 8 trạm, tệ hơn ở 16/32 trạm.
+         Đào sâu chi tiết theo từng case (16 trạm, 3 seed): vấn đề tập
+         trung ở kịch bản `stationary_near` (khoảng cách 2m — sít nhất
+         trong 3 kịch bản) — miss ratio OMNeT++ giờ **nhất quán** cao hơn
+         ns-3 vài điểm đến vài chục điểm ở mọi seed (khác trước đây là
+         "lúc hơn lúc kém tùy seed"); `mobile_moderate`/`mobile_edge`
+         (spacing 3m/5m) thì vẫn khớp tốt.
+
+         Kiểm tra thêm 1 tầng sâu hơn: `FreeSpacePathLoss::
+         computeFreeSpacePathLoss` (model suy hao mặc định của INET) có xử
+         lý đặc biệt tại khoảng cách 0: `return distance == 0.0 ? 1.0 :
+         ...` — nghĩa là ở bug cũ (robot chồng lên nhau, d=0), suy hao được
+         tính bằng 0 (tín hiệu neighbor-to-neighbor tới với cường độ tối
+         đa), không phải "không nhiễu" như giả thuyết ban đầu. Nhưng vì
+         robot không gửi trực tiếp cho nhau trong mô hình luồng dữ liệu
+         (chỉ gửi tới `fleet_router`), yếu tố quyết định thực ra là khoảng
+         cách **từng robot → `fleet_router`** chứ không phải robot-robot;
+         ở bug cũ mọi robot cách `fleet_router` **CÙNG một khoảng cách**
+         (vì trùng điểm) — một kiểu nhiễu đồng nhất giả tạo; sau khi sửa,
+         khoảng cách này khác nhau thật cho từng robot, tạo ra mẫu hình
+         nhiễu phức tạp hơn nhiều, khó dự đoán chiều ảnh hưởng chỉ bằng suy
+         luận. Đây là hiệu ứng bậc 3 (hệ quả của việc sửa đúng 1 bug thật),
+         không phải bug độc lập mới — cần điều tra thêm để hiểu đầy đủ,
+         **chưa kết luận được** tại đây.
+
+         **Fix vị trí này đã được giữ lại** (đúng về mặt kỹ thuật, khớp
+         thật với cách ns-3 vận hành) dù chưa cải thiện đều số liệu —
+         không revert một bug fix đã xác minh đúng chỉ vì nó chưa cải
+         thiện 1 chỉ số cụ thể; cần điều tra thêm về mẫu hình nhiễu mới ở
+         `stationary_near` trước khi có kết luận cuối cùng.
+
+       - **Trạng thái tại đây (chưa phải kết luận cuối)**: đã tìm và sửa
+         **3 bug cấu hình thật** trong hạ tầng đối sánh (không phải giới
+         hạn vật lý không sửa được như từng kết luận nhầm ở vòng 1):
+         1. `PendingQueue.packetCapacity` 100 (INET) vs 500 (ns-3).
+         2. `Arp.retryTimeout` 1s bị lộ do đồng bộ hóa thời gian bắt đầu
+            (sửa bằng `GlobalArp`).
+         3. `LinearMobility.initFromDisplayString` khiến toàn bộ robot bị
+            chồng lên nhau tại 1 điểm, còn controller/router/ui cách xa
+            hàng trăm mét (sửa bằng override vị trí đúng theo thứ tự
+            ns-3 thật).
+         8 trạm giờ đạt 96% (case riêng lẻ, 3 seed) — bằng chứng rất mạnh.
+         16/32 trạm còn một mẫu hình nhiễu mới ở `stationary_near` cần
+         điều tra thêm trước khi kết luận cuối cùng cho các quy mô này.
   2. **Soak dài hạn**: đã có `run_heap_soak_asan_probe.py`/
      `run_heap_soak_fleet_asan_probe.py` (lặp nhiều "round" ngắn, không
      phải 1 lần chạy liên tục dài) và

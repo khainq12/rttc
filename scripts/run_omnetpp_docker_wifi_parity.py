@@ -250,6 +250,74 @@ _WIFI_MODE_BPS = {
 }
 
 
+def ns3_encounter_order(trace: Path) -> list[str]:
+    """Replicate ns-3's g_endpointToNode assignment: each endpoint gets the
+    next free index the first time it appears as a src or dst while scanning
+    the CSV top to bottom (external/ns3/fleetqox_trace_replay.cc LoadTrace).
+    This order is NOT a simple formula (it depends on flow/policy generation
+    order inside the trace), so it has to be computed from the actual file.
+    """
+    import csv
+
+    order: list[str] = []
+    seen: set[str] = set()
+    with trace.open(newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            for endpoint in (row["src"], row["dst"]):
+                if endpoint not in seen:
+                    seen.add(endpoint)
+                    order.append(endpoint)
+    return order
+
+
+def ns3_style_positions(
+    order: list[str], station_spacing: float, mobility_speed: float
+) -> dict[str, dict[str, float]]:
+    """Mirror the ns-3 wifi (non-roaming) GridPositionAllocator +
+    ConstantVelocityMobilityModel setup exactly: grid width from the total
+    node count, row-major placement, heading alternating by node-index
+    parity. See fleetqox_trace_replay.cc's non-roaming wifi branch.
+    """
+    import math
+
+    grid_width = max(1, math.ceil(math.sqrt(len(order))))
+    positions: dict[str, dict[str, float]] = {}
+    for i, endpoint in enumerate(order):
+        heading_deg = 0.0 if i % 2 == 0 else 180.0
+        positions[endpoint] = {
+            "x": (i % grid_width) * station_spacing,
+            "y": (i // grid_width) * station_spacing,
+            "heading_deg": heading_deg,
+        }
+    return positions
+
+
+def _position_override_flags(
+    trace: Path, station_spacing: float, mobility_speed: float
+) -> str:
+    order = ns3_encounter_order(trace)
+    positions = ns3_style_positions(order, station_spacing, mobility_speed)
+    name_to_module = {
+        "fleet_controller": "controller",
+        "fleet_router": "fleetRouter",
+        "operator_ui": "operatorUi",
+    }
+    flags: list[str] = []
+    for endpoint, pos in positions.items():
+        if endpoint in name_to_module:
+            module = name_to_module[endpoint]
+        elif endpoint.startswith("robot_"):
+            module = f"robot[{int(endpoint.split('_', 1)[1])}]"
+        else:
+            continue
+        flags.append(f"--*.{module}.mobility.initialX={pos['x']:.12g}m")
+        flags.append(f"--*.{module}.mobility.initialY={pos['y']:.12g}m")
+        flags.append(
+            f"--*.{module}.mobility.initialMovementHeading={pos['heading_deg']:.12g}deg"
+        )
+    return " ".join(flags)
+
+
 def run_omnetpp_case(
     *,
     image: str,
@@ -267,6 +335,9 @@ def run_omnetpp_case(
     )
     trace_flag = shlex.quote('--*.traceFile="' + _container_path(trace) + '"')
     bitrate_bps = _WIFI_MODE_BPS[scenario["wifi_mode"]]
+    position_flags = _position_override_flags(
+        trace, float(scenario["station_spacing"]), float(scenario["mobility_speed"])
+    )
     command = (
         f"cd {shlex.quote(_container_path(build_dir))} && "
         "opp_run_release -u Cmdenv "
@@ -276,6 +347,7 @@ def run_omnetpp_case(
         f"--*.numRobots={robots} "
         f"{trace_flag} "
         f"--*.wlanBitrate={bitrate_bps}bps "
+        f"{position_flags} "
         f"--*.stationSpacing={scenario['station_spacing']}m "
         f"--*.mobilitySpeed={scenario['mobility_speed']}mps "
         f"--*.startOffset={WIFI_WARMUP_MS / 1000.0:.12g}s "
