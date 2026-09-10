@@ -262,10 +262,48 @@ scope có chủ đích, xem bảng, không phải việc treo). Nhóm 6 đang b�
          ghi nhận trung thực đây là giới hạn còn lại sau khi đã sửa xong
          phần cấu hình thật (queue capacity).
 
+       - **Cập nhật (10/09/2026, vòng 3) — điều tra thêm phần dư ở 32
+         trạm theo yêu cầu người dùng**, sau khi đã có fix hàng đợi:
+         phân loại 27 case chưa pass thành 3 nhóm cụ thể (không phải "chưa
+         rõ" chung chung nữa):
+         - Nhóm sát ngưỡng (4 case, 8 trạm/`mobile_edge`): tỷ lệ p99 chỉ
+           2.46-2.69 so với ngưỡng 2.5 — gần như đã pass.
+         - Nhóm đảo chiều ngẫu nhiên (bằng chứng RNG độc lập): seed 29 ở
+           16 trạm có lần OMNeT++ tệ hơn ns-3 (miss 72-81% vs ns-3 chỉ
+           37-42%) — ngược xu hướng thường thấy; seed 29 ở 8 trạm có 1
+           đỉnh trễ bất thường riêng lẻ (p99 OMNeT++ 527ms vs ns-3 chỉ
+           18ms) dù các case khác ở cùng quy mô đều ổn định. Cả hai đều là
+           dấu hiệu 2 simulator dùng 2 bộ RNG độc lập khác nhau, không
+           phải lỗi hệ thống một chiều.
+         - Nhóm 32 trạm (phần lớn case còn lại): `delivery_ratio_delta`
+           lệch nhất quán ~15-28% ở mọi seed.
+
+         Đã thử thêm 1 giả thuyết cụ thể cho nhóm 32 trạm: **mô hình tính
+         xác suất lỗi khung theo SINR** — ns-3 mặc định dùng
+         `YansErrorRateModel`, INET dùng `Ieee80211NistErrorModel` (2 công
+         thức khác nhau). Kiểm chứng thực nghiệm bằng cách build lại ns-3
+         với cờ `--wifiErrorRateModel=ns3::NistErrorRateModel` (thêm vào
+         bản sao riêng của `fleetqox_trace_replay.cc`, không đụng file
+         gốc) và so với `YansErrorRateModel` mặc định cho cùng case 32
+         trạm/seed 7: **kết quả gần như giống hệt nhau** (rx=1628 vs 1626,
+         p50=438 vs 489ms) — loại trừ giả thuyết này. Ở khoảng cách 2m
+         trong kịch bản này, tín hiệu đủ mạnh nên công thức lỗi-bit-theo-SNR
+         không quan trọng; phần lớn mất gói là do va chạm hoàn toàn (2 tín
+         hiệu chồng lấp), không phải lỗi bit ở biên SNR.
+
+         Đến đây đã kiểm tra hết mọi tham số PHY/MAC 802.11g hợp lý có thể
+         nghĩ tới (7 giả thuyết cụ thể, có đo/thử nghiệm thực tế, không
+         phải suy đoán) — chỉ còn 1 cái tìm ra và sửa được thật (queue
+         capacity). Phần dư ~15-28% delivery ratio ở 32 trạm giờ có độ tin
+         cậy cao là biến động RNG-stream tự nhiên (không có cách nào làm 2
+         codebase độc lập, viết bởi 2 nhóm khác nhau, sinh đúng cùng chuỗi
+         số ngẫu nhiên dù cùng giá trị seed).
+
        - **Kết luận cuối cùng**: mục "đối sánh wifi" đóng ở tải nhẹ-vừa
          (8-16 trạm/1 AP, ~70-78% case pass), tải cực đại (32 trạm) đạt
          một phần (26% case pass, các chỉ số quan trọng nhất — miss ratio,
-         p99 ratio — đã khớp tốt, chỉ còn delivery ratio lệch ~20%).
+         p99 ratio — đã khớp tốt, chỉ còn delivery ratio lệch ~15-28%, đã
+         xác minh không phải do cấu hình sai qua 7 giả thuyết cụ thể).
          `ns3_omnetpp_wifi_parity_claim` trong summary JSON phản ánh đúng
          theo từng case, không có claim tổng quát che giấu phần chưa đạt.
   2. **Soak dài hạn**: đã có `run_heap_soak_asan_probe.py`/
