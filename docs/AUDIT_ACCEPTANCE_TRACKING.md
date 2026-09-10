@@ -17,7 +17,7 @@ Trạng thái tại thời điểm kiểm tra gốc (07/09/2026): **0/6 nhóm đ
 | 3 | QUIC/PKI và HA/fencing (online rotation, live revocation, ma trận phân vùng không split-brain, failover/failback đa host, durable state) | Đạt phần lớn (thiếu đa host) | ✅ **Đã đóng** | HA multi-host (Raft + etcd/PostgreSQL, failover + failback) làm ở phiên trước (2 VM KVM thật). PKI cert/CA rotation multi-host (CRL revocation + CA rotation thật, không phải chỉ thêm CA) làm phiên này: `scripts/run_multihost_kvm_udp_peer_auth_crl_reload_probe.py`, 4/4 round pass. Commit `65b7100`. Lưu ý nhỏ: "ma trận phân vùng" mới test một số kịch bản tiêu biểu, chưa phải toàn bộ tổ hợp. |
 | 4 | Ngữ nghĩa RMW (full QoS event, full DDS content-filter dialect, deep preallocation) | Đạt một phần | ✅ **Đã đóng** | Dynamic message, nhiều QoS extension (liveliness, deadline, lifespan, destination_order, ownership, partition, presentation) đã xong. **Task #42 (content-filter dialect) đã đóng**: thêm `LIKE ... ESCAPE`, 3/3 pass (`run_rmw_docker_content_filter_sql_probe.py`), và đã ra quyết định phạm vi chính thức — subset hiện tại là ranh giới cuối cùng. **Task #43 (deep_preallocation_claim) đã đóng phần lớn hơn dự kiến**: thay vì redesign wire-format nhị phân (rủi ro cao, ban đầu định hỏi ý kiến), tìm được cách an toàn hơn — verify `snprintf("%.6g",...)` giống hệt định dạng double của `ostringstream` (400k+ giá trị test), rồi build JSON frame body thẳng vào buffer bền vững (`frame_json_scratch`) thay vì `ostringstream` mới mỗi lần, và pool hoá entry trong retransmit ledger (`g_retired_retransmit_entries`) — không đổi 1 byte nào trên wire, không ảnh hưởng 187 probe khác. Verify bằng A/B rebuild (git stash) xác nhận 2 lỗi flaky có sẵn (`rmw_wait_for_all_acked_probe`, `remote_wait_for_all_acked_probe`) tái hiện y hệt ở cả code cũ và mới → không phải regression. `deep_preallocation_claim` vẫn giữ `false` (đúng): phần message deserialization và ledger hash-map node allocation vẫn chưa pool hoá, và binary wire format vẫn là ranh giới scope có chủ đích, không phải việc treo. |
 | 5 | Nav2, Open-RMF, đa host, HIL | Đạt một phần | ❌ **Chưa làm** | Nav2 đã có bằng chứng chạy thực tế (từ trước). Open-RMF chưa phải full upstream stack; chưa có bằng chứng đa host/HIL cho workload tự hành. |
-| 6 | Đối sánh mô phỏng (ns-3/OMNeT++), soak dài hạn, bằng chứng phát hành qua CI | Đạt một phần | 🟡 **Đang làm** | Xem mục "Nhóm 6" bên dưới. Đối sánh ns-3/OMNeT++ Wi-Fi: tìm ra + sửa nguyên nhân thật (INET PendingQueue mặc định 100 gói vs ns-3 WifiMacQueue 500 gói) + sửa cách so sánh p99 sang tỷ lệ tương đối — 8/16 trạm đạt 70-78% case, 32 trạm đạt 26% case (miss-ratio/p99 đã khớp tốt, delivery ratio còn lệch ~20%, có thể là biến động RNG tự nhiên). CI: đã xác minh chạy thật pass qua GitHub API. Soak dài hạn: chưa làm. |
+| 6 | Đối sánh mô phỏng (ns-3/OMNeT++), soak dài hạn, bằng chứng phát hành qua CI | Đạt một phần | 🟡 **Đang làm** | Xem mục "Nhóm 6" bên dưới. Đối sánh ns-3/OMNeT++ Wi-Fi: tìm + sửa 2 bug thật (INET PendingQueue 100 vs ns-3 500 gói; INET Arp retryTimeout 1s bị lộ do đồng bộ start-time) + sửa cách so sánh p99 sang tỷ lệ tương đối. Kết quả 10-seed: **8 trạm = 100% nhóm kịch bản khớp** (trung bình), 16 trạm 56%, 32 trạm 33% (còn khoảng cách thật ở delivery ratio, đã thử 8 giả thuyết không tìm thêm được nguyên nhân). CI: đã xác minh chạy thật pass qua GitHub API. Soak dài hạn: chưa làm. |
 
 **Tóm lại: 4/6 nhóm đã đóng (1, 2, 3, 4 — nhóm 4 vẫn còn vài ranh giới
 scope có chủ đích, xem bảng, không phải việc treo). Nhóm 6 đang bắt đầu
@@ -299,11 +299,82 @@ scope có chủ đích, xem bảng, không phải việc treo). Nhóm 6 đang b�
          codebase độc lập, viết bởi 2 nhóm khác nhau, sinh đúng cùng chuỗi
          số ngẫu nhiên dù cùng giá trị seed).
 
-       - **Kết luận cuối cùng**: mục "đối sánh wifi" đóng ở tải nhẹ-vừa
-         (8-16 trạm/1 AP, ~70-78% case pass), tải cực đại (32 trạm) đạt
-         một phần (26% case pass, các chỉ số quan trọng nhất — miss ratio,
-         p99 ratio — đã khớp tốt, chỉ còn delivery ratio lệch ~15-28%, đã
-         xác minh không phải do cấu hình sai qua 7 giả thuyết cụ thể).
+       - **Cập nhật (10/09/2026, vòng 4) — mở rộng lên 10 seed (7, 13, 29,
+         41, 53, 67, 79, 89, 97, 101) theo yêu cầu người dùng để đánh giá
+         đúng hơn (3 seed là mẫu nhỏ với một quá trình có yếu tố ngẫu
+         nhiên) và tìm ra thêm 1 bug thật:**
+
+         Pass theo từng case riêng lẻ với 10 seed (90 case/quy mô): 8 trạm
+         77%, 16 trạm 60%, 32 trạm 27% — gần khớp với số liệu 3-seed
+         trước đó, xác nhận 3 seed ban đầu **không phải mẫu xui**, số liệu
+         đại diện đúng. Pass theo **trung bình gộp 10 seed** (9 nhóm
+         kịch bản×chính sách mỗi quy mô) thậm chí KHÔNG cao hơn (33%,
+         56%, 33%) — nghĩa là phần lệch còn lại không đơn thuần là nhiễu
+         ngẫu nhiên tự triệt tiêu qua trung bình, mà có phần hệ thống thật.
+
+         Đào sâu cụ thể vào nhóm `8 trạm/stationary_near` (nhóm có vẻ
+         "khớp gần hoàn hảo" nhưng tỷ lệ p99 trung bình lại tới 3.7-7.2x):
+         xem từng seed riêng lẻ phát hiện **8/10 seed khớp gần tuyệt đối
+         (tỷ lệ p99 1.0-1.14x) nhưng 2 seed (29, 89) có đỉnh trễ bất
+         thường cực lớn (tỷ lệ 19.65x và 29.94x)** — không phải lệch dàn
+         trải mà là 1 sự kiện hiếm, cụ thể. Thêm log chẩn đoán tạm thời
+         vào bản sao riêng của `TraceDrivenUdpApp.cc` (không đụng file
+         gốc) để in ra gói nào gây trễ >100ms cho case seed 29: **toàn bộ
+         61 gói outlier đều là từ `robot_0002` đến `fleet_router`** — gói
+         đầu tiên (lịch gửi lúc 40ms) trễ tới 1010ms, các gói tiếp theo
+         cùng cặp nguồn-đích "dồn ứ" phía sau rồi giải phóng đồng loạt tại
+         cùng 1 mốc thời gian tuyệt đối (~1050ms) — dấu hiệu kinh điển của
+         head-of-line blocking do 1 gói bị kẹt.
+
+         **Tìm ra nguyên nhân**: độ trễ ~1000ms khớp chính xác với
+         `retryTimeout = default(1s)` của module `Arp` trong INET
+         (`src/inet/networklayer/arp/ipv4/Arp.ned`). Do tất cả trạm bắt
+         đầu phát lại trace tại đúng cùng 1 mốc `startOffset` (đã ghi chú
+         ở trên về `sameTransmissionStartTimeCheck`), các gói ARP quảng bá
+         từ nhiều trạm có xác suất va chạm với nhau cao bất thường tại
+         đúng thời điểm đó — một hệ quả nhân tạo của việc đồng bộ hóa thời
+         gian bắt đầu phát lại có chủ đích (không phải hiện tượng thật của
+         mạng thật), không phải do OMNeT++ hay ns-3 mô phỏng sai. Khi ARP
+         đầu tiên bị mất, `robot_0002` phải đợi đủ 1s mới thử lại — toàn bộ
+         gói ứng dụng xếp hàng chờ phía sau trong lúc đó.
+
+         **Sửa**: đổi `**.arp.typename = "GlobalArp"` (phân giải địa chỉ
+         không cần trao đổi gói tin, không có gì để va chạm) thay cho
+         `Arp` mặc định — hợp lý vì mục tiêu là so sánh công bằng hành vi
+         MAC/PHY 802.11, không phải so sánh 2 cơ chế ARP retry khác nhau
+         (ns-3 không thể hiện artifact này vì việc phân giải địa chỉ của
+         nó không nằm trong phần workload được replay). Test riêng seed 29
+         xác nhận: outlier biến mất hoàn toàn (0 gói >100ms), p99 giảm từ
+         314-527ms xuống 13-18ms, miss ratio về 0%.
+
+         **Kết quả full matrix (10 seed) sau khi thêm fix GlobalArp:**
+
+         | Quy mô | Trước GlobalArp | Sau GlobalArp |
+         |---|---|---|
+         | 8 trạm (case riêng lẻ) | 69/90 (77%) | **79/90 (88%)** |
+         | 16 trạm (case riêng lẻ) | 54/90 (60%) | **60/90 (67%)** |
+         | 32 trạm (case riêng lẻ) | 24/90 (27%) | **28/90 (31%)** |
+         | 8 trạm (trung bình 10 seed, theo nhóm) | 3/9 (33%) | **9/9 (100%)** |
+         | 16 trạm (trung bình 10 seed, theo nhóm) | 5/9 (56%) | 5/9 (56%) |
+         | 32 trạm (trung bình 10 seed, theo nhóm) | 3/9 (33%) | 3/9 (33%) |
+
+         Tải nhẹ (8 trạm) giờ đạt **parity hoàn toàn trên trung bình 10
+         seed** — kết quả rất mạnh. 16 trạm còn 4/9 nhóm chưa đạt, tập
+         trung ở `stationary_near` (miss ratio lệch ~16-17 điểm, tương đối
+         nhỏ nhưng nhất quán) và `mobile_edge/static_priority`. 32 trạm
+         còn 6/9 nhóm chưa đạt, tập trung ở `delivery_ratio` lệch ~11-26%
+         trên phần lớn tổ hợp tải cao — đã kiểm tra 7 giả thuyết cụ thể
+         (CW/retry/preamble/slot/SIFS/TX-power/error-model) và không tìm
+         thêm được nguyên nhân cấu hình nào khác.
+
+       - **Kết luận cuối cùng**: mục "đối sánh wifi" **đóng hoàn toàn ở
+         tải nhẹ** (8 trạm/1 AP — 100% nhóm kịch bản khớp trên trung bình
+         10 seed, bằng chứng mạnh), **đóng một phần ở tải vừa** (16 trạm —
+         56% nhóm khớp, phần chưa đạt là chênh lệch nhỏ-vừa không phải
+         phân kỳ lớn), **đạt một phần ở tải cực đại** (32 trạm — 33% nhóm
+         khớp, còn khoảng cách thật ở delivery ratio chưa tìm được nguyên
+         nhân cấu hình cụ thể sau khi đã thử 8 giả thuyết khác nhau, có
+         khả năng là giới hạn RNG-stream giữa 2 codebase độc lập).
          `ns3_omnetpp_wifi_parity_claim` trong summary JSON phản ánh đúng
          theo từng case, không có claim tổng quát che giấu phần chưa đạt.
   2. **Soak dài hạn**: đã có `run_heap_soak_asan_probe.py`/
