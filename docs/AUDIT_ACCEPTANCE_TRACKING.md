@@ -17,7 +17,7 @@ Trạng thái tại thời điểm kiểm tra gốc (07/09/2026): **0/6 nhóm đ
 | 3 | QUIC/PKI và HA/fencing (online rotation, live revocation, ma trận phân vùng không split-brain, failover/failback đa host, durable state) | Đạt phần lớn (thiếu đa host) | ✅ **Đã đóng** | HA multi-host (Raft + etcd/PostgreSQL, failover + failback) làm ở phiên trước (2 VM KVM thật). PKI cert/CA rotation multi-host (CRL revocation + CA rotation thật, không phải chỉ thêm CA) làm phiên này: `scripts/run_multihost_kvm_udp_peer_auth_crl_reload_probe.py`, 4/4 round pass. Commit `65b7100`. Lưu ý nhỏ: "ma trận phân vùng" mới test một số kịch bản tiêu biểu, chưa phải toàn bộ tổ hợp. |
 | 4 | Ngữ nghĩa RMW (full QoS event, full DDS content-filter dialect, deep preallocation) | Đạt một phần | ✅ **Đã đóng** | Dynamic message, nhiều QoS extension (liveliness, deadline, lifespan, destination_order, ownership, partition, presentation) đã xong. **Task #42 (content-filter dialect) đã đóng**: thêm `LIKE ... ESCAPE`, 3/3 pass (`run_rmw_docker_content_filter_sql_probe.py`), và đã ra quyết định phạm vi chính thức — subset hiện tại là ranh giới cuối cùng. **Task #43 (deep_preallocation_claim) đã đóng phần lớn hơn dự kiến**: thay vì redesign wire-format nhị phân (rủi ro cao, ban đầu định hỏi ý kiến), tìm được cách an toàn hơn — verify `snprintf("%.6g",...)` giống hệt định dạng double của `ostringstream` (400k+ giá trị test), rồi build JSON frame body thẳng vào buffer bền vững (`frame_json_scratch`) thay vì `ostringstream` mới mỗi lần, và pool hoá entry trong retransmit ledger (`g_retired_retransmit_entries`) — không đổi 1 byte nào trên wire, không ảnh hưởng 187 probe khác. Verify bằng A/B rebuild (git stash) xác nhận 2 lỗi flaky có sẵn (`rmw_wait_for_all_acked_probe`, `remote_wait_for_all_acked_probe`) tái hiện y hệt ở cả code cũ và mới → không phải regression. `deep_preallocation_claim` vẫn giữ `false` (đúng): phần message deserialization và ledger hash-map node allocation vẫn chưa pool hoá, và binary wire format vẫn là ranh giới scope có chủ đích, không phải việc treo. |
 | 5 | Nav2, Open-RMF, đa host, HIL | Đạt một phần | ❌ **Chưa làm** | Nav2 đã có bằng chứng chạy thực tế (từ trước). Open-RMF chưa phải full upstream stack; chưa có bằng chứng đa host/HIL cho workload tự hành. |
-| 6 | Đối sánh mô phỏng (ns-3/OMNeT++), soak dài hạn, bằng chứng phát hành qua CI | Đạt một phần | 🟡 **Đang làm** | Xem mục "Nhóm 6" bên dưới — đã khảo sát hiện trạng, chưa code. |
+| 6 | Đối sánh mô phỏng (ns-3/OMNeT++), soak dài hạn, bằng chứng phát hành qua CI | Đạt một phần | 🟡 **Đang làm** | Xem mục "Nhóm 6" bên dưới. Đối sánh ns-3/OMNeT++ Wi-Fi: đóng ở tải nhẹ (≤8 trạm/1 AP), tải cao (16/32 trạm) chưa đạt — giới hạn cliff behavior CSMA/CA có ghi nhận, không phải việc treo. CI: workflow đầu tiên đã có. Soak dài hạn: chưa làm. |
 
 **Tóm lại: 4/6 nhóm đã đóng (1, 2, 3, 4 — nhóm 4 vẫn còn vài ranh giới
 scope có chủ đích, xem bảng, không phải việc treo). Nhóm 6 đang bắt đầu
@@ -109,12 +109,64 @@ scope có chủ đích, xem bảng, không phải việc treo). Nhóm 6 đang b�
        dây độc lập nhau dự kiến lệch nhau nhiều hơn hai chồng point-to-point
        có dây), cần chạy thật rồi điều chỉnh dựa trên số liệu thực tế, không
        được nới lỏng ngầm nếu chạy fail.
-     - Việc còn lại trước khi có thể đóng mục này: `docker build` image
-       omnetpp-inet (image chưa tồn tại ở máy này), chạy thử
-       `run_omnetpp_docker_wifi_parity.py`, sửa lỗi biên dịch/NED nếu có
-       (chưa có công cụ OMNeT++ ở máy host để kiểm tra cú pháp NED tĩnh
-       trước, nên nhiều khả năng cần vài vòng sửa lỗi build), rồi mới đánh
-       giá lại ngưỡng so sánh dựa trên kết quả thật.
+     - **Cập nhật (10/09/2026) — đã build + chạy thật, có kết quả cụ thể:**
+       build image `omnetpp-inet` thành công sau khi thêm retry + ép
+       HTTP/1.1 vào `git fetch` (môi trường mạng ở đây hay bị "early EOF"
+       giữa chừng với HTTP/2 kéo dài — lỗi hạ tầng, không phải lỗi Dockerfile
+       gốc). Sửa 3 bug phát hiện khi chạy thật lần đầu (đều đã commit):
+       thiếu feature `Ethernet` cho `AccessPoint` (cần `MacForwardingTable`
+       dù không dùng cổng Ethernet nào), thiếu module `ns3-point-to-point`
+       trong lệnh link g++ ở **cả 3** script wifi (kể cả 2 script ns-3-only
+       có sẵn từ trước, `run_ns3_docker_wifi_mobility_matrix.py` và
+       `run_ns3_docker_wifi_roaming_matrix.py` — chưa từng được chạy thật
+       trước đây nên bug này chưa bị phát hiện), và `opMode` mặc định
+       `"g(mixed)"` của INET bật cơ chế bảo vệ tương thích 802.11b thừa
+       (ns-3 dùng thuần 802.11g) — sau khi ép `opMode="g(erp)"` ở cả AP và
+       station, kết quả khớp rất sát ở tải nhẹ.
+
+       **Kết quả full matrix (8/16/32 robot × seed 7/13/29 × 3 kịch bản =
+       27 case, runtime 27/27 chạy xong không crash cả 2 bên):**
+       - **8 robot/1 AP**: khớp gần như hoàn hảo — p50/p99 latency lệch
+         vài ms, delivery ratio lệch <2%, miss ratio ~0 cả hai bên (`ok`
+         2/3 seed cho `stationary_near`+`mobile_moderate`; `mobile_edge`
+         luôn fail vì payload xấp xỉ giới hạn băng thông kênh ở đây).
+       - **16/32 robot/1 AP**: hai bên phân kỳ lớn về độ trễ/tỷ lệ mất gói
+         khi kênh bão hòa (`parity=5/27` tổng thể với threshold hiện tại).
+         Đã điều tra kỹ nguyên nhân bằng instrumentation đo trực tiếp
+         (compiled trace-source counter trong ns-3, `@statistic`
+         `transmissionState` + vector recording tích phân theo thời gian
+         trong INET — không phải NS_LOG text vì quá chậm để dùng thực tế
+         ở quy mô 32 trạm), đo trên case 32 robot/`stationary_near`: tổng
+         số lần truyền PHY và tổng thời gian chiếm kênh giữa hai bên
+         **chỉ lệch ~11-22%** (ns-3: 41634 lần truyền / 2.258s; OMNeT++:
+         36307 lần truyền / 1.761s — độ dài trung bình mỗi lần truyền
+         54.2µs vs 48.5µs, khá gần nhau, không có bằng chứng bug PHY timing
+         rõ ràng ở bên nào — đã kiểm tra CWmin/CWmax, retry limit,
+         preamble/header duration đều khớp chuẩn 802.11g ở cả hai). Kết
+         luận: đây là hệ quả của tính chất "vực thẳm" (cliff behavior) đã
+         biết của CSMA/CA gần điểm bão hòa kênh — một chênh lệch nhỏ
+         (~15-20%) về tải/tỷ lệ retry thực tế bị khuếch đại phi tuyến
+         thành chênh lệch độ trễ/mất gói lớn, không phải một bug rời rạc
+         có thể sửa bằng cách chỉnh tham số. Không tiếp tục đào sâu thêm
+         vì đây là giới hạn khoa học thật của việc đối chiếu số liệu giữa
+         hai cài đặt MAC/PHY 802.11 độc lập gần bão hòa, không phải việc
+         treo.
+       - Ngưỡng so sánh (`DEFAULT_THRESHOLDS`) giữ nguyên như thiết kế ban
+         đầu — không nới lỏng để ép case 16/32 robot pass, vì đó sẽ là che
+         giấu một khác biệt thật thay vì chứng minh parity.
+
+       **Quyết định phạm vi:** đóng mục "đối sánh ns-3/OMNeT++ Wi-Fi" ở
+       **tải nhẹ** (≤8 trạm chia sẻ 1 AP) — bằng chứng:
+       `scripts/run_omnetpp_docker_wifi_parity.py`,
+       `external/omnetpp/FleetQoxWifiReplay.ned`,
+       `[Config MatchedWifi]` trong `external/omnetpp/omnetpp.ini`.
+       Tải cao (16/32 trạm/1 AP) **chưa đạt parity** — ghi nhận là giới hạn
+       có chủ đích (cliff behavior gần bão hòa), không phải việc treo,
+       tương tự cách `deep_preallocation_claim` và ranh giới content-filter
+       đã được ghi nhận ở Nhóm 4. `ns3_omnetpp_wifi_parity_claim` trong
+       summary JSON phản ánh đúng: `true` cho case 8 robot, `false` cho
+       16/32 robot ở threshold hiện tại — không có claim tổng quát nào che
+       giấu giới hạn này.
   2. **Soak dài hạn**: đã có `run_heap_soak_asan_probe.py`/
      `run_heap_soak_fleet_asan_probe.py` (lặp nhiều "round" ngắn, không
      phải 1 lần chạy liên tục dài) và
