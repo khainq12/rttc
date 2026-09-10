@@ -56,7 +56,8 @@ WORKDIR /opt/inet
 RUN bash -lc '. /opt/omnetpp/setenv -q \
         && . ./setenv -q \
         && opp_featuretool disable all \
-        && opp_featuretool enable --with-required Ipv4 Loopback Ppp Queueing Udp \
+        && opp_featuretool enable --with-required \
+            Ipv4 Loopback Ppp Queueing Udp Ieee80211 Mobility \
         && make makefiles \
         && make MODE=release -j"$(nproc)"' \
     && cp -L /opt/inet/src/libINET.so /tmp/libINET.so \

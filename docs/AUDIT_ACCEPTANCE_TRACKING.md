@@ -80,6 +80,41 @@ scope có chủ đích, xem bảng, không phải việc treo). Nhóm 6 đang b�
      thấy có claim nào cho TSN/mesh trong `capabilities.json`, nên có thể
      không cần làm phần đó (cần xác nhận lại với báo cáo hành chính gốc
      nếu có yêu cầu rõ).
+
+     **Cập nhật (10/09/2026) — đã viết code, CHƯA build/chạy (chờ xác nhận
+     người dùng trước khi chạy docker build vì tốn thời gian/tài nguyên):**
+     - `external/omnetpp/Dockerfile`: bật thêm feature `Ieee80211` và
+       `Mobility` trong INET (trước đó chỉ có Ipv4/Loopback/Ppp/Queueing/Udp
+       — không có wireless).
+     - `external/omnetpp/FleetQoxWifiReplay.ned`: network mới — 1
+       `AccessPoint` (`Ieee80211ScalarRadioMedium`) + `WirelessHost` cho
+       từng endpoint duy nhất trong trace (`controller`, `fleetRouter`,
+       `operatorUi`, `robot[numRobots]`), dùng `LinearMobility` (tốc độ +
+       hướng hằng số, xen kẽ +x/-x giống `ConstantVelocityMobilityModel`
+       của ns-3) và mgmt kiểu Simplified (association cố định, không phụ
+       thuộc thời điểm beacon/probe trong cửa sổ replay ngắn). Lưu ý về
+       phạm vi: thứ tự gán vị trí node theo index không khớp thứ tự phát
+       hiện endpoint của ns-3 (thứ tự đó chỉ là hệ quả của cách quét CSV,
+       không phải một phần định nghĩa kịch bản) — mật độ trạm
+       (`stationSpacing`) và độ lớn tốc độ (`mobilitySpeed`) thì khớp.
+     - `external/omnetpp/omnetpp.ini`: thêm `[Config MatchedWifi]`.
+     - `scripts/run_omnetpp_docker_wifi_parity.py`: runner đối sánh mới,
+       chạy cả 3 kịch bản đã có sẵn trong
+       `run_ns3_docker_wifi_mobility_matrix.py` (`stationary_near`,
+       `mobile_moderate`, `mobile_edge`) trên cả hai simulator với cùng
+       trace/seed/policy/robot-count.
+     - **Ngưỡng so sánh (`DEFAULT_THRESHOLDS`) trong script này là giả
+       thuyết ban đầu, CHƯA được kiểm chứng bằng dữ liệu chạy thật** — nới
+       rộng hơn ngưỡng của phần P2P có chủ ý (vì hai chồng MAC/PHY không
+       dây độc lập nhau dự kiến lệch nhau nhiều hơn hai chồng point-to-point
+       có dây), cần chạy thật rồi điều chỉnh dựa trên số liệu thực tế, không
+       được nới lỏng ngầm nếu chạy fail.
+     - Việc còn lại trước khi có thể đóng mục này: `docker build` image
+       omnetpp-inet (image chưa tồn tại ở máy này), chạy thử
+       `run_omnetpp_docker_wifi_parity.py`, sửa lỗi biên dịch/NED nếu có
+       (chưa có công cụ OMNeT++ ở máy host để kiểm tra cú pháp NED tĩnh
+       trước, nên nhiều khả năng cần vài vòng sửa lỗi build), rồi mới đánh
+       giá lại ngưỡng so sánh dựa trên kết quả thật.
   2. **Soak dài hạn**: đã có `run_heap_soak_asan_probe.py`/
      `run_heap_soak_fleet_asan_probe.py` (lặp nhiều "round" ngắn, không
      phải 1 lần chạy liên tục dài) và
