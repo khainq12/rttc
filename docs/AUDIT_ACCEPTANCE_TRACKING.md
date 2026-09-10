@@ -17,10 +17,11 @@ Trạng thái tại thời điểm kiểm tra gốc (07/09/2026): **0/6 nhóm đ
 | 3 | QUIC/PKI và HA/fencing (online rotation, live revocation, ma trận phân vùng không split-brain, failover/failback đa host, durable state) | Đạt phần lớn (thiếu đa host) | ✅ **Đã đóng** | HA multi-host (Raft + etcd/PostgreSQL, failover + failback) làm ở phiên trước (2 VM KVM thật). PKI cert/CA rotation multi-host (CRL revocation + CA rotation thật, không phải chỉ thêm CA) làm phiên này: `scripts/run_multihost_kvm_udp_peer_auth_crl_reload_probe.py`, 4/4 round pass. Commit `65b7100`. Lưu ý nhỏ: "ma trận phân vùng" mới test một số kịch bản tiêu biểu, chưa phải toàn bộ tổ hợp. |
 | 4 | Ngữ nghĩa RMW (full QoS event, full DDS content-filter dialect, deep preallocation) | Đạt một phần | 🟡 **Một phần** | Dynamic message, nhiều QoS extension (liveliness, deadline, lifespan, destination_order, ownership, partition, presentation) đã xong. **Task #42 (content-filter dialect) đã đóng**: thêm `LIKE ... ESCAPE`, 3/3 pass (`run_rmw_docker_content_filter_sql_probe.py`), và đã ra quyết định phạm vi chính thức — subset hiện tại là ranh giới cuối cùng. **Task #43 (deep_preallocation_claim) đã đóng phần lớn hơn dự kiến**: thay vì redesign wire-format nhị phân (rủi ro cao, ban đầu định hỏi ý kiến), tìm được cách an toàn hơn — verify `snprintf("%.6g",...)` giống hệt định dạng double của `ostringstream` (400k+ giá trị test), rồi build JSON frame body thẳng vào buffer bền vững (`frame_json_scratch`) thay vì `ostringstream` mới mỗi lần, và pool hoá entry trong retransmit ledger (`g_retired_retransmit_entries`) — không đổi 1 byte nào trên wire, không ảnh hưởng 187 probe khác. Verify bằng A/B rebuild (git stash) xác nhận 2 lỗi flaky có sẵn (`rmw_wait_for_all_acked_probe`, `remote_wait_for_all_acked_probe`) tái hiện y hệt ở cả code cũ và mới → không phải regression. `deep_preallocation_claim` vẫn giữ `false` (đúng): phần message deserialization và ledger hash-map node allocation vẫn chưa pool hoá, và binary wire format vẫn là ranh giới scope có chủ đích, không phải việc treo. |
 | 5 | Nav2, Open-RMF, đa host, HIL | Đạt một phần | ❌ **Chưa làm** | Nav2 đã có bằng chứng chạy thực tế (từ trước). Open-RMF chưa phải full upstream stack; chưa có bằng chứng đa host/HIL cho workload tự hành. |
-| 6 | Đối sánh mô phỏng (ns-3/OMNeT++), soak dài hạn, bằng chứng phát hành qua CI | Đạt một phần | ❌ **Chưa làm** | ns-3/OMNeT++ đã chạy thực tế nhưng đối sánh chủ yếu P2P (MatchedP2p), chưa mở rộng wireless/TSN/mesh. Chưa có soak dài hạn và CI-qualified evidence bundle. `main` cũng chưa có branch protection / `.github/workflows`. |
+| 6 | Đối sánh mô phỏng (ns-3/OMNeT++), soak dài hạn, bằng chứng phát hành qua CI | Đạt một phần | 🟡 **Đang làm** | Xem mục "Nhóm 6" bên dưới — đã khảo sát hiện trạng, chưa code. |
 
 **Tóm lại: 3/6 nhóm đã đóng (1, 2, 3). Nhóm 4 đã đóng cả task #42 và #43
-(vẫn còn vài ranh giới scope có chủ đích, xem bảng). Còn 5, 6 chưa làm.**
+(vẫn còn vài ranh giới scope có chủ đích, xem bảng). Nhóm 6 đang bắt đầu.
+Nhóm 5 chưa làm.**
 
 ## Việc tiếp theo (theo task list nội bộ)
 
@@ -61,11 +62,38 @@ Trạng thái tại thời điểm kiểm tra gốc (07/09/2026): **0/6 nhóm đ
 - **Nhóm 5**: đưa FleetRMW vào path ROS 2 thật của RMF components (không
   chỉ gọi service tương thích kiểu); chạy kịch bản đa host cho Open-RMF;
   cân nhắc HIL nếu phạm vi sản xuất yêu cầu.
-- **Nhóm 6**: mở rộng OMNeT++/ns-3 sang wireless/roaming tương đương
-  MatchedP2p hiện có; nếu TSN/mesh nằm trong claim thì cần chạy thực tế
-  trên cả hai simulator; thiết lập soak dài hạn + bundle bằng chứng
-  qua CI (bắt đầu bằng việc thêm `.github/workflows` và branch
-  protection cho `main`).
+- **Nhóm 6** (đang làm, bắt đầu 10/09/2026) — khảo sát hiện trạng 3 phần:
+  1. **Đối sánh mô phỏng ns-3/OMNeT++**: phát hiện quan trọng khác với ghi
+     chú "Trạng thái gốc" ở trên — phía **ns-3 đã có sẵn** kịch bản wireless
+     thật (`run_ns3_docker_wifi_mobility_matrix.py`: 802.11g + mobility,
+     `run_ns3_docker_wifi_roaming_matrix.py`: chuyển vùng dual-AP), không
+     phải chỉ P2P. Cái thiếu thực sự là phía **OMNeT++ hoàn toàn chưa có
+     mô hình wireless nào** — `external/omnetpp/FleetQoxTraceReplay.ned`
+     chỉ dùng `DatarateChannel` (kênh point-to-point cấu hình
+     datarate/delay/per cố định), không có NIC 802.11/mobility gì cả, nên
+     `run_omnetpp_docker_parity.py` (đối sánh ns-3 vs OMNeT++) chỉ đối
+     sánh được ở kịch bản P2P. Muốn đóng mục này cần viết mới mạng OMNeT++
+     dùng INET wireless (Ieee80211 NIC + access point + mobility model)
+     khớp tham số với 1 kịch bản wifi ns-3 đã có, rồi chạy đối sánh như
+     `omnetpp_docker_parity` hiện tại — đây là phần nặng nhất trong Nhóm 6
+     (viết .ned mới + build lại Docker image omnetpp-inet). TSN/mesh: chưa
+     thấy có claim nào cho TSN/mesh trong `capabilities.json`, nên có thể
+     không cần làm phần đó (cần xác nhận lại với báo cáo hành chính gốc
+     nếu có yêu cầu rõ).
+  2. **Soak dài hạn**: đã có `run_heap_soak_asan_probe.py`/
+     `run_heap_soak_fleet_asan_probe.py` (lặp nhiều "round" ngắn, không
+     phải 1 lần chạy liên tục dài) và
+     `run_rmw_docker_quic_gateway_async_burst_soak.py`. Cần: 1 kịch bản
+     chạy liên tục thật sự dài (vài giờ trở lên, không phải lặp round
+     ngắn), theo dõi leak bộ nhớ/degrade hiệu năng theo thời gian. Cần
+     người dùng xác nhận thời lượng mong muốn trước khi chạy thật (tốn
+     tài nguyên/thời gian) — cần chạy nền (background).
+  3. **Bằng chứng qua CI**: repo hiện **chưa có `.github/workflows` nào và
+     chưa có branch protection cho `main`** (xác nhận qua kiểm tra trực
+     tiếp). Đây là phần rẻ nhất/rõ nhất — sẽ làm trước: thêm workflow build
+     + chạy một tập probe nhẹ trên GitHub Actions mỗi lần push/PR. Bật
+     branch protection là thay đổi cấu hình repo (không chỉ thêm file) nên
+     sẽ xin xác nhận riêng trước khi bật.
 
 ## Quy ước cập nhật file này
 
