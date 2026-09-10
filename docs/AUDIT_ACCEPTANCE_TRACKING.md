@@ -571,7 +571,43 @@ scope có chủ đích, xem bảng, không phải việc treo). Nhóm 6 đang b�
          codebase độc lập (đã xác nhận ở vòng 7) bị khuếch đại rõ rệt.
          Không phải 1 bug còn ẩn — là hệ quả tất yếu của thiết kế workload
          chạm đúng ngưỡng bão hòa kênh ở quy mô 16 trạm trở lên.
-  2. **Soak dài hạn**: đã có `run_heap_soak_asan_probe.py`/
+
+         **Cập nhật (10/09/2026, vòng 9) — người dùng hỏi tiếp: "kịch bản
+         test có đại diện đúng use case thật không, mục tiêu dự án là tối
+         ưu cho nhiều robot mà?"** Đây là câu hỏi đúng trọng tâm hơn cả câu
+         hỏi trước. Kiểm tra: tổng traffic thật ở 32 trạm (gộp 3 policy) =
+         **3852 gói/giây, 4.14 Mbit/s**; ngân sách "capacity" dùng để
+         admission-control quyết định gửi/hoãn = chỉ **1.6 Mbit/s**
+         (`capacity_bytes_per_second = max(200_000, robots*6_000)`).
+
+         **Phát hiện**: công thức capacity này tính theo **byte/giây**,
+         nhưng Wi-Fi 802.11 thật bị giới hạn chủ yếu bởi **số gói/giây**
+         (mỗi gói — dù 96 byte hay 800 byte — đều tốn overhead cố định
+         ~150-250µs để tranh chấp kênh + truyền + chờ ACK, gần như không
+         phụ thuộc kích thước gói khi gói nhỏ). Với traffic điều khiển
+         50Hz tần suất cao (đặc trưng đúng kiểu "nhiều gói nhỏ"), mô hình
+         byte-rate đánh giá dư tải trong khi kênh Wi-Fi thật đã gần/vượt
+         trần gói/giây — đây là khoảng cách thật giữa cách policy đo
+         "capacity" và cách 802.11 thật giới hạn.
+
+         **Quan trọng**: công thức `max(200_000, robots*6_000)` **không
+         phải do phiên này tự đặt cho bài wifi-parity** — đã kiểm tra, đây
+         là quy ước có sẵn từ trước, dùng chung ở **4 script khác nhau**
+         (`run_ns3_docker_fleet_matrix.py`,
+         `run_ns3_docker_wifi_mobility_matrix.py`,
+         `run_ns3_docker_wifi_roaming_matrix.py`, và bài p2p parity trước
+         đó `run_omnetpp_docker_parity.py`) — kế thừa đúng quy ước sẵn có,
+         không phải lỗi mới tạo ra riêng cho bài này.
+
+         **Ý nghĩa cho dự án**: đây là phát hiện có giá trị vượt ra ngoài
+         phạm vi "đối sánh 2 simulator" — gợi ý rằng mô hình capacity
+         dùng cho admission control trong `fleetqox/control_plane.py`
+         (và các script ns-3 liên quan) nên cân nhắc thêm ràng buộc theo
+         **số gói/giây**, không chỉ byte/giây, nếu muốn mô hình hóa đúng
+         giới hạn thật của Wi-Fi cho traffic tần suất cao (điều khiển
+         real-time). **Chưa sửa** — nằm ngoài phạm vi nhiệm vụ đối sánh
+         simulator của Nhóm 6, cần xem xét riêng nếu muốn cải thiện độ
+         chân thực của mô hình capacity trong toàn dự án.
      `run_heap_soak_fleet_asan_probe.py` (lặp nhiều "round" ngắn, không
      phải 1 lần chạy liên tục dài) và
      `run_rmw_docker_quic_gateway_async_burst_soak.py`. Cần: 1 kịch bản
