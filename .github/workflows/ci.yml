@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: Build image and run smoke probes
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build rmw-netem:jazzy image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: external/rmw-netem/Dockerfile
+          tags: localhost/fleetrmw/rmw-netem:jazzy
+          push: false
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Fast, single-container, non-networked probes only -- no netem, no
+      # multi-container compose, no privileged capabilities. These are
+      # deliberately a minimal smoke gate, not the full probe suite: most
+      # of this project's evidence comes from multi-container/netem/KVM
+      # scenarios that need capabilities and topology a shared CI runner
+      # does not have. See docs/AUDIT_ACCEPTANCE_TRACKING.md (Group 6) for
+      # the plan to grow this bundle.
+      - name: Deep-preallocation probe (rmw_pubsub.cpp allocation reuse)
+        run: |
+          python3 scripts/run_rmw_docker_deep_preallocation_probe.py \
+            --iterations 3 --json
+
+      - name: Content-filter SQL probe (dialect + ESCAPE)
+        run: |
+          python3 scripts/run_rmw_docker_content_filter_sql_probe.py \
+            --iterations 3 --json
+
+      - name: Upload probe summaries
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-probe-summaries
+          path: results_rmw_socket/*.json
+          if-no-files-found: warn
