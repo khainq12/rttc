@@ -62,6 +62,17 @@ RUN git init /opt/inet \
     && git -C /opt/inet checkout --detach FETCH_HEAD \
     && test "$(git -C /opt/inet rev-parse HEAD)" = "${INET_COMMIT}"
 
+# Cross-simulator RNG matching (FleetQoX Group 6): lets a station's
+# Contention module draw its backoff from an explicit physical RNG slot
+# instead of INET's default getRNG(0) mapping, so it can be aligned with
+# ns-3's per-station AssignStreams() index. See MatchedMrg32k3aRng.{h,cc}
+# and fleetqox_trace_replay.cc's --matchedBackoffRng option for the
+# counterpart pieces. Generated against INET_COMMIT above; if that commit
+# ever changes, regenerate the patch against the new Contention.{ned,h,cc}.
+COPY patches/0001-contention-matched-backoff-rng.patch /tmp/
+RUN git -C /opt/inet apply --verbose /tmp/0001-contention-matched-backoff-rng.patch \
+    && rm /tmp/0001-contention-matched-backoff-rng.patch
+
 WORKDIR /opt/inet
 RUN bash -lc '. /opt/omnetpp/setenv -q \
         && . ./setenv -q \

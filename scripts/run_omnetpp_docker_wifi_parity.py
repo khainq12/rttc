@@ -199,6 +199,8 @@ def compile_omnetpp_wifi(image: str, build_dir: Path) -> subprocess.CompletedPro
                 "cp "
                 f"{source_dir}/TraceDrivenUdpApp.h "
                 f"{source_dir}/TraceDrivenUdpApp.cc "
+                f"{source_dir}/MatchedMrg32k3aRng.h "
+                f"{source_dir}/MatchedMrg32k3aRng.cc "
                 f"{source_dir}/omnetpp.ini "
                 f"{shlex.quote(container_dir)}/"
             ),
@@ -231,14 +233,17 @@ def run_ns3_case(
     trace: Path,
     scenario: dict[str, Any],
     seed: int,
+    matched_rng: bool = False,
 ) -> subprocess.CompletedProcess[str]:
+    matched_rng_flag = "--matchedBackoffRng=true --matchedBackoffRngBase=0 " if matched_rng else ""
     command = (
         f"{shlex.quote(_container_path(binary))} "
         f"--trace={shlex.quote(_container_path(trace))} --topology=wifi "
         f"--wifiMode={scenario['wifi_mode']} "
         f"--mobilitySpeed={scenario['mobility_speed']} "
         f"--stationSpacing={scenario['station_spacing']} "
-        f"--warmupMs={WIFI_WARMUP_MS} --seed={seed} --run={seed}"
+        f"--warmupMs={WIFI_WARMUP_MS} --seed={seed} --run={seed} "
+        f"{matched_rng_flag}"
     )
     return docker_run(image, command, timeout=600)
 
@@ -318,6 +323,38 @@ def _position_override_flags(
     return " ".join(flags)
 
 
+def _matched_rng_override_flags(trace: Path) -> tuple[str, int]:
+    """Mirror fleetqox_trace_replay.cc's --matchedBackoffRng convention:
+    station i (in ns-3's g_endpointToNode / CSV-encounter order) gets
+    physical RNG slot i, the single AP gets slot stationCount. Returns the
+    CLI override flags plus the total RNG slot count (for --num-rngs).
+    """
+    order = ns3_encounter_order(trace)
+    name_to_module = {
+        "fleet_controller": "controller",
+        "fleet_router": "fleetRouter",
+        "operator_ui": "operatorUi",
+    }
+    flags: list[str] = []
+    for i, endpoint in enumerate(order):
+        if endpoint in name_to_module:
+            module = name_to_module[endpoint]
+        elif endpoint.startswith("robot_"):
+            module = f"robot[{int(endpoint.split('_', 1)[1])}]"
+        else:
+            continue
+        flags.append(
+            f"--*.{module}.wlan[*].mac.dcf.channelAccess.contention."
+            f"matchedBackoffRngIndex={i}"
+        )
+    ap_index = len(order)
+    flags.append(
+        "--*.ap.wlan[*].mac.dcf.channelAccess.contention."
+        f"matchedBackoffRngIndex={ap_index}"
+    )
+    return " ".join(flags), ap_index + 1
+
+
 def run_omnetpp_case(
     *,
     image: str,
@@ -326,6 +363,7 @@ def run_omnetpp_case(
     robots: int,
     scenario: dict[str, Any],
     seed: int,
+    matched_rng: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     drain_ms = 10_000.0
     sim_limit = _sim_time_limit_seconds(trace, WIFI_WARMUP_MS, drain_ms)
@@ -338,12 +376,18 @@ def run_omnetpp_case(
     position_flags = _position_override_flags(
         trace, float(scenario["station_spacing"]), float(scenario["mobility_speed"])
     )
+    config_name = "MatchedWifi"
+    rng_flags = ""
+    if matched_rng:
+        config_name = "MatchedWifiRng"
+        rng_override_flags, num_rngs = _matched_rng_override_flags(trace)
+        rng_flags = f"--num-rngs={num_rngs} {rng_override_flags} "
     command = (
         f"cd {shlex.quote(_container_path(build_dir))} && "
         "opp_run_release -u Cmdenv "
         "-l /opt/inet/src/INET -l ./FleetQoxReplay "
         f"-n .:/opt/inet/src -x {exclusions} "
-        "-f omnetpp.ini -c MatchedWifi "
+        f"-f omnetpp.ini -c {config_name} "
         f"--*.numRobots={robots} "
         f"{trace_flag} "
         f"--*.wlanBitrate={bitrate_bps}bps "
@@ -351,6 +395,7 @@ def run_omnetpp_case(
         f"--*.stationSpacing={scenario['station_spacing']}m "
         f"--*.mobilitySpeed={scenario['mobility_speed']}mps "
         f"--*.startOffset={WIFI_WARMUP_MS / 1000.0:.12g}s "
+        f"{rng_flags}"
         f"--sim-time-limit={sim_limit:.12g}s --seed-set={seed}"
     )
     return docker_run(image, command, timeout=600)
@@ -366,6 +411,7 @@ def run_parity_matrix(
     seconds: int,
     thresholds: dict[str, float],
     build_image: bool,
+    matched_rng: bool = False,
 ) -> dict[str, Any]:
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -446,6 +492,7 @@ def run_parity_matrix(
                     trace=trace_path,
                     scenario=scenario,
                     seed=seed,
+                    matched_rng=matched_rng,
                 )
                 omnetpp_run = run_omnetpp_case(
                     image=omnetpp_image,
@@ -454,6 +501,7 @@ def run_parity_matrix(
                     robots=robots,
                     scenario=scenario,
                     seed=seed,
+                    matched_rng=matched_rng,
                 )
                 ns3_policies = parse_csv_summary(ns3_run.stdout)
                 omnetpp_policies = parse_csv_summary(omnetpp_run.stdout)
@@ -512,6 +560,7 @@ def run_parity_matrix(
             "inet": INET_VERSION,
         },
         "images": {"ns3": ns3_image, "omnetpp": omnetpp_image},
+        "matched_rng": matched_rng,
         "image_build": image_build,
         "compile": compile_evidence,
         "topology_scope": "matched_single_ap_802_11g_infrastructure_grid_mobility",
@@ -567,6 +616,17 @@ def main() -> int:
         default=Path("results_omnetpp/omnetpp_ns3_docker_wifi_parity_v1_summary.json"),
     )
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--matched-rng",
+        action="store_true",
+        help=(
+            "Use explicit, cross-simulator-aligned MRG32k3a backoff RNG "
+            "streams (ns-3 --matchedBackoffRng + INET MatchedMrg32k3aRng) "
+            "instead of each simulator's own default RNG, to isolate how "
+            "much of the residual wifi-parity gap is RNG-stream variance "
+            "vs. genuine MAC/queue algorithm divergence."
+        ),
+    )
     args = parser.parse_args()
     summary = run_parity_matrix(
         omnetpp_image=args.omnetpp_image,
@@ -577,6 +637,7 @@ def main() -> int:
         seconds=max(args.seconds, 1),
         thresholds=dict(DEFAULT_THRESHOLDS),
         build_image=not args.skip_image_build,
+        matched_rng=args.matched_rng,
     )
     summary_path = ROOT / args.summary_json
     summary_path.parent.mkdir(parents=True, exist_ok=True)

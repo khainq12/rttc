@@ -303,6 +303,15 @@ main(int argc, char* argv[])
   double warmupMs = 0.0;
   uint32_t seed = 1;
   uint64_t run = 1;
+  bool matchedBackoffRng = false;
+  // Explicit AssignStreams() values live in a reserved namespace disjoint
+  // from ns-3's auto-increment counter (RandomVariableStream::SetStream()
+  // maps them to 2^63 + stream internally), so there is no collision risk
+  // from keeping this small. Keep it 0 by default so a station's stream
+  // index equals its plain g_endpointToNode index -- the OMNeT++ side
+  // (MatchedMrg32k3aRng's rngId / physical RNG slot count) mirrors this
+  // exact convention and would need updating if this default changes.
+  uint64_t matchedBackoffRngBase = 0;
 
   CommandLine cmd(__FILE__);
   cmd.AddValue("trace", "FleetQoX simulator CSV trace", tracePath);
@@ -319,6 +328,18 @@ main(int argc, char* argv[])
   cmd.AddValue("warmupMs", "Delay trace transmission start for association warmup", warmupMs);
   cmd.AddValue("seed", "ns-3 RNG seed", seed);
   cmd.AddValue("run", "ns-3 RNG run number", run);
+  cmd.AddValue(
+      "matchedBackoffRng",
+      "Assign deterministic per-station Txop backoff RNG streams "
+      "(station i -> matchedBackoffRngBase + i, AP j -> "
+      "matchedBackoffRngBase + stationCount + j) instead of ns-3's "
+      "global auto-increment counter, so the mapping can be replicated "
+      "by another simulator",
+      matchedBackoffRng);
+  cmd.AddValue(
+      "matchedBackoffRngBase",
+      "Base stream index used when matchedBackoffRng is enabled",
+      matchedBackoffRngBase);
   cmd.Parse(argc, argv);
 
   if (tracePath.empty())
@@ -442,6 +463,35 @@ main(int argc, char* argv[])
     NetDeviceContainer stationDevices = wifi.Install(phy, mac, nodes);
     mac.SetType("ns3::ApWifiMac", "Ssid", SsidValue(ssid));
     NetDeviceContainer accessPointDevices = wifi.Install(phy, mac, accessPoints);
+
+    if (matchedBackoffRng)
+    {
+      // Bypass ns-3's global auto-increment stream counter (order-dependent
+      // on unrelated object construction, e.g. unused IPv6 DAD timers) and
+      // assign the Txop backoff RNG (the one driving CSMA/CA contention
+      // decisions, see Txop::GetBackoffSlots) an explicit, closed-form
+      // stream index per device: station i -> base + i, AP j -> base +
+      // stationCount + j. This formula is reproduced in the INET side so
+      // both simulators consume matching MRG32k3a substreams per station.
+      auto assignBackoffStream = [](Ptr<NetDevice> device, int64_t stream) {
+        Ptr<WifiMac> wifiMac = DynamicCast<WifiNetDevice>(device)->GetMac();
+        PointerValue ptr;
+        wifiMac->GetAttribute("Txop", ptr);
+        Ptr<Txop> txop = ptr.Get<Txop>();
+        txop->AssignStreams(stream);
+      };
+      for (uint32_t i = 0; i < stationDevices.GetN(); ++i)
+      {
+        assignBackoffStream(
+            stationDevices.Get(i), static_cast<int64_t>(matchedBackoffRngBase + i));
+      }
+      for (uint32_t i = 0; i < accessPointDevices.GetN(); ++i)
+      {
+        assignBackoffStream(
+            accessPointDevices.Get(i),
+            static_cast<int64_t>(matchedBackoffRngBase + stationDevices.GetN() + i));
+      }
+    }
 
     for (uint32_t i = 0; i < stationDevices.GetN(); ++i)
     {

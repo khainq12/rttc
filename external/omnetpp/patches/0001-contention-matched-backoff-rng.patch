@@ -1,0 +1,49 @@
+diff --git a/src/inet/linklayer/ieee80211/mac/contention/Contention.cc b/src/inet/linklayer/ieee80211/mac/contention/Contention.cc
+index 4a1471e..5946a6f 100644
+--- a/src/inet/linklayer/ieee80211/mac/contention/Contention.cc
++++ b/src/inet/linklayer/ieee80211/mac/contention/Contention.cc
+@@ -27,6 +27,7 @@ void Contention::initialize(int stage)
+ {
+     if (stage == INITSTAGE_LOCAL) {
+         backoffOptimization = par("backoffOptimization");
++        matchedBackoffRngIndex = par("matchedBackoffRngIndex");
+         lastIdleStartTime = simTime() - SimTime::getMaxTime() / 2;
+         mac = check_and_cast<Ieee80211Mac *>(getContainingNicModule(this)->getSubmodule("mac"));
+         startTxEvent = new cMessage("startTx");
+@@ -79,7 +80,11 @@ void Contention::startContention(int cw, simtime_t ifs, simtime_t eifs, simtime_
+     this->eifs = eifs;
+     this->slotTime = slotTime;
+     this->callback = callback;
+-    backoffSlots = intrand(cw + 1);
++    // FleetQoX cross-simulator RNG matching: draw from an explicit physical
++    // RNG slot (aligned with ns-3's AssignStreams() index for this station)
++    // instead of this module's default getRNG(0) mapping when enabled.
++    backoffSlots = matchedBackoffRngIndex >= 0 ? getRNG(matchedBackoffRngIndex)->intRand(cw + 1)
++                                                : intrand(cw + 1);
+     emit(backoffPeriodGeneratedSignal, backoffSlots);
+     EV_DETAIL << "Starting contention: cw = " << cw << ", slots = " << backoffSlots << ", slotTime = " << slotTime << ", ifs = " << ifs << ", eifs = " << eifs << endl;
+     handleWithFSM(START);
+diff --git a/src/inet/linklayer/ieee80211/mac/contention/Contention.h b/src/inet/linklayer/ieee80211/mac/contention/Contention.h
+index 3042528..ef3adc2 100644
+--- a/src/inet/linklayer/ieee80211/mac/contention/Contention.h
++++ b/src/inet/linklayer/ieee80211/mac/contention/Contention.h
+@@ -47,6 +47,7 @@ class INET_API Contention : public SimpleModule, public IContention
+     simtime_t backoffOptimizationDelta = SIMTIME_ZERO;
+     bool mediumFree = true;
+     bool backoffOptimization = true;
++    int matchedBackoffRngIndex = -1; // FleetQoX cross-simulator RNG matching: see Contention.ned
+     simtime_t startTime = SIMTIME_ZERO; // TODO for debugging
+ 
+   protected:
+diff --git a/src/inet/linklayer/ieee80211/mac/contention/Contention.ned b/src/inet/linklayer/ieee80211/mac/contention/Contention.ned
+index fc47843..71b7aa0 100644
+--- a/src/inet/linklayer/ieee80211/mac/contention/Contention.ned
++++ b/src/inet/linklayer/ieee80211/mac/contention/Contention.ned
+@@ -20,6 +20,7 @@ simple Contention extends SimpleModule like IContention
+         displayStringTextFormat = default("{fsmState}");
+         bool initialChannelBusy = default(true); // Assume that the channel was busy before the simulation started
+         bool backoffOptimization = default(true);    // We can pretend the frame has arrived into the queue a little bit earlier, and maybe able to start transmitting immediately
++        int matchedBackoffRngIndex = default(-1); // FleetQoX cross-simulator RNG matching: physical RNG slot (getRNG index) to draw the backoff from; -1 disables this and keeps INET's normal getRNG(0) mapping
+         @display("i=block/timer");
+         @signal[backoffPeriodGenerated](type=long);
+         @signal[backoffStarted](type=simtime_t);
