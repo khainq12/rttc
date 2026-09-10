@@ -15,13 +15,13 @@ Trạng thái tại thời điểm kiểm tra gốc (07/09/2026): **0/6 nhóm đ
 | 1 | An toàn bộ nhớ / sanitizer đúng topology (2 tiến trình + netem + 32 KiB) | Chưa đạt | ✅ **Đã đóng** | `scripts/run_heap_soak_asan_probe.py`, kết quả `results_rmw_socket/heap_soak_asan_probe_summary.json`: 40/40 round, 2 tiến trình OS riêng biệt (container publisher/subscriber khác nhau), netem thật (`loss random 15%`), payload 32768 byte, ASan+UBSan 0 lỗi, teardown sạch mọi round. Gắn với task B0 (root-cause crash relay teardown). |
 | 2 | Độ tin cậy 32 KiB ở 16/32 robot (delivery + publisher ACK completion) | Chưa đạt | ✅ **Đã đóng** | Root-cause bug `wait_for_all_acked` graph-membership pruning (publisher thoát sớm do ack giả) + 2 lỗi phụ (fragment-NACK backoff quá ngắn, relay executor đơn luồng nghẽn ở quy mô 64 route). Grid 9/9 (8/16/32 robot × seed 7/13/29) pass với tiêu chí đầy đủ (`publisher.ack_wait_complete AND relay.downstream_ack_wait_complete AND min_topic_delivery_ratio==1.0`). Commit `b9790d3`. |
 | 3 | QUIC/PKI và HA/fencing (online rotation, live revocation, ma trận phân vùng không split-brain, failover/failback đa host, durable state) | Đạt phần lớn (thiếu đa host) | ✅ **Đã đóng** | HA multi-host (Raft + etcd/PostgreSQL, failover + failback) làm ở phiên trước (2 VM KVM thật). PKI cert/CA rotation multi-host (CRL revocation + CA rotation thật, không phải chỉ thêm CA) làm phiên này: `scripts/run_multihost_kvm_udp_peer_auth_crl_reload_probe.py`, 4/4 round pass. Commit `65b7100`. Lưu ý nhỏ: "ma trận phân vùng" mới test một số kịch bản tiêu biểu, chưa phải toàn bộ tổ hợp. |
-| 4 | Ngữ nghĩa RMW (full QoS event, full DDS content-filter dialect, deep preallocation) | Đạt một phần | 🟡 **Một phần** | Dynamic message, nhiều QoS extension (liveliness, deadline, lifespan, destination_order, ownership, partition, presentation) đã xong. **Task #42 (content-filter dialect) đã đóng**: thêm `LIKE ... ESCAPE`, 3/3 pass (`run_rmw_docker_content_filter_sql_probe.py`), và đã ra quyết định phạm vi chính thức — subset hiện tại là ranh giới cuối cùng. **Task #43 (deep_preallocation_claim) đã đóng phần lớn hơn dự kiến**: thay vì redesign wire-format nhị phân (rủi ro cao, ban đầu định hỏi ý kiến), tìm được cách an toàn hơn — verify `snprintf("%.6g",...)` giống hệt định dạng double của `ostringstream` (400k+ giá trị test), rồi build JSON frame body thẳng vào buffer bền vững (`frame_json_scratch`) thay vì `ostringstream` mới mỗi lần, và pool hoá entry trong retransmit ledger (`g_retired_retransmit_entries`) — không đổi 1 byte nào trên wire, không ảnh hưởng 187 probe khác. Verify bằng A/B rebuild (git stash) xác nhận 2 lỗi flaky có sẵn (`rmw_wait_for_all_acked_probe`, `remote_wait_for_all_acked_probe`) tái hiện y hệt ở cả code cũ và mới → không phải regression. `deep_preallocation_claim` vẫn giữ `false` (đúng): phần message deserialization và ledger hash-map node allocation vẫn chưa pool hoá, và binary wire format vẫn là ranh giới scope có chủ đích, không phải việc treo. |
+| 4 | Ngữ nghĩa RMW (full QoS event, full DDS content-filter dialect, deep preallocation) | Đạt một phần | ✅ **Đã đóng** | Dynamic message, nhiều QoS extension (liveliness, deadline, lifespan, destination_order, ownership, partition, presentation) đã xong. **Task #42 (content-filter dialect) đã đóng**: thêm `LIKE ... ESCAPE`, 3/3 pass (`run_rmw_docker_content_filter_sql_probe.py`), và đã ra quyết định phạm vi chính thức — subset hiện tại là ranh giới cuối cùng. **Task #43 (deep_preallocation_claim) đã đóng phần lớn hơn dự kiến**: thay vì redesign wire-format nhị phân (rủi ro cao, ban đầu định hỏi ý kiến), tìm được cách an toàn hơn — verify `snprintf("%.6g",...)` giống hệt định dạng double của `ostringstream` (400k+ giá trị test), rồi build JSON frame body thẳng vào buffer bền vững (`frame_json_scratch`) thay vì `ostringstream` mới mỗi lần, và pool hoá entry trong retransmit ledger (`g_retired_retransmit_entries`) — không đổi 1 byte nào trên wire, không ảnh hưởng 187 probe khác. Verify bằng A/B rebuild (git stash) xác nhận 2 lỗi flaky có sẵn (`rmw_wait_for_all_acked_probe`, `remote_wait_for_all_acked_probe`) tái hiện y hệt ở cả code cũ và mới → không phải regression. `deep_preallocation_claim` vẫn giữ `false` (đúng): phần message deserialization và ledger hash-map node allocation vẫn chưa pool hoá, và binary wire format vẫn là ranh giới scope có chủ đích, không phải việc treo. |
 | 5 | Nav2, Open-RMF, đa host, HIL | Đạt một phần | ❌ **Chưa làm** | Nav2 đã có bằng chứng chạy thực tế (từ trước). Open-RMF chưa phải full upstream stack; chưa có bằng chứng đa host/HIL cho workload tự hành. |
 | 6 | Đối sánh mô phỏng (ns-3/OMNeT++), soak dài hạn, bằng chứng phát hành qua CI | Đạt một phần | 🟡 **Đang làm** | Xem mục "Nhóm 6" bên dưới — đã khảo sát hiện trạng, chưa code. |
 
-**Tóm lại: 3/6 nhóm đã đóng (1, 2, 3). Nhóm 4 đã đóng cả task #42 và #43
-(vẫn còn vài ranh giới scope có chủ đích, xem bảng). Nhóm 6 đang bắt đầu.
-Nhóm 5 chưa làm.**
+**Tóm lại: 4/6 nhóm đã đóng (1, 2, 3, 4 — nhóm 4 vẫn còn vài ranh giới
+scope có chủ đích, xem bảng, không phải việc treo). Nhóm 6 đang bắt đầu
+(đã có CI workflow đầu tiên). Nhóm 5 chưa làm.**
 
 ## Việc tiếp theo (theo task list nội bộ)
 
@@ -88,12 +88,22 @@ Nhóm 5 chưa làm.**
      ngắn), theo dõi leak bộ nhớ/degrade hiệu năng theo thời gian. Cần
      người dùng xác nhận thời lượng mong muốn trước khi chạy thật (tốn
      tài nguyên/thời gian) — cần chạy nền (background).
-  3. **Bằng chứng qua CI**: repo hiện **chưa có `.github/workflows` nào và
-     chưa có branch protection cho `main`** (xác nhận qua kiểm tra trực
-     tiếp). Đây là phần rẻ nhất/rõ nhất — sẽ làm trước: thêm workflow build
-     + chạy một tập probe nhẹ trên GitHub Actions mỗi lần push/PR. Bật
-     branch protection là thay đổi cấu hình repo (không chỉ thêm file) nên
-     sẽ xin xác nhận riêng trước khi bật.
+  3. **Bằng chứng qua CI** — ✅ **Đã có workflow đầu tiên** (commit
+     `8baa2b9`): `.github/workflows/ci.yml` build image
+     `rmw-netem:jazzy` từ `external/rmw-netem/Dockerfile` có sẵn (dùng GH
+     Actions layer cache), rồi chạy 2 probe nhẹ làm smoke gate —
+     `deep_preallocation_probe` và `content_filter_sql_probe` (chọn 2 cái
+     này vì không cần netem/multi-container/quyền đặc biệt mà runner dùng
+     chung không có, khác với phần lớn bằng chứng thật của dự án). Kích
+     hoạt khi push/PR vào `main`. Đây là smoke gate nhỏ ban đầu, **chưa
+     phải full probe suite** — hầu hết bằng chứng thật (netem matrix đa
+     container, KVM đa host) cần hạ tầng/quyền mà runner chia sẻ không có,
+     nên việc mở rộng bundle này (nếu muốn) sẽ cần tính riêng. Chưa xác
+     minh được lần chạy đầu tiên trên GitHub thành công hay không (không
+     có công cụ `gh`/token truy cập API từ môi trường này) — cần người
+     dùng tự kiểm tra tab Actions trên GitHub. Branch protection cho
+     `main` vẫn **chưa bật** — đó là thay đổi cấu hình repo (không chỉ
+     thêm file) nên cần xác nhận riêng trước khi bật.
 
 ## Quy ước cập nhật file này
 
