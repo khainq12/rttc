@@ -167,6 +167,58 @@ scope có chủ đích, xem bảng, không phải việc treo). Nhóm 6 đang b�
        summary JSON phản ánh đúng: `true` cho case 8 robot, `false` cho
        16/32 robot ở threshold hiện tại — không có claim tổng quát nào che
        giấu giới hạn này.
+
+       **Điều tra sâu thêm (10/09/2026, theo yêu cầu người dùng)** — đã
+       kiểm tra tuần tự các nghi vấn cụ thể, có số liệu, để loại trừ khả
+       năng "có bug sửa được" trước khi chấp nhận giới hạn ở trên:
+       - Đếm trực tiếp (không đoán) số lần truyền PHY và tổng thời gian
+         chiếm kênh ở case 32 robot/`stationary_near` bằng compiled
+         trace-source instrumentation (bản sao riêng của
+         `fleetqox_trace_replay.cc`, không đụng file gốc) cho ns-3, và
+         `@statistic[transmissionState]` + vector recording tích phân theo
+         thời gian cho INET (thử NS_LOG text trước nhưng quá chậm — >340MB
+         log cho 1 giây mô phỏng, không khả thi). Kết quả: ns-3 41634 lần
+         truyền/2.258s chiếm kênh (TB 54.2µs/lần); INET 36307 lần
+         truyền/1.761s (TB 48.5µs/lần) — chỉ lệch ~11-22%, không phải
+         chênh lệch lớn kiểu bug.
+       - Kiểm tra trung bình (không chỉ giá trị tệ nhất) trên toàn bộ 27
+         case mỗi quy mô: lệch tăng đều và nhất quán theo số trạm (8→16→32:
+         delivery delta TB 5.1%→7.9%→17.3%) — xác nhận đây là khuôn mẫu
+         thật, không phải một seed xui.
+       - Kiểm tra các tham số MAC/PHY chuẩn 802.11g có thể gây lệch: CWmin
+         (15)/CWmax(1023) khớp cả hai; short retry limit(7)/long retry
+         limit(4) khớp cả hai; preamble+SIGNAL duration (16µs+4µs OFDM)
+         khớp cả hai; **slot time**: xác nhận kỹ vì lúc đầu tưởng
+         `opMode="g(erp)"` có thể không kích hoạt đúng slot time 9µs ngắn
+         (thay vì 20µs kiểu legacy) — đọc source `Ieee80211ErpOfdmMode.cc`
+         xác nhận `erpOnlyOfdmMode*` (dùng bởi `"g(erp)"`) có `isErpOnly
+         = true` → đúng 9µs, khớp ns-3; SIFS 10µs khớp cả hai.
+       - Công suất phát/độ nhạy máy thu: ns-3 mặc định 16.0dBm (~40mW) TX,
+         CCA -62dBm, RxSensitivity -101dBm; INET mặc định 13.0dBm (20mW)
+         TX, energy-detection -85dBm, receiver.sensitivity -85dBm,
+         snirThreshold 4dB. Có khác biệt thật (đọc trực tiếp từ
+         `Ieee80211Radio.ned` và từ getter runtime của `YansWifiPhy` qua
+         một chương trình chẩn đoán riêng), nhưng ở khoảng cách trạm 2-5m
+         trong kịch bản này tín hiệu đều dư thừa mạnh so với cả hai ngưỡng
+         nên khó là yếu tố quyết định; cơ chế quyết định lỗi khung ở tầng
+         thấp hơn (PER liên tục theo SNR ở ns-3 vs ngưỡng SNIR cứng có
+         thêm lớp `Ieee80211NistErrorModel` ở INET) là khác biệt kiến trúc
+         còn lại chưa kiểm chứng hết, nhưng để đi tiếp cần so sánh logic
+         xác suất lỗi khung ở mức bit giữa 2 codebase — vượt phạm vi hợp
+         lý của phiên làm việc này, cần chuyên môn sâu về mô hình PHY
+         không dây.
+       - **Kết luận sau điều tra**: không tìm thấy tham số cấu hình sai cụ
+         thể nào có thể sửa để đóng gap này. Bằng chứng hiện có (chênh
+         lệch tổng số lần truyền/tổng thời gian chiếm kênh chỉ ~11-22%,
+         nhưng bị khuếch đại thành chênh lệch độ trễ/mất gói gấp nhiều lần
+         ở vùng gần bão hòa) khớp với đặc tính lý thuyết đã biết của
+         CSMA/CA (mô hình Bianchi) chứ không phải dấu hiệu of một bug rời
+         rạc. Không tiếp tục đào sâu thêm (đã thử introspect thuộc tính
+         mặc định của `ns3::YansWifiPhy` qua chương trình C++ riêng, gặp
+         segfault khi dùng `TypeId::LookupByName` trước khi có instance —
+         phải chuyển sang tạo object rồi gọi getter trực tiếp mới lấy được
+         số liệu — cho thấy đã chạm ranh giới thực tế của việc debug thêm
+         trong phạm vi một phiên).
   2. **Soak dài hạn**: đã có `run_heap_soak_asan_probe.py`/
      `run_heap_soak_fleet_asan_probe.py` (lặp nhiều "round" ngắn, không
      phải 1 lần chạy liên tục dài) và
@@ -185,12 +237,25 @@ scope có chủ đích, xem bảng, không phải việc treo). Nhóm 6 đang b�
      hoạt khi push/PR vào `main`. Đây là smoke gate nhỏ ban đầu, **chưa
      phải full probe suite** — hầu hết bằng chứng thật (netem matrix đa
      container, KVM đa host) cần hạ tầng/quyền mà runner chia sẻ không có,
-     nên việc mở rộng bundle này (nếu muốn) sẽ cần tính riêng. Chưa xác
-     minh được lần chạy đầu tiên trên GitHub thành công hay không (không
-     có công cụ `gh`/token truy cập API từ môi trường này) — cần người
-     dùng tự kiểm tra tab Actions trên GitHub. Branch protection cho
-     `main` vẫn **chưa bật** — đó là thay đổi cấu hình repo (không chỉ
-     thêm file) nên cần xác nhận riêng trước khi bật.
+     nên việc mở rộng bundle này (nếu muốn) sẽ cần tính riêng.
+
+     **Cập nhật (10/09/2026) — đã xác minh bằng GitHub REST API công khai**
+     (không có `gh`/token, nhưng repo public nên `curl
+     api.github.com/repos/khainq12/rttc/actions/runs` không cần xác thực):
+     5/5 lần chạy thật trên `main` đều **success** (commit `06352a7`,
+     `e9b88e3`, `f68c8d0`, `a24d91f`, và lần chạy mới nhất); 1 lần duy nhất
+     ghi `cancelled` là lần chạy cho chính commit thêm workflow (`8baa2b9`)
+     — bị hủy tự động vì có commit kế tiếp đè lên gần như ngay sau đó, không
+     phải lỗi. Kiểm tra chi tiết từng step của lần chạy gần nhất
+     (`GET .../actions/runs/34449076885/jobs`): build image, chạy
+     `Deep-preallocation probe`, chạy `Content-filter SQL probe`, upload
+     summary — tất cả đều `success`. **Việc này coi như đã đóng**: CI đã
+     chạy thật và pass, không còn là "chưa xác minh được".
+
+     Branch protection cho `main` vẫn **chưa bật** — đó là thay đổi cấu
+     hình repo (không chỉ thêm file) nên cần xác nhận riêng trước khi bật;
+     đây là việc duy nhất còn mở của phần CI (không bắt buộc để "đóng" mục
+     bằng-chứng-CI, chỉ là một cứng hoá thêm nếu muốn).
 
 ## Quy ước cập nhật file này
 
