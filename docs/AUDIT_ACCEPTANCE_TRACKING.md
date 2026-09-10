@@ -541,6 +541,36 @@ scope có chủ đích, xem bảng, không phải việc treo). Nhóm 6 đang b�
          số cấu hình sai — không tìm được cách sửa hợp lý nằm trong phạm
          vi dự án đối sánh (sửa sẽ cần viết lại 1 phần thuật toán MAC của
          INET hoặc ns-3).
+
+         **Cập nhật (10/09/2026, vòng 8) — câu hỏi cuối cùng của người
+         dùng: "tại sao 8 trạm cao mà 16/32 lại thấp đột ngột, không giảm
+         từ từ?"** — nghi ngờ hợp lý là dấu hiệu bug. Kiểm tra bằng cách đo
+         **ns-3 một mình** (không so sánh với INET) ở nhiều quy mô liên
+         tục: 4, 6, 8, 10, 12, 16, 24, 32 trạm (cùng seed, cùng kịch bản
+         `stationary_near`, dùng đúng trace kết hợp cả 3 policy như test
+         thật — lần đầu vô tình test sai với trace chỉ 1 policy, cho kết
+         quả gây hiểu lầm, đã tự sửa và làm lại đúng cách).
+
+         **Kết quả**: `miss_ratio` của ns-3 (không liên quan gì đến INET)
+         gần như 0% liên tục từ 4 đến 12 trạm, rồi **nhảy vọt đột ngột lên
+         58-70% ngay tại 16 trạm**, tiếp tục tăng lên 88-95% ở 24/32 trạm.
+         Đây thật sự là một "vực thẳm" (không phải suy giảm từ từ) —
+         **và nó xảy ra ngay trong ns-3 một mình**, không phải hiện tượng
+         chỉ xuất hiện khi so sánh 2 simulator.
+
+         **Kết luận cuối cùng, đầy đủ**: khối lượng traffic thật của kịch
+         bản test (điều khiển 50Hz × N robot + trạng thái/nhận thức, gộp
+         cả 3 policy trong 1 lần mô phỏng) vượt quá khả năng chịu tải thực
+         của kênh 802.11g 54Mbps ở đâu đó giữa 12 và 16 trạm — đây là giới
+         hạn vật lý/giao thức thật (khớp lý thuyết Bianchi về CSMA/CA gần
+         bão hòa), không phải bug ở simulator nào. Điều này giải thích
+         trọn vẹn mẫu hình quan sát được: dưới ngưỡng (≤12 trạm) hệ thống
+         dư tải nhiều nên 2 simulator độc lập vẫn giao gần hoàn hảo và
+         khớp nhau tốt; vượt ngưỡng (≥16 trạm) hệ thống rơi vào chế độ hỗn
+         loạn/nhạy cảm cao, nơi khác biệt thuật toán MAC nhỏ giữa 2
+         codebase độc lập (đã xác nhận ở vòng 7) bị khuếch đại rõ rệt.
+         Không phải 1 bug còn ẩn — là hệ quả tất yếu của thiết kế workload
+         chạm đúng ngưỡng bão hòa kênh ở quy mô 16 trạm trở lên.
   2. **Soak dài hạn**: đã có `run_heap_soak_asan_probe.py`/
      `run_heap_soak_fleet_asan_probe.py` (lặp nhiều "round" ngắn, không
      phải 1 lần chạy liên tục dài) và
