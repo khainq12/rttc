@@ -608,6 +608,80 @@ scope có chủ đích, xem bảng, không phải việc treo). Nhóm 6 đang b�
          real-time). **Chưa sửa** — nằm ngoài phạm vi nhiệm vụ đối sánh
          simulator của Nhóm 6, cần xem xét riêng nếu muốn cải thiện độ
          chân thực của mô hình capacity trong toàn dự án.
+
+         **Cập nhật (10/09/2026, vòng 10) — người dùng làm rõ mục tiêu chiến
+         lược: dự án này là 1 middleware muốn chứng minh hành vi KHÔNG ĐỔI
+         dù chạy trên simulator nào (ns-3 hay INET/OMNeT++), để làm căn cứ
+         trước khi đầu tư thực nghiệm phần cứng thật.** Sau khi được giải
+         thích rõ chi phí thật (phải vá lõi C++ của 1 trong 2 simulator,
+         chưa từng làm trong phiên này — mọi sửa trước đó đều nằm trong
+         code/config của dự án) và khuyến nghị không nên làm, người dùng
+         **vẫn chủ động chọn thử vá lõi simulator** để cố khớp RNG 2 bên
+         (qua `AskUserQuestion`, chọn phương án không được khuyến nghị).
+
+         **Điều tra kiến trúc RNG của ns-3** (build ns-3.41 từ mã nguồn có
+         vá thêm log chẩn đoán, lần đầu tiên trong dự án — trước đó ns-3
+         luôn chỉ cài qua `apt`): xác nhận `RngSeedManager::GetNextStreamIndex()`
+         là **1 bộ đếm toàn cục duy nhất**, tăng dần theo đúng **thứ tự
+         construct object trong C++** của toàn bộ chương trình — **không
+         phải công thức theo per-node**. Đo thực nghiệm (kịch bản 8 robot,
+         12 thiết bị wifi): 37 stream bị tiêu thụ trong lúc cài đặt wifi
+         (không chia đều 12 thiết bị), rồi 99 stream nữa trong lúc cài
+         internet stack (gần chắc chắn từ các object IPv6 DAD không dùng
+         tới, dù kịch bản chỉ chạy IPv4/UDP thuần). Kết luận: không thể suy
+         ngược ra công thức để bên INET tự tái tạo đúng thứ tự này, vì kiến
+         trúc module của OMNeT++ (khai báo qua NED, xây từng node 1 lần)
+         không có giai đoạn tương đương với cách ns-3 xây "tất cả node rồi
+         mới đến tất cả mobility rồi mới đến tất cả internet stack" theo 3
+         lượt riêng biệt.
+
+         **Tìm ra lối thoát**: ns-3 có sẵn API công khai
+         `WifiHelper::AssignStreams(devices, baseStream)` để gán stream
+         **tường minh, tuần tự, theo đúng thứ tự container** — bỏ qua hoàn
+         toàn bộ đếm toàn cục mong manh. `Txop::AssignStreams()` set thẳng
+         vào `m_rng`, đúng con RNG sinh backoff CSMA/CA
+         (`Txop::GetBackoffSlots`, dùng `m_rng->GetInteger(0, cw)`). Script
+         hiện tại **chưa từng gọi hàm này** (0 kết quả grep) — nghĩa là
+         thứ tự stream đang phụ thuộc bộ đếm toàn cục mong manh nói trên.
+
+         **Đã triển khai** (chưa build/chạy, chờ lệnh "chạy" theo quy ước):
+         1. `external/ns3/fleetqox_trace_replay.cc`: thêm cờ CLI
+            `--matchedBackoffRng`/`--matchedBackoffRngBase` (mặc định tắt,
+            không đổi hành vi cũ) — khi bật, gán stream tường minh cho
+            Txop của từng station (`base + i`) và AP (`base + stationCount
+            + j`), công thức đóng, có thể tái tạo.
+         2. `external/omnetpp/MatchedMrg32k3aRng.{h,cc}`: port lại **bit-for-
+            bit** thuật toán MRG32k3a của ns-3 (`rng-stream.cc`, L'Ecuyer
+            2001) thành 1 lớp `cRNG` của OMNeT++, kể cả cách quy đổi
+            double→integer khớp đúng `UniformRandomVariable::GetInteger`
+            của ns-3.
+         3. `external/omnetpp/patches/0001-contention-matched-backoff-rng.patch`:
+            vá module `Contention` của INET (đây **là** hành động vá lõi
+            simulator mà người dùng đã chủ động chọn) — thêm tham số
+            `matchedBackoffRngIndex`, cho phép lấy backoff từ 1 RNG-slot
+            vật lý tường minh thay vì mapping mặc định `getRNG(0)`. Áp
+            dụng qua `git apply` trong `Dockerfile` lúc build image, ghim
+            đúng theo `INET_COMMIT` hiện tại.
+         4. `omnetpp.ini`: thêm `[Config MatchedWifiRng]` (kế thừa
+            `MatchedWifi`, chọn `rng-class = "MatchedMrg32k3aRng"`).
+         5. `run_omnetpp_docker_wifi_parity.py`: thêm cờ `--matched-rng`,
+            tái dùng đúng hàm `ns3_encounter_order()` sẵn có (đã dùng cho
+            việc khớp vị trí robot ở vòng trước) để sinh override CLI cho
+            từng station/AP ở cả 2 bên, đảm bảo cùng 1 chỉ số stream.
+
+         **Chưa xong**: chưa build lại 2 image, chưa chạy lại ma trận
+         16/32 robot để đo mức độ thu hẹp độ lệch — đây là bước tiếp theo,
+         cần build C++ (ns-3 + INET, ~10-20 phút) và chạy lại toàn bộ ma
+         trận wifi-parity, nên chờ người dùng xác nhận trước khi thực thi.
+         **Lưu ý quan trọng về giới hạn của cách tiếp cận này**: dù RNG
+         backoff khớp tuyệt đối, thứ tự sự kiện thật trong mô phỏng (khi
+         nào 1 gói đến hàng đợi, khi nào kênh bận/rảnh theo góc nhìn của
+         từng station) vẫn phụ thuộc lịch sự kiện rời rạc của từng
+         simulator — 2 MAC stack độc lập (đã xác nhận khác thuật toán ở
+         vòng 7) có thể vẫn tiêu thụ stream RNG theo thứ tự khác nhau dù
+         "cùng" tập số ngẫu nhiên, nên đây là thử nghiệm có cơ sở kỹ thuật
+         nhưng **không đảm bảo chắc chắn thu hẹp được độ lệch** — kết quả
+         thật cần đo, không suy đoán trước.
      `run_heap_soak_fleet_asan_probe.py` (lặp nhiều "round" ngắn, không
      phải 1 lần chạy liên tục dài) và
      `run_rmw_docker_quic_gateway_async_burst_soak.py`. Cần: 1 kịch bản
