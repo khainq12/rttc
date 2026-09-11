@@ -47,27 +47,19 @@ class DiagnoseRunTest(unittest.TestCase):
         self.assertFalse(diagnosis["fragment_loss_observed"])
         self.assertEqual(diagnosis["reason"], "miss_without_detected_fragment_loss")
 
-    def test_nack_sent_but_sender_never_saw_it(self):
-        diagnosis = diagnose_run(result(passed=False, nacks_sent=3))
-        self.assertEqual(diagnosis["reason"], "nack_sent_but_not_received_by_sender")
-
-    def test_nack_received_but_no_repair_sent(self):
+    def test_repair_requested_but_ttl_expired(self):
         diagnosis = diagnose_run(
-            result(passed=False, nacks_sent=3, nacks_received=3)
+            result(passed=False, nacks_sent=3, ttl_expirations=1)
         )
-        self.assertEqual(diagnosis["reason"], "nack_received_but_no_repair_sent")
+        self.assertEqual(
+            diagnosis["reason"], "repair_requested_but_ttl_expired_before_completion"
+        )
 
-    def test_repair_sent_but_ttl_expired(self):
+    def test_nack_budget_exhausted_takes_priority_over_ttl(self):
         diagnosis = diagnose_run(
-            result(
-                passed=False,
-                nacks_sent=3,
-                nacks_received=3,
-                retransmitted=3,
-                ttl_expirations=1,
-            )
+            result(passed=False, nacks_sent=3, ttl_expirations=1, nack_exhausted=1)
         )
-        self.assertEqual(diagnosis["reason"], "repair_sent_but_ttl_expired_before_arrival")
+        self.assertEqual(diagnosis["reason"], "nack_budget_exhausted")
 
     def test_reassembly_failure_takes_priority(self):
         diagnosis = diagnose_run(

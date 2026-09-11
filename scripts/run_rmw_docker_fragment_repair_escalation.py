@@ -101,6 +101,15 @@ def diagnose_run(result: dict[str, Any]) -> dict[str, Any]:
     )
 
     nacks_sent = int(metrics.get("fragment_nacks_sent", 0))
+    # fragment_nacks_received / fragments_selectively_retransmitted count
+    # this relay hop acting as a REPAIR SOURCE for whatever is downstream
+    # of it (subscriber) -- a completely different leg from nacks_sent
+    # (this hop, as a receiver, requesting repair from whatever is
+    # upstream of it -- publisher). Only the relay probe exposes these
+    # metrics at all (publisher/subscriber don't), so there is no
+    # visibility into whether the publisher actually received/responded
+    # to a NACK the relay sent it -- don't use these two counters to
+    # classify a miss on the publisher->relay leg, only report them.
     nacks_received = int(metrics.get("fragment_nacks_received", 0))
     retransmitted = int(metrics.get("fragments_selectively_retransmitted", 0))
     ttl_expirations = int(metrics.get("fragment_assembly_ttl_expirations", 0))
@@ -117,19 +126,21 @@ def diagnose_run(result: dict[str, Any]) -> dict[str, Any]:
         if oversize_drops > 0 or metadata_mismatch_drops > 0:
             reason = "reassembly_failure"
         elif not fragment_loss_observed:
-            # A miss happened but the NACK/repair path never engaged at
-            # all -- either the loss detector itself is broken, or the
-            # miss isn't fragment-loss-related (e.g. whole-datagram drop
-            # before fragmentation, or an application-layer bug).
+            # A miss happened but this hop's OWN loss detector (watching
+            # what it receives from upstream) never engaged at all --
+            # either the miss is on a leg this probe can't see (relay->
+            # subscriber), or it isn't fragment-loss-related at all (e.g.
+            # an application-layer bug).
             reason = "miss_without_detected_fragment_loss"
-        elif nacks_sent > 0 and nacks_received == 0:
-            reason = "nack_sent_but_not_received_by_sender"
-        elif nacks_received > 0 and retransmitted == 0:
-            reason = "nack_received_but_no_repair_sent"
-        elif retransmitted > 0 and ttl_expirations > 0:
-            reason = "repair_sent_but_ttl_expired_before_arrival"
         elif nack_exhausted > 0:
             reason = "nack_budget_exhausted"
+        elif nacks_sent > 0 and ttl_expirations > 0:
+            # This hop detected loss and requested repair from upstream,
+            # but its own fragment-assembly TTL expired before a complete
+            # repair arrived. Can't attribute further (publisher-side
+            # response isn't observable from here) without adding
+            # equivalent metrics to the publisher/subscriber probes too.
+            reason = "repair_requested_but_ttl_expired_before_completion"
         else:
             reason = "unclassified_miss"
 
