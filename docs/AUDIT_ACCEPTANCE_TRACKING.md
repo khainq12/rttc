@@ -1450,6 +1450,71 @@ image chính.** Bước tiếp theo (chưa làm, ngoài phạm vi phiên này): 
 pipeline này để đo lại delivery ratio của Group 6 ở quy mô 16/32 robot
 với RMW thật thay vì raw UDP, so sánh với baseline hiện có.
 
+### 11/09/2026 (tiếp) — Đo delivery ratio thật ở quy mô 16 robot: gặp bug crash MỚI, fix xong, phát hiện vấn đề tiếp theo
+
+Thực hiện đúng bước tiếp theo đã ghi ở trên: chạy
+`run_ns3_docker_wifi_tap_rmw_probe.py --num-robots 16` (19 endpoint
+thật) để đo delivery ratio thật. Gặp NGAY một bug mới, khác hẳn mọi bug
+đã fix trước đó trong nhánh TapBridge.
+
+**Triệu chứng**: 16/19 endpoint crash ngay ở message ĐẦU TIÊN với
+`RCLError: Failed to publish: failed to send FleetRMW payload through
+UDP transport` (`rmw_pubsub.cpp:6358`). Tái lập ổn định qua 2 seed độc
+lập (7, 13) — không phải ngẫu nhiên.
+
+**Root cause**: thêm tạm `errno`/`strerror(errno)` vào error message
+(build lại `rmw_fleetqox_cpp` qua `colcon build`, `--parallel-workers 1
+MAKEFLAGS=-j2` để tránh OOM `cc1plus` — cùng vấn đề bộ nhớ VM Docker đã
+gặp khi build ns-3) → lộ ra `errno=113 (No route to host)` =
+**EHOSTUNREACH** ở MỌI lần crash. Với 19 station cùng associate vào 1 AP
+mô phỏng gần như đồng thời, gói ARP đầu tiên của nhiều station bị mất do
+contention → kernel đánh dấu neighbor entry `FAILED` → `sendto()` trả về
+`EHOSTUNREACH` ngay lập tức (đồng bộ, không cần round-trip). Vòng lặp
+retry sẵn có trong `rmw_pubsub.cpp` (`send_datagram_to_targets`) CHỈ
+retry cho `ENOBUFS`/`EAGAIN`/`EWOULDBLOCK` (nghẽn buffer kernel cục bộ) —
+`EHOSTUNREACH` không nằm trong tập này nên fail cứng ngay lần gửi đầu,
+`rclpy` biến `RMW_RET_ERROR` thành exception, giết chết node.
+
+**Fix** (`ros2_ws/src/rmw_fleetqox_cpp/src/rmw_pubsub.cpp`, commit
+`303062d`): thêm `ENETUNREACH`/`EHOSTUNREACH` vào tập lỗi được retry,
+NHƯNG với ngân sách retry riêng (`kUnreachableRetryLimit=40` ×
+`kUnreachableRetryBackoffMs=50ms` = tối đa 2s) thay vì tái dùng
+`kSendRetryLimit=20 × kSendRetryBackoffMs=5ms=100ms` của lớp buffer-full
+— lý do: phục hồi từ EHOSTUNREACH cần một round-trip ARP/association
+thật, không phải chỉ đợi buffer kernel rảnh, nên cần backoff dài hơn
+hẳn. Đồng thời giữ lại `errno`/`strerror` trong message lỗi vĩnh viễn
+(không phải chỉ debug tạm) vì message chung chung cũ đã che giấu hẳn
+lớp lỗi này suốt session.
+
+**Xác nhận fix**: build lại sạch, chạy lại đúng kịch bản 16-robot/seed
+13 → **0 crash trên cả 19 endpoint** (trước: 16/19 crash), 100% trace
+row (2289/2289) gửi thành công ở tầng ứng dụng/kernel.
+
+**Phát hiện MỚI, CHƯA giải quyết**: dù không còn crash, `rx=0` ở TẤT CẢ
+19 endpoint kể cả sau khi gửi thành công 2289 message — nghĩa là gói
+tin rời được kernel cục bộ nhưng KHÔNG đến nơi qua mạng wifi mô phỏng.
+Kiểm tra escalate quy mô (đúng phương pháp "tối thiểu rồi tăng dần" đã
+dùng suốt dự án) với CÙNG bản fix:
+- 1 robot (4 endpoint): delivery bình thường — `fleet_router rx=76`,
+  `operator_ui rx=2`, `robot_0000 rx=105` (khớp kết quả đã xác nhận
+  trước đó, fix không làm hỏng gì ở quy mô nhỏ).
+- 8 robot (11 endpoint): delivery sụp gần hết — tổng `tx=1573`,
+  `rx=22` (~1.4%).
+- 16 robot (19 endpoint): delivery sụp hoàn toàn — tổng `tx=2289`,
+  `rx=0` (0%).
+
+**Giả thuyết đang nghi ngờ** (CHƯA xác nhận): đây có thể là hiện tượng
+"congestion collapse" thật ở tầng 802.11 khi nhiều station cạnh tranh
+airtime cùng lúc — nhưng CŨNG có khả năng chính retry loop mới thêm
+(ARP re-request lặp lại theo mỗi lần `sendto()` thất bại) làm NẶNG
+THÊM tình trạng nghẽn (ARP request cũng là frame broadcast, tốn airtime
+y như data frame), tạo vòng lặp tự siết cổ: càng retry → càng nghẽn →
+càng fail → càng retry. Chưa phân biệt được 2 khả năng này. Bước tiếp
+theo (ngoài phạm vi phần vừa làm): đo airtime/collision thật ở tầng
+ns-3 (PhyTxBegin/PhyRxDrop trace, tương tự kỹ thuật đã dùng ở nhánh điều
+tra ARP relay trước đó) để xác định nguyên nhân, trước khi kết luận đây
+là giới hạn năng lực kênh thật hay tác dụng phụ của chính bản fix.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
