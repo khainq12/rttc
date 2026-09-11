@@ -30,8 +30,8 @@
 // already be 22 characters. Index-to-endpoint order is fixed and must be
 // mirrored exactly by the orchestration script: 0=controller, 1=fleet_router,
 // 2=operator_ui, 3..numRobots+2=robot_0000..robot_{numRobots-1} (matching
-// fleetqox/trace.py's naming), and index numRobots+3 for the access point.
-// Printed to stdout at startup so the orchestrator can verify agreement
+// fleetqox/trace.py's naming). The AP gets no tap device at all (see
+// below). Printed to stdout at startup so the orchestrator can verify agreement
 // instead of relying on two hardcoded copies of the same order staying in
 // sync silently.
 //
@@ -118,7 +118,6 @@ main(int argc, char* argv[])
   {
     stationTapNames.push_back(tapPrefix + std::to_string(i));
   }
-  const std::string apTapName = tapPrefix + "ap";
   constexpr std::size_t kMaxLinuxInterfaceNameLength = 15; // IFNAMSIZ - 1
   for (const auto& name : stationTapNames)
   {
@@ -129,12 +128,6 @@ main(int argc, char* argv[])
                                << "-character Linux interface name limit -- shorten --tapPrefix");
     }
   }
-  if (apTapName.size() > kMaxLinuxInterfaceNameLength)
-  {
-    NS_FATAL_ERROR(
-        "tap device name '" << apTapName << "' exceeds the " << kMaxLinuxInterfaceNameLength
-                             << "-character Linux interface name limit -- shorten --tapPrefix");
-  }
 
   std::cout << "FLEETQOX_TAP_MAPPING station_index,endpoint,tap_device\n";
   for (uint32_t i = 0; i < totalStations; ++i)
@@ -142,7 +135,6 @@ main(int argc, char* argv[])
     std::cout << "FLEETQOX_TAP_MAPPING " << i << "," << stationEndpointLabels[i] << ","
               << stationTapNames[i] << "\n";
   }
-  std::cout << "FLEETQOX_TAP_MAPPING ap,ap," << apTapName << "\n";
   std::cout.flush();
 
   NodeContainer stations;
@@ -195,10 +187,15 @@ main(int argc, char* argv[])
   accessPoint.Get(0)->GetObject<MobilityModel>()->SetPosition(
       Vector(gridWidth / 2.0, gridWidth / 2.0, 0.0));
 
-  // Wifi devices don't support promiscuous mode, so each tap must already
-  // exist and be attached with Mode=UseLocal rather than letting TapBridge
-  // create+configure it (ConfigureLocal), matching the reference pattern
-  // in ns-3's tap-bridge module (examples/tap-wifi-virtual-machine.cc).
+  // The AP deliberately gets NO TapBridge: its only job is relaying
+  // frames between associated stations inside the simulation (standard
+  // ApWifiMac behavior), and nothing real needs to send/receive through
+  // it directly -- every FleetQoX endpoint is a station. Only bridge the
+  // stations, each to its own pre-created tap (wifi devices don't support
+  // promiscuous mode, so Mode=UseLocal is required rather than letting
+  // TapBridge create+configure the device itself with ConfigureLocal;
+  // matches ns-3's tap-bridge module reference pattern in
+  // examples/tap-wifi-virtual-machine.cc).
   TapBridgeHelper tapBridge;
   tapBridge.SetAttribute("Mode", StringValue("UseLocal"));
   for (uint32_t i = 0; i < stations.GetN(); ++i)
@@ -206,8 +203,6 @@ main(int argc, char* argv[])
     tapBridge.SetAttribute("DeviceName", StringValue(stationTapNames[i]));
     tapBridge.Install(stations.Get(i), stationDevices.Get(i));
   }
-  tapBridge.SetAttribute("DeviceName", StringValue(apTapName));
-  tapBridge.Install(accessPoint.Get(0), apDevices.Get(0));
 
   Simulator::Stop(Seconds(simDuration));
   Simulator::Run();
