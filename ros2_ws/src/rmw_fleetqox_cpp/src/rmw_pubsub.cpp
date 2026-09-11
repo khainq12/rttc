@@ -3572,6 +3572,17 @@ private:
   static constexpr size_t kMaxUdpPayloadBytes = 65507;
   static constexpr int kSendRetryLimit = 20;
   static constexpr int kSendRetryBackoffMs = 5;
+  // ENETUNREACH/EHOSTUNREACH signal a transient L2/L3 resolution gap (ARP
+  // not yet resolved, a peer mid-(re)association, brief route flap during
+  // roaming) rather than local backpressure -- recovering needs an actual
+  // ARP/association round trip, not just draining a kernel buffer, so this
+  // class gets a longer backoff and more attempts than kSendRetryBackoffMs.
+  // Confirmed as a real gap: a 16-station wifi burst where many stations'
+  // very first ARP exchange loses to contention hit EHOSTUNREACH on the
+  // first send and, with no retry for this errno class, crashed the
+  // publisher outright instead of transiently backing off.
+  static constexpr int kUnreachableRetryLimit = 40;
+  static constexpr int kUnreachableRetryBackoffMs = 50;
   static constexpr size_t kUdpFragmentChunkBytes = 60000;
   static constexpr std::int64_t kFragmentHistoryTtlNs = 60000000000ll;
   static constexpr size_t kMaxFragmentRepairIndexesPerRequest = 64;
@@ -6311,18 +6322,31 @@ private:
         reinterpret_cast<const sockaddr *>(&target),
         sizeof(target));
       if (sent < 0 || static_cast<size_t>(sent) != payload.size()) {
-        if (sent < 0 && (errno == ENOBUFS || errno == EAGAIN || errno == EWOULDBLOCK)) {
-          // The local kernel send buffer is momentarily full -- typical
-          // when several fragments are produced faster than a
-          // bandwidth-constrained link (e.g. netem-limited roaming) can
-          // drain them. This describes transient backpressure on this one
-          // send, not a broken socket, so back off briefly and retry a
+        const int first_errno = errno;
+        const bool is_buffer_transient =
+          first_errno == ENOBUFS || first_errno == EAGAIN || first_errno == EWOULDBLOCK;
+        const bool is_unreachable_transient =
+          first_errno == ENETUNREACH || first_errno == EHOSTUNREACH;
+        if (sent < 0 && (is_buffer_transient || is_unreachable_transient)) {
+          // ENOBUFS/EAGAIN/EWOULDBLOCK: the local kernel send buffer is
+          // momentarily full -- typical when several fragments are
+          // produced faster than a bandwidth-constrained link (e.g.
+          // netem-limited roaming) can drain them; recovers in a few
+          // milliseconds of catch-up.
+          // ENETUNREACH/EHOSTUNREACH: the peer's L2 address isn't resolved
+          // yet (ARP still in flight, peer mid-(re)association) rather
+          // than a broken socket -- recovering needs an actual ARP/
+          // association round trip, so this class gets a longer backoff
+          // and more attempts. Both describe transient conditions on this
+          // one send, not a broken socket, so back off and retry a
           // bounded number of times instead of failing the whole publish
-          // (and, via rclpy, crashing the caller) over what is usually a
-          // few milliseconds of catch-up.
+          // (and, via rclpy, crashing the caller).
+          const int retry_limit = is_buffer_transient ? kSendRetryLimit : kUnreachableRetryLimit;
+          const int retry_backoff_ms =
+            is_buffer_transient ? kSendRetryBackoffMs : kUnreachableRetryBackoffMs;
           bool retried_ok = false;
-          for (int attempt = 0; attempt < kSendRetryLimit; ++attempt) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(kSendRetryBackoffMs));
+          for (int attempt = 0; attempt < retry_limit; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(retry_backoff_ms));
             const auto retry_sent = ::sendto(
               fd_,
               payload.data(),
@@ -6334,8 +6358,10 @@ private:
               retried_ok = true;
               break;
             }
+            const int retry_errno = errno;
             if (!(retry_sent < 0 &&
-              (errno == ENOBUFS || errno == EAGAIN || errno == EWOULDBLOCK)))
+              (retry_errno == ENOBUFS || retry_errno == EAGAIN || retry_errno == EWOULDBLOCK ||
+              retry_errno == ENETUNREACH || retry_errno == EHOSTUNREACH)))
             {
               break;
             }
@@ -6355,9 +6381,15 @@ private:
             *out_exceeds_path_mtu = true;
           }
         }
-        RMW_SET_ERROR_MSG(label == nullptr ?
-          "failed to send FleetRMW payload through UDP transport" :
-          "failed to send FleetRMW payload through UDP transport");
+        {
+          // Include errno/strerror -- a bare generic string previously
+          // hid exactly this class of transient-but-unretried failure
+          // (see the ENETUNREACH/EHOSTUNREACH retry class above).
+          const int send_errno = errno;
+          std::string diag = std::string("failed to send FleetRMW payload through UDP transport: errno=") +
+            std::to_string(send_errno) + " (" + std::strerror(send_errno) + ")";
+          RMW_SET_ERROR_MSG(diag.c_str());
+        }
         return RMW_RET_ERROR;
       }
     }
