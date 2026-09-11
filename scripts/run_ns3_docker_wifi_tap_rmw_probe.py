@@ -140,7 +140,7 @@ def build_shell_script(
             "g++ -std=c++17 external/ns3/fleetqox_trace_replay_tap.cc "
             "-o /tmp/fleetqox_tap_bridge "
             "$(pkg-config --cflags --libs ns3-core ns3-network ns3-mobility "
-            "ns3-wifi ns3-tap-bridge ns3-csma ns3-bridge)"
+            "ns3-wifi ns3-tap-bridge)"
         ),
         # libns3-tap-bridge.so has the tap-creator helper's absolute path
         # baked in at whatever location it was built from (confirmed via

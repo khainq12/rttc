@@ -63,9 +63,7 @@
 // overwrite them again later. Apply the patch to whatever ns-3 source
 // tree the target image builds against before compiling this file.
 
-#include "ns3/bridge-module.h"
 #include "ns3/core-module.h"
-#include "ns3/csma-module.h"
 #include "ns3/mobility-module.h"
 #include "ns3/network-module.h"
 #include "ns3/tap-bridge-module.h"
@@ -76,6 +74,7 @@
 #include <cmath>
 #include <cstdio>
 #include <iostream>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -164,6 +163,81 @@ void
 AssociatedStaTrace(uint16_t /* aid */, Mac48Address /* address */)
 {
   g_associatedStaCount.fetch_add(1, std::memory_order_relaxed);
+}
+
+// STATIC cross-AP-group relay (11/09/2026, see docs/AUDIT_ACCEPTANCE_TRACKING.md
+// "đào sâu fix bridge flooding"): replaces an earlier CsmaHelper +
+// BridgeHelper backhaul that made the 16-robot delivery collapse WORSE,
+// not better (mac_tx_total ~4.6x higher, matching numAps). Root cause:
+// ns-3's BridgeNetDevice is a DYNAMIC LEARNING bridge -- it only learns
+// "this MAC lives behind this port" from that MAC's OWN outbound
+// traffic. Any station that mostly/only RECEIVES (e.g. fleet_router,
+// operator_ui -- tx=0 in this harness's traffic pattern) never sends
+// anything to learn FROM, so every frame addressed to it is flooded to
+// EVERY AP group forever, not just during an initial convergence
+// window; confirmed by ApWifiMac::Receive additionally pushing even
+// ordinary SAME-group relay traffic up to the promiscuous bridge
+// callback (WifiNetDevice::ForwardUp's PACKET_OTHERHOST branch), which
+// the un-converged bridge then ALSO flooded onto the backhaul. Since
+// this program already knows the complete station -> AP-group mapping
+// at setup time (stationIndexesByGroup), a real learning bridge adds
+// nothing -- direct, static, single-hop relay is both simpler and
+// strictly better here.
+std::map<Mac48Address, uint32_t> g_macToApGroup;
+std::vector<Ptr<NetDevice>> g_apDeviceByGroup;
+
+bool
+ApCrossGroupRelay(
+    Ptr<NetDevice> device, Ptr<const Packet> packet, uint16_t protocol, const Address& src,
+    const Address& dst, NetDevice::PacketType type)
+{
+  Mac48Address from = Mac48Address::ConvertFrom(src);
+  if (type == NetDevice::PACKET_BROADCAST || type == NetDevice::PACKET_MULTICAST)
+  {
+    // ARP requests are Ethernet broadcast -- without relaying these too,
+    // a station in one AP group can never even RESOLVE a station in
+    // another group's L2 address, so no cross-group unicast could ever
+    // form in the first place. Confirmed as a real bug: a first version
+    // of this relay handled PACKET_OTHERHOST (unicast) only, and cross-
+    // group traffic went completely silent (mac_tx_large pinned near 0
+    // for the rest of the run while mac_tx_small/ARP-sized kept climbing
+    // -- ARP requests going out and never getting a reply back).
+    // ApWifiMac's own ForwardDown already relayed this within `device`'s
+    // own group, so flood it to every OTHER group only.
+    for (Ptr<NetDevice> apDevice : g_apDeviceByGroup)
+    {
+      if (apDevice != device)
+      {
+        apDevice->SendFrom(packet->Copy(), from, Mac48Address::ConvertFrom(dst), protocol);
+      }
+    }
+    return true;
+  }
+  // PACKET_OTHERHOST is exactly "not addressed to this AP itself, and
+  // not broadcast/multicast" -- fires both for genuine cross-group
+  // unicast traffic (which needs relaying) and for ordinary same-group
+  // unicast traffic ApWifiMac already relayed over the air directly
+  // (which does not; the g_apDeviceByGroup lookup below tells the two
+  // apart).
+  if (type != NetDevice::PACKET_OTHERHOST)
+  {
+    return false;
+  }
+  Mac48Address to = Mac48Address::ConvertFrom(dst);
+  auto it = g_macToApGroup.find(to);
+  if (it == g_macToApGroup.end())
+  {
+    return false;
+  }
+  Ptr<NetDevice> targetApDevice = g_apDeviceByGroup[it->second];
+  if (targetApDevice == device)
+  {
+    // Same-group traffic ApWifiMac's own ForwardDown already delivered
+    // over the air -- relaying it again here would duplicate it.
+    return false;
+  }
+  targetApDevice->SendFrom(packet->Copy(), from, to, protocol);
+  return true;
 }
 
 void
@@ -407,33 +481,35 @@ main(int argc, char* argv[])
     stationDevices.Add(stationDeviceByIndex[i]);
   }
 
-  // Wired backhaul between the APs, exactly like a real multi-AP
-  // deployment's distribution system (APs uplinked to one switch): each
-  // AP's wifi AP NetDevice is BRIDGED (BridgeHelper, standard ns-3
-  // multi-AP-via-CSMA-backbone pattern) to a shared CSMA "backbone"
-  // NetDevice, so a station on AP group 0's channel can still reach a
-  // station on AP group 2's channel -- without this, the numAps groups
-  // are fully isolated islands (each on its own non-interfering
-  // YansWifiChannel by construction), which is NOT what "split the fleet
-  // across parallel channels" is supposed to mean, and confirmed as a
-  // real bug: a first numAps=4 run had cross-group peers permanently
-  // unreachable, so every graph-advertisement send to a cross-group peer
-  // burned the full ENETUNREACH/EHOSTUNREACH retry budget
-  // (kUnreachableRetryLimit x kUnreachableRetryBackoffMs, rmw_pubsub.cpp)
-  // during node startup, blowing through the orchestrator's ready-file
-  // deadline entirely. No backhaul needed when numAps == 1 (nothing to
-  // bridge).
+  // Cross-AP-group backhaul, so a station on AP group 0's channel can
+  // still reach a station on AP group 2's channel -- without this, the
+  // numAps groups are fully isolated islands (each on its own
+  // non-interfering YansWifiChannel by construction), which is NOT what
+  // "split the fleet across parallel channels" is supposed to mean; a
+  // first attempt confirmed this as a real bug (permanently unreachable
+  // cross-group peers stalled every endpoint's startup on the
+  // ENETUNREACH/EHOSTUNREACH retry budget). A second attempt used a
+  // CsmaHelper+BridgeHelper backhaul (the standard ns-3 multi-AP-over-
+  // wired-LAN pattern) but made things WORSE, not better -- see the
+  // STATIC cross-AP-group relay comment above for why (a dynamic
+  // learning bridge never learns receive-only stations' location and
+  // floods everything addressed to them forever). This program already
+  // knows the exact station -> AP-group mapping, so relay statically:
+  // no backhaul device/channel needed when numAps == 1 (nothing to
+  // relay across).
   if (numAps > 1)
   {
-    CsmaHelper csma;
-    NetDeviceContainer backhaulDevices = csma.Install(accessPoints);
-    for (uint32_t g = 0; g < accessPoints.GetN(); ++g)
+    for (uint32_t i = 0; i < totalStations; ++i)
     {
-      NetDeviceContainer bridgePorts;
-      bridgePorts.Add(apDevices.Get(g));
-      bridgePorts.Add(backhaulDevices.Get(g));
-      BridgeHelper bridge;
-      bridge.Install(accessPoints.Get(g), bridgePorts);
+      g_macToApGroup[stationMacs[i]] = i % numAps;
+    }
+    for (uint32_t g = 0; g < apDevices.GetN(); ++g)
+    {
+      g_apDeviceByGroup.push_back(apDevices.Get(g));
+    }
+    for (uint32_t g = 0; g < apDevices.GetN(); ++g)
+    {
+      apDevices.Get(g)->SetPromiscReceiveCallback(MakeCallback(&ApCrossGroupRelay));
     }
   }
 
