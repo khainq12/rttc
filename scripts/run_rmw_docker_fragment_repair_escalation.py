@@ -39,6 +39,7 @@ from scripts.run_rmw_docker_loss_resilient_fragment_campaign import (  # noqa: E
     run_campaign,
 )
 from scripts.run_ros2_relay_rmw_netem_probe import (  # noqa: E402
+    DEFAULT_FLEETQOX_FRAGMENT_ASSEMBLY_TTL_MS,
     DEFAULT_FLEETQOX_LOSS_RESILIENT_FRAGMENT_CHUNK_BYTES,
     DEFAULT_FLEETQOX_RELIABLE_MAX_RETRANSMISSIONS,
     DEFAULT_IMAGE,
@@ -58,6 +59,23 @@ _ROAMING_PRIMARY_LOSS = 0.28
 
 def _loss_scale_for_percent(percent: float) -> float:
     return percent / (_ROAMING_PRIMARY_LOSS * 100.0)
+
+
+def _min_timeout_s_for_robot_count(robot_count: int) -> float:
+    """Floor for the probe's overall wait timeout at a given robot count.
+
+    DEFAULT_FLEETQOX_FRAGMENT_ASSEMBLY_TTL_MS (60s) is the fragment-repair
+    mechanism's OWN internal give-up point per message -- longer than the
+    25s --timeout-s default this script (and the campaign it wraps)
+    otherwise inherits. If the harness's overall wait window is shorter
+    than that TTL, it can declare a run "failed" by giving up before the
+    mechanism's own retry logic would have finished, misclassifying "test
+    harness didn't wait long enough" as a delivery miss. Scale a floor off
+    the real TTL plus margin per robot for repair-queue contention instead
+    of trusting a flat default at every ladder step.
+    """
+    ttl_s = DEFAULT_FLEETQOX_FRAGMENT_ASSEMBLY_TTL_MS / 1000.0
+    return ttl_s + 10.0 + 2.0 * robot_count
 
 
 DEFAULT_LADDER: list[tuple[str, int, float]] = [
@@ -147,7 +165,12 @@ def run_escalation(
     steps: list[dict[str, Any]] = []
     stopped_at: str | None = None
     for label, robot_count, loss_scale in ladder:
-        print(f"=== step: {label} ===", file=sys.stderr, flush=True)
+        step_timeout_s = max(timeout_s, _min_timeout_s_for_robot_count(robot_count))
+        print(
+            f"=== step: {label} (timeout_s={step_timeout_s:.0f}) ===",
+            file=sys.stderr,
+            flush=True,
+        )
         campaign = run_campaign(
             root=root,
             image=image,
@@ -158,7 +181,7 @@ def run_escalation(
             robot_count=robot_count,
             payload_bytes=payload_bytes,
             publish_interval_ms=publish_interval_ms,
-            timeout_s=timeout_s,
+            timeout_s=step_timeout_s,
             fragment_chunk_bytes=fragment_chunk_bytes,
             max_retransmissions=max_retransmissions,
         )
@@ -172,6 +195,7 @@ def run_escalation(
             "robot_count": robot_count,
             "netem_loss_scale": loss_scale,
             "loss_percent": min(100.0, _ROAMING_PRIMARY_LOSS * 100.0 * loss_scale),
+            "timeout_s": step_timeout_s,
             "passed": step_passed,
             "diagnoses": diagnoses,
         }
@@ -214,7 +238,18 @@ def main() -> int:
     parser.add_argument("--samples", type=int, default=2)
     parser.add_argument("--payload-bytes", type=int, default=32768)
     parser.add_argument("--publish-interval-ms", type=int, default=2000)
-    parser.add_argument("--timeout-s", type=float, default=25.0)
+    parser.add_argument(
+        "--timeout-s",
+        type=float,
+        default=25.0,
+        help=(
+            "Floor for the probe's overall wait timeout, per step raised to "
+            "at least _min_timeout_s_for_robot_count(robot_count) (based on "
+            "the 60s fragment-assembly TTL plus per-robot margin) so a "
+            "slow-but-successful repair at higher robot counts isn't "
+            "misread as a miss."
+        ),
+    )
     parser.add_argument(
         "--fragment-chunk-bytes",
         type=int,
