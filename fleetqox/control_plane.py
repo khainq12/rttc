@@ -367,13 +367,15 @@ class PredictiveAdmissionController(CausalSemanticDeadlineScheduler):
 
         pressure = self._pressure(entries, link)
         remaining = link.capacity_bytes_per_tick
+        remaining_packets = link.capacity_packets_per_tick
         selected: list[FlowDecision] = []
 
         for partition in self._ordered_partitions(entries):
-            admitted, remaining = self._admit_partition(
+            admitted, remaining, remaining_packets = self._admit_partition(
                 partition,
                 capacity=remaining,
                 pressure=pressure,
+                remaining_packets=remaining_packets,
             )
             selected.extend(admitted)
 
@@ -459,15 +461,24 @@ class PredictiveAdmissionController(CausalSemanticDeadlineScheduler):
         *,
         capacity: int,
         pressure: float,
-    ) -> tuple[list[FlowDecision], int]:
+        remaining_packets: int | None = None,
+    ) -> tuple[list[FlowDecision], int, int | None]:
         decisions: list[FlowDecision] = []
         remaining = capacity
         for entry in entries:
+            if remaining_packets is not None and remaining_packets <= 0:
+                # Real 802.11 airtime per packet is mostly fixed overhead
+                # (DIFS/backoff/preamble/ACK), independent of payload size --
+                # once the packet-rate ceiling is hit, no further entry can
+                # be admitted regardless of remaining byte budget.
+                break
             decision = self._decision_for_entry(entry, pressure, remaining)
             if decision and decision.allocated_bytes <= remaining:
                 decisions.append(decision)
                 remaining -= decision.allocated_bytes
-        return decisions, remaining
+                if remaining_packets is not None:
+                    remaining_packets -= 1
+        return decisions, remaining, remaining_packets
 
     def _decision_for_entry(
         self,

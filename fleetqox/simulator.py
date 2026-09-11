@@ -300,15 +300,21 @@ def fifo_policy(
     link: NetworkLink,
 ) -> list[FlowDecision]:
     remaining = link.capacity_bytes_per_tick
+    remaining_packets = link.capacity_packets_per_tick
     decisions: list[FlowDecision] = []
     for spec, obs in candidates:
         if obs.age_ms > spec.qos.lifespan_ms:
             decisions.append(_decision(spec, "drop", 0, "stale"))
             continue
         size = _size(spec, obs)
+        if remaining_packets is not None and remaining_packets <= 0:
+            decisions.append(_decision(spec, "defer", 0, "fifo packet-rate full"))
+            continue
         if size <= remaining:
             decisions.append(_decision(spec, "send", size, "fifo"))
             remaining -= size
+            if remaining_packets is not None:
+                remaining_packets -= 1
         else:
             decisions.append(_decision(spec, "defer", 0, "fifo full"))
     return decisions
@@ -334,6 +340,7 @@ def static_priority_policy(
         reverse=True,
     )
     remaining = link.capacity_bytes_per_tick
+    remaining_packets = link.capacity_packets_per_tick
     sent_ids = set()
     decisions: list[FlowDecision] = []
     for spec, obs in ordered:
@@ -341,10 +348,14 @@ def static_priority_policy(
             decisions.append(_decision(spec, "drop", 0, "stale"))
             sent_ids.add(spec.flow_id)
             continue
+        if remaining_packets is not None and remaining_packets <= 0:
+            continue
         size = _size(spec, obs)
         if size <= remaining:
             decisions.append(_decision(spec, "send", size, "static priority"))
             remaining -= size
+            if remaining_packets is not None:
+                remaining_packets -= 1
             sent_ids.add(spec.flow_id)
     for spec, _ in candidates:
         if spec.flow_id not in sent_ids:

@@ -77,6 +77,19 @@ from scripts.run_omnetpp_docker_parity import (  # noqa: E402
 
 SCHEMA_VERSION = "fleetqox.omnetpp_ns3_docker_wifi_parity.v2"
 WIFI_WARMUP_MS = 1000.0
+# Approximate real-802.11g DCF per-packet airtime floor for a small control
+# frame at 54Mbps under legacy (non-QoS) ERP-OFDM: DIFS(28us) + average
+# CWmin/2 backoff(15/2 slots * 9us =~68us) + PLCP preamble/header(~24us) +
+# short-payload transmission(~15-20us) + SIFS(10us) + ACK(preamble+14B at a
+# basic rate, ~40-50us) =~ 190-200us/packet in isolation, i.e. a theoretical
+# ceiling around 5000 packets/s for ONE uncontended station. With N stations
+# genuinely contending for the shared medium, collisions and backoff growth
+# push the real aggregate ceiling well below that (matches the Bianchi-model
+# degradation already confirmed empirically for this scenario -- see
+# docs/AUDIT_ACCEPTANCE_TRACKING.md). This is a conservative, documented
+# approximation for admission control to shed load against, not an exact
+# throughput model; tune via --capacity-packets-per-second if needed.
+DEFAULT_CAPACITY_PACKETS_PER_SECOND = 3000
 DEFAULT_THRESHOLDS = {
     "delivery_ratio_delta": 0.10,
     "deadline_miss_ratio_delta": 0.10,
@@ -412,6 +425,7 @@ def run_parity_matrix(
     thresholds: dict[str, float],
     build_image: bool,
     matched_rng: bool = False,
+    capacity_packets_per_second: int | None = DEFAULT_CAPACITY_PACKETS_PER_SECOND,
 ) -> dict[str, Any]:
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -473,6 +487,7 @@ def run_parity_matrix(
                 seconds=seconds,
                 seed=seed,
                 capacity_bytes_per_second=max(200_000, robots * 6_000),
+                capacity_packets_per_second=capacity_packets_per_second,
                 policies=POLICIES,
                 include_non_sent=False,
             )
@@ -561,6 +576,7 @@ def run_parity_matrix(
         },
         "images": {"ns3": ns3_image, "omnetpp": omnetpp_image},
         "matched_rng": matched_rng,
+        "capacity_packets_per_second": capacity_packets_per_second,
         "image_build": image_build,
         "compile": compile_evidence,
         "topology_scope": "matched_single_ap_802_11g_infrastructure_grid_mobility",
@@ -627,6 +643,16 @@ def main() -> int:
             "vs. genuine MAC/queue algorithm divergence."
         ),
     )
+    parser.add_argument(
+        "--capacity-packets-per-second",
+        type=int,
+        default=DEFAULT_CAPACITY_PACKETS_PER_SECOND,
+        help=(
+            "Packet-rate admission ceiling (0 disables it, restoring the "
+            "byte-rate-only budget). Default derived from real 802.11g DCF "
+            "per-packet overhead -- see DEFAULT_CAPACITY_PACKETS_PER_SECOND."
+        ),
+    )
     args = parser.parse_args()
     summary = run_parity_matrix(
         omnetpp_image=args.omnetpp_image,
@@ -638,6 +664,7 @@ def main() -> int:
         thresholds=dict(DEFAULT_THRESHOLDS),
         build_image=not args.skip_image_build,
         matched_rng=args.matched_rng,
+        capacity_packets_per_second=args.capacity_packets_per_second or None,
     )
     summary_path = ROOT / args.summary_json
     summary_path.parent.mkdir(parents=True, exist_ok=True)

@@ -122,6 +122,13 @@ class NetworkLink:
     """Network budget visible to the scheduler for the current tick."""
 
     capacity_bytes_per_tick: int
+    # Optional packet-count ceiling for the tick, separate from the byte
+    # budget above. Real 802.11 airtime is dominated by a mostly
+    # size-independent per-packet overhead (DIFS/backoff/preamble/ACK), so a
+    # byte-only budget under-prices high-frequency small packets (e.g. 50Hz
+    # control) relative to real channel capacity. None means no packet-rate
+    # constraint (all existing callers keep their current behavior).
+    capacity_packets_per_tick: int | None = None
     loss: float = 0.0
     jitter_ms: float = 0.0
     rtt_ms: float = 20.0
@@ -129,6 +136,8 @@ class NetworkLink:
     def validates(self) -> None:
         if self.capacity_bytes_per_tick < 0:
             raise ValueError("capacity must be non-negative")
+        if self.capacity_packets_per_tick is not None and self.capacity_packets_per_tick < 0:
+            raise ValueError("capacity_packets_per_tick must be non-negative")
         if not 0 <= self.loss <= 1:
             raise ValueError("loss must be in [0, 1]")
         if self.jitter_ms < 0 or self.rtt_ms < 0:

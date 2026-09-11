@@ -77,10 +77,21 @@ def generate_trace_events(
     seconds: int,
     seed: int,
     capacity_bytes_per_second: int | None,
+    capacity_packets_per_second: int | None = None,
     policies: Iterable[str] | None = None,
     include_non_sent: bool = False,
 ) -> list[dict[str, object]]:
-    """Generate trace events for one T0-style workload scenario."""
+    """Generate trace events for one T0-style workload scenario.
+
+    capacity_packets_per_second is an optional, separate packet-rate
+    ceiling (None = no constraint, matching prior behavior). Real 802.11
+    airtime is dominated by mostly size-independent per-packet overhead
+    (DIFS/backoff/preamble/ACK), so the byte-rate budget above alone
+    under-prices high-frequency small packets (e.g. 50Hz control) relative
+    to real channel capacity -- this lets admission control shed that load
+    proactively instead of over-admitting packets the real MAC layer can't
+    actually carry.
+    """
 
     requested = list(
         policies
@@ -106,6 +117,11 @@ def generate_trace_events(
         if capacity_bytes_per_second is not None
         else max(200_000, robots * 6_000)
     ) // ticks_per_second
+    capacity_packets_per_tick = (
+        capacity_packets_per_second // ticks_per_second
+        if capacity_packets_per_second is not None
+        else None
+    )
     flows = build_fleet_workload(robots, seed)
 
     events: list[dict[str, object]] = []
@@ -120,6 +136,7 @@ def generate_trace_events(
                 ticks=ticks,
                 seed=seed,
                 capacity_per_tick=capacity_per_tick,
+                capacity_packets_per_tick=capacity_packets_per_tick,
                 tick_ms=tick_ms,
                 ticks_per_second=ticks_per_second,
                 include_non_sent=include_non_sent,
@@ -161,6 +178,7 @@ def _generate_policy_trace(
     tick_ms: float,
     ticks_per_second: int,
     include_non_sent: bool,
+    capacity_packets_per_tick: int | None = None,
 ) -> list[dict[str, object]]:
     rng = random.Random(seed)
     ages = {flow.flow_id: 0.0 for flow in flows}
@@ -170,6 +188,7 @@ def _generate_policy_trace(
         timestamp_ms = tick * tick_ms
         link = NetworkLink(
             capacity_bytes_per_tick=_vary_capacity(capacity_per_tick, tick),
+            capacity_packets_per_tick=capacity_packets_per_tick,
             loss=0.04 + (0.10 if tick % 83 in range(8) else 0.0),
             jitter_ms=8.0 + (18.0 if tick % 57 in range(6) else 0.0),
             rtt_ms=22.0 + (35.0 if tick % 67 in range(4) else 0.0),
