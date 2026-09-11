@@ -1115,15 +1115,66 @@ nào crash.
   của FleetQoX hay không.
 
 Cả 2 nhánh khả thi nhất (infra-mode và ad-hoc) trong image ns-3 hiện
-tại đều đi vào ngõ cụt theo cách khác nhau. Hướng còn lại chưa thử:
-build ns-3 từ source thật (có debug symbols + NS_LOG hoạt động) thay
-vì dùng bản apt-package release — chi phí lớn hơn nhiều (build ns-3 từ
-đầu trong Docker) và không chắc tìm ra fix trong thời gian hợp lý. Đề
-xuất: tạm dừng nhánh "bridge process thật qua TAP" ở đây, quay lại
-đánh giá có nên chuyển sang phương án ban đầu (viết lại rút gọn
-fragment/NACK/repair trực tiếp trong 2 app trace-replay của Group 6,
-phương án đã đề xuất nhưng người dùng chọn phương án TAP thay vào lúc
-đầu) hay tiếp tục đầu tư vào build ns-3 từ source.
+tại đều đi vào ngõ cụt theo cách khác nhau.
+
+### Thử ns-3 version khác (3.46, Ubuntu 26.04 LTS) — 11/09/2026
+
+Theo đề xuất ưu tiên "thử version ns-3 khác trước" (ít rủi ro nhất,
+không cần patch source): dựng container riêng trên `ubuntu:26.04`
+("resolute", LTS hiện hành) — **không đụng vào image `rmw-netem:jazzy`
+đang dùng cho pipeline chính** — cài `ns3`/`libns3-dev` qua apt (bản
+**3.46-2**, mới hơn 3.41 tới 5 version/~1.5 năm phát triển), build lại
+đúng testcase tối giản TAP→TapBridge→AP→STA (không có FleetRMW/ROS2,
+đúng theo yêu cầu "chỉ cần ARP+UDP chạy được là đạt").
+
+2 vấn đề build/hạ tầng gặp phải và đã fix (không liên quan tới câu hỏi
+chính, chỉ là chi phí setup bản mới):
+- ns-3 3.46 header dùng C++20 (`<=>`, `std::remove_cvref_t`,
+  `std::bind_front`, `.contains()`) — build lỗi với `-std=c++17` cũ,
+  đổi sang `-std=c++20`.
+- Thiếu `libsqlite3-dev`/`libgsl-dev` (chỉ có runtime `.so`, không có
+  dev symlink) — linker báo "cannot find libsqlite3.so" — cài thêm 2
+  gói dev.
+- Cùng bug tap-creator baked-in-path như bản 3.41 (đường dẫn build-time
+  khác thư mục cài thật) — dùng lại đúng kỹ thuật symlink cũ (lần này
+  viết tổng quát hơn: tự trích path bị baked-in bằng `strings` +
+  symlink động, không hardcode).
+
+**Kết quả sau khi hết lỗi build: TÁI HIỆN Y HỆT LỖI CŨ.** Lần này
+process ns-3 không hề crash khi attach tap (khác hẳn lần đầu với 3.41
+gặp lỗi tap-creator) — tức là mọi bước setup hạ tầng đều qua trót lọt —
+nhưng `ping`/ARP/UDP vẫn thất bại giống hệt: `ping` báo "Destination
+Host Unreachable" toàn bộ 4/4 gói, `ip neigh show` → `FAILED`, UDP
+server timeout không nhận được gì.
+
+**Kết luận: KHÔNG PHẢI bug đặc thù của bản 3.41.** Lỗi tồn tại xuyên
+suốt ít nhất từ 3.41 → 3.46 (5 version, apt package mới nhất tính đến
+2026 qua Ubuntu 26.04 LTS). Loại trừ dứt điểm hướng "đổi version ns-3"
+như 1 fix đơn giản — khả năng 1 version MỚI HƠN NỮA (chưa release) sửa
+đúng bug này mà không cần hiểu rõ nguyên nhân là rất thấp.
+
+### Tổng kết 3 hướng đã thử và kết luận
+
+1. **CSMA thay wifi**: xác nhận TapBridge/orchestration đúng — dùng
+   được làm baseline benchmark FleetRMW không cần wifi thật.
+2. **Ad-hoc wifi thay infra-mode**: segfault ngay trong ns-3 (bản 3.41),
+   không dùng được.
+3. **Đổi version ns-3 (3.41 → 3.46)**: lỗi vẫn y hệt — không phải bug
+   theo version, khả năng là bug/giới hạn có tính hệ thống trong cách
+   `ApWifiMac` xử lý frame do TapBridge bơm từ ngoài vào (external
+   injection), hoặc 1 thiếu sót cấu hình chưa tìm ra dù đã loại trừ MAC
+   mismatch, PHY rate, và giờ cả version.
+
+Với cả 3 hướng ít rủi ro đã thử hết và đều không ra kết quả tích cực,
+hướng còn lại thực sự "patch trực tiếp Wi-Fi MAC/TapBridge" (như mục 4
+người dùng đề xuất) sẽ cần build ns-3 từ source thật (có debug
+symbols + NS_LOG hoạt động, hiện tại image nào cũng không có) — chi phí
+lớn hơn nhiều so với 3 hướng đã thử. Đề xuất: tạm dừng nhánh "bridge
+process thật qua TAP" ở đây, quay lại đánh giá có nên chuyển sang
+phương án ban đầu (viết lại rút gọn fragment/NACK/repair trực tiếp
+trong 2 app trace-replay của Group 6, phương án đã đề xuất nhưng người
+dùng chọn phương án TAP thay vào lúc đầu) hay tiếp tục đầu tư build
+ns-3 từ source để có NS_LOG/backtrace thật.
 
 ## Quy ước cập nhật file này
 
