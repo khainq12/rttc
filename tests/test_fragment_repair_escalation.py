@@ -83,7 +83,7 @@ class DiagnoseRunTest(unittest.TestCase):
 
     def test_ladder_escalates_robot_count_at_fixed_loss(self):
         robot_counts = [step[1] for step in DEFAULT_LADDER[1:]]
-        self.assertEqual(robot_counts, [1, 4, 8, 16])
+        self.assertEqual(robot_counts, [1, 4, 8, 16, 32])
         loss_scales = [step[2] for step in DEFAULT_LADDER[1:]]
         self.assertTrue(all(scale == loss_scales[0] for scale in loss_scales))
 

@@ -84,6 +84,7 @@ DEFAULT_LADDER: list[tuple[str, int, float]] = [
     ("4 robots, ~5% loss", 4, _loss_scale_for_percent(5.0)),
     ("8 robots, ~5% loss", 8, _loss_scale_for_percent(5.0)),
     ("16 robots, ~5% loss", 16, _loss_scale_for_percent(5.0)),
+    ("32 robots, ~5% loss", 32, _loss_scale_for_percent(5.0)),
 ]
 
 
