@@ -63,7 +63,9 @@
 // overwrite them again later. Apply the patch to whatever ns-3 source
 // tree the target image builds against before compiling this file.
 
+#include "ns3/bridge-module.h"
 #include "ns3/core-module.h"
+#include "ns3/csma-module.h"
 #include "ns3/mobility-module.h"
 #include "ns3/network-module.h"
 #include "ns3/tap-bridge-module.h"
@@ -165,7 +167,7 @@ AssociatedStaTrace(uint16_t /* aid */, Mac48Address /* address */)
 }
 
 void
-PrintWifiStats(uint32_t totalStations)
+PrintWifiStats(uint32_t totalStations, uint32_t numAps)
 {
   // The orchestrator kills this process once every endpoint finishes,
   // rather than waiting for --simDuration's natural Simulator::Stop --
@@ -175,9 +177,10 @@ PrintWifiStats(uint32_t totalStations)
   // kill is the data available (Simulator::Schedule ties this to the
   // realtime simulator's wall clock, so "every 5s" really is every 5
   // real seconds).
-  Simulator::Schedule(Seconds(5.0), &PrintWifiStats, totalStations);
+  Simulator::Schedule(Seconds(5.0), &PrintWifiStats, totalStations, numAps);
   std::cout << "FLEETQOX_WIFI_STATS {"
             << "\"total_stations\":" << totalStations << ","
+            << "\"num_aps\":" << numAps << ","
             << "\"associated_stations\":" << g_associatedStaCount.load() << ","
             << "\"mac_tx_total\":" << g_macTxTotal.load() << ","
             << "\"mac_tx_small\":" << g_macTxSmall.load() << ","
@@ -210,6 +213,7 @@ main(int argc, char* argv[])
   std::string tapPrefix = "ftap";
   double simDuration = 30.0;
   bool wifiQos = false;
+  uint32_t numAps = 1;
 
   CommandLine cmd(__FILE__);
   cmd.AddValue("numRobots", "Number of robot stations (plus 3 fixed endpoints)", numRobots);
@@ -233,6 +237,21 @@ main(int argc, char* argv[])
       "contents), so this only controls whether the MAC has separate ACs "
       "to place traffic into at all.",
       wifiQos);
+  cmd.AddValue(
+      "numAps",
+      "Split stations across this many APs, each on its OWN, fully "
+      "non-interfering channel (a separate YansWifiChannel C++ object per "
+      "group -- ns-3's Yans model only computes interference among PHYs "
+      "sharing one channel object, so this is the best-case, fully "
+      "orthogonal-channel scenario). Stations are assigned round-robin "
+      "(station i -> AP i%numAps) so each channel carries an even share "
+      "of the fleet. Added for the 16-robot-scale delivery-collapse "
+      "investigation (see docs/AUDIT_ACCEPTANCE_TRACKING.md) to test "
+      "whether a single 802.11g/single-AP channel's real capacity ceiling "
+      "-- not any software-layer bug -- is what collapses delivery at "
+      "scale. Default 1 preserves the original single-AP topology "
+      "exactly.",
+      numAps);
   cmd.Parse(argc, argv);
 
   if (numRobots == 0)
@@ -242,6 +261,10 @@ main(int argc, char* argv[])
   if (mobilitySpeed < 0.0 || stationSpacing <= 0.0 || simDuration <= 0.0)
   {
     NS_FATAL_ERROR("mobilitySpeed must be nonnegative, stationSpacing and simDuration positive");
+  }
+  if (numAps == 0)
+  {
+    NS_FATAL_ERROR("numAps must be positive");
   }
 
   // TapBridge requires the realtime simulator (packets must actually be
@@ -313,12 +336,19 @@ main(int argc, char* argv[])
 
   NodeContainer stations;
   stations.Create(totalStations);
-  NodeContainer accessPoint;
-  accessPoint.Create(1);
+  NodeContainer accessPoints;
+  accessPoints.Create(numAps);
 
-  YansWifiChannelHelper channel = YansWifiChannelHelper::Default();
-  YansWifiPhyHelper phy;
-  phy.SetChannel(channel.Create());
+  // Round-robin station -> AP-group assignment: station i joins AP
+  // (i % numAps)'s channel. Purely an ns-3-internal grouping -- the tap
+  // device name/index/MAC contract with the orchestrator script (by
+  // station index i) is completely unaffected, so this needs no changes
+  // on the Linux/orchestration side.
+  std::vector<std::vector<uint32_t>> stationIndexesByGroup(numAps);
+  for (uint32_t i = 0; i < totalStations; ++i)
+  {
+    stationIndexesByGroup[i % numAps].push_back(i);
+  }
 
   WifiHelper wifi;
   wifi.SetStandard(WIFI_STANDARD_80211g);
@@ -326,14 +356,86 @@ main(int argc, char* argv[])
       "ns3::ConstantRateWifiManager", "DataMode", StringValue(wifiMode), "ControlMode",
       StringValue(wifiMode));
 
-  Ssid ssid = Ssid("fleetqox-wifi");
-  WifiMacHelper mac;
-  mac.SetType(
-      "ns3::StaWifiMac", "Ssid", SsidValue(ssid), "ActiveProbing", BooleanValue(false),
-      "QosSupported", BooleanValue(wifiQos));
-  NetDeviceContainer stationDevices = wifi.Install(phy, mac, stations);
-  mac.SetType("ns3::ApWifiMac", "Ssid", SsidValue(ssid), "QosSupported", BooleanValue(wifiQos));
-  NetDeviceContainer apDevices = wifi.Install(phy, mac, accessPoint);
+  // stationDevices must end up index-aligned with `stations`/`stationMacs`/
+  // `stationTapNames` (station i -> stationDevices.Get(i)) for every loop
+  // below to keep working unchanged -- wifi.Install() only accepts one
+  // NodeContainer per call, so each AP group's Install() call runs
+  // separately (on that group's own NodeContainer of just its stations)
+  // and the resulting per-group NetDeviceContainer devices are scattered
+  // back into their ORIGINAL station-index slots here, rather than
+  // appended in per-group order.
+  std::vector<Ptr<NetDevice>> stationDeviceByIndex(totalStations);
+  NetDeviceContainer apDevices;
+  for (uint32_t g = 0; g < numAps; ++g)
+  {
+    // A separate YansWifiChannel C++ object per group -- ns-3's Yans wifi
+    // model computes interference/collision only among PHYs sharing ONE
+    // channel object (there is no separate RF-frequency model layered on
+    // top), so distinct channel objects are exactly "fully
+    // non-interfering channels," the best case a real multi-AP/
+    // multi-channel deployment can achieve.
+    YansWifiChannelHelper channelHelper = YansWifiChannelHelper::Default();
+    YansWifiPhyHelper phy;
+    phy.SetChannel(channelHelper.Create());
+
+    Ssid ssid = Ssid("fleetqox-wifi-" + std::to_string(g));
+    WifiMacHelper mac;
+
+    NodeContainer groupStations;
+    for (uint32_t stationIndex : stationIndexesByGroup[g])
+    {
+      groupStations.Add(stations.Get(stationIndex));
+    }
+    if (groupStations.GetN() > 0)
+    {
+      mac.SetType(
+          "ns3::StaWifiMac", "Ssid", SsidValue(ssid), "ActiveProbing", BooleanValue(false),
+          "QosSupported", BooleanValue(wifiQos));
+      NetDeviceContainer groupStationDevices = wifi.Install(phy, mac, groupStations);
+      for (uint32_t k = 0; k < stationIndexesByGroup[g].size(); ++k)
+      {
+        stationDeviceByIndex[stationIndexesByGroup[g][k]] = groupStationDevices.Get(k);
+      }
+    }
+
+    mac.SetType("ns3::ApWifiMac", "Ssid", SsidValue(ssid), "QosSupported", BooleanValue(wifiQos));
+    apDevices.Add(wifi.Install(phy, mac, accessPoints.Get(g)));
+  }
+  NetDeviceContainer stationDevices;
+  for (uint32_t i = 0; i < totalStations; ++i)
+  {
+    stationDevices.Add(stationDeviceByIndex[i]);
+  }
+
+  // Wired backhaul between the APs, exactly like a real multi-AP
+  // deployment's distribution system (APs uplinked to one switch): each
+  // AP's wifi AP NetDevice is BRIDGED (BridgeHelper, standard ns-3
+  // multi-AP-via-CSMA-backbone pattern) to a shared CSMA "backbone"
+  // NetDevice, so a station on AP group 0's channel can still reach a
+  // station on AP group 2's channel -- without this, the numAps groups
+  // are fully isolated islands (each on its own non-interfering
+  // YansWifiChannel by construction), which is NOT what "split the fleet
+  // across parallel channels" is supposed to mean, and confirmed as a
+  // real bug: a first numAps=4 run had cross-group peers permanently
+  // unreachable, so every graph-advertisement send to a cross-group peer
+  // burned the full ENETUNREACH/EHOSTUNREACH retry budget
+  // (kUnreachableRetryLimit x kUnreachableRetryBackoffMs, rmw_pubsub.cpp)
+  // during node startup, blowing through the orchestrator's ready-file
+  // deadline entirely. No backhaul needed when numAps == 1 (nothing to
+  // bridge).
+  if (numAps > 1)
+  {
+    CsmaHelper csma;
+    NetDeviceContainer backhaulDevices = csma.Install(accessPoints);
+    for (uint32_t g = 0; g < accessPoints.GetN(); ++g)
+    {
+      NetDeviceContainer bridgePorts;
+      bridgePorts.Add(apDevices.Get(g));
+      bridgePorts.Add(backhaulDevices.Get(g));
+      BridgeHelper bridge;
+      bridge.Install(accessPoints.Get(g), bridgePorts);
+    }
+  }
 
   // Same grid-position formula as fleetqox_trace_replay.cc's non-roaming
   // wifi branch, so station density stays comparable to the raw-UDP test.
@@ -353,13 +455,21 @@ main(int argc, char* argv[])
     model->SetVelocity(Vector(direction * mobilitySpeed, 0.0, 0.0));
   }
 
+  // All APs sit at the same physical position -- each is on its OWN
+  // non-interfering channel object (see the numAps setup above), so
+  // co-location is a realistic dense-deployment pattern here (multiple
+  // APs in one room on different channels), and physical placement only
+  // matters for propagation loss WITHIN a channel, not across channels.
   MobilityHelper apMobility;
   apMobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
-  apMobility.Install(accessPoint);
+  apMobility.Install(accessPoints);
   const double gridWidth =
       std::ceil(std::sqrt(static_cast<double>(totalStations))) * stationSpacing;
-  accessPoint.Get(0)->GetObject<MobilityModel>()->SetPosition(
-      Vector(gridWidth / 2.0, gridWidth / 2.0, 0.0));
+  for (uint32_t g = 0; g < accessPoints.GetN(); ++g)
+  {
+    accessPoints.Get(g)->GetObject<MobilityModel>()->SetPosition(
+        Vector(gridWidth / 2.0, gridWidth / 2.0, 0.0));
+  }
 
   // The AP deliberately gets NO TapBridge: its only job is relaying
   // frames between associated stations inside the simulation (standard
@@ -433,11 +543,11 @@ main(int argc, char* argv[])
     apMac->TraceConnectWithoutContext("AssociatedSta", MakeCallback(&AssociatedStaTrace));
   }
 
-  Simulator::Schedule(Seconds(5.0), &PrintWifiStats, totalStations);
+  Simulator::Schedule(Seconds(5.0), &PrintWifiStats, totalStations, numAps);
 
   Simulator::Stop(Seconds(simDuration));
   Simulator::Run();
-  PrintWifiStats(totalStations);
+  PrintWifiStats(totalStations, numAps);
   Simulator::Destroy();
 
   return 0;

@@ -119,6 +119,7 @@ def build_shell_script(
     fragment_chunk_bytes: int = DEFAULT_FLEETQOX_LOSS_RESILIENT_FRAGMENT_CHUNK_BYTES,
     udp_datagram_budget_bytes: int = DEFAULT_FLEETQOX_UDP_DATAGRAM_BUDGET_BYTES,
     graph_renew_interval_ms: int | None = None,
+    num_aps: int = 1,
 ) -> str:
     ips = {endpoint: f"{BASE_IP_PREFIX}{i + 2}" for i, endpoint in enumerate(endpoints)}
 
@@ -139,7 +140,7 @@ def build_shell_script(
             "g++ -std=c++17 external/ns3/fleetqox_trace_replay_tap.cc "
             "-o /tmp/fleetqox_tap_bridge "
             "$(pkg-config --cflags --libs ns3-core ns3-network ns3-mobility "
-            "ns3-wifi ns3-tap-bridge)"
+            "ns3-wifi ns3-tap-bridge ns3-csma ns3-bridge)"
         ),
         # libns3-tap-bridge.so has the tap-creator helper's absolute path
         # baked in at whatever location it was built from (confirmed via
@@ -195,7 +196,7 @@ def build_shell_script(
             "# --- start the simulated wifi network ---",
             (
                 f"/tmp/fleetqox_tap_bridge --numRobots={num_robots} --tapPrefix=ftap "
-                f"--simDuration={sim_duration_s:.12g} "
+                f"--simDuration={sim_duration_s:.12g} --numAps={num_aps} "
                 f"> {results_dir_container}/ns3_tap.log 2>&1 &"
             ),
             "NS3_PID=$!",
@@ -396,6 +397,7 @@ def run_probe(
     fragment_chunk_bytes: int = DEFAULT_FLEETQOX_LOSS_RESILIENT_FRAGMENT_CHUNK_BYTES,
     udp_datagram_budget_bytes: int = DEFAULT_FLEETQOX_UDP_DATAGRAM_BUDGET_BYTES,
     graph_renew_interval_ms: int | None = None,
+    num_aps: int = 1,
 ) -> dict[str, Any]:
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -425,6 +427,7 @@ def run_probe(
         fragment_chunk_bytes=fragment_chunk_bytes,
         udp_datagram_budget_bytes=udp_datagram_budget_bytes,
         graph_renew_interval_ms=graph_renew_interval_ms,
+        num_aps=num_aps,
     )
 
     completed = subprocess.run(
@@ -512,6 +515,18 @@ def main() -> int:
             "default."
         ),
     )
+    parser.add_argument(
+        "--num-aps",
+        type=int,
+        default=1,
+        help=(
+            "Split stations round-robin across this many APs, each on its "
+            "own fully non-interfering ns-3 wifi channel -- diagnostic for "
+            "the 16-robot-scale delivery-collapse investigation, see "
+            "docs/AUDIT_ACCEPTANCE_TRACKING.md. Default 1 matches the "
+            "original single-AP topology."
+        ),
+    )
     args = parser.parse_args()
 
     summary = run_probe(
@@ -525,6 +540,7 @@ def main() -> int:
         start_offset_ms=max(args.start_offset_ms, 0.0),
         drain_s=max(args.drain_s, 1.0),
         graph_renew_interval_ms=args.graph_renew_interval_ms,
+        num_aps=max(args.num_aps, 1),
     )
     summary_path = ROOT / args.summary_json
     summary_path.parent.mkdir(parents=True, exist_ok=True)
