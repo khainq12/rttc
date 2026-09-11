@@ -906,6 +906,67 @@ scope có chủ đích, xem bảng, không phải việc treo). Nhóm 6 đang b�
      đây là việc duy nhất còn mở của phần CI (không bắt buộc để "đóng" mục
      bằng-chứng-CI, chỉ là một cứng hoá thêm nếu muốn).
 
+## Điều tra riêng: cơ chế fragment/NACK/repair của FleetRMW (11/09/2026)
+
+**Không thuộc Nhóm 6** (đó là đối sánh ns-3/INET cho wifi) — đây là mảng
+khác: tầng truyền tin cậy thật của middleware (chia fragment, NACK, repair,
+reassembly) trong `rmw_fleetqox_cpp` (C++, `rmw_pubsub.cpp`). Người dùng đề
+xuất phương pháp debug leo thang: bắt đầu từ baseline đã biết chắc chắn ổn
+(1 robot, 32 KiB, 0% loss), tăng dần loss rồi số robot (1→4→8→16→32), dừng
+ngay ở bước đầu tiên miss, log 4 tín hiệu nhân quả (mất fragment? → NACK?
+→ repair? → hết hạn TTL/reassembly?) thay vì sửa code ngay khi thấy miss.
+
+**Hạ tầng có sẵn nhưng chưa dùng tới**: binary probe relay
+(`generic_serialized_relay_probe.cpp`) đã tính sẵn đúng các bộ đếm cần
+thiết (`fragment_nacks_sent`, `fragment_nacks_received`,
+`fragments_selectively_retransmitted`, `fragment_assembly_ttl_expirations`...)
+nhưng script Python wrapper (`run_ros2_relay_rmw_netem_probe.py`) đang bỏ
+qua không đọc ra. Đã nối lại (`relay_fragment_repair_metrics`) và viết
+[`run_rmw_docker_fragment_repair_escalation.py`](../scripts/run_rmw_docker_fragment_repair_escalation.py)
+chạy đúng thang leo trên.
+
+**Tự rà soát trước khi chạy, tìm ra 2 lỗi thật trong chính công cụ debug**
+(không phải trong `rmw_fleetqox_cpp`):
+1. `--timeout-s` mặc định kế thừa (25s) ngắn hơn
+   `DEFAULT_FLEETQOX_FRAGMENT_ASSEMBLY_TTL_MS` (60s — chính cơ chế repair
+   tự cho phép trước khi bỏ cuộc) — có thể khiến harness báo fail trước khi
+   repair kịp hoàn thành ở quy mô lớn. Đã sửa: timeout theo từng bước =
+   60s + 10s + 2s×số robot (72s→134s).
+2. `fragment_nacks_received`/`fragments_selectively_retransmitted` đo
+   **chặng khác** với `fragment_nacks_sent` (relay đóng vai trò nguồn sửa
+   cho chặng relay→subscriber, không liên quan gì tới chặng publisher→relay
+   bị mất gói) — ban đầu code phân loại nhầm chúng là cặp yêu cầu/phản hồi
+   cùng 1 giao dịch. Đã sửa lại logic phân loại cho đúng, chỉ dựa vào tín
+   hiệu thật sự quan sát được từ phía relay.
+
+**Kết quả chạy thật (2 lần)**:
+- Lần 1: baseline (1 robot, 0% loss) seed=7 fail, seed=13/29 pass — dấu
+  hiệu không nhất quán, nghi hạ tầng (docker/flaky), **không kết luận vội**.
+- Lần 2 (chạy lại để kiểm chứng): baseline **pass cả 3 seed** — xác nhận
+  lần 1 đúng là flaky hạ tầng, không phải bug thật. Ladder leo sạch qua
+  0% loss → 5% loss → 4 → 8 robot (pass tất cả). **Duy nhất 1 case miss**:
+  16 robot/seed=29 — thiếu đúng 1/32 gói control
+  (`control_delivery_ratio=0.96875`), `fragment_nacks_sent=244`,
+  `fragment_assembly_ttl_expirations=1` — relay đã phát hiện mất gói, đã
+  gửi NACK, nhưng 1 assembly cụ thể không hoàn thành trước khi hết TTL.
+
+**Kết luận theo đúng tiêu chí người dùng đề ra**: *"Nếu 1 robot + 32 KiB +
+0% loss đã fail → nghi code fragmentation/reassembly. Nếu chỉ 16 robot +
+5% mới fail → nghi contention/bandwidth/repair amplification."* — kết quả
+khớp chính xác vế thứ 2: baseline hoàn toàn sạch, chỉ 1/3 seed ở quy mô
+16 robot mới miss (1/32 gói) → **đây là hiện tượng tranh chấp/khuếch đại
+tải khi repair dưới áp lực nhiều robot, không phải bug fragmentation/
+reassembly ở tầng code cơ bản**. Đúng khoảng trống mà dự án chưa từng đo
+trước đây (`docker_loss_resilient_large_sample_fragment_5run_summary.json`
+chỉ từng chạy robot_count=1).
+
+**Giới hạn còn lại**: chỉ probe relay xuất `fleetqox_transport_metrics` —
+publisher/subscriber không có, nên không thể xác nhận publisher có thực sự
+nhận/phản hồi NACK hay không (muốn xem hết chuỗi nhân quả đầy đủ cần thêm
+instrumentation tương tự cho 2 probe kia — chưa làm). **Chưa chạy bước 32
+robot** (ladder dừng ở bước 16 robot theo đúng thiết kế "dừng ở miss đầu
+tiên").
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
