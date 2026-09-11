@@ -118,6 +118,7 @@ def build_shell_script(
     results_dir_container: str,
     fragment_chunk_bytes: int = DEFAULT_FLEETQOX_LOSS_RESILIENT_FRAGMENT_CHUNK_BYTES,
     udp_datagram_budget_bytes: int = DEFAULT_FLEETQOX_UDP_DATAGRAM_BUDGET_BYTES,
+    graph_renew_interval_ms: int | None = None,
 ) -> str:
     ips = {endpoint: f"{BASE_IP_PREFIX}{i + 2}" for i, endpoint in enumerate(endpoints)}
 
@@ -239,7 +240,19 @@ def build_shell_script(
             # relying on reactive PMTU discovery to eventually trigger
             # it) is required, not just an optimization.
             f"FLEETQOX_RMW_LOSS_RESILIENT_FRAGMENT_CHUNK_BYTES={fragment_chunk_bytes} "
-            f"FLEETQOX_RMW_UDP_DATAGRAM_BUDGET_BYTES={udp_datagram_budget_bytes} && "
+            f"FLEETQOX_RMW_UDP_DATAGRAM_BUDGET_BYTES={udp_datagram_budget_bytes} "
+            + (
+                # Diagnostic knob for the 16-robot-scale delivery-collapse
+                # investigation (see docs/AUDIT_ACCEPTANCE_TRACKING.md):
+                # rmw_fleetqox_cpp's own graph-advertisement renewal loop
+                # re-broadcasts every publisher/subscription to every peer
+                # on this interval (500ms default), an O(publishers x
+                # peers) cost per tick and O(N^2) system-wide as peer
+                # count grows -- unset leaves the RMW's own default.
+                f"FLEETQOX_RMW_GRAPH_RENEW_INTERVAL_MS={graph_renew_interval_ms} "
+                if graph_renew_interval_ms is not None else ""
+            )
+            + "&& "
             f"python3 {_container_path(ROOT / 'scripts' / 'fleetqox_rmw_trace_endpoint.py')} "
             f"--trace={shlex.quote(trace_container_path)} "
             f"--endpoint={shlex.quote(endpoint)} "
@@ -382,6 +395,7 @@ def run_probe(
     drain_s: float,
     fragment_chunk_bytes: int = DEFAULT_FLEETQOX_LOSS_RESILIENT_FRAGMENT_CHUNK_BYTES,
     udp_datagram_budget_bytes: int = DEFAULT_FLEETQOX_UDP_DATAGRAM_BUDGET_BYTES,
+    graph_renew_interval_ms: int | None = None,
 ) -> dict[str, Any]:
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -410,6 +424,7 @@ def run_probe(
         results_dir_container=results_dir_container,
         fragment_chunk_bytes=fragment_chunk_bytes,
         udp_datagram_budget_bytes=udp_datagram_budget_bytes,
+        graph_renew_interval_ms=graph_renew_interval_ms,
     )
 
     completed = subprocess.run(
@@ -485,6 +500,18 @@ def main() -> int:
         type=Path,
         default=Path("results_rmw_socket/ns3_wifi_tap_rmw_probe_summary.json"),
     )
+    parser.add_argument(
+        "--graph-renew-interval-ms",
+        type=int,
+        default=None,
+        help=(
+            "Override FLEETQOX_RMW_GRAPH_RENEW_INTERVAL_MS (rmw_fleetqox_cpp "
+            "default: 500ms) -- diagnostic knob for the 16-robot-scale "
+            "delivery-collapse investigation, see "
+            "docs/AUDIT_ACCEPTANCE_TRACKING.md. Unset leaves the RMW's own "
+            "default."
+        ),
+    )
     args = parser.parse_args()
 
     summary = run_probe(
@@ -497,6 +524,7 @@ def main() -> int:
         sim_duration_s=max(args.sim_duration_s, 1.0),
         start_offset_ms=max(args.start_offset_ms, 0.0),
         drain_s=max(args.drain_s, 1.0),
+        graph_renew_interval_ms=args.graph_renew_interval_ms,
     )
     summary_path = ROOT / args.summary_json
     summary_path.parent.mkdir(parents=True, exist_ok=True)

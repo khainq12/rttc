@@ -38,7 +38,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import ctypes
 import json
+import os
 from pathlib import Path
 import time
 from typing import Any
@@ -46,6 +48,46 @@ from typing import Any
 # rclpy is only available inside the ROS 2 image this script is meant to
 # run in; importing it lazily (inside main()) keeps the pure trace/topic/
 # payload helpers below unit-testable on a plain host.
+
+
+def fleetqox_transport_metrics() -> dict[str, Any]:
+    """Read rmw_fleetqox_cpp's fragment/NACK/repair counters via the same
+    ctypes-into-librmw_fleetqox_cpp.so mechanism as
+    run_ros2_direct_rmw_netem_probe.py's fleetqox_transport_metrics() --
+    added for the 16-robot-scale delivery-collapse investigation (see
+    docs/AUDIT_ACCEPTANCE_TRACKING.md), to tell "channel genuinely
+    saturated" apart from "the reliability layer's own NACK-driven
+    repair retransmissions are amplifying the load that saturates it" --
+    a subset of the full counter list there, focused on retransmission
+    volume rather than every internal queue/budget signal.
+    """
+    if os.environ.get("RMW_IMPLEMENTATION") != "rmw_fleetqox_cpp":
+        return {}
+    try:
+        library = ctypes.CDLL("librmw_fleetqox_cpp.so")
+    except OSError:
+        return {"available": False}
+    names = (
+        "fragment_nacks_sent",
+        "fragment_nacks_received",
+        "fragments_selectively_retransmitted",
+        "nack_retransmissions",
+        "reliable_timeout_retransmissions",
+        "fragment_send_failures",
+        "udp_datagram_budget_failures",
+        "fragment_completion_markers_sent",
+        "fragment_completion_markers_received",
+        "fragment_active_assemblies",
+        "fragment_assembly_ttl_expirations",
+        "unreachable_retry_attempts",
+        "unreachable_retry_giveups",
+    )
+    metrics: dict[str, Any] = {"available": True}
+    for name in names:
+        symbol = getattr(library, f"rmw_fleetqox_cpp_socket_{name}")
+        symbol.restype = ctypes.c_uint64
+        metrics[name] = int(symbol())
+    return metrics
 
 
 def _topic_for(destination: str, flow_class: str) -> str:
@@ -252,6 +294,7 @@ def main() -> int:
         "rx": len(received),
         "sent_event_ids": sent,
         "received": received,
+        "fleetqox_transport_metrics": fleetqox_transport_metrics(),
     }
     args.summary_json.parent.mkdir(parents=True, exist_ok=True)
     args.summary_json.write_text(json.dumps(result, sort_keys=True), encoding="utf-8")

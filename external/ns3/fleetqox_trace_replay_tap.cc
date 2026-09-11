@@ -69,6 +69,8 @@
 #include "ns3/tap-bridge-module.h"
 #include "ns3/wifi-module.h"
 
+#include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <iostream>
@@ -78,6 +80,125 @@
 using namespace ns3;
 
 NS_LOG_COMPONENT_DEFINE("FleetQoxTraceReplayTap");
+
+// WIFI-LEVEL DIAGNOSTIC COUNTERS (11/09/2026, see docs/AUDIT_ACCEPTANCE_TRACKING.md
+// "đào tiếp bằng trace ns-3"): distinguish genuine 802.11 congestion
+// collapse at 16-station scale from the RMW-level EHOSTUNREACH retry loop
+// (rmw_pubsub.cpp) amplifying it via repeated ARP broadcasts. Plain
+// atomics rather than per-packet printing -- a 16-station/90s run at real
+// application data rates would produce far too much output to read, and
+// RealtimeSimulatorImpl's callback delivery previously showed interleaved/
+// corrupted stdout under concurrent writes during earlier trace-based
+// debugging in this same investigation. Small-vs-large size split is a
+// cheap proxy for ARP/control frames (~42-60B) vs actual RMW UDP payloads
+// (hundreds of bytes, per rmw_pubsub.cpp's observed 700-900B fragments) --
+// exact enough for this diagnostic without parsing EtherType.
+namespace
+{
+constexpr std::size_t kSmallFrameThresholdBytes = 100;
+constexpr std::size_t kMaxRxDropReasons = 32;
+
+std::atomic<uint64_t> g_macTxTotal{0};
+std::atomic<uint64_t> g_macTxSmall{0};
+std::atomic<uint64_t> g_macTxLarge{0};
+std::atomic<uint64_t> g_macTxDropTotal{0};
+std::atomic<uint64_t> g_macRxTotal{0};
+std::atomic<uint64_t> g_macRxDropTotal{0};
+std::atomic<uint64_t> g_phyTxBeginTotal{0};
+std::atomic<uint64_t> g_phyRxDropTotal{0};
+std::array<std::atomic<uint64_t>, kMaxRxDropReasons> g_phyRxDropByReason{};
+std::atomic<uint64_t> g_associatedStaCount{0};
+
+void
+MacTxTrace(Ptr<const Packet> packet)
+{
+  g_macTxTotal.fetch_add(1, std::memory_order_relaxed);
+  if (packet->GetSize() <= kSmallFrameThresholdBytes)
+  {
+    g_macTxSmall.fetch_add(1, std::memory_order_relaxed);
+  }
+  else
+  {
+    g_macTxLarge.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void
+MacTxDropTrace(Ptr<const Packet> /* packet */)
+{
+  g_macTxDropTotal.fetch_add(1, std::memory_order_relaxed);
+}
+
+void
+MacRxTrace(Ptr<const Packet> /* packet */)
+{
+  g_macRxTotal.fetch_add(1, std::memory_order_relaxed);
+}
+
+void
+MacRxDropTrace(Ptr<const Packet> /* packet */)
+{
+  g_macRxDropTotal.fetch_add(1, std::memory_order_relaxed);
+}
+
+void
+PhyTxBeginTrace(Ptr<const Packet> /* packet */, double /* txPowerW */)
+{
+  g_phyTxBeginTotal.fetch_add(1, std::memory_order_relaxed);
+}
+
+void
+PhyRxDropTrace(Ptr<const Packet> /* packet */, WifiPhyRxfailureReason reason)
+{
+  g_phyRxDropTotal.fetch_add(1, std::memory_order_relaxed);
+  auto idx = static_cast<std::size_t>(reason);
+  if (idx < kMaxRxDropReasons)
+  {
+    g_phyRxDropByReason[idx].fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void
+AssociatedStaTrace(uint16_t /* aid */, Mac48Address /* address */)
+{
+  g_associatedStaCount.fetch_add(1, std::memory_order_relaxed);
+}
+
+void
+PrintWifiStats(uint32_t totalStations)
+{
+  // The orchestrator kills this process once every endpoint finishes,
+  // rather than waiting for --simDuration's natural Simulator::Stop --
+  // so a print scheduled to run only AFTER Simulator::Run() returns
+  // would never fire. Reschedule this call every few seconds instead, so
+  // whatever cumulative snapshot made it to the log right before the
+  // kill is the data available (Simulator::Schedule ties this to the
+  // realtime simulator's wall clock, so "every 5s" really is every 5
+  // real seconds).
+  Simulator::Schedule(Seconds(5.0), &PrintWifiStats, totalStations);
+  std::cout << "FLEETQOX_WIFI_STATS {"
+            << "\"total_stations\":" << totalStations << ","
+            << "\"associated_stations\":" << g_associatedStaCount.load() << ","
+            << "\"mac_tx_total\":" << g_macTxTotal.load() << ","
+            << "\"mac_tx_small\":" << g_macTxSmall.load() << ","
+            << "\"mac_tx_large\":" << g_macTxLarge.load() << ","
+            << "\"mac_tx_drop_total\":" << g_macTxDropTotal.load() << ","
+            << "\"mac_rx_total\":" << g_macRxTotal.load() << ","
+            << "\"mac_rx_drop_total\":" << g_macRxDropTotal.load() << ","
+            << "\"phy_tx_begin_total\":" << g_phyTxBeginTotal.load() << ","
+            << "\"phy_rx_drop_total\":" << g_phyRxDropTotal.load() << ","
+            << "\"phy_rx_drop_by_reason\":[";
+  for (std::size_t i = 0; i < kMaxRxDropReasons; ++i)
+  {
+    uint64_t count = g_phyRxDropByReason[i].load();
+    if (count > 0)
+    {
+      std::cout << "[" << i << "," << count << "],";
+    }
+  }
+  std::cout << "]}" << std::endl;
+}
+} // namespace
 
 int
 main(int argc, char* argv[])
@@ -285,8 +406,38 @@ main(int argc, char* argv[])
     smac->GetFrameExchangeManager()->SetAddress(stationMacs[i]);
   }
 
+  // Hook every station's + the AP's Phy/Mac trace sources -- see the
+  // WIFI-LEVEL DIAGNOSTIC COUNTERS block above for why (distinguishing a
+  // genuine 802.11 capacity/collision ceiling at scale from the RMW
+  // retry loop's own ARP broadcasts adding to the contention).
+  for (uint32_t i = 0; i < stationDevices.GetN(); ++i)
+  {
+    Ptr<WifiNetDevice> dev = DynamicCast<WifiNetDevice>(stationDevices.Get(i));
+    dev->GetMac()->TraceConnectWithoutContext("MacTx", MakeCallback(&MacTxTrace));
+    dev->GetMac()->TraceConnectWithoutContext("MacTxDrop", MakeCallback(&MacTxDropTrace));
+    dev->GetMac()->TraceConnectWithoutContext("MacRx", MakeCallback(&MacRxTrace));
+    dev->GetMac()->TraceConnectWithoutContext("MacRxDrop", MakeCallback(&MacRxDropTrace));
+    dev->GetPhy()->TraceConnectWithoutContext("PhyTxBegin", MakeCallback(&PhyTxBeginTrace));
+    dev->GetPhy()->TraceConnectWithoutContext("PhyRxDrop", MakeCallback(&PhyRxDropTrace));
+  }
+  for (uint32_t i = 0; i < apDevices.GetN(); ++i)
+  {
+    Ptr<WifiNetDevice> dev = DynamicCast<WifiNetDevice>(apDevices.Get(i));
+    dev->GetMac()->TraceConnectWithoutContext("MacTx", MakeCallback(&MacTxTrace));
+    dev->GetMac()->TraceConnectWithoutContext("MacTxDrop", MakeCallback(&MacTxDropTrace));
+    dev->GetMac()->TraceConnectWithoutContext("MacRx", MakeCallback(&MacRxTrace));
+    dev->GetMac()->TraceConnectWithoutContext("MacRxDrop", MakeCallback(&MacRxDropTrace));
+    dev->GetPhy()->TraceConnectWithoutContext("PhyTxBegin", MakeCallback(&PhyTxBeginTrace));
+    dev->GetPhy()->TraceConnectWithoutContext("PhyRxDrop", MakeCallback(&PhyRxDropTrace));
+    Ptr<ApWifiMac> apMac = DynamicCast<ApWifiMac>(dev->GetMac());
+    apMac->TraceConnectWithoutContext("AssociatedSta", MakeCallback(&AssociatedStaTrace));
+  }
+
+  Simulator::Schedule(Seconds(5.0), &PrintWifiStats, totalStations);
+
   Simulator::Stop(Seconds(simDuration));
   Simulator::Run();
+  PrintWifiStats(totalStations);
   Simulator::Destroy();
 
   return 0;

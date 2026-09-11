@@ -2850,6 +2850,24 @@ public:
     return udp_datagram_budget_failures_.load(std::memory_order_relaxed);
   }
 
+  // Added for the 16-robot-scale delivery-collapse investigation (see
+  // docs/AUDIT_ACCEPTANCE_TRACKING.md): counts every retry attempt made
+  // for the ENETUNREACH/EHOSTUNREACH class specifically (not the
+  // ENOBUFS/EAGAIN/EWOULDBLOCK buffer-full class), to tell "ARP/
+  // association usually resolves in a retry or two" apart from "this
+  // class of retry is burning most of its budget on most sends and
+  // contributing meaningful extra offered load to an already-saturated
+  // channel."
+  std::uint64_t unreachable_retry_attempts() const
+  {
+    return unreachable_retry_attempts_.load(std::memory_order_relaxed);
+  }
+
+  std::uint64_t unreachable_retry_giveups() const
+  {
+    return unreachable_retry_giveups_.load(std::memory_order_relaxed);
+  }
+
   std::uint64_t udp_pmtu_discovery_events() const
   {
     return udp_pmtu_discovery_events_.load(std::memory_order_relaxed);
@@ -6347,6 +6365,9 @@ private:
           bool retried_ok = false;
           for (int attempt = 0; attempt < retry_limit; ++attempt) {
             std::this_thread::sleep_for(std::chrono::milliseconds(retry_backoff_ms));
+            if (is_unreachable_transient) {
+              unreachable_retry_attempts_.fetch_add(1, std::memory_order_relaxed);
+            }
             const auto retry_sent = ::sendto(
               fd_,
               payload.data(),
@@ -6368,6 +6389,9 @@ private:
           }
           if (retried_ok) {
             continue;
+          }
+          if (is_unreachable_transient) {
+            unreachable_retry_giveups_.fetch_add(1, std::memory_order_relaxed);
           }
         }
         if (sent < 0 && errno == EMSGSIZE && udp_datagram_budget_bytes_ <= 0) {
@@ -7951,6 +7975,8 @@ private:
   std::atomic<size_t> fragment_effective_chunk_bytes_max_{0};
   std::atomic<std::uint64_t> fragment_chunk_budget_reductions_{0};
   std::atomic<std::uint64_t> udp_datagram_budget_failures_{0};
+  std::atomic<std::uint64_t> unreachable_retry_attempts_{0};
+  std::atomic<std::uint64_t> unreachable_retry_giveups_{0};
   std::atomic<std::uint64_t> udp_pmtu_discovery_events_{0};
   std::atomic<std::uint64_t> udp_pmtu_rejections_{0};
   std::atomic<int> udp_pmtu_discovered_min_bytes_{0};
@@ -14499,6 +14525,16 @@ std::uint64_t rmw_fleetqox_cpp_socket_fragment_chunk_budget_reductions()
 std::uint64_t rmw_fleetqox_cpp_socket_udp_datagram_budget_failures()
 {
   return socket_transport().udp_datagram_budget_failures();
+}
+
+std::uint64_t rmw_fleetqox_cpp_socket_unreachable_retry_attempts()
+{
+  return socket_transport().unreachable_retry_attempts();
+}
+
+std::uint64_t rmw_fleetqox_cpp_socket_unreachable_retry_giveups()
+{
+  return socket_transport().unreachable_retry_giveups();
 }
 
 std::uint64_t rmw_fleetqox_cpp_socket_udp_pmtu_discovery_events()
