@@ -967,6 +967,107 @@ instrumentation tương tự cho 2 probe kia — chưa làm). **Chưa chạy bư
 robot** (ladder dừng ở bước 16 robot theo đúng thiết kế "dừng ở miss đầu
 tiên").
 
+## Điều tra riêng: bridge process rmw_fleetqox_cpp thật qua ns-3 TapBridge (11/09/2026)
+
+**Bối cảnh**: Group 6 (wifi-parity) dùng raw single-shot UDP không có
+reliability tầng ứng dụng (xem `external/ns3/fleetqox_trace_replay.cc` /
+`external/omnetpp/TraceDrivenUdpApp.cc`) — khác với `rmw_fleetqox_cpp`
+thật (có cơ chế fragment/NACK/repair, đã xác nhận hoạt động đúng qua
+escalation ladder ở mục trên). Người dùng chọn phương án nhiều rủi ro
+hơn: nối thẳng process `rmw_fleetqox_cpp` thật qua mạng wifi mô phỏng
+bằng ns-3 TapBridge (thay vì viết lại rút gọn fragment/NACK/repair trực
+tiếp trong 2 app trace-replay).
+
+**Đã xây dựng xong 3 phần** (đều đã unit test, đều đã chạy thật trong
+Docker):
+1. `scripts/fleetqox_rmw_trace_endpoint.py` — replay trace CSV của 1
+   endpoint qua `rmw_fleetqox_cpp` thật (rclpy).
+2. `external/ns3/fleetqox_trace_replay_tap.cc` — topology wifi mô phỏng,
+   bridge qua `TapBridge` (Mode=UseLocal) cho từng station.
+3. `scripts/run_ns3_docker_wifi_tap_rmw_probe.py` — orchestration
+   bridge+tap+veth+netns/station trong 1 container.
+
+**5 bug hạ tầng thật đã tìm + fix qua debug bằng real Docker run** (không
+phải đoán mò — mỗi bug đều có bằng chứng cụ thể từ log/packet capture):
+1. Thiếu `--cap-add SYS_ADMIN` (chỉ có NET_ADMIN) → `ip netns add` lỗi
+   "Operation not permitted".
+2. `libns3-tap-bridge.so` có đường dẫn tap-creator helper build-time bị
+   baked-in sai (`/build/ns3-.../ns3.41-tap-creator` không tồn tại) → fix
+   bằng symlink sang `/usr/libexec/ns3/ns3.41-tap-creator` (đường dẫn apt
+   cài thật).
+3. Thiếu source ROS2/`rmw_fleetqox_cpp` setup.bash trong `ip netns exec`
+   (chạy 1 lệnh, không phải login shell) → `ModuleNotFoundError: rclpy`.
+4. Thiếu bật `FLEETQOX_RMW_LOSS_RESILIENT_FRAGMENT_CHUNK_BYTES` /
+   `..._UDP_DATAGRAM_BUDGET_BYTES` → payload lớn (>1472B) lỗi "exceeds
+   PMTU" (topology bridge L2 giả không có ICMP PMTU feedback thật).
+5. **`wait "${ENDPOINT_PIDS[@]}"` dưới `set -e`**: nếu 1 endpoint process
+   lỗi, `wait` trả về nonzero và **toàn bộ script abort ngay tại dòng đó**
+   — bỏ qua hết phần dump log/result phía sau (thứ TỒN TẠI CHÍNH ĐỂ giải
+   thích lỗi đó). Sửa bằng `set +e` / `set -e` bracket quanh `wait`, lưu
+   `$?` vào `ENDPOINT_EXIT`, `exit $ENDPOINT_EXIT` ở cuối sau khi đã dump
+   hết log.
+6. **Start-gate timeout lệch nhau**: endpoint tự chờ `--start-file` tối đa
+   15s (tái dùng `--discovery-timeout-s`), nhưng orchestrator chờ MỌI
+   endpoint sẵn sàng tối đa 30s rồi mới touch `start` — endpoint xong sớm
+   tự timeout trước khi endpoint chậm hơn kịp giải phóng cổng chung. Sửa
+   bằng tham số riêng `--start-wait-timeout-s=60` (tách khỏi
+   `--discovery-timeout-s`).
+
+**Sau khi sửa hết 6 bug trên, cả 4 endpoint (1-robot scenario) chạy xong
+sạch (exit=0, không crash) nhưng rx=0 ở TẤT CẢ — không endpoint nào nhận
+được gì dù tx>0.**
+
+**Điều tra sâu bằng raw packet capture (Python AF_PACKET, vì image không
+có ping/tcpdump và `NS_LOG` không hoạt động — build ns-3 apt-package tắt
+sẵn logging)**:
+- ARP broadcast request (station0 hỏi "ai có 10.50.0.3") **được relay
+  đúng** qua AP tới station1 nhiều lần (xác nhận qua sniff tại `br0`,
+  `ftap1`, VÀ bên trong `ns1`'s `eth0`) — chứng minh tầng L2
+  bridge+tap+ns-3-wifi+AP-relay hoạt động cho **broadcast**.
+- `ns1`'s kernel nhận đúng request, sinh đúng ARP reply (unicast) — reply
+  **rời khỏi `ftap1` thành công** (xác nhận qua sniff) nhưng **KHÔNG BAO
+  GIỜ tới `ftap0`/`br0`** — mất hoàn toàn ở chặng AP→station0
+  (FromDS-relay, unicast).
+- Tìm ra 1 bug thật: `TapBridge` Mode=UseLocal **không** đồng bộ MAC thật
+  của tap host-side với MAC ns-3 gán cho WifiNetDevice (2 giá trị hoàn
+  toàn khác nhau, xác nhận bằng cách in cả 2 ra) — payload ARP (trường
+  SHA) mang MAC "thật" mà AP's association table không biết, nên bị AP
+  drop. **Đã fix**: gán MAC tất định (`02:00:00:00:00:0N`) cho cả
+  WifiNetDevice (C++, `SetAddress()`) VÀ netns `eth0` tương ứng (Python,
+  `_station_mac()`), xác nhận bằng cách đọc lại địa chỉ CẢ TRƯỚC LẪN SAU
+  `TapBridge::Install()` — giữ nguyên, không bị ghi đè.
+- **Sau khi fix MAC đồng bộ hoàn toàn, unicast reply VẪN không quay lại
+  được station0** — loại trừ dứt điểm giả thuyết "MAC mismatch là
+  nguyên nhân duy nhất". Đã thử thêm: giảm `DataMode` xuống
+  `ErpOfdmRate6Mbps` (loại trừ giả thuyết PHY rate/path-loss) — vẫn
+  không có gì thay đổi. Đối chiếu với `fleetqox_trace_replay.cc` (bài
+  test wifi-parity ĐANG hoạt động đúng của Group 6) xác nhận: cùng dùng
+  `StaWifiMac`/`ApWifiMac` (infrastructure mode), cùng association chỉ
+  mất <1s (`warmupMs=1000` đã đủ) — nên relay unicast qua AP **tự nó
+  không phải là thứ bị hỏng** khi traffic sinh ra từ BÊN TRONG mô
+  phỏng (qua stack Ipv4/Udp riêng của ns-3). Vấn đề có vẻ đặc thù cho
+  trường hợp traffic được TapBridge bơm từ NGOÀI vào (external
+  injection) cụ thể ở chặng return/FromDS.
+
+**Kết luận tạm thời — CHƯA GIẢI QUYẾT**: hạ tầng orchestration (Docker,
+netns, tap, bridge, MAC addressing, timeout/set-e) đã đúng và đã xác
+nhận qua packet capture thật. Còn lại 1 giới hạn cụ thể, chưa rõ nguyên
+nhân gốc: unicast AP→station relay không hoạt động khi station nhận là
+station "ngoài" (TapBridge-injected), dù cùng cấu hình wifi/AP y hệt
+bản đang chạy tốt của Group 6. Không có source `.cc` của ns-3 trong
+image (chỉ header + built .so, `apt` package không kèm source) và
+`NS_LOG` không hoạt động (build release, logging bị compile out) nên
+không introspect được `ApWifiMac`/`TapBridge` thật bên trong để xác
+định chính xác — mọi giả thuyết đã kiểm chứng bằng thực nghiệm
+(packet capture), không đoán suông. Việc "bridge process thật qua TAP"
+cần điều tra thêm (vd: test topology CSMA có dây thay wifi để cô lập
+xem lỗi có đặc thù cho wifi/AP hay không, hoặc lấy source ns-3 riêng
+để đọc `ap-wifi-mac.cc`/`tap-bridge.cc` thật) trước khi có thể dùng để
+đánh giá lại Group 6.
+
+**Các fix hạ tầng thật (6 bug trên) đã commit dù mục tiêu cuối chưa đạt**
+— vẫn là cải thiện đúng, độc lập với câu hỏi mở còn lại.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và

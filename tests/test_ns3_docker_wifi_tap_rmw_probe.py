@@ -2,6 +2,8 @@ import json
 import unittest
 
 from scripts.run_ns3_docker_wifi_tap_rmw_probe import (
+    START_WAIT_TIMEOUT_S,
+    _station_mac,
     build_shell_script,
     endpoint_list,
     parse_endpoint_results,
@@ -71,6 +73,46 @@ class BuildShellScriptTest(unittest.TestCase):
         for endpoint in self.endpoints:
             self.assertIn(f"FLEETQOX_TAP_RESULT_BEGIN:{endpoint}", self.script)
             self.assertIn(f"FLEETQOX_TAP_RESULT_END:{endpoint}", self.script)
+
+    def test_endpoint_start_wait_timeout_exceeds_orchestrator_ready_deadline(self):
+        # Each endpoint's own --start-wait-timeout-s must be large enough
+        # that a fast-discovering endpoint never times itself out before a
+        # slower sibling finishes discovery and the orchestrator's own
+        # ready-poll deadline releases the shared start gate -- confirmed
+        # as a real bug when both were left at the same value.
+        self.assertIn(f"--start-wait-timeout-s={START_WAIT_TIMEOUT_S} ", self.script)
+
+    def test_wait_on_endpoint_pids_does_not_abort_under_set_dash_e(self):
+        # A failing endpoint must not abort the script at the `wait` line
+        # itself -- that would skip all the log/result dumping below it,
+        # which exists specifically to explain such a failure. Confirmed
+        # as a real bug: `wait "$X"; ENDPOINT_EXIT=$?` still aborts on the
+        # wait line under -e (";" doesn't protect against -e), so the
+        # bracket must be an explicit set +e/set -e pair.
+        wait_index = self.script.index('wait "${ENDPOINT_PIDS[@]}"')
+        surrounding = self.script[max(0, wait_index - 40) : wait_index + 60]
+        self.assertIn("set +e", surrounding)
+        self.assertIn("set -e", surrounding)
+        self.assertIn("exit $ENDPOINT_EXIT", self.script)
+
+    def test_netns_eth0_mac_matches_station_mac_formula(self):
+        for i in range(len(self.endpoints)):
+            self.assertIn(f"ip link set eth0 address {_station_mac(i)}", self.script)
+
+
+class StationMacTest(unittest.TestCase):
+    def test_deterministic_and_matches_cxx_formula(self):
+        # Must byte-for-byte match fleetqox_trace_replay_tap.cc's
+        # stationMacs formula (02:00:00:00:<hi>:<lo>) -- confirmed by a
+        # real run that a real process's ARP replies are dropped by the
+        # AP's association table when the two sides disagree.
+        self.assertEqual(_station_mac(0), "02:00:00:00:00:00")
+        self.assertEqual(_station_mac(1), "02:00:00:00:00:01")
+        self.assertEqual(_station_mac(256), "02:00:00:00:01:00")
+
+    def test_locally_administered_bit_set(self):
+        first_octet = int(_station_mac(0).split(":")[0], 16)
+        self.assertTrue(first_octet & 0x02)
 
 
 class ParseEndpointResultsTest(unittest.TestCase):

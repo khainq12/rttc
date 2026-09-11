@@ -129,11 +129,39 @@ main(int argc, char* argv[])
     }
   }
 
-  std::cout << "FLEETQOX_TAP_MAPPING station_index,endpoint,tap_device\n";
+  // TapBridge's UseLocal mode does NOT copy the pre-existing tap device's
+  // real MAC onto the ns-3 WifiNetDevice it bridges -- confirmed by a real
+  // run where ftap0's host-side MAC and station 0's WifiNetDevice address
+  // (queried right after TapBridge::Install) were completely different.
+  // The WifiNetDevice keeps ns-3's own default sequential allocation
+  // (00:00:00:00:00:01, 02, ...) for the AP's association table, while
+  // anything the REAL process on the tap's far side sends (e.g. an ARP
+  // reply's "sender hardware address", populated by Linux from the
+  // sending interface's OWN address) carries a DIFFERENT, ns-3-unaware
+  // MAC. The AP only relays unicast frames to addresses in its
+  // association table, so a reply addressed to that unknown MAC is
+  // silently dropped -- broadcast frames still get through (relayed to
+  // everyone), which is why ARP requests reached the far station but
+  // replies never came back.
+  //
+  // Fix: give every station an EXPLICIT, deterministic MAC here (rather
+  // than relying on ns-3's undocumented default allocation order), and
+  // have the orchestrator script set that SAME address on the real
+  // process's own netns interface -- so the simulated station and the
+  // real process behind its tap share one L2 identity end to end.
+  std::vector<Mac48Address> stationMacs;
+  for (uint32_t i = 0; i < totalStations; ++i)
+  {
+    char macBuf[18];
+    std::snprintf(macBuf, sizeof(macBuf), "02:00:00:00:%02x:%02x", (i >> 8) & 0xFF, i & 0xFF);
+    stationMacs.push_back(Mac48Address(macBuf));
+  }
+
+  std::cout << "FLEETQOX_TAP_MAPPING station_index,endpoint,tap_device,mac_address\n";
   for (uint32_t i = 0; i < totalStations; ++i)
   {
     std::cout << "FLEETQOX_TAP_MAPPING " << i << "," << stationEndpointLabels[i] << ","
-              << stationTapNames[i] << "\n";
+              << stationTapNames[i] << "," << stationMacs[i] << "\n";
   }
   std::cout.flush();
 
@@ -196,6 +224,16 @@ main(int argc, char* argv[])
   // TapBridge create+configure the device itself with ConfigureLocal;
   // matches ns-3's tap-bridge module reference pattern in
   // examples/tap-wifi-virtual-machine.cc).
+  // Explicit addresses must be assigned before Install() brings the MAC
+  // up and starts association -- ns-3's association handshake begins
+  // almost immediately once the simulation runs, and switching a
+  // station's address after it has already associated with the AP under
+  // its old address would just reintroduce the same mismatch.
+  for (uint32_t i = 0; i < stationDevices.GetN(); ++i)
+  {
+    stationDevices.Get(i)->SetAddress(stationMacs[i]);
+  }
+
   TapBridgeHelper tapBridge;
   tapBridge.SetAttribute("Mode", StringValue("UseLocal"));
   for (uint32_t i = 0; i < stations.GetN(); ++i)

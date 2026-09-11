@@ -44,8 +44,19 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from fleetqox.trace import generate_trace_events, write_simulator_csv  # noqa: E402
+from scripts.run_ros2_relay_rmw_netem_probe import (  # noqa: E402
+    DEFAULT_FLEETQOX_LOSS_RESILIENT_FRAGMENT_CHUNK_BYTES,
+    DEFAULT_FLEETQOX_UDP_DATAGRAM_BUDGET_BYTES,
+)
 
 DEFAULT_IMAGE = "localhost/fleetrmw/rmw-netem:jazzy"
+# Reuses the colcon install space run_ros2_relay_rmw_netem_probe.py's own
+# SERIALIZED_RELAY_INSTALL builds/leaves behind under /work (volume-mounted,
+# so it survives across --rm containers) -- rclpy and rmw_fleetqox_cpp
+# aren't found by a plain `python3 ...` in this image without both this and
+# /opt/ros/jazzy/setup.bash sourced first, confirmed by the first real run
+# failing with ModuleNotFoundError: No module named 'rclpy'.
+FLEETQOX_RMW_INSTALL = ".tmp_fleetrmw_matched_v2_install"
 RMW_PORT = 9100
 BASE_IP_PREFIX = "10.50.0."  # .0/.1 reserved; stations start at .2
 # ns-3's TapBridge (Mode=UseLocal) needs the tap device to already exist
@@ -55,12 +66,40 @@ BASE_IP_PREFIX = "10.50.0."  # .0/.1 reserved; stations start at .2
 # real runs show endpoints failing to reach each other early on, this is
 # the first thing to increase.
 NS3_ATTACH_WAIT_S = 3
+# How long the outer shell script polls for every endpoint's --ready-file
+# before giving up (see build_shell_script's READY_DEADLINE). Each
+# endpoint's own --start-wait-timeout-s (how long IT waits for --start-file
+# after touching its own --ready-file) must be at least this large plus
+# margin -- otherwise a fast-discovering endpoint can time itself out
+# before a slower sibling ever finishes discovery and releases the shared
+# start gate. Confirmed as a real bug: with both timeouts equal to the
+# endpoint script's old 15s discovery_timeout_s default (vs. this 30s
+# ready-poll deadline), 2 of 4 endpoints crashed with "timed out waiting
+# for data-plane start gate" despite the other 2 succeeding.
+READY_DEADLINE_S = 30
+START_WAIT_TIMEOUT_S = READY_DEADLINE_S + 30
 
 
 def endpoint_list(num_robots: int) -> list[str]:
     endpoints = ["fleet_controller", "fleet_router", "operator_ui"]
     endpoints.extend(f"robot_{i:04d}" for i in range(num_robots))
     return endpoints
+
+
+def _station_mac(index: int) -> str:
+    """Deterministic MAC for station `index`, matching fleetqox_trace_replay_tap.cc's
+    stationMacs formula EXACTLY (02:00:00:00:<index>) -- must be set on
+    each netns's own eth0 too, since TapBridge's UseLocal mode does not
+    copy the tap's real MAC onto the ns-3 WifiNetDevice it bridges (the
+    device keeps whatever address ns-3 assigns it). Without this, a real
+    process's ARP replies -- which Linux populates using its OWN
+    interface's address, not anything ns-3-aware -- carry a MAC the AP's
+    association table has never heard of and are silently dropped:
+    confirmed by a real run where broadcast ARP requests reached the far
+    station's tap but unicast replies never made it back. Giving the real
+    interface and its simulated station the SAME address closes that gap.
+    """
+    return f"02:00:00:00:{(index >> 8) & 0xFF:02x}:{index & 0xFF:02x}"
 
 
 def _container_path(path: Path) -> str:
@@ -77,12 +116,20 @@ def build_shell_script(
     start_offset_ms: float,
     drain_s: float,
     results_dir_container: str,
+    fragment_chunk_bytes: int = DEFAULT_FLEETQOX_LOSS_RESILIENT_FRAGMENT_CHUNK_BYTES,
+    udp_datagram_budget_bytes: int = DEFAULT_FLEETQOX_UDP_DATAGRAM_BUDGET_BYTES,
 ) -> str:
     ips = {endpoint: f"{BASE_IP_PREFIX}{i + 2}" for i, endpoint in enumerate(endpoints)}
 
     lines: list[str] = [
         "set -e",
         f"mkdir -p {shlex.quote(results_dir_container)}",
+        (
+            f"test -f /work/{FLEETQOX_RMW_INSTALL}/setup.bash || "
+            f"(echo 'missing {FLEETQOX_RMW_INSTALL}/setup.bash -- run "
+            "scripts/run_ros2_relay_rmw_netem_probe.py once first to build "
+            "the rmw_fleetqox_cpp colcon install this reuses' >&2 && exit 1)"
+        ),
         # Build the ns-3 tap-bridge program fresh every run, matching the
         # existing wifi-parity scripts' compile-on-each-invocation pattern
         # (ns3-tap-bridge is confirmed present in this image already, no
@@ -92,6 +139,19 @@ def build_shell_script(
             "-o /tmp/fleetqox_tap_bridge "
             "$(pkg-config --cflags --libs ns3-core ns3-network ns3-mobility "
             "ns3-wifi ns3-tap-bridge)"
+        ),
+        # libns3-tap-bridge.so.41 has the tap-creator helper's absolute
+        # path baked in at the location it was built from
+        # (/build/ns3-*/.../build/src/tap-bridge/ns3.41-tap-creator, per
+        # `strings` on the .so) rather than where the .deb actually
+        # installs it (/usr/libexec/ns3/ns3.41-tap-creator) -- confirmed
+        # by the first real run failing with execlp() ENOENT. Symlink the
+        # baked-in path to the real binary; apt-installed ns-3 never
+        # changes this, so it's safe to always do.
+        (
+            "mkdir -p /build/ns3-Q7chNJ/ns3-3.41/ns-3.41/build/src/tap-bridge && "
+            "ln -sf /usr/libexec/ns3/ns3.41-tap-creator "
+            "/build/ns3-Q7chNJ/ns3-3.41/ns-3.41/build/src/tap-bridge/ns3.41-tap-creator"
         ),
     ]
 
@@ -110,6 +170,9 @@ def build_shell_script(
                 f"ip netns add ns{i}",
                 f"ip link set v{i}ns netns ns{i}",
                 f"ip netns exec ns{i} ip link set v{i}ns name eth0",
+                # Must match fleetqox_trace_replay_tap.cc's stationMacs[i]
+                # exactly -- see _station_mac's docstring for why.
+                f"ip netns exec ns{i} ip link set eth0 address {_station_mac(i)}",
                 f"ip netns exec ns{i} ip addr add {ips[endpoint]}/24 dev eth0",
                 f"ip netns exec ns{i} ip link set eth0 up",
                 f"ip netns exec ns{i} ip link set lo up",
@@ -144,20 +207,42 @@ def build_shell_script(
         )
         result_json = f"{results_dir_container}/result_{i}.json"
         log_file = f"{results_dir_container}/endpoint_{i}.log"
-        cmd = (
-            f"ip netns exec ns{i} env "
-            f"RMW_IMPLEMENTATION=rmw_fleetqox_cpp "
-            f"FLEETQOX_RMW_BIND=0.0.0.0:{RMW_PORT} "
-            f"FLEETQOX_RMW_PEERS={peers} "
+        # ip netns exec runs a single command, not a login shell -- rclpy
+        # and rmw_fleetqox_cpp aren't importable/loadable without both
+        # /opt/ros/jazzy/setup.bash and the rmw_fleetqox_cpp colcon
+        # install's setup.bash sourced first (confirmed by the first real
+        # run failing with ModuleNotFoundError: No module named 'rclpy'),
+        # so wrap everything in an inner `bash -c` to source them.
+        inner = (
+            "source /opt/ros/jazzy/setup.bash && "
+            f"source /work/{FLEETQOX_RMW_INSTALL}/setup.bash && "
+            "export RMW_IMPLEMENTATION=rmw_fleetqox_cpp "
+            f"FLEETQOX_RMW_BIND=0.0.0.0:{RMW_PORT} FLEETQOX_RMW_PEERS={peers} "
+            # Without these, a first real run showed sends for
+            # oversized payloads (>1472B, e.g. the 2200B perception /
+            # 3500-9000B human_qoe flows) failing outright with
+            # "FleetRMW UDP payload exceeds automatically discovered
+            # path MTU" -- this synthetic bridged-L2 topology has no
+            # real IP router to generate the ICMP "fragmentation
+            # needed" feedback real PMTU discovery relies on, so
+            # explicitly enabling loss-resilient chunking (rather than
+            # relying on reactive PMTU discovery to eventually trigger
+            # it) is required, not just an optimization.
+            f"FLEETQOX_RMW_LOSS_RESILIENT_FRAGMENT_CHUNK_BYTES={fragment_chunk_bytes} "
+            f"FLEETQOX_RMW_UDP_DATAGRAM_BUDGET_BYTES={udp_datagram_budget_bytes} && "
             f"python3 {_container_path(ROOT / 'scripts' / 'fleetqox_rmw_trace_endpoint.py')} "
             f"--trace={shlex.quote(trace_container_path)} "
             f"--endpoint={shlex.quote(endpoint)} "
             f"--policy={shlex.quote(policy)} "
             f"--start-offset-ms={start_offset_ms:.12g} "
             f"--drain-s={drain_s:.12g} "
+            f"--start-wait-timeout-s={START_WAIT_TIMEOUT_S} "
             f"--summary-json={shlex.quote(result_json)} "
             f"--ready-file={shlex.quote(ready_files[i])} "
-            f"--start-file={shlex.quote(start_file)} "
+            f"--start-file={shlex.quote(start_file)}"
+        )
+        cmd = (
+            f"ip netns exec ns{i} bash -c {shlex.quote(inner)} "
             f"> {shlex.quote(log_file)} 2>&1 &"
         )
         lines.append(cmd)
@@ -173,7 +258,8 @@ def build_shell_script(
             # process on --start-file until all of them have signalled
             # --ready-file, then release them together.
             "# --- wait for every endpoint to finish discovery, then release them together ---",
-            "READY_DEADLINE=$(( $(date +%s) + 30 ))",
+            f"READY_DEADLINE=$(( $(date +%s) + {READY_DEADLINE_S} ))",
+            "READY_TIMED_OUT=0",
             "while true; do",
             "  MISSING=0",
         ]
@@ -181,32 +267,74 @@ def build_shell_script(
         + [
             "  [ $MISSING -eq 0 ] && break",
             "  if [ $(date +%s) -ge $READY_DEADLINE ]; then",
-            "    echo 'timed out waiting for every endpoint to become ready' >&2",
+            "    READY_TIMED_OUT=1",
             "    break",
             "  fi",
             "  sleep 0.2",
             "done",
+            "if [ $READY_TIMED_OUT -eq 1 ]; then",
+            "  echo 'timed out waiting for every endpoint to become ready -- dumping logs' >&2",
+        ]
+        + [
+            f"  echo '--- {name} ---' >&2; cat {shlex.quote(path)} >&2 2>/dev/null || true"
+            for name, path in [("ns3_tap.log", f"{results_dir_container}/ns3_tap.log")]
+            + [
+                (f"endpoint_{i}.log ({endpoints[i]})", f"{results_dir_container}/endpoint_{i}.log")
+                for i in range(len(endpoints))
+            ]
+        ]
+        + [
+            "  kill $NS3_PID 2>/dev/null || true",
+            '  kill "${ENDPOINT_PIDS[@]}" 2>/dev/null || true',
+            "  exit 1",
+            "fi",
             f"touch {shlex.quote(start_file)}",
-            "# --- wait for every real process, then tear down the network ---",
+            # --- wait for every real process, then tear down the network ---
+            # `wait` returns the exit status of the (last) awaited process,
+            # and under `set -e` a failing endpoint here would abort the
+            # WHOLE script on this line -- before any of the log/result
+            # dumping below ever runs. That is exactly backwards: an
+            # endpoint process failing is precisely the case the dump below
+            # exists to explain, so this must not itself trigger -e. `||
+            # true` here does NOT hide the failure -- ENDPOINT_EXIT below
+            # still records it and the trailing check still exits 1 after
+            # every diagnostic has been printed.
+            # `cmd1; cmd2` does NOT protect cmd2 from -e if cmd1 fails --
+            # only an explicit set +e/set -e bracket (or `||`) does, so
+            # `wait ...; ENDPOINT_EXIT=$?` would abort on the wait line
+            # itself before the assignment ever ran.
+            "set +e",
             'wait "${ENDPOINT_PIDS[@]}"',
+            "ENDPOINT_EXIT=$?",
+            "set -e",
             "kill $NS3_PID 2>/dev/null || true",
             "wait $NS3_PID 2>/dev/null || true",
         ]
     )
     # The container runs with --rm, so its filesystem (including every
-    # endpoint's result JSON under results_dir_container) disappears the
-    # moment it exits -- print each one to stdout, bracketed by a marker
-    # containing its endpoint name, so run_probe() can pull them back out
-    # of the captured subprocess output instead of needing `docker cp`
-    # before removal.
+    # endpoint's result JSON and log under results_dir_container)
+    # disappears the moment it exits -- print each one to stdout,
+    # bracketed by a marker containing its endpoint name, so run_probe()
+    # can pull them back out of the captured subprocess output instead of
+    # needing `docker cp` before removal. Every cat is followed by
+    # `|| true`, not chained with &&: under `set -e`, a plain failing
+    # command aborts the WHOLE script immediately even when followed by
+    # `; next_command` (";" does not protect against -e the way "||"
+    # does) -- a missing result file must not abort the script before its
+    # END marker (or any later endpoint's output) ever gets printed, which
+    # is exactly the failure this section exists to surface, not hide.
+    lines.append("echo '=== ns-3 tap-bridge log ==='")
+    lines.append(f"cat {shlex.quote(results_dir_container)}/ns3_tap.log 2>/dev/null || true")
     for i, endpoint in enumerate(endpoints):
         result_json = f"{results_dir_container}/result_{i}.json"
-        lines.append(
-            f"echo FLEETQOX_TAP_RESULT_BEGIN:{endpoint} && "
-            f"cat {shlex.quote(result_json)} 2>/dev/null && "
-            f"echo && echo FLEETQOX_TAP_RESULT_END:{endpoint}"
-        )
+        log_file = f"{results_dir_container}/endpoint_{i}.log"
+        lines.append(f"echo \"=== endpoint log: {endpoint} ===\"")
+        lines.append(f"cat {shlex.quote(log_file)} 2>/dev/null || true")
+        lines.append(f"echo FLEETQOX_TAP_RESULT_BEGIN:{endpoint}")
+        lines.append(f"cat {shlex.quote(result_json)} 2>/dev/null || true")
+        lines.append(f"echo; echo FLEETQOX_TAP_RESULT_END:{endpoint}")
     lines.append("echo FLEETQOX_TAP_PROBE_DONE")
+    lines.append("exit $ENDPOINT_EXIT")
     return "\n".join(lines)
 
 
@@ -242,6 +370,8 @@ def run_probe(
     sim_duration_s: float,
     start_offset_ms: float,
     drain_s: float,
+    fragment_chunk_bytes: int = DEFAULT_FLEETQOX_LOSS_RESILIENT_FRAGMENT_CHUNK_BYTES,
+    udp_datagram_budget_bytes: int = DEFAULT_FLEETQOX_UDP_DATAGRAM_BUDGET_BYTES,
 ) -> dict[str, Any]:
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -268,6 +398,8 @@ def run_probe(
         start_offset_ms=start_offset_ms,
         drain_s=drain_s,
         results_dir_container=results_dir_container,
+        fragment_chunk_bytes=fragment_chunk_bytes,
+        udp_datagram_budget_bytes=udp_datagram_budget_bytes,
     )
 
     completed = subprocess.run(
@@ -277,6 +409,13 @@ def run_probe(
             "--rm",
             "--cap-add",
             "NET_ADMIN",
+            # `ip netns add` bind-mounts the new namespace under
+            # /run/netns for persistent by-name reference, which needs
+            # CAP_SYS_ADMIN (NET_ADMIN alone isn't enough) -- confirmed by
+            # the first real run failing with "mount --make-shared
+            # /run/netns failed: Operation not permitted".
+            "--cap-add",
+            "SYS_ADMIN",
             "--device",
             "/dev/net/tun",
             "--entrypoint",

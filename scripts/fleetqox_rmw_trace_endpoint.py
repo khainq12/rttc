@@ -116,6 +116,21 @@ def main() -> int:
         help="max wait for every publisher to see at least one subscriber before sending",
     )
     parser.add_argument(
+        "--start-wait-timeout-s",
+        type=float,
+        default=60.0,
+        help=(
+            "max wait for --start-file to appear after this endpoint's own "
+            "--ready-file is touched. Deliberately a SEPARATE knob from "
+            "--discovery-timeout-s: what this endpoint is waiting for here "
+            "is the SLOWEST sibling endpoint finishing its own discovery, "
+            "not its own -- an endpoint that discovers quickly must not "
+            "time itself out before a slower sibling ever gets to release "
+            "the shared start gate. Must be set by the caller to at least "
+            "the orchestrator's own ready-file poll deadline plus margin."
+        ),
+    )
+    parser.add_argument(
         "--drain-s",
         type=float,
         default=10.0,
@@ -205,7 +220,7 @@ def main() -> int:
         args.ready_file.parent.mkdir(parents=True, exist_ok=True)
         args.ready_file.touch()
     if args.start_file:
-        start_deadline = time.monotonic() + args.discovery_timeout_s
+        start_deadline = time.monotonic() + args.start_wait_timeout_s
         while time.monotonic() < start_deadline and not args.start_file.exists():
             rclpy.spin_once(node, timeout_sec=0.05)
         if not args.start_file.exists():
