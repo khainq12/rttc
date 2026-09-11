@@ -1244,14 +1244,47 @@ frame FromDS, đây là địa chỉ NGƯỜI GỬI GỐC) = chính mình (case 
 thể (case 2) — 2 biến số đổi ĐỒNG THỜI nên chưa tách được biến nào là
 nguyên nhân thật.
 
-**Trạng thái: bug thật #2 đã tìm + fix (đáng giữ lại dù chưa đủ để giải
-quyết end-to-end) — bug còn lại được thu hẹp RẤT nhiều so với trước
-(từ "không biết gì" xuống "1 hành vi cụ thể, tái hiện 100%, đã loại trừ
-4 giả thuyết bằng dữ liệu trực tiếp") nhưng CHƯA XÁC ĐỊNH được nguyên
-nhân gốc chính xác** — bước tiếp theo hợp lý (chưa làm): tách 2 biến
-còn lại (thử relay unicast của CHÍNH gói station0 vừa gửi lại cho nó,
-so với relay broadcast của gói station1 gửi) để xem biến nào (RA hay
-A3) thực sự là nguyên nhân.
+### Tách RA vs A3 bằng station thứ 3 (11/09/2026)
+
+`RA=A3` (người nhận = người gửi gốc) là **không thể** với traffic
+unicast thật giữa 2 endpoint khác nhau (chỉ xảy ra nếu 1 trạm tự gửi
+cho chính nó — không tự nhiên, không đáng dựng). Vì vậy không tách được
+RA/A3 theo kiểu "giữ 1 biến cố định, đổi biến kia" thuần túy. Thay vào
+đó, dựng thí nghiệm khả thi nhất: **thêm station2 hoàn toàn mới, độc
+lập gửi ARP request TỚI station1** (station1 vẫn đóng vai người trả
+lời chung cho cả station0 lẫn station2) — mở rộng
+`fleetqox_tap_wifi_trace_diag.cc` từ 2 lên 3 station. Câu hỏi: liệu lỗi
+"relay unicast bị MacRxDrop" có ĐI THEO danh tính station0 cụ thể
+(gợi ý trạng thái bị "nhiễm" riêng của station0), hay xảy ra với BẤT KỲ
+station nào nhận relay unicast của dữ liệu người khác (gợi ý RA=unicast
+tự nó là nguyên nhân, không liên quan danh tính).
+
+**Kết quả: station2 (hoàn toàn mới, chưa từng liên quan tới cặp
+station0/station1 trước đó) THẤT BẠI Y HỆT station0** — `ip neigh` cả 2
+đều `FAILED` sau nhiều lần retry ARP của kernel. Điều này loại trừ dứt
+điểm giả thuyết "trạng thái riêng của station0" và xác nhận: **lỗi đi
+theo `RA=unicast cụ thể` (khác broadcast), không phụ thuộc station nào
+là người gửi/người nhận.** Kết hợp với dữ liệu đã có trước đó (relay
+broadcast LUÔN thành công, kể cả khi `A3` là 1 station KHÁC người
+nhận — station1 từng nhận đúng relay broadcast có `A3`=station0) — bức
+tranh giờ đã đủ rõ: **biến quyết định là `RA` (broadcast thành công,
+unicast thất bại), không phải `A3` (self hay other không quan trọng)**.
+
+**Trạng thái cuối cùng của nhánh debug ARP-only**: bug thật #2
+(FrameExchangeManager address desync) đã tìm + fix, giữ lại trong
+pipeline chính. Bug còn lại đã được đặc tả CHÍNH XÁC và ĐẦY ĐỦ bằng
+chứng thực nghiệm (không đoán): **relay unicast (FromDS, RA cụ thể
+không phải broadcast) của `ApWifiMac` luôn bị `WifiMac::MacRxDrop` ở
+MỌI station nhận, mặc dù PHY/CRC/ACK/BSSID/địa chỉ/sequence number đều
+đúng — trong khi relay broadcast (RA=ff:ff:ff:ff:ff:ff) của CHÍNH cơ
+chế đó luôn thành công.** Đây có khả năng cao là 1 giới hạn/bug thật
+trong `ApWifiMac`'s non-QoS unicast-relay path khi driven bởi traffic
+BƠM TỪ NGOÀI qua TapBridge (không phải traffic sinh ra từ bên trong mô
+phỏng, như cách Group 6's `fleetqox_trace_replay.cc` vẫn đang dùng) —
+không phải lỗi cấu hình của FleetQoX có thể tự sửa tiếp mà không có
+source `.cc` thật của `ApWifiMac`/`RegularWifiMac` để đọc logic relay
+chính xác (điều kiện MacRxDrop cụ thể nằm ở đâu trong code, không thấy
+được qua trace source hay header).
 
 ## Quy ước cập nhật file này
 
