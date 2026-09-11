@@ -85,6 +85,10 @@ static std::map<std::string, uint32_t> g_endpointToNode;
 static std::map<uint32_t, Ipv4Address> g_nodeToAddress;
 static std::map<std::string, Ptr<Socket>> g_sourceSockets;
 static std::map<std::string, PolicyStats> g_stats;
+// Keyed by (policy, flow_class): lets --wifiQos evaluation see whether EDCA
+// prioritization shifted latency/miss-ratio between flow classes within a
+// policy, instead of only the aggregate-across-all-classes view above.
+static std::map<std::pair<std::string, std::string>, PolicyStats> g_flowClassStats;
 static uint16_t g_port = 9100;
 static double g_startOffsetMs = 0.0;
 static uint64_t g_associationEvents = 0;
@@ -216,18 +220,20 @@ ReceivePacket(Ptr<Socket> socket)
       continue;
     }
     const TraceEvent& event = g_events[id];
-    auto& stats = g_stats[event.policy];
-    stats.rx++;
-    stats.bytes += packet->GetSize();
-
     const double latencyMs =
       Simulator::Now().GetMilliSeconds() - (event.timestampMs + g_startOffsetMs);
-    stats.latencyMs.push_back(latencyMs);
-    if (latencyMs > event.deadlineMs)
+    const bool missedDeadline = latencyMs > event.deadlineMs;
+    for (auto* stats : {&g_stats[event.policy], &g_flowClassStats[{event.policy, event.flowClass}]})
     {
-      stats.deadlineMiss++;
+      stats->rx++;
+      stats->bytes += packet->GetSize();
+      stats->latencyMs.push_back(latencyMs);
+      if (missedDeadline)
+      {
+        stats->deadlineMiss++;
+      }
+      stats->utilityDelivered += event.utility;
     }
-    stats.utilityDelivered += event.utility;
   }
 }
 
@@ -286,6 +292,7 @@ SendEvent(uint32_t eventIndex, NodeContainer nodes)
   socket->SetPriority(UserPriorityForFlowClass(event.flowClass));
   socket->SendTo(packet, 0, InetSocketAddress(dstAddress, g_port));
   g_stats[event.policy].tx++;
+  g_flowClassStats[{event.policy, event.flowClass}].tx++;
 }
 
 static double
@@ -313,6 +320,15 @@ PrintSummary()
     const double missRatio = stats.rx == 0 ? 0.0 : static_cast<double>(stats.deadlineMiss) / stats.rx;
     std::cout << policy << "," << stats.tx << "," << stats.rx << "," << stats.bytes << ","
               << missRatio << "," << Percentile(stats.latencyMs, 50.0) << ","
+              << Percentile(stats.latencyMs, 99.0) << "," << stats.utilityDelivered << "\n";
+  }
+  std::cout << "policy,flow_class,tx,rx,bytes,deadline_miss_ratio,p50_ms,p99_ms,utility\n";
+  for (auto& [key, stats] : g_flowClassStats)
+  {
+    const auto& [policy, flowClass] = key;
+    const double missRatio = stats.rx == 0 ? 0.0 : static_cast<double>(stats.deadlineMiss) / stats.rx;
+    std::cout << policy << "," << flowClass << "," << stats.tx << "," << stats.rx << ","
+              << stats.bytes << "," << missRatio << "," << Percentile(stats.latencyMs, 50.0) << ","
               << Percentile(stats.latencyMs, 99.0) << "," << stats.utilityDelivered << "\n";
   }
 }

@@ -104,6 +104,40 @@ DEFAULT_THRESHOLDS = {
 }
 
 
+def parse_flow_class_csv_summary(stdout: str) -> list[dict[str, Any]]:
+    """Parse the per-(policy, flow_class) breakdown both fleetqox_trace_replay.cc
+    (ns-3) and TraceDrivenUdpApp.cc (INET) print alongside the per-policy
+    table, for diagnosing whether --wifi-qos shifts latency/miss-ratio
+    between flow classes differently between the two simulators.
+    """
+    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    try:
+        header_index = lines.index(
+            "policy,flow_class,tx,rx,bytes,deadline_miss_ratio,p50_ms,p99_ms,utility"
+        )
+    except ValueError:
+        return []
+    rows = []
+    for line in lines[header_index + 1 :]:
+        cells = line.split(",")
+        if len(cells) != 9:
+            continue
+        rows.append(
+            {
+                "policy": cells[0],
+                "flow_class": cells[1],
+                "tx": int(cells[2]),
+                "rx": int(cells[3]),
+                "bytes": int(cells[4]),
+                "deadline_miss_ratio": float(cells[5]),
+                "p50_ms": float(cells[6]),
+                "p99_ms": float(cells[7]),
+                "utility": float(cells[8]),
+            }
+        )
+    return rows
+
+
 def compare_policy_rows_wifi(
     ns3_rows: list[dict[str, Any]],
     omnetpp_rows: list[dict[str, Any]],

@@ -79,6 +79,11 @@ struct TraceStore
   std::string path;
   std::vector<TraceEvent> events;
   std::map<std::string, PolicyStats> stats;
+  // Keyed by (policy, flow_class): lets --wifi-qos evaluation see whether
+  // EDCA prioritization shifted latency/miss-ratio between flow classes
+  // within a policy, instead of only the aggregate-across-all-classes view
+  // above. Mirrors external/ns3/fleetqox_trace_replay.cc's g_flowClassStats.
+  std::map<std::pair<std::string, std::string>, PolicyStats> flow_class_stats;
 };
 
 TraceStore & traceStore()
@@ -267,6 +272,15 @@ void printSummary()
       miss_ratio << ',' << percentile(stats.latency_ms, 50.0) << ',' <<
       percentile(stats.latency_ms, 99.0) << ',' << stats.utility_delivered << '\n';
   }
+  std::cout << "policy,flow_class,tx,rx,bytes,deadline_miss_ratio,p50_ms,p99_ms,utility\n";
+  for (const auto & [key, stats] : store.flow_class_stats) {
+    const auto & [policy, flow_class] = key;
+    const double miss_ratio = stats.rx == 0 ? 0.0 :
+      static_cast<double>(stats.deadline_misses) / static_cast<double>(stats.rx);
+    std::cout << policy << ',' << flow_class << ',' << stats.tx << ',' << stats.rx << ',' <<
+      stats.bytes << ',' << miss_ratio << ',' << percentile(stats.latency_ms, 50.0) << ',' <<
+      percentile(stats.latency_ms, 99.0) << ',' << stats.utility_delivered << '\n';
+  }
   std::cout.flush();
 }
 
@@ -363,6 +377,7 @@ void TraceDrivenUdpApp::sendDueEvents()
       userPriorityForFlowClass(event.flow_class));
     socket_.sendTo(packet, destination, destination_port_);
     traceStore().stats[event.policy].tx++;
+    traceStore().flow_class_stats[{event.policy, event.flow_class}].tx++;
     sent_++;
     next_outgoing_event_++;
   }
@@ -373,15 +388,18 @@ void TraceDrivenUdpApp::socketDataArrived(inet::UdpSocket *, inet::Packet * pack
   std::size_t event_index = 0;
   if (eventIndexFromPacket(*packet, event_index) && event_index < traceStore().events.size()) {
     const auto & event = traceStore().events[event_index];
-    auto & stats = traceStore().stats[event.policy];
     const double latency_ms = ::omnetpp::simTime().dbl() * 1000.0 -
       (event.timestamp_ms + start_offset_ms_);
-    stats.rx++;
-    stats.bytes += event.bytes;
-    stats.latency_ms.push_back(latency_ms);
-    stats.utility_delivered += event.semantic_utility;
-    if (latency_ms > event.deadline_ms) {
-      stats.deadline_misses++;
+    const bool missed_deadline = latency_ms > event.deadline_ms;
+    for (auto * stats : {&traceStore().stats[event.policy],
+           &traceStore().flow_class_stats[{event.policy, event.flow_class}]}) {
+      stats->rx++;
+      stats->bytes += event.bytes;
+      stats->latency_ms.push_back(latency_ms);
+      stats->utility_delivered += event.semantic_utility;
+      if (missed_deadline) {
+        stats->deadline_misses++;
+      }
     }
     received_++;
   }
