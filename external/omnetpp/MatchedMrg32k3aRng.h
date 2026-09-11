@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <omnetpp/crng.h>
+#include <omnetpp/globals.h> // omnetpp::internal::classes / EXECUTE_ON_STARTUP for Register_Class()
 
 // Bit-for-bit port of ns-3's MRG32k3a generator
 // (ns-3 src/core/model/rng-stream.cc, L'Ecuyer 2001, "combined multiple

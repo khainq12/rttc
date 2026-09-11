@@ -644,7 +644,8 @@ scope có chủ đích, xem bảng, không phải việc treo). Nhóm 6 đang b�
          hiện tại **chưa từng gọi hàm này** (0 kết quả grep) — nghĩa là
          thứ tự stream đang phụ thuộc bộ đếm toàn cục mong manh nói trên.
 
-         **Đã triển khai** (chưa build/chạy, chờ lệnh "chạy" theo quy ước):
+         **Đã triển khai** (đã build và đo thật — xem cập nhật 11/09/2026
+         bên dưới cho kết quả cuối cùng):
          1. `external/ns3/fleetqox_trace_replay.cc`: thêm cờ CLI
             `--matchedBackoffRng`/`--matchedBackoffRngBase` (mặc định tắt,
             không đổi hành vi cũ) — khi bật, gán stream tường minh cho
@@ -669,19 +670,45 @@ scope có chủ đích, xem bảng, không phải việc treo). Nhóm 6 đang b�
             việc khớp vị trí robot ở vòng trước) để sinh override CLI cho
             từng station/AP ở cả 2 bên, đảm bảo cùng 1 chỉ số stream.
 
-         **Chưa xong**: chưa build lại 2 image, chưa chạy lại ma trận
-         16/32 robot để đo mức độ thu hẹp độ lệch — đây là bước tiếp theo,
-         cần build C++ (ns-3 + INET, ~10-20 phút) và chạy lại toàn bộ ma
-         trận wifi-parity, nên chờ người dùng xác nhận trước khi thực thi.
-         **Lưu ý quan trọng về giới hạn của cách tiếp cận này**: dù RNG
-         backoff khớp tuyệt đối, thứ tự sự kiện thật trong mô phỏng (khi
-         nào 1 gói đến hàng đợi, khi nào kênh bận/rảnh theo góc nhìn của
-         từng station) vẫn phụ thuộc lịch sự kiện rời rạc của từng
-         simulator — 2 MAC stack độc lập (đã xác nhận khác thuật toán ở
-         vòng 7) có thể vẫn tiêu thụ stream RNG theo thứ tự khác nhau dù
-         "cùng" tập số ngẫu nhiên, nên đây là thử nghiệm có cơ sở kỹ thuật
-         nhưng **không đảm bảo chắc chắn thu hẹp được độ lệch** — kết quả
-         thật cần đo, không suy đoán trước.
+         **Cập nhật (11/09/2026) — đã build và đo thật (người dùng ra lệnh
+         "chạy đi").** Build lại image OMNeT++/INET (patch áp dụng sạch,
+         compile thành công). Smoke test 8 trạm/1 seed phát hiện 1 lỗi
+         thật: `MatchedMrg32k3aRng.cc` thiếu include `omnetpp/globals.h`
+         (nơi khai báo `omnetpp::internal::classes` và `EXECUTE_ON_STARTUP`
+         mà macro `Register_Class` cần) — lỗi compile, không phải lỗi
+         logic RNG; sửa xong bằng 1 dòng include, build lại pass ngay.
+
+         **Kết quả đo đầy đủ**: chạy lại đúng ma trận 16/32 robot × 3 seed
+         (7/13/29) × 3 kịch bản × 3 policy = 54 tổ hợp, so sánh trực tiếp
+         với baseline RNG mặc định (`omnetpp_ns3_docker_wifi_parity_v6_summary.json`,
+         cùng trace/seed/kịch bản):
+
+         | Quy mô | Pass (baseline) | Pass (matched-RNG) | Delivery-delta TB (baseline) | Delivery-delta TB (matched-RNG) | Delivery-delta MAX (baseline) | Delivery-delta MAX (matched-RNG) |
+         |---|---|---|---|---|---|---|
+         | 16 trạm | 16/27 | 21/27 | 0.0389 | 0.0378 | 0.1079 | 0.1220 |
+         | 32 trạm | 6/27 | 9/27 | 0.1496 | 0.1499 | 0.2784 | 0.2778 |
+
+         **Kết luận, dứt điểm**: matched-RNG **không thu hẹp được độ lệch
+         một cách hệ thống**. Số case "pass" nhích lên (16/27→21/27 và
+         6/27→9/27) nhưng đó là các case biên dao động qua lại 2 phía
+         ngưỡng 10% (ví dụ 16 trạm/seed 29/mobile_moderate/fifo đi từ PASS
+         (delta 0.027) sang FAIL (delta 0.117) — **tệ hơn** khi bật
+         matched-RNG), không phải cải thiện đồng nhất. Độ lệch trung bình
+         và độ lệch lớn nhất — chỉ số phản ánh đúng mức độ khác biệt thật —
+         **gần như không đổi** ở cả 2 quy mô (đặc biệt rõ ở 32 trạm, nơi
+         vấn đề nghiêm trọng nhất: 0.1496→0.1499, gần như bằng nhau tuyệt
+         đối). Điều này xác nhận bằng thực nghiệm (không phải suy đoán)
+         đúng cảnh báo đã nêu trước khi chạy: khớp RNG backoff tuyệt đối
+         **không kéo theo** khớp thứ tự sự kiện thật giữa 2 MAC stack độc
+         lập — độ lệch còn lại ở 16/32 trạm là khác biệt thuật toán
+         xử lý hàng đợi/tranh chấp thật (đã xác nhận cụ thể ở vòng 7), chứ
+         không phải "biến động RNG" như từng nghi ngờ ban đầu, và **cách
+         tiếp cận vá RNG này (dù đã triển khai đúng, đo được, không phải
+         thử sai) không giải quyết được vấn đề** — không có thêm hướng vá
+         cấu hình nào hợp lý còn lại trong phạm vi dự án đối sánh. Mã
+         nguồn được giữ lại (đã hoạt động đúng, có ích cho việc đo lường
+         trong tương lai nếu muốn), nhưng **không đưa vào làm cấu hình mặc
+         định** vì không cải thiện được kết quả.
      `run_heap_soak_fleet_asan_probe.py` (lặp nhiều "round" ngắn, không
      phải 1 lần chạy liên tục dài) và
      `run_rmw_docker_quic_gateway_async_burst_soak.py`. Cần: 1 kịch bản
