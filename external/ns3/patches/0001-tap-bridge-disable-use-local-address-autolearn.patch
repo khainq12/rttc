@@ -1,0 +1,35 @@
+diff --git a/src/tap-bridge/model/tap-bridge.cc b/src/tap-bridge/model/tap-bridge.cc
+index 9a75fdb..7a58d36 100644
+--- a/src/tap-bridge/model/tap-bridge.cc
++++ b/src/tap-bridge/model/tap-bridge.cc
+@@ -782,18 +782,18 @@ TapBridge::ForwardToBridgedDevice(uint8_t* buf, ssize_t len)
+         //
+         NS_ASSERT_MSG(Mac48Address::ConvertFrom(src) != Mac48Address::GetBroadcast(),
+                       "TapBridge::ForwardToBridgedDevice:  Source addr is broadcast");
+-        if (!m_ns3AddressRewritten)
+-        {
+-            //
+-            // Set the ns-3 device's mac address to the overlying container's
+-            // mac address
+-            //
+-            Mac48Address learnedMac = Mac48Address::ConvertFrom(src);
+-            NS_LOG_LOGIC("Learned MacAddr is " << learnedMac
+-                                               << ": setting ns-3 device to use this address");
+-            m_bridgedDevice->SetAddress(Mac48Address::ConvertFrom(learnedMac));
+-            m_ns3AddressRewritten = true;
+-        }
++        // FLEETQOX: disabled USE_LOCAL's "learn the ns-3 device's address
++        // from the source of the first forwarded packet" behavior. It
++        // races against ANY traffic that happens to reach this tap
++        // first -- including spurious background traffic (e.g. IPv6
++        // neighbor discovery, sent automatically when a Linux interface
++        // comes up) or another bridged station's own multicast flooded
++        // across the shared bridge -- and whichever wins becomes
++        // permanent for the rest of the run, confirmed via a custom
++        // debug build to visibly diverge from the address explicitly
++        // configured on this station's real interface. We set the
++        // address ourselves, explicitly, right after TapBridge::Install()
++        // returns, and want that decision to stick unconditionally.
+         //
+         // If we are operating in USE_LOCAL mode, we may be attached to an ns-3
+         // device that does not support bridging (SupportsSendFrom returns false).

@@ -1286,6 +1286,99 @@ source `.cc` thật của `ApWifiMac`/`RegularWifiMac` để đọc logic relay
 chính xác (điều kiện MacRxDrop cụ thể nằm ở đâu trong code, không thấy
 được qua trace source hay header).
 
+### GIẢI QUYẾT: build ns-3 từ source, tìm root cause thật + fix (11/09/2026)
+
+Theo yêu cầu "build ns-3 từ source để có debug symbols" — clone
+`ns-3.46` thật từ `gitlab.com/nsnam/ns-3-dev` (tag `ns-3.46`, khớp bản
+apt đang test), build bằng CMake trực tiếp (KHÔNG dùng script `./ns3`
+— bản này bị lỗi `argparse` không tương thích Python 3.14 của Ubuntu
+26.04, không liên quan gì tới vấn đề đang điều tra) với
+`-DCMAKE_BUILD_TYPE=Debug -DNS3_LOG=ON`, giới hạn module
+(`core;network;mobility;wifi;tap-bridge`, tự kéo theo vài module phụ
+thuộc) để build nhanh hơn. Gặp OOM khi build với `-j 24` (VM Docker
+Desktop chỉ có ~3.7GB RAM khả dụng dù host có 15GB) — hạ xuống `-j 3`
+build lại thành công, resume đúng từ chỗ dừng nhờ ninja.
+
+**Đọc thẳng source (`sta-wifi-mac.cc`, `ap-wifi-mac.cc`,
+`mac-rx-middle.cc`, `wifi-net-device.cc`) xác nhận**: `ApWifiMac::Receive()`
+relay unicast đúng logic (`to.IsGroup() || IsAssociated(to)`), không
+phải nguồn gốc bug. Dùng `NS_LOG` thật (`StaWifiMac=logic|debug`) tìm
+ra dòng chính xác gây `MacRxDrop`: `StaWifiMac::Receive()`'s check đầu
+tiên `hdr->GetAddr1() != myAddr` — với `myAddr =
+GetDevice()->GetAddress()`. Patch 1 dòng in trực tiếp giá trị runtime
+(`std::cout` ngay tại đó, rebuild incremental ~vài giây nhờ CMake/ninja)
+xác nhận: **`WifiMac::GetAddress()`/`GetDevice()->GetAddress()` thỉnh
+thoảng trả về 1 địa chỉ MAC NGẪU NHIÊN (không phải giá trị ta đã set),
+trong khi `FrameExchangeManager::GetAddress()` VẪN đúng — một split-brain
+KHÁC, sâu hơn bug #2 đã fix trước đó.**
+
+**Truy ra tận gốc**: `TapBridge::ForwardToBridgedDevice()` (Mode=UseLocal,
+`src/tap-bridge/model/tap-bridge.cc`) có cơ chế "học" địa chỉ MAC của
+thiết bị ns-3 TỪ ĐỊA CHỈ NGUỒN của GÓI ĐẦU TIÊN nó forward từ tap vào
+ns-3 — chỉ chạy 1 LẦN, canh giữ bởi cờ `m_ns3AddressRewritten`. Vấn đề:
+gói "đầu tiên" này KHÔNG CHẮC LÀ traffic thật của mình — có thể là
+traffic NỀN không mong muốn (IPv6 Neighbor Discovery, Linux tự động gửi
+khi interface up) hoặc traffic MULTICAST của TRẠM KHÁC bị flood qua
+cùng bridge — và bất kỳ cái nào "thắng" cuộc đua này sẽ bị KHÓA VĨNH
+VIỄN làm địa chỉ ns-3 dùng, dù KHÔNG liên quan gì tới trạm thật đang
+chạy trên tap đó. Xác nhận bằng debug print thêm vào ngay tại lệnh gọi
+(in `this`, `m_bridgedDevice`, `src`, `m_ns3AddressRewritten`) — thấy rõ
+land vào các địa chỉ hoàn toàn không khớp bất kỳ station nào ta set.
+
+**Đã thử 3 hướng workaround ở tầng orchestration trước khi patch source
+(đều KHÔNG đủ hoặc lộ thêm bug Linux kernel/bridge riêng, ghi lại vì có
+giá trị tham khảo cho ai gặp lại)**:
+1. Set MAC thật của tap (`ip link set ftap$i address ...`) khớp địa chỉ
+   station — sửa được triệt để phần ns-3 (xác nhận qua debug print: 0
+   anomaly suốt cả run) nhưng lộ ra bug MỚI: Linux **KHÔNG BAO GIỜ
+   bridge 1 frame có đích trùng địa chỉ phần cứng CỦA CHÍNH port đó** —
+   hành vi lõi kernel, kiểm tra TRƯỚC CẢ logic bridging, không sửa được
+   qua `bridge fdb del/add` (cả 2 lệnh đều FAIL thẳng khi thử) hay
+   `bridge link set ... learning off` (chỉ ảnh hưởng dynamic learning,
+   không ảnh hưởng permanent local-address entry).
+2. `sysctl net.ipv6.conf.*.disable_ipv6=1` để chặn traffic nền IPv6 —
+   FAIL vì `/proc/sys` read-only trong container (thiếu quyền, không
+   sửa được từ bên trong container đang chạy).
+3. `ip link set ftap$i multicast off` — hoạt động MỘT PHẦN nhưng vẫn
+   còn traffic multicast rò rỉ từ nguồn khác (có thể từ chính `br$i`).
+
+**Fix thật, ở tầng ns-3**: patch
+`external/ns3/patches/0001-tap-bridge-disable-use-local-address-autolearn.patch`
+— tắt hẳn cơ chế "học từ gói đầu tiên" trong `TapBridge::ForwardToBridgedDevice()`
+(Mode=UseLocal), để lại việc set địa chỉ hoàn toàn cho code C++ của mình
+(`SetAddress()` gọi tường minh ngay sau `TapBridge::Install()`, không có
+race nào cạnh tranh nữa vì auto-learn đã bị tắt). Rebuild `wifi` +
+`tap-bridge` module (vài giây, incremental) + link lại
+`fleetqox_tap_wifi_trace_diag.cc` (custom build, không qua pkg-config) —
+**chạy lại đúng kịch bản đã fail nhiều chục lần trước đó: THÀNH CÔNG
+NGAY LẦN ĐẦU** — `ip neigh show` báo `REACHABLE`, thấy cả UDP/ARP 2
+chiều hoạt động (station1 cũng tự ARP ngược lại station0 và nhận được
+reply). **Xác nhận lại lần 2 (build sạch, xoá hết debug print thừa,
+dùng lại orchestration script ĐƠN GIẢN — bỏ hết 3 workaround ở trên,
+không cần nữa vì patch đã giải quyết tận gốc) — vẫn REACHABLE ổn định.**
+
+**Đã áp dụng**:
+- `external/ns3/patches/0001-tap-bridge-disable-use-local-address-autolearn.patch`
+  — patch ns-3 thật, cần áp dụng vào BẤT KỲ source tree ns-3 nào dùng
+  để build image chạy `fleetqox_trace_replay_tap.cc`.
+- `external/ns3/fleetqox_trace_replay_tap.cc` — chuyển block
+  `SetAddress()`/`FrameExchangeManager::SetAddress()` ra SAU
+  `TapBridge::Install()` (khớp cấu hình đã xác nhận hoạt động), thêm
+  comment đầu file giải thích đầy đủ root cause + tham chiếu patch.
+
+**CHƯA làm — việc còn lại để dùng được trong pipeline thật**:
+production hiện dùng `rmw-netem:jazzy` với **ns-3 3.41 cài qua apt**
+(KHÔNG phải bản 3.46 tự build có patch này). Cần: (1) lấy source ns-3
+3.41 thật (không chỉ 3.46), áp patch tương tự (có thể cần điều chỉnh vì
+số dòng/context khác bản), (2) build lại từ source VÀO TRONG Dockerfile
+của `rmw-netem:jazzy` (thay vì `apt install ns3 libns3-dev`), (3) chạy
+lại toàn bộ pipeline TAP-bridge (`run_ns3_docker_wifi_tap_rmw_probe.py`)
+với image mới để xác nhận end-to-end thật (ARP → UDP thật → FleetRMW
+thật), điều mà nhánh "chỉ ARP" này CHƯA test (đúng theo yêu cầu giới
+hạn scope ban đầu). Đây là 1 thay đổi hạ tầng build đáng kể (build ns-3
+từ source trong Docker build tốn thời gian + dung lượng hơn nhiều so
+với `apt install`), nên cần quyết định rõ trước khi làm.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và

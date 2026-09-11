@@ -19,3 +19,4 @@ asan*.log
 ubsan*.log
 .venv/
 .multihost_vm/
+.ns3-build-tmp/

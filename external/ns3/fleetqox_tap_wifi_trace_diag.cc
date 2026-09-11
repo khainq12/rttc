@@ -1,5 +1,16 @@
 // DIAGNOSTIC ONLY -- not part of the FleetQoX TAP-bridge pipeline.
 //
+// RESOLVED (11/09/2026): the bug this file traces down IS a real ns-3
+// defect, not a FleetQoX configuration issue -- TapBridge (Mode=UseLocal)
+// races its own one-shot "learn my address from the first forwarded
+// packet's source" against spurious traffic (IPv6 ND, other stations'
+// multicast). Root cause + fix (a source patch, not fixable from this
+// program alone) are in
+// external/ns3/patches/0001-tap-bridge-disable-use-local-address-autolearn.patch
+// and documented in full in docs/AUDIT_ACCEPTANCE_TRACKING.md. This file
+// is kept as the tool that found it -- see git history for the intact
+// investigation as it unfolded.
+//
 // Continues the investigation in fleetqox_trace_replay_tap.cc /
 // fleetqox_tap_csma_diag.cc / fleetqox_tap_adhoc_diag.cc (see
 // docs/AUDIT_ACCEPTANCE_TRACKING.md): a real process's ARP reply,
@@ -219,35 +230,6 @@ main(int argc, char* argv[])
   apMobility.Install(ap);
   ap.Get(0)->GetObject<MobilityModel>()->SetPosition(Vector(3.0, 3.0, 0.0));
 
-  // Deterministic MACs (matches the fix in fleetqox_trace_replay_tap.cc /
-  // run_ns3_docker_wifi_tap_rmw_probe.py's _station_mac) so the netns
-  // side can be set to the identical address.
-  for (uint32_t i = 0; i < stationDevices.GetN(); ++i)
-  {
-    char macBuf[18];
-    std::snprintf(macBuf, sizeof(macBuf), "02:00:00:00:00:%02x", static_cast<unsigned>(i & 0xFF));
-    Mac48Address addr(macBuf);
-    stationDevices.Get(i)->SetAddress(addr);
-    // WifiMac::SetAddress() only updates the MLD/device-level identity
-    // (WifiMac::m_address) -- the actual over-the-air frames (including
-    // the Association Request's source address) are built by the
-    // per-link FrameExchangeManager, which has its OWN separate m_self
-    // address that SetAddress() at the device level never touches.
-    // Confirmed via trace: without this, AP::AssociatedSta recorded the
-    // peer as ns-3's original default address, not this one, even
-    // though device->GetAddress() correctly reported it.
-    Ptr<StaWifiMac> smac = DynamicCast<StaWifiMac>(
-        DynamicCast<WifiNetDevice>(stationDevices.Get(i))->GetMac());
-    smac->GetFrameExchangeManager()->SetAddress(addr);
-    std::cout << "FLEETQOX_DEBUG_MAC device.GetAddress() station" << i << " = "
-              << stationDevices.Get(i)->GetAddress() << "\n";
-    std::cout << "FLEETQOX_DEBUG_MAC mac->GetAddress() station" << i << " = " << smac->GetAddress()
-              << "\n";
-    std::cout << "FLEETQOX_DEBUG_MAC fem->GetAddress() station" << i << " = "
-              << smac->GetFrameExchangeManager()->GetAddress() << "\n";
-  }
-  std::cout.flush();
-
   // --- trace hooks ---
   std::vector<std::string> labels = {"station0", "station1", "station2"};
   for (uint32_t i = 0; i < stations.GetN(); ++i)
@@ -292,6 +274,44 @@ main(int argc, char* argv[])
     tapBridge.SetAttribute("DeviceName", StringValue(tapNames[i]));
     tapBridge.Install(stations.Get(i), stationDevices.Get(i));
   }
+
+  // Deterministic MACs (matches run_ns3_docker_wifi_tap_rmw_probe.py's
+  // _station_mac) so the netns side can be set to the identical address.
+  // MUST run AFTER TapBridge::Install(), not before: TapBridge's
+  // UseLocal mode reads the pre-existing tap device's own real (kernel-
+  // assigned, effectively random) MAC and overwrites WifiMac::m_address
+  // with it during Install() -- confirmed via a custom ns-3 debug build
+  // with an added print statement, which showed WifiMac::GetAddress()
+  // returning a random address post-Install even though it had been set
+  // correctly just before. Setting it here, after Install(), wins that
+  // race instead of trying to make the tap's own host-side interface
+  // MAC match ours (which was tried and separately broke Linux bridge
+  // MAC learning: giving ftap<i> the SAME address as the real process's
+  // eth0 makes the bridge record it as ftap<i>'s own permanent local
+  // address, so it stops forwarding frames for that address to the
+  // other port at all -- confirmed via `bridge fdb show`).
+  for (uint32_t i = 0; i < stationDevices.GetN(); ++i)
+  {
+    char macBuf[18];
+    std::snprintf(macBuf, sizeof(macBuf), "02:00:00:00:00:%02x", static_cast<unsigned>(i & 0xFF));
+    Mac48Address addr(macBuf);
+    stationDevices.Get(i)->SetAddress(addr);
+    // WifiMac::SetAddress() only updates the MLD/device-level identity
+    // (WifiMac::m_address) -- the actual over-the-air frames (including
+    // the Association Request's source address) are built by the
+    // per-link FrameExchangeManager, which has its OWN separate m_self
+    // address that SetAddress() at the device level never touches.
+    Ptr<StaWifiMac> smac = DynamicCast<StaWifiMac>(
+        DynamicCast<WifiNetDevice>(stationDevices.Get(i))->GetMac());
+    smac->GetFrameExchangeManager()->SetAddress(addr);
+    std::cout << "FLEETQOX_DEBUG_MAC device.GetAddress() station" << i << " = "
+              << stationDevices.Get(i)->GetAddress() << "\n";
+    std::cout << "FLEETQOX_DEBUG_MAC mac->GetAddress() station" << i << " = " << smac->GetAddress()
+              << "\n";
+    std::cout << "FLEETQOX_DEBUG_MAC fem->GetAddress() station" << i << " = "
+              << smac->GetFrameExchangeManager()->GetAddress() << "\n";
+  }
+  std::cout.flush();
 
   // Scheduled well after association (typically completes by ~0.2s) to
   // directly verify each station's stored BSSID matches the AP's actual

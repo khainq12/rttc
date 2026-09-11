@@ -37,6 +37,31 @@
 //
 // Copy this file into an ns-3 workspace under scratch/ and run it with:
 //   ./ns3 run "scratch/fleetqox_trace_replay_tap --numRobots=8 --tapPrefix=ftap"
+//
+// ROOT CAUSE + FIX for unicast relay never reaching stations (11/09/2026,
+// see docs/AUDIT_ACCEPTANCE_TRACKING.md for the full investigation):
+// ns-3's own TapBridge (Mode=UseLocal) sets this device's MAC address
+// from the SOURCE address of the FIRST packet it ever forwards from the
+// tap into ns-3 (TapBridge::ForwardToBridgedDevice, gated by
+// m_ns3AddressRewritten so it fires exactly once, in
+// external/tap-bridge/model/tap-bridge.cc). That races against ANY
+// traffic reaching the tap first -- spurious background traffic (e.g.
+// IPv6 neighbor discovery, sent automatically when the interface comes
+// up) or another bridged station's own multicast flooded across the
+// shared bridge both count -- and whichever wins becomes this station's
+// permanent address for the ns-3 side, silently diverging from what its
+// real process actually uses. Confirmed via a custom ns-3 debug build:
+// the address explicitly set below is DIFFERENT from what
+// StaWifiMac::Receive() sees on the SAME device later in the run,
+// causing unicast relay (which requires an exact address match, unlike
+// broadcast) to be dropped with WifiMac::MacRxDrop even though the PHY
+// layer and ACK exchange both succeed. Fixed at the ns-3 level by
+// external/ns3/patches/0001-tap-bridge-disable-use-local-address-autolearn.patch
+// (disables that auto-learning entirely) -- REQUIRED for this program to
+// work; the SetAddress() calls below are necessary but not sufficient
+// without it, since TapBridge's own auto-learning would otherwise
+// overwrite them again later. Apply the patch to whatever ns-3 source
+// tree the target image builds against before compiling this file.
 
 #include "ns3/core-module.h"
 #include "ns3/mobility-module.h"
@@ -224,11 +249,24 @@ main(int argc, char* argv[])
   // TapBridge create+configure the device itself with ConfigureLocal;
   // matches ns-3's tap-bridge module reference pattern in
   // examples/tap-wifi-virtual-machine.cc).
-  // Explicit addresses must be assigned before Install() brings the MAC
-  // up and starts association -- ns-3's association handshake begins
-  // almost immediately once the simulation runs, and switching a
-  // station's address after it has already associated with the AP under
-  // its old address would just reintroduce the same mismatch.
+  TapBridgeHelper tapBridge;
+  tapBridge.SetAttribute("Mode", StringValue("UseLocal"));
+  for (uint32_t i = 0; i < stations.GetN(); ++i)
+  {
+    tapBridge.SetAttribute("DeviceName", StringValue(stationTapNames[i]));
+    tapBridge.Install(stations.Get(i), stationDevices.Get(i));
+  }
+
+  // Must run AFTER TapBridge::Install(), not before -- without the
+  // tap-bridge patch (see the file-header comment above), TapBridge's
+  // own address auto-learning fires asynchronously, on a background
+  // thread, whenever it happens to process its first packet, which can
+  // be BEFORE OR AFTER this point in program order regardless of source
+  // ordering; with the patch applied, that auto-learning is disabled
+  // entirely, so this explicit assignment is what actually takes effect
+  // and there is no race to lose either way. Kept after Install() so the
+  // behavior degrades safely (fails loudly via mismatched addresses,
+  // not silently) if this file is ever built against an unpatched ns-3.
   for (uint32_t i = 0; i < stationDevices.GetN(); ++i)
   {
     stationDevices.Get(i)->SetAddress(stationMacs[i]);
@@ -241,23 +279,10 @@ main(int argc, char* argv[])
     // ApWifiMac, TypeId-introspected -- no source or NS_LOG needed):
     // without this, the AP's association table recorded each station
     // under ns-3's original default address, not this one, even though
-    // device->GetAddress() correctly reported the new value -- so the
-    // AP could never correctly address a unicast relay back to a
-    // station using ITS OWN reported address. This is necessary but,
-    // per docs/AUDIT_ACCEPTANCE_TRACKING.md, not yet SUFFICIENT to fix
-    // unicast AP relay end to end -- a further unexplained MacRxDrop
-    // remains even with this fix and a fully correct RA/BSSID.
+    // device->GetAddress() correctly reported the new value.
     Ptr<StaWifiMac> smac = DynamicCast<StaWifiMac>(
         DynamicCast<WifiNetDevice>(stationDevices.Get(i))->GetMac());
     smac->GetFrameExchangeManager()->SetAddress(stationMacs[i]);
-  }
-
-  TapBridgeHelper tapBridge;
-  tapBridge.SetAttribute("Mode", StringValue("UseLocal"));
-  for (uint32_t i = 0; i < stations.GetN(); ++i)
-  {
-    tapBridge.SetAttribute("DeviceName", StringValue(stationTapNames[i]));
-    tapBridge.Install(stations.Get(i), stationDevices.Get(i));
   }
 
   Simulator::Stop(Seconds(simDuration));
