@@ -1643,6 +1643,91 @@ bug/hạn chế khiến traffic CROSS-AP bị khuếch đại thay vì giảm t�
 CHƯA phải bằng chứng phủ nhận hướng đi, mà là một bug/hạn chế triển khai
 cụ thể cần fix tiếp nếu muốn theo hướng này.
 
+### 11/09/2026 (tiếp) — Đào sâu fix bridge flooding: tìm đúng root cause, fix xong, cải thiện thật nhưng vẫn chưa đủ
+
+Theo yêu cầu người dùng "đào sâu fix bridge flooding". Đọc trực tiếp
+source ns-3 3.41 (`bridge-net-device.cc`, `ap-wifi-mac.cc`,
+`wifi-net-device.cc`, `node.cc`) đã clone sẵn ở `.ns3-build-tmp/ns3-341-src`
+từ nhánh điều tra ARP relay trước đó (không cần clone lại).
+
+**Root cause thật (xác nhận qua đọc source, không phải đoán)**:
+`BridgeNetDevice` là learning bridge ĐỘNG — chỉ học "MAC này nằm sau
+port nào" từ chính traffic ĐI RA của MAC đó (`ForwardUnicast`/
+`ForwardBroadcast` đều gọi `Learn(src, incomingPort)`, chỉ học SOURCE,
+không bao giờ học DESTINATION trước). Hệ quả: các endpoint CHỈ NHẬN
+(như `fleet_router`, `operator_ui` — `tx=0` cố định trong kịch bản này)
+KHÔNG BAO GIỜ tự gửi gì để bridge học được vị trí của chúng → MỌI gói
+gửi TỚI chúng bị FLOOD ra tất cả AP MÃI MÃI, không chỉ trong giai đoạn
+hội tụ ban đầu. Tệ hơn: đọc `ApWifiMac::Receive` (dòng ~1706-1723 bản
+3.41) thấy ngay cả traffic relay CÙNG một AP (`to.IsGroup() ||
+IsAssociated(to)`) cũng bị đẩy lên `ForwardUp()` (qua nhánh
+`PACKET_OTHERHOST` của `WifiNetDevice::ForwardUp`) THÊM vào việc đã
+relay qua sóng — nghĩa là traffic nội bộ 1 AP cũng bị bridge nhìn thấy
+và có thể bị flood dư thừa ra backbone dù không cần thiết.
+
+**Fix**: bỏ hẳn `CsmaHelper`+`BridgeHelper` (learning bridge), thay
+bằng relay TĨNH tự viết — vì chương trình này đã biết CHÍNH XÁC station
+nào thuộc AP-group nào ngay từ lúc setup (`stationIndexesByGroup`),
+không cần "học" gì cả. Đăng ký `SetPromiscReceiveCallback` trực tiếp
+trên wifi-device của mỗi AP; callback tra bảng `MAC đích → AP-group`
+(build tĩnh từ đầu) rồi `SendFrom()` thẳng tới đúng 1 AP đích — không
+CSMA, không backbone, không bảng học nào cả.
+
+**Bug lần 1 của chính fix mới**: chỉ xử lý `PACKET_OTHERHOST` (unicast
+đã biết đích), BỎ SÓT hoàn toàn `PACKET_BROADCAST`/`PACKET_MULTICAST`.
+Hệ quả: ARP request (luôn là broadcast) không bao giờ vượt qua AP-group
+→ station ở nhóm này KHÔNG BAO GIỜ phân giải được địa chỉ MAC của
+station ở nhóm khác → unicast cross-group không bao giờ hình thành
+được. Xác nhận qua triệu chứng: `mac_tx_large` (proxy cho traffic thật)
+đứng yên gần 0 suốt cả run trong khi `mac_tx_small` (proxy ARP) tăng
+liên tục không dừng (request gửi đi liên tục, không bao giờ nhận được
+reply). Test sanity 4 endpoint/4 AP: `rx=0` tuyệt đối ở CẢ 4 endpoint.
+
+**Fix cuối**: flood riêng broadcast/multicast ra TẤT CẢ AP-group khác
+(không tra bảng theo MAC cụ thể — broadcast vốn phải tới mọi nơi, đây
+là hành vi ĐÚNG/bắt buộc của switch thật, không phải bug). Test sanity
+4 endpoint/4 AP: **`rx` khớp CHÍNH XÁC baseline single-AP khỏe mạnh**
+(`fleet_router rx=76`, `operator_ui rx=2`, `robot_0000 rx=103`),
+`phy_rx_drop_total` giảm từ 12636 (bridge, 4 endpoint) xuống còn 388
+(giảm ~32 lần) — xác nhận cả correctness lẫn hiệu quả giảm nghẽn ở quy
+mô nhỏ.
+
+**Chạy lại 16 robot / 4 AP với relay tĩnh đã fix — cải thiện THẬT
+nhưng vẫn hoàn toàn không đủ**:
+- `rx` từ 0 (mọi lần chạy 1-AP và cả bản bridge-lỗi trước đó) → **1**
+  (message đầu tiên từng nhận được ở quy mô 16-robot trong toàn bộ
+  phiên điều tra này).
+- `phy_rx_drop_total` giảm ~62%: 432020 (1-AP, graph-renew 4000ms) →
+  **164600**.
+- NHƯNG: `BUSY_DECODING_PREAMBLE`(58011) + `PREAMBLE_DETECT_FAILURE`
+  (50895) = 108906/164600 (66%) — collision thật VẪN chiếm đa số drop,
+  chưa được giải quyết triệt để.
+
+**Tại sao vẫn không đủ (đã xác định nguyên nhân cụ thể)**: `fleet_controller`
+MỘT MÌNH chiếm 1626/2289 (71%) tổng traffic của cả fleet, và giống mọi
+station khác, nó bị GIỚI HẠN trên ĐÚNG 1 kênh (round-robin gán nó vào 1
+trong 4 group). Chia CÁC STATION KHÁC ra nhiều kênh song song không hề
+giảm tải cho kênh RIÊNG của `fleet_controller` — nó vẫn phải gửi TOÀN
+BỘ 1626 message qua đúng 1 radio, đúng 1 kênh, y hệt như ở topology
+1-AP. "Nhiều kênh song song" chỉ thật sự hiệu quả khi tải được phân bố
+ĐỀU giữa các station — với traffic pattern fan-out cực lệch như kịch
+bản Group 6 này (1 controller gửi cho gần như tất cả robot), hướng đi
+này có giới hạn cấu trúc rõ ràng, không phải do lỗi triển khai.
+
+**File thay đổi**: `external/ns3/fleetqox_trace_replay_tap.cc` (bỏ
+CSMA/Bridge, thêm `ApCrossGroupRelay` tĩnh + flood broadcast/multicast),
+`scripts/run_ns3_docker_wifi_tap_rmw_probe.py` (bỏ `ns3-csma ns3-bridge`
+khỏi link line, không còn cần).
+
+**Hướng tiếp theo nếu muốn tiếp tục** (chưa làm, cần quyết định của
+người dùng): gán riêng `fleet_controller` (hoặc nói chung, station có
+tải cao nhất) vào 1 kênh KHÔNG chia sẻ với station nào khác thay vì
+round-robin đơn giản — nhưng đây là tinh chỉnh cụ thể cho ĐÚNG traffic
+pattern hiện tại (fan-out lệch từ 1 nguồn), không phải giải pháp tổng
+quát, và ngay cả khi làm vậy vẫn cần đo lại để xác nhận có đủ hay
+không, vì bản thân băng thông 1 kênh 802.11g cho 1626 message vẫn có
+giới hạn riêng của nó.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
