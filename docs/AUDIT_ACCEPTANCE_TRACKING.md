@@ -769,6 +769,55 @@ scope có chủ đích, xem bảng, không phải việc treo). Nhóm 6 đang b�
          `run_omnetpp_docker_wifi_parity.py` đã cập nhật thành 1200 gói/giây
          (thực nghiệm, không phải lý thuyết) kèm giải thích đầy đủ trong
          code.
+
+         **Cập nhật (11/09/2026, vòng 12) — người dùng tiếp tục hỏi "đã áp
+         dụng đúng config mạng, môi trường chưa" — kiểm tra và phát hiện
+         thật: cả 2 simulator đang chạy 802.11 DCF KHÔNG QoS** (ns-3
+         `QosSupported` mặc định false dưới 802.11n; INET `qosStation` mặc
+         định false) — mọi loại traffic (control, state, perception, debug)
+         tranh chấp kênh bình đẳng trong cùng 1 hàng đợi best-effort, trong
+         khi hầu hết thiết bị thật đều hỗ trợ WMM (802.11e EDCA), cơ chế
+         chuẩn để traffic điều khiển được ưu tiên thật ở tầng MAC. Đây là
+         khoảng cách config thật, đúng hướng người dùng nghi ngờ.
+
+         **Đã triển khai** ở cả 2 bên, cùng 1 bảng ánh xạ flow_class→WMM User
+         Priority (`safety/control→AC_VO`, `coordination/state→AC_VI`,
+         `human_qoe→AC_VI`, `perception→AC_BE`, `debug/bulk→AC_BK`): cờ
+         `--wifiQos` cho ns-3 (gắn `SocketPriorityTag` mỗi gói), tham số
+         `wifiQos`/`qosStation` cho INET (gắn `UserPriorityReq`, đồng thời
+         phải đọc thêm cột `flow_class` từ CSV — trước đây `TraceDrivenUdpApp.cc`
+         không dùng cột này).
+
+         **Kết quả đo (16/32 trạm, chỉ bật QoS, tắt ngưỡng packet-rate để
+         cô lập biến số)** — **bất ngờ và không đối xứng**:
+
+         | Chỉ số | 16 trạm ns-3 (base→qos) | 16 trạm INET (base→qos) | 32 trạm ns-3 (base→qos) | 32 trạm INET (base→qos) |
+         |---|---|---|---|---|
+         | deadline_miss_ratio | 0.8075→0.8862 (tệ hơn) | 0.8660→**0.3121** | 0.9467→0.9475 (không đổi) | 0.9094→**0.3998** |
+         | delivery_ratio | 0.6625→0.6485 | 0.6613→**0.7779** | 0.5413→0.5322 | 0.4976→**0.6790** |
+         | parity pass toàn ma trận | 0/18 (tệ hơn baseline) | | | |
+
+         **INET cải thiện rất mạnh** (deadline-miss giảm ~50 điểm %) nhưng
+         **ns-3 gần như không đổi** (thậm chí nhích tệ hơn ở 16 trạm) — dẫn
+         đến độ khớp giữa 2 simulator **tệ đi rõ rệt** (0/18, so với 6-16/27
+         trước đó). Đã kiểm tra code ns-3 (`ApWifiMac::ForwardDown` xác nhận
+         AP relay giữ nguyên TID gốc khi chuyển tiếp trong cùng BSS —
+         `hdr->GetQosTid()` được truyền qua đúng; `StaWifiMac::Enqueue` xác
+         nhận `QosUtilsGetTidForPacket` đọc đúng `SocketPriorityTag`) —
+         không tìm thấy bug rõ ràng trong cách gắn tag/enable QoS phía ns-3.
+         Giả thuyết hợp lý nhất (**chưa kiểm chứng**): `deadline_miss_ratio`
+         gộp chung TẤT CẢ flow class trong 1 policy — bật EDCA có thể giúp
+         hẳn CONTROL/COORDINATION (AC_VO/AC_VI) nhưng làm PERCEPTION/DEBUG
+         (AC_BE/AC_BK, bị hạ cấp) tệ đi, và 2 simulator có thể cân bằng lại
+         hiệu ứng này khác nhau đủ mạnh để tạo ra chênh lệch lớn như vậy ở
+         mức tổng hợp theo policy — cần đo **riêng theo từng flow_class**
+         (chưa có, `PrintSummary()`/CSV output hiện chỉ gộp theo policy) mới
+         xác nhận được. **Chưa kết luận dứt điểm, chưa áp dụng làm mặc
+         định** — kết quả không rõ ràng là 1 chiến thắng (độ khớp giữa 2
+         simulator tệ đi), khác hẳn hướng packet-rate (vòng 11, cải thiện cả
+         2 mục tiêu đồng thời). Mã nguồn được giữ lại (cờ `--wifi-qos`, tắt
+         mặc định), cần thêm bước đo theo flow_class trước khi quyết định
+         hướng tiếp theo.
      `run_heap_soak_fleet_asan_probe.py` (lặp nhiều "round" ngắn, không
      phải 1 lần chạy liên tục dài) và
      `run_rmw_docker_quic_gateway_async_burst_soak.py`. Cần: 1 kịch bản
