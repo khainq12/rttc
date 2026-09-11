@@ -6,9 +6,8 @@ from scripts.run_rmw_docker_fragment_repair_escalation import (
 )
 
 
-def result(
+def _metrics(
     *,
-    passed: bool,
     nacks_sent: int = 0,
     nacks_received: int = 0,
     retransmitted: int = 0,
@@ -16,22 +15,32 @@ def result(
     nack_exhausted: int = 0,
     oversize_drops: int = 0,
     metadata_mismatch_drops: int = 0,
-    active_missing: int = 0,
+) -> dict:
+    return {
+        "fragment_nacks_sent": nacks_sent,
+        "fragment_nacks_received": nacks_received,
+        "fragments_selectively_retransmitted": retransmitted,
+        "fragment_assembly_ttl_expirations": ttl_expirations,
+        "fragment_nack_exhausted_assemblies": nack_exhausted,
+        "fragment_assembly_oversize_drops": oversize_drops,
+        "fragment_assembly_metadata_mismatch_drops": metadata_mismatch_drops,
+    }
+
+
+def result(
+    *,
+    passed: bool,
+    publisher: dict | None = None,
+    relay: dict | None = None,
+    subscriber: dict | None = None,
 ) -> dict:
     return {
         "status": "ok",
         "control_delivery_ratio": 1.0 if passed else 0.5,
         "state_delivery_ratio": 1.0 if passed else 0.5,
-        "relay_fragment_repair_metrics": {
-            "fragment_nacks_sent": nacks_sent,
-            "fragment_nacks_received": nacks_received,
-            "fragments_selectively_retransmitted": retransmitted,
-            "fragment_assembly_ttl_expirations": ttl_expirations,
-            "fragment_nack_exhausted_assemblies": nack_exhausted,
-            "fragment_assembly_oversize_drops": oversize_drops,
-            "fragment_assembly_metadata_mismatch_drops": metadata_mismatch_drops,
-            "fragment_active_missing_indexes": active_missing,
-        },
+        "publisher_fragment_repair_metrics": publisher or _metrics(),
+        "relay_fragment_repair_metrics": relay or _metrics(),
+        "subscriber_fragment_repair_metrics": subscriber or _metrics(),
     }
 
 
@@ -44,26 +53,79 @@ class DiagnoseRunTest(unittest.TestCase):
     def test_miss_with_no_detected_fragment_loss_is_suspicious(self):
         diagnosis = diagnose_run(result(passed=False))
         self.assertFalse(diagnosis["passed"])
-        self.assertFalse(diagnosis["fragment_loss_observed"])
         self.assertEqual(diagnosis["reason"], "miss_without_detected_fragment_loss")
 
-    def test_repair_requested_but_ttl_expired(self):
+    def test_leg1_nack_never_reached_publisher(self):
+        # relay (leg1 receiver) detected loss and its assembly TTL expired,
+        # but the publisher (leg1 source) never logged receiving a NACK.
         diagnosis = diagnose_run(
-            result(passed=False, nacks_sent=3, ttl_expirations=1)
+            result(
+                passed=False,
+                relay=_metrics(nacks_sent=3, ttl_expirations=1),
+                publisher=_metrics(),
+            )
         )
         self.assertEqual(
-            diagnosis["reason"], "repair_requested_but_ttl_expired_before_completion"
+            diagnosis["reason"], "leg1_publisher_to_relay:nack_sent_but_never_reached_source"
+        )
+
+    def test_leg1_publisher_received_nack_but_never_repaired(self):
+        diagnosis = diagnose_run(
+            result(
+                passed=False,
+                relay=_metrics(nacks_sent=3, ttl_expirations=1),
+                publisher=_metrics(nacks_received=3, retransmitted=0),
+            )
+        )
+        self.assertEqual(
+            diagnosis["reason"],
+            "leg1_publisher_to_relay:source_received_nack_but_never_sent_repair",
+        )
+
+    def test_leg1_repair_sent_but_still_too_late(self):
+        diagnosis = diagnose_run(
+            result(
+                passed=False,
+                relay=_metrics(nacks_sent=3, ttl_expirations=1),
+                publisher=_metrics(nacks_received=3, retransmitted=3),
+            )
+        )
+        self.assertEqual(
+            diagnosis["reason"],
+            "leg1_publisher_to_relay:repair_sent_but_ttl_expired_before_arrival",
+        )
+
+    def test_leg2_used_when_leg1_is_clean(self):
+        # relay->subscriber leg has its own TTL expiration while leg1 shows
+        # nothing wrong at all.
+        diagnosis = diagnose_run(
+            result(
+                passed=False,
+                subscriber=_metrics(nacks_sent=2, ttl_expirations=1),
+                relay=_metrics(nacks_received=0),
+            )
+        )
+        self.assertEqual(
+            diagnosis["reason"], "leg2_relay_to_subscriber:nack_sent_but_never_reached_source"
         )
 
     def test_nack_budget_exhausted_takes_priority_over_ttl(self):
         diagnosis = diagnose_run(
-            result(passed=False, nacks_sent=3, ttl_expirations=1, nack_exhausted=1)
+            result(
+                passed=False,
+                relay=_metrics(nacks_sent=3, ttl_expirations=1, nack_exhausted=1),
+            )
         )
-        self.assertEqual(diagnosis["reason"], "nack_budget_exhausted")
+        self.assertEqual(
+            diagnosis["reason"], "leg1_publisher_to_relay:nack_budget_exhausted"
+        )
 
-    def test_reassembly_failure_takes_priority(self):
+    def test_reassembly_failure_takes_priority_over_leg_chain(self):
         diagnosis = diagnose_run(
-            result(passed=False, nacks_sent=3, metadata_mismatch_drops=1)
+            result(
+                passed=False,
+                relay=_metrics(nacks_sent=3, metadata_mismatch_drops=1),
+            )
         )
         self.assertEqual(diagnosis["reason"], "reassembly_failure")
 

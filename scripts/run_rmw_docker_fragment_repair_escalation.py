@@ -88,10 +88,65 @@ DEFAULT_LADDER: list[tuple[str, int, float]] = [
 ]
 
 
-def diagnose_run(result: dict[str, Any]) -> dict[str, Any]:
-    """Build the fragment->NACK->repair->delivery causal chain for one run."""
+def _leg_chain(
+    *,
+    receiver_metrics: dict[str, Any],
+    source_metrics: dict[str, Any],
+) -> dict[str, Any]:
+    """One directed leg's causal chain: receiver detects loss -> source
+    receives the NACK -> source retransmits -> receiver's own reassembly
+    completes before its TTL. `receiver_metrics`/`source_metrics` are each
+    hop's OWN fleetqox_transport_metrics (a hop is a "receiver" for
+    traffic it accepts from upstream, a "source" for traffic it forwards
+    downstream -- the same physical process is a source on one leg and a
+    receiver on the other).
+    """
+    return {
+        "loss_detected": int(receiver_metrics.get("fragment_nacks_sent", 0)),
+        "nack_received_by_source": int(source_metrics.get("fragment_nacks_received", 0)),
+        "repair_sent_by_source": int(
+            source_metrics.get("fragments_selectively_retransmitted", 0)
+        ),
+        "receiver_assembly_ttl_expirations": int(
+            receiver_metrics.get("fragment_assembly_ttl_expirations", 0)
+        ),
+        "receiver_nack_budget_exhausted": int(
+            receiver_metrics.get("fragment_nack_exhausted_assemblies", 0)
+        ),
+    }
 
-    metrics = result.get("relay_fragment_repair_metrics") or {}
+
+def _leg_reason(leg: dict[str, Any]) -> str | None:
+    """None means this leg's chain looks clean (no TTL expiration to
+    explain); the caller only calls this for a leg whose TTL expired.
+    """
+    if leg["receiver_assembly_ttl_expirations"] == 0:
+        return None
+    if leg["receiver_nack_budget_exhausted"] > 0:
+        return "nack_budget_exhausted"
+    if leg["loss_detected"] == 0:
+        # TTL expired but the receiver's own detector never logged loss --
+        # possible if the whole datagram (not a mid-fragment loss) never
+        # arrived, so there was nothing to fragment-NACK about.
+        return "ttl_expired_without_detected_fragment_loss"
+    if leg["nack_received_by_source"] == 0:
+        return "nack_sent_but_never_reached_source"
+    if leg["repair_sent_by_source"] == 0:
+        return "source_received_nack_but_never_sent_repair"
+    return "repair_sent_but_ttl_expired_before_arrival"
+
+
+def diagnose_run(result: dict[str, Any]) -> dict[str, Any]:
+    """Build the full 2-leg fragment->NACK->repair->delivery causal chain:
+    publisher -> relay (the lossy netem leg) -> subscriber. Requires
+    publisher_fragment_repair_metrics / relay_fragment_repair_metrics /
+    subscriber_fragment_repair_metrics on `result` (all three hops'
+    fleetqox_transport_metrics, surfaced by run_ros2_relay_rmw_netem_probe.py).
+    """
+
+    pub_m = result.get("publisher_fragment_repair_metrics") or {}
+    relay_m = result.get("relay_fragment_repair_metrics") or {}
+    sub_m = result.get("subscriber_fragment_repair_metrics") or {}
     control_ratio = result.get("control_delivery_ratio")
     state_ratio = result.get("state_delivery_ratio")
     passed = bool(
@@ -100,62 +155,43 @@ def diagnose_run(result: dict[str, Any]) -> dict[str, Any]:
         and state_ratio == 1.0
     )
 
-    nacks_sent = int(metrics.get("fragment_nacks_sent", 0))
-    # fragment_nacks_received / fragments_selectively_retransmitted count
-    # this relay hop acting as a REPAIR SOURCE for whatever is downstream
-    # of it (subscriber) -- a completely different leg from nacks_sent
-    # (this hop, as a receiver, requesting repair from whatever is
-    # upstream of it -- publisher). Only the relay probe exposes these
-    # metrics at all (publisher/subscriber don't), so there is no
-    # visibility into whether the publisher actually received/responded
-    # to a NACK the relay sent it -- don't use these two counters to
-    # classify a miss on the publisher->relay leg, only report them.
-    nacks_received = int(metrics.get("fragment_nacks_received", 0))
-    retransmitted = int(metrics.get("fragments_selectively_retransmitted", 0))
-    ttl_expirations = int(metrics.get("fragment_assembly_ttl_expirations", 0))
-    nack_exhausted = int(metrics.get("fragment_nack_exhausted_assemblies", 0))
-    oversize_drops = int(metrics.get("fragment_assembly_oversize_drops", 0))
-    metadata_mismatch_drops = int(
-        metrics.get("fragment_assembly_metadata_mismatch_drops", 0)
+    # leg1: publisher -> relay (the netem-lossy "primary_wifi" path).
+    # relay is the receiver; publisher is the repair source.
+    leg1 = _leg_chain(receiver_metrics=relay_m, source_metrics=pub_m)
+    # leg2: relay -> subscriber (not netem-lossy in the "roaming" profile,
+    # but tracked regardless in case contention alone causes loss here).
+    # subscriber is the receiver; relay is the repair source.
+    leg2 = _leg_chain(receiver_metrics=sub_m, source_metrics=relay_m)
+
+    oversize_drops = int(relay_m.get("fragment_assembly_oversize_drops", 0)) + int(
+        sub_m.get("fragment_assembly_oversize_drops", 0)
     )
-    active_missing = int(metrics.get("fragment_active_missing_indexes", 0))
-    fragment_loss_observed = nacks_sent > 0 or active_missing > 0
+    metadata_mismatch_drops = int(
+        relay_m.get("fragment_assembly_metadata_mismatch_drops", 0)
+    ) + int(sub_m.get("fragment_assembly_metadata_mismatch_drops", 0))
 
     reason = "no_miss"
     if not passed:
         if oversize_drops > 0 or metadata_mismatch_drops > 0:
             reason = "reassembly_failure"
-        elif not fragment_loss_observed:
-            # A miss happened but this hop's OWN loss detector (watching
-            # what it receives from upstream) never engaged at all --
-            # either the miss is on a leg this probe can't see (relay->
-            # subscriber), or it isn't fragment-loss-related at all (e.g.
-            # an application-layer bug).
-            reason = "miss_without_detected_fragment_loss"
-        elif nack_exhausted > 0:
-            reason = "nack_budget_exhausted"
-        elif nacks_sent > 0 and ttl_expirations > 0:
-            # This hop detected loss and requested repair from upstream,
-            # but its own fragment-assembly TTL expired before a complete
-            # repair arrived. Can't attribute further (publisher-side
-            # response isn't observable from here) without adding
-            # equivalent metrics to the publisher/subscriber probes too.
-            reason = "repair_requested_but_ttl_expired_before_completion"
         else:
-            reason = "unclassified_miss"
+            leg1_reason = _leg_reason(leg1)
+            leg2_reason = _leg_reason(leg2)
+            if leg1_reason is not None:
+                reason = f"leg1_publisher_to_relay:{leg1_reason}"
+            elif leg2_reason is not None:
+                reason = f"leg2_relay_to_subscriber:{leg2_reason}"
+            elif leg1["loss_detected"] == 0 and leg2["loss_detected"] == 0:
+                reason = "miss_without_detected_fragment_loss"
+            else:
+                reason = "unclassified_miss"
 
     return {
         "passed": passed,
         "control_delivery_ratio": control_ratio,
         "state_delivery_ratio": state_ratio,
-        "fragment_loss_observed": fragment_loss_observed,
-        "fragment_nacks_sent": nacks_sent,
-        "fragment_nacks_received": nacks_received,
-        "fragments_selectively_retransmitted": retransmitted,
-        "fragment_assembly_ttl_expirations": ttl_expirations,
-        "fragment_nack_exhausted_assemblies": nack_exhausted,
-        "fragment_assembly_oversize_drops": oversize_drops,
-        "fragment_assembly_metadata_mismatch_drops": metadata_mismatch_drops,
+        "leg1_publisher_to_relay": leg1,
+        "leg2_relay_to_subscriber": leg2,
         "reason": reason,
     }
 
@@ -220,12 +256,18 @@ def run_escalation(
         }
         steps.append(step)
         for d in diagnoses:
+            l1, l2 = d["leg1_publisher_to_relay"], d["leg2_relay_to_subscriber"]
             print(
                 f"  seed={d['seed']} passed={d['passed']} reason={d['reason']} "
                 f"control={d['control_delivery_ratio']} state={d['state_delivery_ratio']} "
-                f"nacks_sent={d['fragment_nacks_sent']} nacks_received={d['fragment_nacks_received']} "
-                f"retransmitted={d['fragments_selectively_retransmitted']} "
-                f"ttl_expirations={d['fragment_assembly_ttl_expirations']}",
+                f"leg1(pub->relay) loss_detected={l1['loss_detected']} "
+                f"nack_received_by_pub={l1['nack_received_by_source']} "
+                f"repair_sent_by_pub={l1['repair_sent_by_source']} "
+                f"relay_ttl_exp={l1['receiver_assembly_ttl_expirations']} | "
+                f"leg2(relay->sub) loss_detected={l2['loss_detected']} "
+                f"nack_received_by_relay={l2['nack_received_by_source']} "
+                f"repair_sent_by_relay={l2['repair_sent_by_source']} "
+                f"sub_ttl_exp={l2['receiver_assembly_ttl_expirations']}",
                 file=sys.stderr,
                 flush=True,
             )
