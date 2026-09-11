@@ -790,6 +790,18 @@ def run_probe(
                 relay.get("executor_drain_mode")
                 if relay_mode == "generic_serialized" else None
             ),
+            # Fragment/NACK/repair diagnostic counters the relay probe
+            # binary already computes and prints (see
+            # generic_serialized_relay_probe.cpp's fleetqox_transport_metrics
+            # block) but this script previously discarded -- exposes the
+            # fragment-loss / NACK-sent / NACK-received / repair-sent /
+            # TTL-timeout signals needed to tell "fragment lost but never
+            # repaired" apart from "repaired but too slow" apart from
+            # "never even lost" when diagnosing a delivery miss.
+            "relay_fragment_repair_metrics": (
+                relay.get("fleetqox_transport_metrics", {})
+                if relay_mode == "generic_serialized" else {}
+            ),
             "middle_payload_remains_serialized":
                 relay_mode == "generic_serialized",
             "middle_application_deserialization":
