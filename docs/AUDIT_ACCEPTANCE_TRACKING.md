@@ -1728,6 +1728,50 @@ quát, và ngay cả khi làm vậy vẫn cần đo lại để xác nhận có 
 không, vì bản thân băng thông 1 kênh 802.11g cho 1626 message vẫn có
 giới hạn riêng của nó.
 
+### 11/09/2026 (tiếp) — Thử gán riêng fleet_controller vào 1 kênh: giả thuyết bị BÁC BỎ
+
+Theo yêu cầu người dùng "thử gán riêng fleet_controller vào 1 kênh
+riêng". Thêm `--isolateController` vào `fleetqox_trace_replay_tap.cc`:
+dành AP-group 0 riêng cho station 0 (`fleet_controller`, luôn cố định
+là index 0 theo thứ tự đã ghi ở đầu file), round-robin các station CÒN
+LẠI trên `numAps-1` group còn lại. Thêm `--isolate-controller` vào
+`run_ns3_docker_wifi_tap_rmw_probe.py`. Test sanity 4 endpoint/4 AP:
+delivery vẫn đúng (khớp baseline).
+
+**Chạy 16 robot / 4 AP / isolate-controller: giả thuyết SAI, kết quả
+KHÔNG cải thiện — thậm chí hơi tệ hơn**:
+- `rx`: quay lại **0** (so với `rx=1` ở bản 4-AP round-robin thường,
+  KHÔNG cô lập, đo ngay trước đó).
+- `phy_rx_drop_total`: **206207** — CAO HƠN bản không cô lập (164600),
+  không thấp hơn.
+
+**Diễn giải**: cô lập `fleet_controller` đảm bảo kênh UPLINK của nó
+hoàn toàn sạch (không station nào khác cạnh tranh), nhưng KHÔNG hề
+giảm tải DOWNLINK trên kênh của bên NHẬN — và quan trọng hơn, cô lập
+này buộc 100% trong số 1626 message của `fleet_controller` đều phải đi
+qua relay 2-hop (trước đây, khi chia sẻ nhóm, một phần nhỏ tình cờ có
+đích CÙNG nhóm, tiết kiệm được 1 hop). Kết quả gần như y hệt (thậm chí
+nhỉnh hơn) cho thấy: nút thắt CHÍNH không nằm ở việc `fleet_controller`
+chia sẻ kênh với ai — nhiều khả năng nút thắt thật là traffic nền
+`pubsub_graph_renewal_loop()` (mỗi trong 19 endpoint quảng bá tới 18
+peer khác, mỗi 500ms, ĐỘC LẬP với topology kênh) đã xác nhận một phần
+ở thí nghiệm graph-renewal-interval trước đó — traffic này tồn tại và
+chiếm băng thông trên MỌI kênh bất kể cách chia station, nên tinh
+chỉnh CHỈ VỀ PHÍA fleet_controller không chạm được vào nguyên nhân gốc.
+
+**File thay đổi**: `external/ns3/fleetqox_trace_replay_tap.cc`
+(`--isolateController`), `scripts/run_ns3_docker_wifi_tap_rmw_probe.py`
+(`--isolate-controller`).
+
+**Kết luận cho toàn bộ nhánh "multi-AP/kênh song song"**: đã thử 3 biến
+thể (round-robin đơn thuần → static relay đúng → cô lập
+`fleet_controller`), cải thiện thật nhưng nhỏ nhất chỉ đến từ chính
+việc CHIA KÊNH nói chung (round-robin, `rx` 0→1, drop -62%), KHÔNG đến
+từ việc tối ưu VỊ TRÍ của 1 station cụ thể. Bằng chứng hiện có nghiêng
+về: nút thắt chính là tổng tải hệ thống (traffic nền O(N²) + traffic
+ứng dụng) vượt năng lực ngay cả khi đã chia 4 kênh, chứ không phải do
+1 station bị đặt sai kênh.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
