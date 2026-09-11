@@ -182,6 +182,25 @@ def main() -> int:
     for topic in incoming_topics:
         node.create_subscription(String, topic, on_message, qos)
 
+    # Discovery (pub-sub matching over the RMW's peer transport) happens
+    # BEFORE the ready/start gate below, and can legitimately take a
+    # different amount of real time on each endpoint. If start_wall were
+    # set right after each endpoint's own discovery finished (the naive
+    # order), endpoints that discovered faster would end up replaying the
+    # trace against an earlier "t=0" than slower ones, skewing the
+    # cross-endpoint schedule the trace intends. Finishing discovery FIRST
+    # and only touching --ready-file once it's done means every endpoint
+    # is already fully discovered by the time --start-file releases them
+    # all together, so start_wall can be set immediately at that shared
+    # release point with no further per-endpoint variance.
+    discovery_deadline = time.monotonic() + args.discovery_timeout_s
+    while time.monotonic() < discovery_deadline:
+        rclpy.spin_once(node, timeout_sec=0.1)
+        if not publishers or all(
+            pub.get_subscription_count() > 0 for pub in publishers.values()
+        ):
+            break
+
     if args.ready_file:
         args.ready_file.parent.mkdir(parents=True, exist_ok=True)
         args.ready_file.touch()
@@ -191,14 +210,6 @@ def main() -> int:
             rclpy.spin_once(node, timeout_sec=0.05)
         if not args.start_file.exists():
             raise RuntimeError("timed out waiting for data-plane start gate")
-
-    discovery_deadline = time.monotonic() + args.discovery_timeout_s
-    while time.monotonic() < discovery_deadline:
-        rclpy.spin_once(node, timeout_sec=0.1)
-        if not publishers or all(
-            pub.get_subscription_count() > 0 for pub in publishers.values()
-        ):
-            break
 
     start_wall = time.monotonic()
     sent: list[str] = []
