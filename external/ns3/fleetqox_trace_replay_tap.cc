@@ -232,6 +232,24 @@ main(int argc, char* argv[])
   for (uint32_t i = 0; i < stationDevices.GetN(); ++i)
   {
     stationDevices.Get(i)->SetAddress(stationMacs[i]);
+    // WifiNetDevice::SetAddress() only updates the MLD/device-level
+    // identity (WifiMac::m_address, what GetAddress() returns) -- the
+    // actual over-the-air frames (association request included) are
+    // built by the per-link FrameExchangeManager, which keeps its OWN
+    // separate address that SetAddress() at the device level never
+    // touches. Confirmed via ns-3's own trace sources (AssociatedSta on
+    // ApWifiMac, TypeId-introspected -- no source or NS_LOG needed):
+    // without this, the AP's association table recorded each station
+    // under ns-3's original default address, not this one, even though
+    // device->GetAddress() correctly reported the new value -- so the
+    // AP could never correctly address a unicast relay back to a
+    // station using ITS OWN reported address. This is necessary but,
+    // per docs/AUDIT_ACCEPTANCE_TRACKING.md, not yet SUFFICIENT to fix
+    // unicast AP relay end to end -- a further unexplained MacRxDrop
+    // remains even with this fix and a fully correct RA/BSSID.
+    Ptr<StaWifiMac> smac = DynamicCast<StaWifiMac>(
+        DynamicCast<WifiNetDevice>(stationDevices.Get(i))->GetMac());
+    smac->GetFrameExchangeManager()->SetAddress(stationMacs[i]);
   }
 
   TapBridgeHelper tapBridge;

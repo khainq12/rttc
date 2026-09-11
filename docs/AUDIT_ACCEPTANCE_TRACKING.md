@@ -1166,15 +1166,92 @@ như 1 fix đơn giản — khả năng 1 version MỚI HƠN NỮA (chưa releas
    mismatch, PHY rate, và giờ cả version.
 
 Với cả 3 hướng ít rủi ro đã thử hết và đều không ra kết quả tích cực,
-hướng còn lại thực sự "patch trực tiếp Wi-Fi MAC/TapBridge" (như mục 4
-người dùng đề xuất) sẽ cần build ns-3 từ source thật (có debug
-symbols + NS_LOG hoạt động, hiện tại image nào cũng không có) — chi phí
-lớn hơn nhiều so với 3 hướng đã thử. Đề xuất: tạm dừng nhánh "bridge
-process thật qua TAP" ở đây, quay lại đánh giá có nên chuyển sang
-phương án ban đầu (viết lại rút gọn fragment/NACK/repair trực tiếp
-trong 2 app trace-replay của Group 6, phương án đã đề xuất nhưng người
-dùng chọn phương án TAP thay vào lúc đầu) hay tiếp tục đầu tư build
-ns-3 từ source để có NS_LOG/backtrace thật.
+người dùng chọn tiếp tục debug sâu `TapBridge <-> ApWifiMac` trực tiếp,
+giới hạn scope chỉ ARP (chưa chạy UDP/FleetRMW) — xem mục tiếp theo.
+
+### Debug sâu TapBridge <-> ApWifiMac bằng runtime trace, giới hạn ARP-only (11/09/2026)
+
+Không có source `.cc` thật và `NS_LOG` không hoạt động (2 giới hạn đã
+nêu ở trên), nhưng ns-3 có 1 CƠ CHẾ KHÁC hoàn toàn độc lập với cả 2:
+**TypeId runtime reflection**. Viết `external/ns3/list_traces_diag.cc`
+(diagnostic-only) gọi `TypeId::GetTraceSourceN()`/`GetTraceSource(i)`
+để liệt kê MỌI trace source + chữ ký callback chính xác của
+`ApWifiMac`, `StaWifiMac`, `WifiMac`, `WifiPhy`,
+`WifiRemoteStationManager` — không cần source, không cần NS_LOG, chỉ
+cần linker KHÔNG bỏ qua thư viện do `--as-needed` (fix bằng
+`-Wl,--no-as-needed`). Cách này lộ ra 1 danh sách phong phú:
+`AssociatedSta`/`DeAssociatedSta` (AP), `Assoc`/`DeAssoc` (STA),
+`MacTx`/`MacTxDrop`/`MacRx`/`MacRxDrop` (cả 2), `PhyTxBegin`/`PhyTxEnd`/
+`PhyRxBegin`/`PhyRxDrop` (PHY), `MacTxDataFailed` (rate manager) —
+đúng những gì cần để quan sát TRỰC TIẾP tại sao AP không relay được,
+thay vì chỉ suy luận gián tiếp từ packet capture bên ngoài.
+
+Viết `external/ns3/fleetqox_tap_wifi_trace_diag.cc` (diagnostic-only,
+rút gọn còn 2 station + 1 AP để log dễ đọc, đúng yêu cầu "chỉ ARP,
+chưa UDP/FleetRMW") — hook toàn bộ các trace trên vào cả 2 station và
+AP.
+
+**Bug thật #2 tìm ra (KHÁC bug MAC-mismatch đã fix trước đó)**: dù
+`device->SetAddress()` (đã áp dụng từ trước) làm `GetAddress()` báo
+ĐÚNG địa chỉ tùy chỉnh, trace `AP ApWifiMac::AssociatedSta` lại ghi
+nhận địa chỉ CỦA STATION LÀ GIÁ TRỊ MẶC ĐỊNH CŨ của ns-3
+(`00:00:00:00:00:01`/`02`), không phải giá trị mới! Đào sâu header
+(`wifi-mac.h`, `frame-exchange-manager.h`, có sẵn dù không có `.cc`)
+lộ ra: **`WifiNetDevice`/`WifiMac` (kể từ khi ns-3 tái cấu trúc để hỗ
+trợ 802.11be Multi-Link Operation) tách địa chỉ thành 2 tầng riêng**:
+`WifiMac::m_address` (tầng "thiết bị/MLD", ĐÂY là cái `SetAddress()`
+sửa và `GetAddress()` đọc) và `FrameExchangeManager::m_self` (tầng
+"per-link", THỰC SỰ được dùng khi xây dựng frame qua sóng — kể cả
+frame Association Request). `SetAddress()` ở tầng thiết bị KHÔNG BAO
+GIỜ chạm tới tầng link — 2 tầng độc lập hoàn toàn. Xác nhận bằng cách
+đọc lại `smac->GetFrameExchangeManager()->GetAddress()` (API public,
+`WifiMac::GetFrameExchangeManager(linkId=SINGLE_LINK_OP_ID)`) — quả
+thật khác `GetAddress()` cho tới khi fix.
+
+**Fix**: gọi THÊM `smac->GetFrameExchangeManager()->SetAddress(addr)`
+song song với `device->SetAddress(addr)`, cho MỌI station. Xác nhận
+bằng trace: `AssociatedSta` giờ báo ĐÚNG địa chỉ tùy chỉnh. **Đã áp
+dụng fix này vào `external/ns3/fleetqox_trace_replay_tap.cc`** (file
+pipeline chính, không chỉ diagnostic) — biên dịch sạch trên CẢ ns-3
+3.41 (image pipeline thật) LẪN 3.46 (image diagnostic).
+
+**Nhưng ARP vẫn KHÔNG round-trip được, dù bug #2 đã fix.** Đào tiếp
+bằng trace + `WifiMacHeader::PeekHeader` (đọc trực tiếp RA/TA/A3/seq/
+type của từng frame qua sóng, tại tầng PHY) qua NHIỀU lần lặp lại (mỗi
+lần retry ARP của kernel Linux, ~1 lần/giây), thấy 1 pattern **hoàn
+toàn nhất quán, lặp lại y hệt mỗi lần**:
+1. Station0 gửi request (broadcast) → AP nhận, ACK, relay (broadcast,
+   `A3`=chính station0) → CẢ 2 station nhận đúng (`MacRx`).
+2. Station1 gửi reply (unicast tới AP) → AP nhận, ACK (xác nhận PHY
+   nhận đúng, CRC hợp lệ) → AP relay lại (`RA` = **ĐÚNG HỆT** địa chỉ
+   station0 đã xác nhận, `TA`=AP, seq mới hoàn toàn không trùng) →
+   **station0 lại gửi ACK link-layer cho relay này (xác nhận PHY/CRC
+   nhận đúng ở tầng thấp) NHƯNG `WifiMac::MacRxDrop` vẫn fire, frame
+   KHÔNG được forward lên tầng ứng dụng.**
+
+Đã loại trừ TRỰC TIẾP bằng dữ liệu thật (không đoán): RA sai (loại —
+khớp tuyệt đối), BSSID sai (loại — đọc lại `GetBssid()` của cả 2
+station + `GetAddress()` của AP, khớp `00:00:00:00:00:03` cả 3), lỗi
+CRC/checksum (loại — station0 vẫn ACK ở tầng PHY, nghĩa là CRC hợp lệ),
+duplicate/replay theo (TA, sequence number) (loại — seq tăng dần bình
+thường, không trùng lặp).
+
+**Khác biệt DUY NHẤT** giữa relay THÀNH CÔNG (bước 1, station nhận lại
+CHÍNH gói broadcast NÓ VỪA GỬI) và relay THẤT BẠI (bước 2, station0
+nhận gói UNICAST relay của gói do STATION KHÁC gửi) là: `A3` (trong
+frame FromDS, đây là địa chỉ NGƯỜI GỬI GỐC) = chính mình (case 1) hay
+= trạm khác (case 2), VÀ `RA`=broadcast (case 1) hay `RA`=unicast cụ
+thể (case 2) — 2 biến số đổi ĐỒNG THỜI nên chưa tách được biến nào là
+nguyên nhân thật.
+
+**Trạng thái: bug thật #2 đã tìm + fix (đáng giữ lại dù chưa đủ để giải
+quyết end-to-end) — bug còn lại được thu hẹp RẤT nhiều so với trước
+(từ "không biết gì" xuống "1 hành vi cụ thể, tái hiện 100%, đã loại trừ
+4 giả thuyết bằng dữ liệu trực tiếp") nhưng CHƯA XÁC ĐỊNH được nguyên
+nhân gốc chính xác** — bước tiếp theo hợp lý (chưa làm): tách 2 biến
+còn lại (thử relay unicast của CHÍNH gói station0 vừa gửi lại cho nó,
+so với relay broadcast của gói station1 gửi) để xem biến nào (RA hay
+A3) thực sự là nguyên nhân.
 
 ## Quy ước cập nhật file này
 
