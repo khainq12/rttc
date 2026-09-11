@@ -802,6 +802,21 @@ def run_probe(
                 relay.get("fleetqox_transport_metrics", {})
                 if relay_mode == "generic_serialized" else {}
             ),
+            # PUBLISHER_SCRIPT and SUBSCRIBER_SCRIPT (imported from
+            # run_ros2_direct_rmw_netem_probe) already compute and print
+            # this exact same block via a ctypes call into
+            # librmw_fleetqox_cpp.so -- this script was capturing their
+            # full JSON (as `publisher`/`subscriber` above) but discarding
+            # this part of it too. Together with relay_fragment_repair_metrics
+            # this completes the causal chain across all three hops: did
+            # the publisher (the actual repair source for the lossy
+            # publisher->relay leg) receive the relay's NACK and respond,
+            # and did the subscriber ever need to NACK the relay for the
+            # relay->subscriber leg.
+            "publisher_fragment_repair_metrics":
+                publisher.get("fleetqox_transport_metrics", {}),
+            "subscriber_fragment_repair_metrics":
+                subscriber.get("fleetqox_transport_metrics", {}),
             "middle_payload_remains_serialized":
                 relay_mode == "generic_serialized",
             "middle_application_deserialization":
