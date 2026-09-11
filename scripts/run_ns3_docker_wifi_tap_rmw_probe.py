@@ -120,6 +120,7 @@ def build_shell_script(
     udp_datagram_budget_bytes: int = DEFAULT_FLEETQOX_UDP_DATAGRAM_BUDGET_BYTES,
     graph_renew_interval_ms: int | None = None,
     num_aps: int = 1,
+    isolate_controller: bool = False,
 ) -> str:
     ips = {endpoint: f"{BASE_IP_PREFIX}{i + 2}" for i, endpoint in enumerate(endpoints)}
 
@@ -197,7 +198,8 @@ def build_shell_script(
             (
                 f"/tmp/fleetqox_tap_bridge --numRobots={num_robots} --tapPrefix=ftap "
                 f"--simDuration={sim_duration_s:.12g} --numAps={num_aps} "
-                f"> {results_dir_container}/ns3_tap.log 2>&1 &"
+                + ("--isolateController=1 " if isolate_controller else "")
+                + f"> {results_dir_container}/ns3_tap.log 2>&1 &"
             ),
             "NS3_PID=$!",
             f"sleep {NS3_ATTACH_WAIT_S}",
@@ -398,6 +400,7 @@ def run_probe(
     udp_datagram_budget_bytes: int = DEFAULT_FLEETQOX_UDP_DATAGRAM_BUDGET_BYTES,
     graph_renew_interval_ms: int | None = None,
     num_aps: int = 1,
+    isolate_controller: bool = False,
 ) -> dict[str, Any]:
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -428,6 +431,7 @@ def run_probe(
         udp_datagram_budget_bytes=udp_datagram_budget_bytes,
         graph_renew_interval_ms=graph_renew_interval_ms,
         num_aps=num_aps,
+        isolate_controller=isolate_controller,
     )
 
     completed = subprocess.run(
@@ -527,6 +531,21 @@ def main() -> int:
             "original single-AP topology."
         ),
     )
+    parser.add_argument(
+        "--isolate-controller",
+        action="store_true",
+        help=(
+            "Reserve AP group 0 exclusively for fleet_controller "
+            "(station 0), round-robining every other station across the "
+            "remaining num-aps-1 groups. Added after a --num-aps=4 run "
+            "still barely delivered anything: fleet_controller alone "
+            "generates 71 percent of the fleet's traffic and, confined "
+            "to one channel like everyone else under plain round-robin, "
+            "that one channel stayed the bottleneck regardless of "
+            "--num-aps -- see docs/AUDIT_ACCEPTANCE_TRACKING.md. No-op "
+            "when --num-aps is 1."
+        ),
+    )
     args = parser.parse_args()
 
     summary = run_probe(
@@ -541,6 +560,7 @@ def main() -> int:
         drain_s=max(args.drain_s, 1.0),
         graph_renew_interval_ms=args.graph_renew_interval_ms,
         num_aps=max(args.num_aps, 1),
+        isolate_controller=args.isolate_controller,
     )
     summary_path = ROOT / args.summary_json
     summary_path.parent.mkdir(parents=True, exist_ok=True)

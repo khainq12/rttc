@@ -326,6 +326,21 @@ main(int argc, char* argv[])
       "scale. Default 1 preserves the original single-AP topology "
       "exactly.",
       numAps);
+  bool isolateController = false;
+  cmd.AddValue(
+      "isolateController",
+      "Reserve AP group 0 exclusively for station 0 (fleet_controller), "
+      "round-robining every OTHER station across the remaining "
+      "numAps-1 groups instead. Added after a numAps=4/16-robot run "
+      "still barely delivered anything despite splitting all OTHER "
+      "stations across channels: fleet_controller alone generates 71 "
+      "percent of the fleet's traffic (1626/2289 sends) and, confined "
+      "to one "
+      "channel like everyone else under plain round-robin, that one "
+      "channel stayed the bottleneck regardless of numAps -- see "
+      "docs/AUDIT_ACCEPTANCE_TRACKING.md. No-op when numAps == 1 or "
+      "false (the default).",
+      isolateController);
   cmd.Parse(argc, argv);
 
   if (numRobots == 0)
@@ -413,15 +428,29 @@ main(int argc, char* argv[])
   NodeContainer accessPoints;
   accessPoints.Create(numAps);
 
-  // Round-robin station -> AP-group assignment: station i joins AP
-  // (i % numAps)'s channel. Purely an ns-3-internal grouping -- the tap
-  // device name/index/MAC contract with the orchestrator script (by
-  // station index i) is completely unaffected, so this needs no changes
-  // on the Linux/orchestration side.
+  // Station -> AP-group assignment. Purely an ns-3-internal grouping --
+  // the tap device name/index/MAC contract with the orchestrator script
+  // (by station index i) is completely unaffected, so this needs no
+  // changes on the Linux/orchestration side.
   std::vector<std::vector<uint32_t>> stationIndexesByGroup(numAps);
-  for (uint32_t i = 0; i < totalStations; ++i)
+  if (isolateController && numAps > 1)
   {
-    stationIndexesByGroup[i % numAps].push_back(i);
+    // Station 0 is always fleet_controller (see the file-header ordering
+    // comment) -- give it group 0 entirely to itself, round-robining
+    // every other station across the REMAINING numAps-1 groups.
+    stationIndexesByGroup[0].push_back(0);
+    for (uint32_t i = 1; i < totalStations; ++i)
+    {
+      stationIndexesByGroup[1 + (i - 1) % (numAps - 1)].push_back(i);
+    }
+  }
+  else
+  {
+    // Plain round-robin: station i joins AP (i % numAps)'s channel.
+    for (uint32_t i = 0; i < totalStations; ++i)
+    {
+      stationIndexesByGroup[i % numAps].push_back(i);
+    }
   }
 
   WifiHelper wifi;
