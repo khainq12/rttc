@@ -27,6 +27,7 @@ network FleetQoxWifiReplay
         double stationSpacing @unit(m) = default(3m);
         double mobilitySpeed @unit(mps) = default(0mps);
         double startOffset @unit(s) = default(1s);
+        bool wifiQos = default(false);
         int totalStations = default(numRobots + 3);
         int gridWidth = default(int(ceil(sqrt(totalStations))));
         @display("bgb=800,650");
@@ -45,6 +46,7 @@ network FleetQoxWifiReplay
             wlan[*].mgmt.typename = "Ieee80211MgmtApSimplified";
             wlan[*].bitrate = parent.wlanBitrate;
             wlan[*].opMode = "g(erp)";
+            wlan[*].mac.qosStation = parent.wifiQos;
             @display("p=400,60");
         }
         controller: WirelessHost {
@@ -62,6 +64,7 @@ network FleetQoxWifiReplay
             mobility.initialMovementHeading = default(0deg);
             wlan[*].bitrate = parent.wlanBitrate;
             wlan[*].opMode = "g(erp)";
+            wlan[*].mac.qosStation = parent.wifiQos;
             wlan[*].mgmt.typename = "Ieee80211MgmtStaSimplified";
             wlan[*].agent.typename = "";
             @display("p=250,300");
@@ -80,6 +83,7 @@ network FleetQoxWifiReplay
             mobility.initialMovementHeading = default(180deg);
             wlan[*].bitrate = parent.wlanBitrate;
             wlan[*].opMode = "g(erp)";
+            wlan[*].mac.qosStation = parent.wifiQos;
             wlan[*].mgmt.typename = "Ieee80211MgmtStaSimplified";
             wlan[*].agent.typename = "";
             @display("p=400,300");
@@ -98,6 +102,7 @@ network FleetQoxWifiReplay
             mobility.initialMovementHeading = default(0deg);
             wlan[*].bitrate = parent.wlanBitrate;
             wlan[*].opMode = "g(erp)";
+            wlan[*].mac.qosStation = parent.wifiQos;
             wlan[*].mgmt.typename = "Ieee80211MgmtStaSimplified";
             wlan[*].agent.typename = "";
             @display("p=550,300");
@@ -116,6 +121,7 @@ network FleetQoxWifiReplay
             mobility.initialMovementHeading = default((index % 2 == 0) ? 0deg : 180deg);
             wlan[*].bitrate = parent.wlanBitrate;
             wlan[*].opMode = "g(erp)";
+            wlan[*].mac.qosStation = parent.wifiQos;
             wlan[*].mgmt.typename = "Ieee80211MgmtStaSimplified";
             wlan[*].agent.typename = "";
             @display("p=70+index*80,520");

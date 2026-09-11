@@ -253,8 +253,10 @@ def run_ns3_case(
     scenario: dict[str, Any],
     seed: int,
     matched_rng: bool = False,
+    wifi_qos: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     matched_rng_flag = "--matchedBackoffRng=true --matchedBackoffRngBase=0 " if matched_rng else ""
+    wifi_qos_flag = "--wifiQos=true " if wifi_qos else ""
     command = (
         f"{shlex.quote(_container_path(binary))} "
         f"--trace={shlex.quote(_container_path(trace))} --topology=wifi "
@@ -263,6 +265,7 @@ def run_ns3_case(
         f"--stationSpacing={scenario['station_spacing']} "
         f"--warmupMs={WIFI_WARMUP_MS} --seed={seed} --run={seed} "
         f"{matched_rng_flag}"
+        f"{wifi_qos_flag}"
     )
     return docker_run(image, command, timeout=600)
 
@@ -383,6 +386,7 @@ def run_omnetpp_case(
     scenario: dict[str, Any],
     seed: int,
     matched_rng: bool = False,
+    wifi_qos: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     drain_ms = 10_000.0
     sim_limit = _sim_time_limit_seconds(trace, WIFI_WARMUP_MS, drain_ms)
@@ -414,6 +418,7 @@ def run_omnetpp_case(
         f"--*.stationSpacing={scenario['station_spacing']}m "
         f"--*.mobilitySpeed={scenario['mobility_speed']}mps "
         f"--*.startOffset={WIFI_WARMUP_MS / 1000.0:.12g}s "
+        f"--*.wifiQos={'true' if wifi_qos else 'false'} "
         f"{rng_flags}"
         f"--sim-time-limit={sim_limit:.12g}s --seed-set={seed}"
     )
@@ -431,6 +436,7 @@ def run_parity_matrix(
     thresholds: dict[str, float],
     build_image: bool,
     matched_rng: bool = False,
+    wifi_qos: bool = False,
     capacity_packets_per_second: int | None = DEFAULT_CAPACITY_PACKETS_PER_SECOND,
 ) -> dict[str, Any]:
     output_dir = output_dir.resolve()
@@ -514,6 +520,7 @@ def run_parity_matrix(
                     scenario=scenario,
                     seed=seed,
                     matched_rng=matched_rng,
+                    wifi_qos=wifi_qos,
                 )
                 omnetpp_run = run_omnetpp_case(
                     image=omnetpp_image,
@@ -523,6 +530,7 @@ def run_parity_matrix(
                     scenario=scenario,
                     seed=seed,
                     matched_rng=matched_rng,
+                    wifi_qos=wifi_qos,
                 )
                 ns3_policies = parse_csv_summary(ns3_run.stdout)
                 omnetpp_policies = parse_csv_summary(omnetpp_run.stdout)
@@ -582,6 +590,7 @@ def run_parity_matrix(
         },
         "images": {"ns3": ns3_image, "omnetpp": omnetpp_image},
         "matched_rng": matched_rng,
+        "wifi_qos": wifi_qos,
         "capacity_packets_per_second": capacity_packets_per_second,
         "image_build": image_build,
         "compile": compile_evidence,
@@ -659,6 +668,17 @@ def main() -> int:
             "per-packet overhead -- see DEFAULT_CAPACITY_PACKETS_PER_SECOND."
         ),
     )
+    parser.add_argument(
+        "--wifi-qos",
+        action="store_true",
+        help=(
+            "Enable 802.11e/WMM QoS (EDCA) on both simulators' wifi MAC and "
+            "tag each packet's Access Category from its flow_class, instead "
+            "of every flow contending in the same best-effort DCF queue -- "
+            "tests whether the current non-QoS config understates what a "
+            "real WMM-capable deployment would achieve for control traffic."
+        ),
+    )
     args = parser.parse_args()
     summary = run_parity_matrix(
         omnetpp_image=args.omnetpp_image,
@@ -670,6 +690,7 @@ def main() -> int:
         thresholds=dict(DEFAULT_THRESHOLDS),
         build_image=not args.skip_image_build,
         matched_rng=args.matched_rng,
+        wifi_qos=args.wifi_qos,
         capacity_packets_per_second=args.capacity_packets_per_second or None,
     )
     summary_path = ROOT / args.summary_json

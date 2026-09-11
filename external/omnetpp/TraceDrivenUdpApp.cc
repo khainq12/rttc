@@ -21,6 +21,7 @@
 #include "inet/common/InitStages.h"
 #include "inet/common/TimeTag_m.h"
 #include "inet/common/packet/Packet.h"
+#include "inet/linklayer/common/UserPriorityTag_m.h"
 #include "inet/networklayer/common/L3AddressResolver.h"
 
 namespace fleetqox_omnetpp {
@@ -31,12 +32,37 @@ struct TraceEvent
   std::uint64_t event_id{0};
   double timestamp_ms{0.0};
   std::string policy;
+  std::string flow_class;
   std::string source;
   std::string destination;
   std::uint32_t bytes{0};
   double deadline_ms{0.0};
   double semantic_utility{0.0};
 };
+
+// Maps a FleetQoX flow_class to an 802.11e/WMM User Priority (0-7), using
+// the standard WMM Access Category mapping (AC_VO=6-7, AC_VI=4-5,
+// AC_BE=0/3, AC_BK=1-2). Mirrors
+// external/ns3/fleetqox_trace_replay.cc's UserPriorityForFlowClass() so
+// both simulators prioritize the same flow classes the same way when QoS
+// is enabled (wlan mac.qosStation = true); with qosStation = false this
+// tag is simply ignored by INET's non-QoS Dcf.
+int userPriorityForFlowClass(const std::string & flowClass)
+{
+  if (flowClass == "safety" || flowClass == "control") {
+    return 6; // AC_VO
+  }
+  if (flowClass == "coordination" || flowClass == "state") {
+    return 5; // AC_VI
+  }
+  if (flowClass == "human_qoe") {
+    return 4; // AC_VI
+  }
+  if (flowClass == "perception") {
+    return 0; // AC_BE
+  }
+  return 1; // AC_BK (debug, bulk, unknown)
+}
 
 struct PolicyStats
 {
@@ -116,13 +142,14 @@ void loadTraceOnce(const std::string & path)
   const auto event_id = requiredColumn(columns, "event_id");
   const auto timestamp = requiredColumn(columns, "timestamp_ms");
   const auto policy = requiredColumn(columns, "policy");
+  const auto flow_class = requiredColumn(columns, "flow_class");
   const auto source = requiredColumn(columns, "src");
   const auto destination = requiredColumn(columns, "dst");
   const auto bytes = requiredColumn(columns, "bytes");
   const auto deadline = requiredColumn(columns, "deadline_ms");
   const auto utility = requiredColumn(columns, "semantic_utility");
   const std::size_t last_required = std::max(
-    {event_id, timestamp, policy, source, destination, bytes, deadline, utility});
+    {event_id, timestamp, policy, flow_class, source, destination, bytes, deadline, utility});
 
   while (std::getline(input, line)) {
     if (line.empty()) {
@@ -136,6 +163,7 @@ void loadTraceOnce(const std::string & path)
     event.event_id = std::stoull(row[event_id]);
     event.timestamp_ms = std::stod(row[timestamp]);
     event.policy = row[policy];
+    event.flow_class = row[flow_class];
     event.source = row[source];
     event.destination = row[destination];
     event.bytes = static_cast<std::uint32_t>(std::stoul(row[bytes]));
@@ -331,6 +359,8 @@ void TraceDrivenUdpApp::sendDueEvents()
     payload->setSequenceNumber(static_cast<int64_t>(event.event_id));
     payload->addTag<inet::CreationTimeTag>()->setCreationTime(::omnetpp::simTime());
     packet->insertAtBack(payload);
+    packet->addTagIfAbsent<inet::UserPriorityReq>()->setUserPriority(
+      userPriorityForFlowClass(event.flow_class));
     socket_.sendTo(packet, destination, destination_port_);
     traceStore().stats[event.policy].tx++;
     sent_++;

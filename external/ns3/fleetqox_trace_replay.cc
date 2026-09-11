@@ -231,6 +231,35 @@ ReceivePacket(Ptr<Socket> socket)
   }
 }
 
+// Maps a FleetQoX flow_class to an 802.11e/WMM User Priority (0-7), using
+// the standard WMM Access Category mapping (AC_VO=6-7, AC_VI=4-5,
+// AC_BE=0/3, AC_BK=1-2). Only takes effect when --wifiQos enables
+// QosSupported on the wifi MAC; ns-3's non-QoS Txop ignores the packet's
+// SocketPriorityTag entirely. SAFETY/CONTROL (the tightest-deadline,
+// highest-priority flows) map to AC_VO, matching how a real WMM-enabled
+// deployment would prioritize them over best-effort/background traffic.
+static uint8_t
+UserPriorityForFlowClass(const std::string& flowClass)
+{
+  if (flowClass == "safety" || flowClass == "control")
+  {
+    return 6; // AC_VO
+  }
+  if (flowClass == "coordination" || flowClass == "state")
+  {
+    return 5; // AC_VI
+  }
+  if (flowClass == "human_qoe")
+  {
+    return 4; // AC_VI
+  }
+  if (flowClass == "perception")
+  {
+    return 0; // AC_BE
+  }
+  return 1; // AC_BK (debug, bulk, unknown)
+}
+
 static Ptr<Socket>
 SourceSocket(const std::string& src, Ptr<Node> node)
 {
@@ -254,6 +283,7 @@ SendEvent(uint32_t eventIndex, NodeContainer nodes)
 
   Ptr<Packet> packet = Create<Packet>(std::max<uint32_t>(event.bytes, 1));
   packet->AddPacketTag(EventIdTag(eventIndex));
+  socket->SetPriority(UserPriorityForFlowClass(event.flowClass));
   socket->SendTo(packet, 0, InetSocketAddress(dstAddress, g_port));
   g_stats[event.policy].tx++;
 }
@@ -312,6 +342,7 @@ main(int argc, char* argv[])
   // (MatchedMrg32k3aRng's rngId / physical RNG slot count) mirrors this
   // exact convention and would need updating if this default changes.
   uint64_t matchedBackoffRngBase = 0;
+  bool wifiQos = false;
 
   CommandLine cmd(__FILE__);
   cmd.AddValue("trace", "FleetQoX simulator CSV trace", tracePath);
@@ -340,6 +371,14 @@ main(int argc, char* argv[])
       "matchedBackoffRngBase",
       "Base stream index used when matchedBackoffRng is enabled",
       matchedBackoffRngBase);
+  cmd.AddValue(
+      "wifiQos",
+      "Enable 802.11e/WMM QoS (EDCA) on the wifi MAC and tag each packet's "
+      "Access Category from its flow_class (safety/control -> AC_VO, "
+      "coordination/state -> AC_VI, human_qoe -> AC_VI, perception -> "
+      "AC_BE, debug/bulk -> AC_BK), instead of a single best-effort DCF "
+      "queue for all traffic",
+      wifiQos);
   cmd.Parse(argc, argv);
 
   if (tracePath.empty())
@@ -359,6 +398,14 @@ main(int argc, char* argv[])
       wifiRange <= 0.0 || warmupMs < 0.0)
   {
     NS_FATAL_ERROR("mobilitySpeed must be nonnegative and stationSpacing positive");
+  }
+  if (matchedBackoffRng && wifiQos)
+  {
+    // assignBackoffStream() below assumes the non-QoS single-Txop MAC
+    // ("Txop" attribute); QoS mode exposes VO_Txop/VI_Txop/BE_Txop/BK_Txop
+    // instead. These two experimental flags haven't been combined/tested
+    // together yet -- fail loudly instead of silently mis-assigning streams.
+    NS_FATAL_ERROR("matchedBackoffRng and wifiQos are not yet supported together");
   }
   RngSeedManager::SetSeed(seed);
   RngSeedManager::SetRun(run);
@@ -459,9 +506,13 @@ main(int argc, char* argv[])
     mac.SetType(
         "ns3::StaWifiMac",
         "Ssid", SsidValue(ssid),
-        "ActiveProbing", BooleanValue(false));
+        "ActiveProbing", BooleanValue(false),
+        "QosSupported", BooleanValue(wifiQos));
     NetDeviceContainer stationDevices = wifi.Install(phy, mac, nodes);
-    mac.SetType("ns3::ApWifiMac", "Ssid", SsidValue(ssid));
+    mac.SetType(
+        "ns3::ApWifiMac",
+        "Ssid", SsidValue(ssid),
+        "QosSupported", BooleanValue(wifiQos));
     NetDeviceContainer accessPointDevices = wifi.Install(phy, mac, accessPoints);
 
     if (matchedBackoffRng)
