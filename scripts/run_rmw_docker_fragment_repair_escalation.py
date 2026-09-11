@@ -199,6 +199,13 @@ def run_escalation(
             "timeout_s": step_timeout_s,
             "passed": step_passed,
             "diagnoses": diagnoses,
+            # Full per-seed result (status, any error text, every raw
+            # counter) so a miss with an otherwise-empty diagnosis (all
+            # counters zero -- no fragment loss/NACK/repair activity at
+            # all) can be told apart from a harness/infra-level failure
+            # (docker setup race, container didn't come up in time, etc.)
+            # instead of being misread as a fragmentation code bug.
+            "raw_runs": campaign["runs"],
         }
         steps.append(step)
         for d in diagnoses:
