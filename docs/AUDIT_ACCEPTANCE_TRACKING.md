@@ -1588,6 +1588,61 @@ vật lý thật của topology đang dùng.
 `scripts/fleetqox_rmw_trace_endpoint.py` (`fleetqox_transport_metrics()`),
 `scripts/run_ns3_docker_wifi_tap_rmw_probe.py` (`--graph-renew-interval-ms`).
 
+### 11/09/2026 (tiếp) — Thử topology nhiều AP/kênh song song: TỆ HƠN, chưa giải quyết
+
+Theo yêu cầu "thử topology nhiều AP/kênh song song xem có cải thiện
+không". Thêm `--numAps` vào `fleetqox_trace_replay_tap.cc`: chia station
+round-robin (`station i` → AP `i % numAps`) vào các nhóm, MỖI nhóm dùng
+một `YansWifiChannel` C++ RIÊNG (mô hình Yans của ns-3 chỉ tính
+interference giữa các PHY chung MỘT channel object — channel object
+riêng = kênh không nhiễu nhau hoàn toàn, kịch bản tốt nhất có thể). Thêm
+`--num-aps` vào `run_ns3_docker_wifi_tap_rmw_probe.py`.
+
+**Lần thử đầu tiên (không backhaul) thất bại ngay ở bước discovery**:
+4 nhóm AP hoàn toàn CÔ LẬP nhau (không kết nối), nên station ở nhóm này
+KHÔNG BAO GIỜ tới được station ở nhóm khác. Mỗi lần gửi graph-advertisement
+tới 1 peer ở nhóm khác kích hoạt trọn vẹn ngân sách retry
+`ENETUNREACH`/`EHOSTUNREACH` (`kUnreachableRetryLimit=40 ×
+kUnreachableRetryBackoffMs=50ms` = 2s/peer, vì permanently-unreachable
+không phân biệt được với "đang hội tụ ARP" qua errno) — làm startup của
+19 endpoint bị treo, vượt hẳn `READY_DEADLINE_S=30s`, script fail với
+"timed out waiting for every endpoint to become ready".
+
+**Fix**: thêm backhaul CSMA nối các AP lại (`CsmaHelper` + `BridgeHelper`
+bridge mỗi AP's wifi-AP-device với CSMA-device của nó trên chính node
+đó) — đúng mô hình canonical ns-3 cho "nhiều AP nối qua LAN có dây",
+giống deployment multi-AP thật (các AP uplink vào 1 switch). Test sanity
+4 endpoint / 4 AP (mỗi endpoint 1 AP riêng): delivery khớp CHÍNH XÁC
+baseline single-AP khỏe mạnh (`fleet_router rx=76`, `operator_ui rx=2`,
+`robot_0000 rx=103`) — xác nhận backhaul hoạt động đúng cho quy mô nhỏ.
+
+**Chạy lại 16 robot / 4 AP + backhaul: TỆ HƠN hẳn, không cải thiện**:
+`rx=0` TUYỆT ĐỐI (không đổi so với 1-AP) — nhưng `mac_tx_total` từ 92484
+(1 AP) TĂNG lên **429322** (~4.6x, gần khớp `numAps=4`), và
+`mac_tx_drop_total` từ ~12 TĂNG lên **228621**. Đây không phải cải
+thiện bị hạn chế — đây là NẶNG THÊM đáng kể.
+
+**Nghi ngờ nguyên nhân (CHƯA xác nhận dứt điểm, CHƯA fix)**: bridge học
+(learning bridge) của `BridgeHelper` có thể KHÔNG hội tụ bảng MAC cho
+các station nằm sau cổng wifi (khác với cổng CSMA thường-Ethernet nó
+được thiết kế/test chính) — mỗi frame unicast tới MAC "chưa học được"
+bị FLOOD ra TẤT CẢ port thay vì chỉ port đúng, và AP nhận flood đó thấy
+đích không nằm trong bảng liên kết của chính nó → `MacTxDrop` ("destined
+to a station not associated with the AP", đúng khớp định nghĩa trace
+source này). Hệ số tăng ~4.6x cho `mac_tx_large` khớp gần đúng với
+`numAps=4`, ủng hộ giả thuyết "mỗi frame bị nhân bản ra N AP thay vì 1".
+CHƯA điều tra sâu hơn (vd: kiểm tra `BridgeNetDevice`'s learning
+callback có nhận đúng source MAC từ phía sau `ApWifiMac` hay không) —
+dừng lại ở đây để báo cáo, chưa tự ý tiếp tục đào sâu thêm.
+
+**Kết luận tạm thời**: hướng "nhiều AP/kênh song song" về mặt lý thuyết
+đúng đắn (giảm được tranh chấp airtime trong PHẠM VI 1 kênh, đã chứng
+minh một phần ở thí nghiệm graph-renewal-interval trước đó khi so sánh
+CÙNG 1 AP với ít traffic hơn), nhưng cách triển khai bridge hiện tại có
+bug/hạn chế khiến traffic CROSS-AP bị khuếch đại thay vì giảm tải —
+CHƯA phải bằng chứng phủ nhận hướng đi, mà là một bug/hạn chế triển khai
+cụ thể cần fix tiếp nếu muốn theo hướng này.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
