@@ -1515,6 +1515,79 @@ ns-3 (PhyTxBegin/PhyRxDrop trace, tương tự kỹ thuật đã dùng ở nhán
 tra ARP relay trước đó) để xác định nguyên nhân, trước khi kết luận đây
 là giới hạn năng lực kênh thật hay tác dụng phụ của chính bản fix.
 
+### 11/09/2026 (tiếp) — Đào bằng trace ns-3: loại 2 giả thuyết, xác định nghẽn PHY thật là nguyên nhân chính
+
+Thêm trace-source counter trực tiếp vào `external/ns3/fleetqox_trace_replay_tap.cc`
+(`MacTx`/`MacTxDrop`/`MacRx`/`MacRxDrop`/`PhyTxBegin`/`PhyRxDrop`/
+`AssociatedSta`, dùng `std::atomic` thay vì in từng gói — 16 station ở
+tốc độ thật sẽ tạo quá nhiều output để đọc, và trước đó đã gặp lỗi
+stdout xen kẽ dưới `RealtimeSimulatorImpl`). In định kỳ mỗi 5s thật
+(`Simulator::Schedule` tự lặp lại) thay vì chỉ in 1 lần sau
+`Simulator::Run()` — orchestrator `kill $NS3_PID` sớm hơn thời điểm
+`Simulator::Stop()` tự nhiên nên bản in 1-lần-cuối không bao giờ chạy.
+
+**Loại giả thuyết #1 — không phải "ARP storm" từ chính fix retry vừa
+thêm**: thêm counter `unreachable_retry_attempts`/`unreachable_retry_giveups`
+trực tiếp vào `rmw_pubsub.cpp` (đếm mỗi lần `sendto()` retry cho riêng
+lớp `ENETUNREACH`/`EHOSTUNREACH`), export qua ctypes (cùng cơ chế
+`librmw_fleetqox_cpp.so` đã có ở `run_ros2_direct_rmw_netem_probe.py`).
+Kết quả 16-robot: tổng **1004 lần retry / 2289 lần gửi (~0.44 lần/gửi
+trung bình), 0 giveups** — hoàn toàn KHÔNG khớp giả thuyết "retry ăn
+gần hết ngân sách 40 lần cho đa số message". Retry chỉ tập trung ở giai
+đoạn khởi động (association/ARP hội tụ), không lặp lại theo từng
+message.
+
+**Loại giả thuyết #2 — không phải "repair storm" từ tầng
+fragment/NACK/repair**: thêm hàm `fleetqox_transport_metrics()` vào
+`scripts/fleetqox_rmw_trace_endpoint.py` (dùng lại đúng cơ chế ctypes
+đã có ở `run_ros2_direct_rmw_netem_probe.py`, món nợ kỹ thuật từ mục
+#23/#25 chưa từng chạy qua kịch bản TAP-bridge này). Kết quả tổng hợp
+19 endpoint: `fragments_selectively_retransmitted=0`,
+`nack_retransmissions=0`, `reliable_timeout_retransmissions=0`,
+`fragment_nacks_sent=10`, `fragment_nacks_received=0` — tầng reliability
+gần như KHÔNG hoạt động, không hề tạo ra traffic khuếch đại.
+
+**Phát hiện thật — traffic nền `pubsub_graph_renewal_loop()`**: đọc
+source thấy `rmw_pubsub.cpp` có một thread nền, mặc định mỗi 500ms
+(`FLEETQOX_RMW_GRAPH_RENEW_INTERVAL_MS`), quảng bá LẠI toàn bộ
+publisher+subscription của node đó tới TẤT CẢ peer khác — chi phí
+O(publishers × peers) mỗi tick, O(N²) toàn hệ thống theo số peer. Thêm
+`--graph-renew-interval-ms` vào `run_ns3_docker_wifi_tap_rmw_probe.py`
+để test. Tăng từ 500ms → 4000ms (mức tối đa RMW cho phép) ở quy mô 16
+robot: `mac_tx_total` giảm ~33% (92484 → 62188 trong 30-35s) — xác nhận
+đây LÀ một phần đáng kể của tải kênh — **nhưng `rx` vẫn = 0 TUYỆT ĐỐI**,
+nghĩa là đây không phải nguyên nhân DUY NHẤT hay chiếm ưu thế áp đảo.
+
+**Kết luận (bằng chứng PHY-level trực tiếp)**: breakdown lý do
+`PhyRxDrop` ở lần chạy 4000ms: `BUSY_DECODING_PREAMBLE=171788` +
+`PREAMBLE_DETECT_FAILURE=181871` = **353659/432020 (82%)** tổng số gói
+bị drop ở tầng PHY. Đây là dấu hiệu kinh điển của xung đột/chồng lấn
+preamble thật ở tầng vật lý 802.11 — không phải nghẽn do chính traffic
+mình đo (mã hoá qua "TXING", chỉ 42656/432020, tức nửa-song-công bình
+thường), cũng không phải artifact instrumentation. **19 station cùng
+associate + gửi vào 1 kênh 802.11g (`ErpOfdmRate54Mbps`, 1 AP duy nhất)
+đơn giản là VƯỢT NĂNG LỰC kênh thật** — dù đã tắt hẳn 2 nguồn khuếch
+đại tình nghi (retry loop của tôi, tầng repair của RMW), và dù giảm hẳn
+traffic discovery xuống 33%, kênh vẫn sập hoàn toàn.
+
+**Trả lời câu hỏi nghiên cứu gốc của phiên này**: ở quy mô 16 robot với
+topology 802.11g đơn-AP hiện tại, KHÔNG có traffic nào (RMW thật hay
+raw UDP) có thể đi qua kênh với tỷ lệ đáng kể — nút thắt là năng lực
+vật lý của kênh/topology, không phải giao thức tầng trên. So sánh
+"RMW thật cải thiện delivery ratio bao nhiêu so với raw UDP" ở quy mô
+này vì vậy không có ý nghĩa cho tới khi giải quyết được giới hạn năng
+lực kênh (vd: nhiều AP/kênh song song, chuẩn 802.11 băng thông rộng
+hơn, hoặc giảm mật độ station trên mỗi AP) — CHƯA làm trong phiên này,
+ngoài phạm vi câu hỏi ban đầu ("có bug gì không") đã được trả lời dứt
+điểm: không còn bug phần mềm nào gây ra hiện tượng này, đây là giới hạn
+vật lý thật của topology đang dùng.
+
+**File thay đổi**: `external/ns3/fleetqox_trace_replay_tap.cc` (counter
++ in định kỳ), `ros2_ws/src/rmw_fleetqox_cpp/src/rmw_pubsub.cpp`
+(counter `unreachable_retry_attempts`/`unreachable_retry_giveups`),
+`scripts/fleetqox_rmw_trace_endpoint.py` (`fleetqox_transport_metrics()`),
+`scripts/run_ns3_docker_wifi_tap_rmw_probe.py` (`--graph-renew-interval-ms`).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
