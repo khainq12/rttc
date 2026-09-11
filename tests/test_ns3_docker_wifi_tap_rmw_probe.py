@@ -99,6 +99,19 @@ class BuildShellScriptTest(unittest.TestCase):
         for i in range(len(self.endpoints)):
             self.assertIn(f"ip link set eth0 address {_station_mac(i)}", self.script)
 
+    def test_tap_creator_symlink_is_extracted_dynamically_not_hardcoded(self):
+        # libns3-tap-bridge.so bakes in the tap-creator helper's
+        # absolute build-time path, which does not exist at runtime --
+        # confirmed to change whenever ns-3 is rebuilt from a different
+        # location (the apt package's own build path, then a completely
+        # different path once the image switched to building ns-3 from
+        # source in the Dockerfile). A hardcoded symlink target breaks
+        # the moment that build location changes again; must always be
+        # extracted from the actual installed .so via `strings`.
+        self.assertIn("strings", self.script)
+        self.assertNotIn("Q7chNJ", self.script)
+        self.assertNotIn("/build/ns3-", self.script)
+
 
 class StationMacTest(unittest.TestCase):
     def test_deterministic_and_matches_cxx_formula(self):

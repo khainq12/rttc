@@ -140,18 +140,28 @@ def build_shell_script(
             "$(pkg-config --cflags --libs ns3-core ns3-network ns3-mobility "
             "ns3-wifi ns3-tap-bridge)"
         ),
-        # libns3-tap-bridge.so.41 has the tap-creator helper's absolute
-        # path baked in at the location it was built from
-        # (/build/ns3-*/.../build/src/tap-bridge/ns3.41-tap-creator, per
-        # `strings` on the .so) rather than where the .deb actually
-        # installs it (/usr/libexec/ns3/ns3.41-tap-creator) -- confirmed
-        # by the first real run failing with execlp() ENOENT. Symlink the
-        # baked-in path to the real binary; apt-installed ns-3 never
-        # changes this, so it's safe to always do.
+        # libns3-tap-bridge.so has the tap-creator helper's absolute path
+        # baked in at whatever location it was built from (confirmed via
+        # `strings` on the .so) rather than where it's actually installed
+        # at runtime (/usr/libexec/ns3/ns3.<ver>-tap-creator) -- first
+        # seen with the apt package's own build-time path
+        # (/build/ns3-*/.../build/src/tap-bridge/...), and reconfirmed
+        # with a DIFFERENT baked path once this image switched to
+        # building ns-3 from source (/tmp/ns3-src/build/src/tap-bridge/...,
+        # matching the Dockerfile's own build location, which gets
+        # deleted after `cmake --install` to keep the image small) -- see
+        # docs/AUDIT_ACCEPTANCE_TRACKING.md. Extract the baked-in path
+        # dynamically via `strings` instead of hardcoding it, since it's
+        # tied to wherever ns-3 happened to be built and has already
+        # changed once.
         (
-            "mkdir -p /build/ns3-Q7chNJ/ns3-3.41/ns-3.41/build/src/tap-bridge && "
-            "ln -sf /usr/libexec/ns3/ns3.41-tap-creator "
-            "/build/ns3-Q7chNJ/ns3-3.41/ns-3.41/build/src/tap-bridge/ns3.41-tap-creator"
+            "TAPCREATOR_REAL=$(find /usr -iname '*tap-creator*' -type f 2>/dev/null | head -1) && "
+            "TAPCREATOR_SO=$(find /usr -iname 'libns3*tap-bridge*' 2>/dev/null | head -1) && "
+            "TAPCREATOR_BAKED=$(strings \"$TAPCREATOR_SO\" 2>/dev/null | "
+            "grep -E '/.*tap-creator$' | head -1) && "
+            "if [ -n \"$TAPCREATOR_BAKED\" ] && [ ! -e \"$TAPCREATOR_BAKED\" ]; then "
+            "mkdir -p \"$(dirname \"$TAPCREATOR_BAKED\")\" && "
+            "ln -sf \"$TAPCREATOR_REAL\" \"$TAPCREATOR_BAKED\"; fi"
         ),
     ]
 

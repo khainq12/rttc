@@ -1,0 +1,39 @@
+diff --git a/src/tap-bridge/model/tap-bridge.cc b/src/tap-bridge/model/tap-bridge.cc
+index ae56de0..987aaae 100644
+--- a/src/tap-bridge/model/tap-bridge.cc
++++ b/src/tap-bridge/model/tap-bridge.cc
+@@ -801,18 +801,22 @@ TapBridge::ForwardToBridgedDevice(uint8_t* buf, ssize_t len)
+         //
+         NS_ASSERT_MSG(Mac48Address::ConvertFrom(src) != Mac48Address("ff:ff:ff:ff:ff:ff"),
+                       "TapBridge::ForwardToBridgedDevice:  Source addr is broadcast");
+-        if (!m_ns3AddressRewritten)
+-        {
+-            //
+-            // Set the ns-3 device's mac address to the overlying container's
+-            // mac address
+-            //
+-            Mac48Address learnedMac = Mac48Address::ConvertFrom(src);
+-            NS_LOG_LOGIC("Learned MacAddr is " << learnedMac
+-                                               << ": setting ns-3 device to use this address");
+-            m_bridgedDevice->SetAddress(Mac48Address::ConvertFrom(learnedMac));
+-            m_ns3AddressRewritten = true;
+-        }
++        // FLEETQOX: disabled USE_LOCAL's "learn the ns-3 device's address
++        // from the source of the first forwarded packet" behavior. It
++        // races against ANY traffic that happens to reach this tap
++        // first -- including spurious background traffic (e.g. IPv6
++        // neighbor discovery, sent automatically when a Linux interface
++        // comes up) or another bridged station's own multicast flooded
++        // across the shared bridge -- and whichever wins becomes
++        // permanent for the rest of the run, confirmed via a custom
++        // ns-3 3.46 debug build to visibly diverge from the address
++        // explicitly configured on this station's real interface. We set
++        // the address ourselves, explicitly, right after
++        // TapBridge::Install() returns, and want that decision to stick
++        // unconditionally. See
++        // external/ns3/patches/0001-tap-bridge-disable-use-local-address-autolearn.patch
++        // (the 3.46 version of this same fix) and
++        // docs/AUDIT_ACCEPTANCE_TRACKING.md for the full investigation.
+         //
+         // If we are operating in USE_LOCAL mode, we may be attached to an ns-3
+         // device that does not support bridging (SupportsSendFrom returns false).

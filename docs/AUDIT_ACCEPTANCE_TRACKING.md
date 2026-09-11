@@ -1366,18 +1366,89 @@ không cần nữa vì patch đã giải quyết tận gốc) — vẫn REACHABL
   `TapBridge::Install()` (khớp cấu hình đã xác nhận hoạt động), thêm
   comment đầu file giải thích đầy đủ root cause + tham chiếu patch.
 
-**CHƯA làm — việc còn lại để dùng được trong pipeline thật**:
-production hiện dùng `rmw-netem:jazzy` với **ns-3 3.41 cài qua apt**
-(KHÔNG phải bản 3.46 tự build có patch này). Cần: (1) lấy source ns-3
-3.41 thật (không chỉ 3.46), áp patch tương tự (có thể cần điều chỉnh vì
-số dòng/context khác bản), (2) build lại từ source VÀO TRONG Dockerfile
-của `rmw-netem:jazzy` (thay vì `apt install ns3 libns3-dev`), (3) chạy
-lại toàn bộ pipeline TAP-bridge (`run_ns3_docker_wifi_tap_rmw_probe.py`)
-với image mới để xác nhận end-to-end thật (ARP → UDP thật → FleetRMW
-thật), điều mà nhánh "chỉ ARP" này CHƯA test (đúng theo yêu cầu giới
-hạn scope ban đầu). Đây là 1 thay đổi hạ tầng build đáng kể (build ns-3
-từ source trong Docker build tốn thời gian + dung lượng hơn nhiều so
-với `apt install`), nên cần quyết định rõ trước khi làm.
+### HOÀN TẤT: đưa patch vào production `rmw-netem:jazzy` (11/09/2026)
+
+Theo "bắt đầu đi" — build ns-3 3.41 THẬT (không phải 3.46) từ source
+(`gitlab.com/nsnam/ns-3-dev`, tag `ns-3.41`), áp patch tương tự (code
+gần như giống hệt 3.46 ở đúng vị trí, chỉ khác
+`Mac48Address::GetBroadcast()` (3.46) vs
+`Mac48Address("ff:ff:ff:ff:ff:ff")` (3.41) — patch riêng:
+`0001-tap-bridge-disable-use-local-address-autolearn-ns3.41.patch`).
+
+**2 việc phát sinh khi build 3.41 thật (khác build 3.46 trước đó)**:
+1. Build FAIL thật với lỗi biên dịch KHÔNG liên quan tới patch:
+   `wifi-phy-state-helper.h` dùng `std::transform` nhưng thiếu
+   `#include <algorithm>` — ns-3 3.41 viết cho compiler cũ hơn
+   nhiều so với GCC 15 (Ubuntu 26.04 build image), libstdc++ mới
+   không còn include header này gián tiếp qua chain cũ nữa. Patch riêng:
+   `0002-wifi-phy-state-helper-missing-algorithm-header-ns3.41.patch`.
+2. `run_ns3_docker_wifi_tap_rmw_probe.py` có đoạn symlink tap-creator
+   HARDCODE cứng đường dẫn baked-in của bản APT
+   (`/build/ns3-Q7chNJ/.../ns3.41-tap-creator`) — bản build từ source
+   MỚI có đường dẫn baked-in KHÁC (`/tmp/ns3-src/build/...`, khớp vị trí
+   build trong Dockerfile, bị xoá sau `cmake --install` để giữ image
+   nhỏ) — hardcode cũ không còn đúng, gây lỗi `execlp() ENOENT` y hệt
+   lỗi đã gặp trước đây. **Sửa triệt để**: đổi từ hardcode sang trích
+   xuất ĐỘNG bằng `strings` (kỹ thuật đã dùng nhiều lần ở scratchpad
+   testing suốt session này) — không còn phụ thuộc vị trí build cụ thể
+   nữa, tự động đúng dù build lại ở đâu.
+
+**Cập nhật `external/rmw-netem/Dockerfile`**: bỏ `ns3`/`libns3-dev` khỏi
+apt install, thêm bước `git clone` + áp 2 patch + `cmake` build (Release
+profile, NS_LOG tắt — khớp hành vi bản apt cũ, không đổi runtime
+behavior ngoài phạm vi fix) + `cmake --install` (module set khớp CHÍNH
+XÁC những gì `pkg-config` được gọi trong TOÀN BỘ scripts/ +
+external/ns3/*.cc: `applications;bridge;core;csma;internet;mobility;
+network;point-to-point;tap-bridge;wifi`). Build ns-3 3.41 từ source
+thành công (177/177 target, không còn OOM nhờ `-j 4` — bài học từ lần
+build 3.46 debug trước đó).
+
+**Build lại toàn bộ image** (`docker build -f
+external/rmw-netem/Dockerfile .`, tag riêng `jazzy-ns3fix-test` trước để
+không đè lên image đang chạy tốt) — build sạch, `pkg-config --cflags
+--libs ns3-core ns3-wifi ns3-tap-bridge` resolve đúng (không cần sửa
+GÌ ở phía Python scripts ngoài chỗ hardcode path đã nêu), naming
+library/`.pc` khớp y hệt quy ước bản apt cũ.
+
+**Kết quả cuối cùng — xác nhận bằng pipeline THẬT, không phải diagnostic
+riêng**: chạy `scripts/run_ns3_docker_wifi_tap_rmw_probe.py` (script
+production, dùng `fleetqox_rmw_trace_endpoint.py` — real `rclpy` +
+`rmw_fleetqox_cpp`, replay CSV trace THẬT qua ROS2 pub/sub, không phải
+UDP/ARP đơn giản của diagnostic) với 1 robot (4 endpoint):
+- **Trước fix (mọi lần chạy suốt session): `rx=0` ở MỌI endpoint,
+  100% mất gói.**
+- **Sau fix: `fleet_router rx=76`, `operator_ui rx=2`, `robot_0000
+  rx=109`/`105`/... — tổng ~180+ message thật nhận được qua đúng
+  transport `rmw_fleetqox_cpp` (fragment/NACK/repair thật) chạy trên
+  kênh wifi mô phỏng thật (ns-3 TapBridge), không phải Docker bridge
+  thường.** (`fleet_controller rx=0` ổn định qua nhiều seed — hợp lý,
+  do đặc điểm trace 1-robot: không ai gửi tin TỚI fleet_controller
+  trong kịch bản này, không phải bug còn sót).
+- Xác nhận ỔN ĐỊNH qua 3 seed độc lập (7, 13, 29) — pattern nhận gói
+  nhất quán, không phải may rủi.
+- Smoke test thêm 1 script ns-3 KHÁC (không dùng tap-bridge, dùng
+  applications/bridge/csma/internet/mobility/network/point-to-point/wifi):
+  `run_ns3_docker_wifi_mobility_matrix.py` — `status=ok rows=3`, xác
+  nhận KHÔNG regression cho các probe ns-3 khác đang dùng chung image.
+
+**Đã PROMOTE**: `docker tag` image đã test thành `localhost/fleetrmw/
+rmw-netem:jazzy` (tag chính, mọi script dùng mặc định) — giữ lại bản
+apt cũ ở tag `jazzy-apt-ns341-backup` để rollback nếu cần (thao tác tag
+Docker, không mất gì, có thể revert tức thì). Xác nhận lại bằng cách
+chạy KHÔNG truyền `--image` (dùng default) — vẫn `rx` đúng như trên.
+
+**Tổng kết toàn bộ nhánh điều tra Group 6 mục "bridge process thật qua
+TAP"**: từ 1 câu hỏi ban đầu ("core chạy tốt, sao mô phỏng vẫn kém") →
+phát hiện Group 6 test raw UDP không có reliability → chọn phương án
+rủi ro cao nhất (nối RMW thật qua TAP) → 7+ bug hạ tầng orchestration →
+2 bug địa chỉ MAC ns-3 thật (FrameExchangeManager desync +
+TapBridge auto-learn race) → build ns-3 từ source 2 lần (3.46 debug để
+tìm bug, 3.41 release để deploy) → patch + tích hợp vào Dockerfile
+production → **XÁC NHẬN THẬT: real RMW traffic (fragment/NACK/repair)
+chạy được qua kênh wifi mô phỏng ns-3 qua TapBridge, đã promote vào
+image chính.** Bước tiếp theo (chưa làm, ngoài phạm vi phiên này): dùng
+pipeline này để đo lại delivery ratio của Group 6 ở quy mô 16/32 robot
+với RMW thật thay vì raw UDP, so sánh với baseline hiện có.
 
 ## Quy ước cập nhật file này
 

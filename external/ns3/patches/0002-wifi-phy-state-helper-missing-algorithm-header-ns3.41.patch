@@ -1,0 +1,12 @@
+diff --git a/src/wifi/model/wifi-phy-state-helper.h b/src/wifi/model/wifi-phy-state-helper.h
+index 40e7487..e1fefcc 100644
+--- a/src/wifi/model/wifi-phy-state-helper.h
++++ b/src/wifi/model/wifi-phy-state-helper.h
+@@ -29,6 +29,7 @@
+ #include "ns3/object.h"
+ #include "ns3/traced-callback.h"
+ 
++#include <algorithm>
+ #include <list>
+ #include <memory>
+ #include <vector>
