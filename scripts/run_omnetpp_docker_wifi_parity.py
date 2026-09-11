@@ -77,19 +77,25 @@ from scripts.run_omnetpp_docker_parity import (  # noqa: E402
 
 SCHEMA_VERSION = "fleetqox.omnetpp_ns3_docker_wifi_parity.v2"
 WIFI_WARMUP_MS = 1000.0
-# Approximate real-802.11g DCF per-packet airtime floor for a small control
-# frame at 54Mbps under legacy (non-QoS) ERP-OFDM: DIFS(28us) + average
-# CWmin/2 backoff(15/2 slots * 9us =~68us) + PLCP preamble/header(~24us) +
-# short-payload transmission(~15-20us) + SIFS(10us) + ACK(preamble+14B at a
-# basic rate, ~40-50us) =~ 190-200us/packet in isolation, i.e. a theoretical
-# ceiling around 5000 packets/s for ONE uncontended station. With N stations
-# genuinely contending for the shared medium, collisions and backoff growth
-# push the real aggregate ceiling well below that (matches the Bianchi-model
-# degradation already confirmed empirically for this scenario -- see
-# docs/AUDIT_ACCEPTANCE_TRACKING.md). This is a conservative, documented
-# approximation for admission control to shed load against, not an exact
-# throughput model; tune via --capacity-packets-per-second if needed.
-DEFAULT_CAPACITY_PACKETS_PER_SECOND = 3000
+# A single-uncontended-station 802.11g DCF airtime estimate (DIFS + CWmin/2
+# backoff + preamble + short payload + SIFS + ACK =~ 190-200us/packet) gives
+# a theoretical ceiling around 5000 packets/s -- but measured empirically
+# against this scenario's actual admitted-packet rate, that estimate never
+# binds: the existing byte-rate budget already keeps admitted traffic under
+# ~2450 packets/s even at 32 robots, so a 3000/s (or looser) cap is a no-op
+# by construction. The value that actually matters is empirical: 12 robots
+# is the largest fleet size this scenario's ns-3-only sweep showed near-0%
+# deadline-miss ratio at (docs/AUDIT_ACCEPTANCE_TRACKING.md, round 8), and
+# its natural admitted rate under the byte budget is ~1050-1150 packets/s.
+# Capping at that level and re-measuring (round 11) showed a real effect at
+# 32 robots -- delivery ratio +19-22 points (ns-3 0.54->0.73, INET 0.50->0.70)
+# and cross-simulator parity pass-rate 6/27->13/27 -- though deadline-miss
+# ratio stays high (~91%) since this workload's deadlines (45-160ms) are
+# tight relative to real per-station contention delay even at reduced
+# volume; the number of CONTENDING STATIONS, not just aggregate packet
+# volume, drives collision overhead, and a flat global cap can't fully
+# capture that. Tune via --capacity-packets-per-second if needed.
+DEFAULT_CAPACITY_PACKETS_PER_SECOND = 1200
 DEFAULT_THRESHOLDS = {
     "delivery_ratio_delta": 0.10,
     "deadline_miss_ratio_delta": 0.10,

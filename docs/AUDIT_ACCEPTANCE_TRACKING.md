@@ -709,6 +709,66 @@ scope có chủ đích, xem bảng, không phải việc treo). Nhóm 6 đang b�
          nguồn được giữ lại (đã hoạt động đúng, có ích cho việc đo lường
          trong tương lai nếu muốn), nhưng **không đưa vào làm cấu hình mặc
          định** vì không cải thiện được kết quả.
+
+         **Cập nhật (11/09/2026, vòng 11) — người dùng hỏi "còn cách nào để
+         giảm miss ratio không", chọn thử hướng A (mô hình capacity theo
+         packet-rate) đã nêu ở vòng 9.** Triển khai: thêm
+         `capacity_packets_per_tick` (tùy chọn, mặc định `None` không đổi
+         hành vi cũ) vào `NetworkLink` (`fleetqox/model.py`), enforce ở
+         `fifo_policy`/`static_priority_policy`
+         (`fleetqox/simulator.py`) và `PredictiveAdmissionController`
+         (`fleetqox/control_plane.py`, đứng sau `fleetqox_predictive_guarded`)
+         — đúng 3 policy được đối sánh ở bài wifi-parity. 59+107 test cũ đều
+         pass (không phá gì, vì mặc định `None`).
+
+         **Lần đo đầu (ngưỡng 3000 gói/giây, ước lượng lý thuyết từ overhead
+         DCF 1 trạm không tranh chấp)**: kết quả **giống hệt tuyệt đối**
+         baseline (miss ratio, delivery ratio y hệt đến 4 chữ số thập phân)
+         — không phải bug: đo trực tiếp gói/tick trong trace cho thấy ngân
+         sách byte hiện tại đã tự nhiên giới hạn xuống chỉ 21-49 gói/tick
+         (~1050-2450 gói/giây) ở quy mô 8-32 trạm, **thấp hơn ngưỡng 3000**
+         nên chưa bao giờ bị chạm tới. Ước lượng lý thuyết ban đầu quá lỏng.
+
+         **Phát hiện khi dò theo quy mô (8→32 trạm, không ngưỡng)**: tốc độ
+         gói admit chỉ tăng ~15-20% từ 12 trạm (21-23 gói/tick, nơi miss
+         ratio ~0% — vòng 8) sang 16 trạm (24-28 gói/tick, miss ratio nhảy
+         lên 58-70%) — **không tỷ lệ thuận** với mức nhảy vọt của miss
+         ratio. Gợi ý mạnh: nguyên nhân chính có thể là **số trạm tranh
+         chấp** (nhiều trạm hơn = nhiều va chạm CSMA/CA hơn, độ trễ backoff
+         tăng phi tuyến) chứ không đơn thuần tổng khối lượng gói/giây.
+
+         **Lần đo thứ 2 (ngưỡng 1200 gói/giây, khớp mức admit tự nhiên ở 12
+         trạm — quy mô lớn nhất còn "an toàn")**: ngưỡng này thật sự bó
+         buộc rõ ở 32 trạm (tx trung bình 3839.7→2978.6, giảm ~22%), ít bó
+         buộc ở 16 trạm (2636.7→2624.1, gần như không đổi vì tốc độ tự
+         nhiên đã dưới ngưỡng).
+
+         | Chỉ số (trung bình, ns-3) | 16 trạm base | 16 trạm cap | 32 trạm base | 32 trạm cap |
+         |---|---|---|---|---|
+         | deadline_miss_ratio | 0.8075 | 0.7474 | 0.9467 | 0.9098 |
+         | delivery_ratio | 0.6625 | 0.6699 | **0.5413** | **0.7344** |
+         | delivery_ratio (INET) | 0.6613 | 0.6690 | **0.4976** | **0.7020** |
+         | parity pass (so 2 simulator) | 16/27 | 14/27 | 6/27 | **13/27** |
+
+         **Kết luận**: hướng packet-rate **có tác dụng thật, đo được**, rõ
+         nhất đúng ở chỗ nặng nhất (32 trạm) — delivery ratio tăng **19-22
+         điểm phần trăm** ở cả 2 simulator, tỷ lệ khớp giữa 2 simulator tăng
+         hơn gấp đôi (6/27→13/27). Đây là bằng chứng cụ thể xác nhận phát
+         hiện "mô hình byte-rate định giá sai gói nhỏ tần suất cao" ở vòng 9
+         là **có thật và sửa được một phần**, không chỉ là suy luận lý
+         thuyết. Nhưng **chưa giải quyết dứt điểm**: `deadline_miss_ratio`
+         vẫn rất cao (~91% ở 32 trạm) vì deadline của traffic (45-160ms) quá
+         chặt so với độ trễ tranh chấp thật ở 32 trạm dù đã giảm tải — kể cả
+         gói được giao vẫn thường giao trễ hạn. Xác nhận thêm: 1 ngưỡng
+         gói/giây cố định toàn cục **không mô hình hóa đúng** tác động của
+         số trạm tranh chấp (điều thật sự gây collision phi tuyến) — muốn
+         giải quyết triệt để cần các hướng B/C đã nêu (nối
+         `RobotBudgetAwareAdmissionController` vào production, gộp gói,
+         nâng chuẩn wifi hỗ trợ aggregation, hoặc hạ tần số điều khiển khi
+         fleet lớn). Ngưỡng mặc định trong
+         `run_omnetpp_docker_wifi_parity.py` đã cập nhật thành 1200 gói/giây
+         (thực nghiệm, không phải lý thuyết) kèm giải thích đầy đủ trong
+         code.
      `run_heap_soak_fleet_asan_probe.py` (lặp nhiều "round" ngắn, không
      phải 1 lần chạy liên tục dài) và
      `run_rmw_docker_quic_gateway_async_burst_soak.py`. Cần: 1 kịch bản
