@@ -818,6 +818,57 @@ scope có chủ đích, xem bảng, không phải việc treo). Nhóm 6 đang b�
          2 mục tiêu đồng thời). Mã nguồn được giữ lại (cờ `--wifi-qos`, tắt
          mặc định), cần thêm bước đo theo flow_class trước khi quyết định
          hướng tiếp theo.
+
+         **Cập nhật (11/09/2026, vòng 13) — đo lại với thống kê tách riêng
+         theo flow_class (gộp cả 18 case 16/32 trạm × 3 seed × 3 kịch bản):**
+
+         | flow_class (AC dự kiến) | ns-3 tx/rx | ns-3 miss% | INET tx/rx | INET miss% |
+         |---|---|---|---|---|
+         | control (AC_VO, ưu tiên cao nhất) | 127011/74361 | **95.7%** (tệ nhất) | 127011/84548 | **14.4%** (tốt nhất) |
+         | coordination (AC_VI) | 15570/8741 | 86.3% | 15570/13218 | 21.2% |
+         | state (AC_VI) | 20685/11815 | 78.2% | 20685/17691 | 20.1% |
+         | human_qoe (AC_VI) | 1026/677 | 84.8% | 1026/884 | 23.0% |
+         | perception (AC_BE) | 9522/5553 | 68.7% | 9522/7442 | 34.7% |
+         | debug (AC_BK, ưu tiên thấp nhất) | 1047/615 | **0.2%** (tốt nhất) | 1047/1047 | 41.5% (tệ nhất) |
+
+         **Phát hiện quan trọng nhất: 2 simulator cho ra THỨ HẠNG ƯU TIÊN
+         NGƯỢC NHAU HOÀN TOÀN, không chỉ lệch độ lớn.** Ở ns-3, `control`
+         (được gán AC_VO, ưu tiên cao nhất theo thiết kế) lại là class **tệ
+         nhất** — tệ hơn cả `debug` (ưu tiên thấp nhất, lại tốt nhất)! Ở
+         INET thì ngược lại: `control` là class **tốt nhất**, đúng như thiết
+         kế QoS dự định, còn `debug` tệ nhất.
+
+         **Giải thích cơ chế cho ns-3 (khớp logic)**: `control` chiếm **73%
+         tổng lưu lượng** (50Hz × N robot, cao hơn hẳn mọi class khác) — dồn
+         hết vào 1 hàng đợi AC_VO (CWmin ngắn nhất, dễ giành kênh nhất)
+         không giúp gì khi CHÍNH BẢN THÂN class đó đã đông đến mức tự nó bão
+         hòa/tự va chạm nội bộ giữa hàng chục trạm. `debug` có tx quá nhỏ
+         (0.6% tổng lưu lượng) nên hàng đợi AC_BK của nó gần như luôn rảnh
+         bất kể "ưu tiên thấp". WMM/EDCA được thiết kế cho traffic ưu tiên
+         cao nhưng **khối lượng nhỏ** (như VoIP) — ở đây `control` vừa ưu
+         tiên cao vừa khối lượng lớn nhất hệ thống, đúng ngược lại giả định
+         thiết kế của EDCA, nên "ưu tiên" phản tác dụng trên ns-3.
+
+         **Phát hiện config phụ, đã sửa**: dò lại `omnetpp.ini`, chỉnh queue
+         500-gói ở vòng 6 (bug #1, `**.wlan[*].mac.dcf.channelAccess.pendingQueue`)
+         chỉ áp dụng cho nhánh `dcf` — khi bật `qosStation`, INET chuyển hẳn
+         sang dùng `mac.hcf.edca.edcaf[0..3].pendingQueue` (4 hàng đợi riêng
+         theo AC, xác nhận qua `Hcf.ned`/`Edca.ned`/`Edcaf.ned`), một cây
+         module hoàn toàn khác — override cũ **âm thầm mất tác dụng**, mỗi
+         hàng đợi AC quay lại mặc định gốc 100 gói. Đã thêm dòng
+         `**.wlan[*].mac.hcf.edca.edcaf[*].pendingQueue.packetCapacity = 500`
+         để phủ đúng nhánh QoS, nhất quán với vòng 6 — **chưa đo lại** sau
+         khi sửa (chờ lệnh "chạy").
+
+         **Kết luận tạm thời**: đây không còn là câu hỏi "QoS có giúp không"
+         mà là bằng chứng cụ thể, mạnh hơn hẳn, cho kết luận đã có từ vòng 7
+         — 2 MAC stack độc lập phản ứng khác nhau về CHẤT chứ không chỉ về
+         LƯỢNG khi cơ chế tranh chấp phức tạp hơn (nhiều hàng đợi EDCA thay
+         vì 1 hàng đợi DCF). Việc control là traffic vừa ưu tiên cao vừa
+         khối lượng lớn nhất là đặc điểm THẬT của kịch bản fleet (không thể
+         sửa bằng cấu hình) — muốn cải thiện cần đổi kiến trúc traffic
+         (gộp gói, giảm tần số 50Hz khi fleet lớn — hướng C đã nêu), không
+         phải chỉnh tham số QoS.
      `run_heap_soak_fleet_asan_probe.py` (lặp nhiều "round" ngắn, không
      phải 1 lần chạy liên tục dài) và
      `run_rmw_docker_quic_gateway_async_burst_soak.py`. Cần: 1 kịch bản
