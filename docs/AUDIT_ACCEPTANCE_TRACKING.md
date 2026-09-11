@@ -1068,6 +1068,63 @@ xem lỗi có đặc thù cho wifi/AP hay không, hoặc lấy source ns-3 riên
 **Các fix hạ tầng thật (6 bug trên) đã commit dù mục tiêu cuối chưa đạt**
 — vẫn là cải thiện đúng, độc lập với câu hỏi mở còn lại.
 
+### Cô lập bằng topology CSMA (có dây) thay wifi — 11/09/2026
+
+Theo đề xuất "test topology CSMA có dây để cô lập" ở trên, viết
+`external/ns3/fleetqox_tap_csma_diag.cc` (diagnostic-only, không phải
+1 phần pipeline chính thức): y hệt cấu trúc tap/bridge/veth/netns đã
+dùng cho wifi, nhưng thay `StaWifiMac`/`ApWifiMac` bằng 1 CSMA bus
+thuần (`CsmaHelper`, không AP, không association) — cùng
+`TapBridge::Install()` per-station y hệt.
+
+**Kết quả: hoạt động đúng ngay lần chạy đầu** — ARP resolve thành công
+(`ip neigh show` → `REACHABLE`), UDP unicast tới đích, server nhận
+đúng payload. **Điều này xác nhận DỨT ĐIỂM**: TapBridge +
+bridge/tap/veth/netns orchestration tự nó hoàn toàn đúng; lỗi unicast
+không quay lại được **đặc thù riêng cho relay wifi infrastructure-mode
+qua AP** (`ApWifiMac`'s FromDS forwarding), không phải vấn đề chung của
+TapBridge.
+
+Thử tiếp bước tự nhiên tiếp theo: bỏ AP, dùng **ad-hoc wifi**
+(`AdhocWifiMac`, station nói thẳng với nhau, không qua relay) — vẫn giữ
+được dynamics CSMA/CA thật của 802.11 mà Group 6 quan tâm, nhưng bỏ hẳn
+chặng AP-relay đang hỏng. Viết
+`external/ns3/fleetqox_tap_adhoc_diag.cc` (diagnostic-only).
+
+**Kết quả: ns-3 segfault ngay trong `Simulator::Run()`** — đã bisect
+bằng debug print sau từng bước (tạo node, cài wifi, cài mobility, cài
+TapBridge từng station) xác nhận: **setup hoàn tất sạch sẽ** (in ra đủ
+"installed tapbridge 0..3", "about to Simulator::Run"), crash chỉ xảy
+ra sau khi event loop bắt đầu xử lý traffic thật. Kiểm chứng thêm: 1
+chương trình `AdhocWifiMac` tối giản **không có TapBridge** thì KHÔNG
+crash (chạy xong sạch) — nên đây là bug đặc thù của tổ hợp
+`AdhocWifiMac` + `TapBridge` (`UseLocal`, `RealtimeSimulatorImpl`)
+trong bản ns-3 3.41 (apt package) này, không phải lỗi cấu hình của
+mình. Không có `gdb` trong image (`apt-get install gdb` báo "no
+installation candidate") nên không lấy được backtrace chính xác dòng
+nào crash.
+
+**Kết luận sau khi cô lập bằng cả 2 hướng**:
+- TapBridge/orchestration: **đã xác nhận đúng** (CSMA chứng minh).
+- Infrastructure-mode wifi (StaWifiMac+ApWifiMac) qua TapBridge: unicast
+  relay chặng AP→station không hoạt động, nguyên nhân gốc trong
+  `ApWifiMac`/`WifiRemoteStationManager` chưa xác định được (không có
+  source thật, không có `NS_LOG`).
+- Ad-hoc wifi qua TapBridge: **không dùng được** — bản ns-3 3.41 image
+  này segfault khi kết hợp với TapBridge, bất kể có phải lỗi cấu hình
+  của FleetQoX hay không.
+
+Cả 2 nhánh khả thi nhất (infra-mode và ad-hoc) trong image ns-3 hiện
+tại đều đi vào ngõ cụt theo cách khác nhau. Hướng còn lại chưa thử:
+build ns-3 từ source thật (có debug symbols + NS_LOG hoạt động) thay
+vì dùng bản apt-package release — chi phí lớn hơn nhiều (build ns-3 từ
+đầu trong Docker) và không chắc tìm ra fix trong thời gian hợp lý. Đề
+xuất: tạm dừng nhánh "bridge process thật qua TAP" ở đây, quay lại
+đánh giá có nên chuyển sang phương án ban đầu (viết lại rút gọn
+fragment/NACK/repair trực tiếp trong 2 app trace-replay của Group 6,
+phương án đã đề xuất nhưng người dùng chọn phương án TAP thay vào lúc
+đầu) hay tiếp tục đầu tư vào build ns-3 từ source.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
