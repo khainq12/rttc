@@ -2199,6 +2199,43 @@ nhận cơ chế chính xác, thay vì chỉ suy luận gián tiếp qua tổng 
 `scripts/run_ns3_docker_wifi_tap_rmw_probe.py`
 (`--rmw-implementation=raw_udp`).
 
+### 12/09/2026 (tiếp) — Thí nghiệm stagger-start theo đề xuất ChatGPT: KẾT QUẢ ÂM TÍNH, bác bỏ giả thuyết "đồng bộ khởi động đơn giản"
+
+ChatGPT đề xuất thí nghiệm rẻ và quyết định nhất tiếp theo: nếu nguyên
+nhân là các gói discovery khởi động (SPDP/SEDP của DDS, hay graph
+advertisement ban đầu của FleetRMW) từ 19 endpoint bị dồn cụm trong vài
+trăm ms đầu do tất cả tiến trình khởi động gần như đồng thời, thì việc
+CHỈ giãn thời điểm khởi động tiến trình (không đổi gì khác, đặc biệt
+không đổi lịch trình gửi dữ liệu ứng dụng — vẫn đồng bộ qua cơ chế
+ready/start-file có sẵn) sẽ khôi phục delivery.
+
+Thêm `--stagger-start-ms` vào `run_ns3_docker_wifi_tap_rmw_probe.py`:
+trễ tuần tự (không chạy nền) trước khi khởi động tiến trình endpoint
+thứ i thêm `i * stagger_start_ms`, chỉ ảnh hưởng THỜI ĐIỂM tiến trình
+bắt đầu chạy (và do đó traffic discovery/khởi động của nó), không đổi
+lịch trình replay dữ liệu.
+
+**Kết quả** (Fast DDS, 16-robot, `--stagger-start-ms 200`, dàn trải
+khởi động 19 tiến trình trên 3.6s thay vì gần như tức thời):
+**vẫn 0/2289 — KHÔNG cải thiện**. Đáng chú ý: tổng khối lượng
+collision/drop còn TỆ HƠN bản không stagger (`mac_rx_drop_total` lên
+tới 1,239,279 so với 436,353 của bản gốc, `phy_rx_drop_total` tại mẫu
+cuối không có do chạy hết trước khi kịp lấy — nhưng xu hướng climbing
+rõ ràng dốc hơn nhiều) — vì stagger kéo dài tổng thời gian hội tụ
+discovery của toàn hệ thống (endpoint cuối khởi động trễ 3.6s, rồi còn
+cần tự hội tụ discovery trong ngân sách riêng), nên tổng thời gian chạy
+và tổng traffic phát sinh còn nhiều hơn, không ít đi.
+
+**Kết luận**: giả thuyết "đồng bộ khởi động đơn giản" (chỉ cần giãn thời
+điểm launch tiến trình) bị bác bỏ ở mức granularity 200ms. Không loại
+trừ khả năng nguyên nhân vẫn là burst đồng bộ nhưng ở tần suất tái diễn
+định kỳ (steady-state SPDP/heartbeat lặp lại theo chu kỳ, không chỉ lúc
+khởi động), cần đo trực tiếp inter-arrival time của traffic discovery
+thay vì chỉ thử nghiệm gián tiếp qua thời điểm khởi động.
+
+**File thay đổi**: `scripts/run_ns3_docker_wifi_tap_rmw_probe.py`
+(`--stagger-start-ms`).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
