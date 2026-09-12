@@ -2284,6 +2284,31 @@ int parse_nonnegative_int_env(const char * name, int default_value, int max_valu
   return static_cast<int>(std::min<long>(parsed, max_value));
 }
 
+// Causal-isolation evidence (see docs/AUDIT_ACCEPTANCE_TRACKING.md "causal
+// isolation: discovery-only"): a Fast DDS discovery-only run (zero
+// application data, discovery/heartbeat traffic alone) reproduced nearly
+// identical MAC load and collision rate to the full workload at matching
+// timestamps on the 19-station 802.11g topology this RMW is evaluated
+// against -- meaning graph-advertisement/heartbeat WIRE TRAFFIC itself,
+// not application data volume, is what saturates the medium. When the
+// fleet's pub/sub topology is known ahead of time (a static/pre-declared
+// fleet, not one whose graph changes at runtime), eliminating that traffic
+// entirely via a caller-supplied static subscription map lets this RMW
+// behave like the raw-UDP control that measured 100% delivery on the same
+// topology, instead of like the DDS implementations that measured 0%.
+// Checked from both a free function (ensure_pubsub_graph_renewal_thread())
+// and LoopbackSocketTransport methods, hence a shared helper rather than a
+// member flag duplicated in two places.
+bool static_discovery_mode_from_env()
+{
+  const char * value = std::getenv("FLEETQOX_RMW_STATIC_MODE");
+  if (value == nullptr) {
+    return false;
+  }
+  const std::string text = trim_copy(value);
+  return text == "1" || text == "true" || text == "yes";
+}
+
 std::uint64_t fnv1a64(const std::string & text, std::uint64_t seed)
 {
   std::uint64_t hash = seed;
@@ -3579,7 +3604,7 @@ public:
     const std::string & type_name,
     std::size_t domain_id)
   {
-    if (peer_addresses_.empty()) {
+    if (peer_addresses_.empty() || static_discovery_mode_) {
       return RMW_RET_OK;
     }
     const rmw_fleetqox_cpp::RouteAdvertisement advertisement{
@@ -3606,7 +3631,7 @@ public:
     const std::string & type_hash_hex = std::string(),
     const std::string & partitions_csv = std::string())
   {
-    if (peer_addresses_.empty()) {
+    if (peer_addresses_.empty() || static_discovery_mode_) {
       return RMW_RET_OK;
     }
     // "add"/"remove" change the actual endpoint set -- bump graph_version so
@@ -3644,7 +3669,7 @@ public:
   // resend occasionally, as a slow safety-net fallback.
   rmw_ret_t send_graph_heartbeat()
   {
-    if (peer_addresses_.empty()) {
+    if (peer_addresses_.empty() || static_discovery_mode_) {
       return RMW_RET_OK;
     }
     rmw_fleetqox_cpp::GraphAdvertisement heartbeat{
@@ -3815,6 +3840,53 @@ private:
       }
     }
     return -1;
+  }
+
+  // FLEETQOX_RMW_STATIC_MODE's counterpart to update_peer_subscription():
+  // pre-populates peer_subscribed_topic_refcounts_ from a caller-supplied
+  // map instead of learning it from wire graph advertisements (which
+  // static mode disables entirely -- see static_discovery_mode_from_env()).
+  // Format: comma-separated "ip:port|domain_id|topic|type_name" entries,
+  // one per (peer, topic) pair the peer is known to subscribe to. Entries
+  // for peers not in FLEETQOX_RMW_PEERS, or that fail to parse, are
+  // silently skipped -- this is a best-effort seed, not a validated
+  // config format, and subscription_aware_targets()'s existing fail-open
+  // fallback (broadcast when a topic has no known subscriber) still
+  // covers anything this misses.
+  void seed_static_subscriptions(const char * env)
+  {
+    if (env == nullptr || env[0] == '\0') {
+      return;
+    }
+    for (const std::string & entry : split_nonempty(env, ',')) {
+      const std::vector<std::string> parts = split_nonempty(entry, '|');
+      if (parts.size() != 4) {
+        continue;
+      }
+      sockaddr_in address{};
+      if (!parse_ipv4_endpoint(trim_copy(parts[0]), &address)) {
+        continue;
+      }
+      int peer_index = -1;
+      for (size_t i = 0; i < peer_addresses_.size(); ++i) {
+        if (endpoints_match(address, peer_addresses_[i])) {
+          peer_index = static_cast<int>(i);
+          break;
+        }
+      }
+      if (peer_index < 0) {
+        continue;
+      }
+      char * end = nullptr;
+      errno = 0;
+      const std::string domain_text = trim_copy(parts[1]);
+      const unsigned long long domain_id = std::strtoull(domain_text.c_str(), &end, 10);
+      if (errno != 0 || end == domain_text.c_str() || *end != '\0') {
+        continue;
+      }
+      const std::string key = subscription_topic_key(domain_id, trim_copy(parts[2]), trim_copy(parts[3]));
+      ++peer_subscribed_topic_refcounts_[static_cast<size_t>(peer_index)][key];
+    }
   }
 
   // peer_policy_=="subscription_aware": only the peers with a currently
@@ -6959,6 +7031,10 @@ private:
     }
     adaptive_peer_scores_.assign(peer_addresses_.size(), 0);
     peer_subscribed_topic_refcounts_.assign(peer_addresses_.size(), {});
+    static_discovery_mode_ = static_discovery_mode_from_env();
+    if (static_discovery_mode_) {
+      seed_static_subscriptions(std::getenv("FLEETQOX_RMW_STATIC_SUBSCRIPTIONS"));
+    }
     if (!quic_gateway_transport_.configure_from_environment()) {
       init_error_ = quic_gateway_transport_.error();
       ::close(fd_);
@@ -8255,6 +8331,11 @@ private:
   int fragment_repair_queue_limit_{64};
   int fragment_repair_cooldown_ms_{100};
   bool fragment_async_send_enabled_{false};
+  // FLEETQOX_RMW_STATIC_MODE -- see static_discovery_mode_from_env()'s
+  // comment. Cached once in start() rather than re-reading the env var on
+  // every send_graph_advertisement()/send_graph_heartbeat()/
+  // send_subscription_advertisement() call.
+  bool static_discovery_mode_{false};
   std::string peer_policy_{"all"};
   std::vector<sockaddr_in> peer_addresses_;
   std::vector<std::string> peer_path_ids_;
@@ -13721,6 +13802,13 @@ void stop_pubsub_graph_renewal_thread()
 
 void ensure_pubsub_graph_renewal_thread()
 {
+  // FLEETQOX_RMW_STATIC_MODE: no wire traffic for this thread to send
+  // (send_graph_heartbeat()/send_graph_advertisement() are no-ops), so
+  // skip starting it at all rather than spinning a thread that only
+  // sleeps -- see static_discovery_mode_from_env()'s comment.
+  if (static_discovery_mode_from_env()) {
+    return;
+  }
   std::lock_guard<std::mutex> lifecycle_lock(g_pubsub_graph_renewal_lifecycle_mutex);
   if (g_pubsub_graph_renewal_shutting_down) {
     return;

@@ -32,6 +32,7 @@ methodology already used for the fragment-repair investigation.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 from pathlib import Path
 import shlex
@@ -106,6 +107,52 @@ def _container_path(path: Path) -> str:
     return f"/work/{path.relative_to(ROOT)}"
 
 
+def _topic_for(destination: str, flow_class: str) -> str:
+    """MUST match scripts/fleetqox_rmw_trace_endpoint.py's _topic_for()
+    exactly -- used here only to compute --static-mode's static
+    subscription map (see build_static_subscriptions), never to talk to a
+    real rclpy topic directly."""
+    safe_dst = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in destination)
+    safe_class = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in flow_class)
+    return f"/fleetqox_trace/{safe_dst}/{safe_class}"
+
+
+# The one ROS2 message type every fleetqox_rmw_trace_endpoint.py process
+# uses (see its own "from std_msgs.msg import String"). type_name is
+# deterministic for a given message type (derived from its introspection
+# type support, not random -- see rmw_pubsub.cpp's
+# ros_type_name_from_introspection_members), so it's safe to hardcode here
+# rather than needing to query a live RMW process for it.
+STATIC_SUBSCRIPTION_TYPE_NAME = "std_msgs/msg/String"
+
+
+def build_static_subscriptions(
+    trace_path: Path, policy: str, endpoints: list[str]
+) -> dict[str, list[tuple[str, str]]]:
+    """For --static-mode: every topic this harness uses is named
+    /fleetqox_trace/{dst}/{flow_class} (see _topic_for), and only the
+    endpoint literally named {dst} ever subscribes to it (each endpoint's
+    incoming_topics is built from rows where dst == itself) -- so the
+    (topic, subscriber) mapping is fully determined by the trace's
+    (src, dst, flow_class) tuples alone, with no need to observe real
+    discovery traffic at all. Returns {publisher_endpoint: [(dst,
+    flow_class), ...]} -- for each publisher, the (dst, flow_class) pairs
+    it will publish under, which is exactly what FLEETQOX_RMW_STATIC_
+    SUBSCRIPTIONS needs to declare (the subscriber for topic
+    _topic_for(dst, flow_class) is peer `dst`).
+    """
+    by_publisher: dict[str, set[tuple[str, str]]] = {endpoint: set() for endpoint in endpoints}
+    with trace_path.open(newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            if row["policy"] != policy:
+                continue
+            src = row["src"]
+            if src not in by_publisher:
+                continue
+            by_publisher[src].add((row["dst"], row["flow_class"]))
+    return {endpoint: sorted(pairs) for endpoint, pairs in by_publisher.items()}
+
+
 def build_shell_script(
     *,
     trace_container_path: str,
@@ -126,6 +173,8 @@ def build_shell_script(
     rmw_implementation: str = "rmw_fleetqox_cpp",
     stagger_start_ms: float = 0.0,
     discovery_only: bool = False,
+    static_mode: bool = False,
+    static_subscriptions: dict[str, list[tuple[str, str]]] | None = None,
 ) -> str:
     ips = {endpoint: f"{BASE_IP_PREFIX}{i + 2}" for i, endpoint in enumerate(endpoints)}
     # ChatGPT-flagged bootstrap-feedback-loop hypothesis (see
@@ -246,6 +295,10 @@ def build_shell_script(
         )
         result_json = f"{results_dir_container}/result_{i}.json"
         log_file = f"{results_dir_container}/endpoint_{i}.log"
+        static_subscription_entries = [
+            f"{ips[dst]}:{RMW_PORT}|0|{_topic_for(dst, flow_class)}|{STATIC_SUBSCRIPTION_TYPE_NAME}"
+            for dst, flow_class in (static_subscriptions or {}).get(endpoint, [])
+        ]
         # ip netns exec runs a single command, not a login shell -- rclpy
         # and rmw_fleetqox_cpp aren't importable/loadable without both
         # /opt/ros/jazzy/setup.bash and the rmw_fleetqox_cpp colcon
@@ -292,7 +345,31 @@ def build_shell_script(
                     # this RMW is shared by many other probes/tests this
                     # investigation hasn't audited.
                     "FLEETQOX_RMW_PEER_POLICY=subscription_aware "
-                    if subscription_aware else ""
+                    if subscription_aware and not static_mode else ""
+                )
+                + (
+                    # The actual fix, not just another diagnostic (see
+                    # docs/AUDIT_ACCEPTANCE_TRACKING.md "static discovery
+                    # mode"): the decisive discovery-only experiment proved
+                    # graph-advertisement/heartbeat WIRE TRAFFIC itself,
+                    # not application data, saturates this topology's
+                    # medium. FleetRMW already knows its full peer list
+                    # statically (FLEETQOX_RMW_PEERS) -- the only reason it
+                    # sends any discovery traffic at all is to learn which
+                    # peer subscribes to which topic. For this harness the
+                    # (topic, subscriber) mapping is fully known in advance
+                    # from the trace (see build_static_subscriptions), so
+                    # static mode eliminates graph-advertisement/heartbeat
+                    # traffic entirely -- FLEETQOX_RMW_STATIC_SUBSCRIPTIONS
+                    # takes over the exact job update_peer_subscription()
+                    # would otherwise learn from wire traffic. Requires
+                    # subscription_aware routing (data-plane fanout must
+                    # actually use the map, not broadcast to everyone).
+                    "FLEETQOX_RMW_PEER_POLICY=subscription_aware "
+                    "FLEETQOX_RMW_STATIC_MODE=1 "
+                    f"FLEETQOX_RMW_STATIC_SUBSCRIPTIONS="
+                    f"{shlex.quote(','.join(static_subscription_entries))} "
+                    if static_mode else ""
                 )
             )
         elif rmw_implementation != "raw_udp":
@@ -493,6 +570,7 @@ def run_probe(
     rmw_implementation: str = "rmw_fleetqox_cpp",
     stagger_start_ms: float = 0.0,
     discovery_only: bool = False,
+    static_mode: bool = False,
 ) -> dict[str, Any]:
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -509,6 +587,9 @@ def run_probe(
     packet_rows = write_simulator_csv(events, trace_path)
 
     endpoints = endpoint_list(num_robots)
+    static_subscriptions = (
+        build_static_subscriptions(trace_path, policy, endpoints) if static_mode else None
+    )
     results_dir_container = "/tmp/fleetqox_tap_results"
     script = build_shell_script(
         trace_container_path=_container_path(trace_path),
@@ -529,6 +610,8 @@ def run_probe(
         rmw_implementation=rmw_implementation,
         stagger_start_ms=stagger_start_ms,
         discovery_only=discovery_only,
+        static_mode=static_mode,
+        static_subscriptions=static_subscriptions,
     )
 
     completed = subprocess.run(
@@ -726,6 +809,23 @@ def main() -> int:
             "discovery-only'."
         ),
     )
+    parser.add_argument(
+        "--static-mode",
+        action="store_true",
+        help=(
+            "The actual fix, not another diagnostic: sets "
+            "FLEETQOX_RMW_STATIC_MODE=1 plus a computed "
+            "FLEETQOX_RMW_STATIC_SUBSCRIPTIONS map, eliminating "
+            "rmw_fleetqox_cpp's graph-advertisement/heartbeat wire traffic "
+            "entirely by pre-declaring the (topic, subscriber) mapping "
+            "this harness's trace already determines statically, instead "
+            "of learning it from discovery traffic at runtime. Implies "
+            "subscription_aware data-plane routing. Only meaningful for "
+            "--rmw-implementation=rmw_fleetqox_cpp (Fast DDS/Cyclone DDS "
+            "are third-party and don't expose this). See "
+            "docs/AUDIT_ACCEPTANCE_TRACKING.md 'static discovery mode'."
+        ),
+    )
     args = parser.parse_args()
 
     summary = run_probe(
@@ -746,6 +846,7 @@ def main() -> int:
         rmw_implementation=args.rmw_implementation,
         stagger_start_ms=max(args.stagger_start_ms, 0.0),
         discovery_only=args.discovery_only,
+        static_mode=args.static_mode,
     )
     summary_path = ROOT / args.summary_json
     summary_path.parent.mkdir(parents=True, exist_ok=True)

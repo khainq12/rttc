@@ -1,10 +1,13 @@
 import json
 import unittest
 
+from pathlib import Path
+
 from scripts.run_ns3_docker_wifi_tap_rmw_probe import (
     START_WAIT_TIMEOUT_S,
     _station_mac,
     build_shell_script,
+    build_static_subscriptions,
     endpoint_list,
     parse_endpoint_results,
 )
@@ -139,6 +142,91 @@ class BuildShellScriptDiscoveryOnlyTest(unittest.TestCase):
             discovery_only=True,
         )
         self.assertNotIn("--discovery-only", script)
+
+
+class BuildShellScriptStaticModeTest(unittest.TestCase):
+    def test_sets_static_mode_env_and_subscription_map(self):
+        endpoints = endpoint_list(1)  # fleet_controller, fleet_router, operator_ui, robot_0000
+        static_subscriptions = {
+            "fleet_controller": [("robot_0000", "control")],
+            "fleet_router": [],
+            "operator_ui": [],
+            "robot_0000": [("fleet_controller", "telemetry")],
+        }
+        script = build_shell_script(
+            trace_container_path="/work/results/trace.csv",
+            endpoints=endpoints,
+            policy="fifo",
+            num_robots=1,
+            sim_duration_s=30.0,
+            start_offset_ms=2000.0,
+            drain_s=10.0,
+            results_dir_container="/tmp/fleetqox_tap_results",
+            static_mode=True,
+            static_subscriptions=static_subscriptions,
+        )
+        self.assertIn("FLEETQOX_RMW_STATIC_MODE=1", script)
+        self.assertIn("FLEETQOX_RMW_PEER_POLICY=subscription_aware", script)
+        # fleet_controller (index 0) publishes to robot_0000 (index 3 ->
+        # 10.50.0.5) on the /fleetqox_trace/robot_0000/control topic.
+        self.assertIn("10.50.0.5:9100|0|/fleetqox_trace/robot_0000/control|std_msgs/msg/String", script)
+
+    def test_does_not_duplicate_peer_policy_with_subscription_aware(self):
+        endpoints = endpoint_list(1)
+        script = build_shell_script(
+            trace_container_path="/work/results/trace.csv",
+            endpoints=endpoints,
+            policy="fifo",
+            num_robots=1,
+            sim_duration_s=30.0,
+            start_offset_ms=2000.0,
+            drain_s=10.0,
+            results_dir_container="/tmp/fleetqox_tap_results",
+            static_mode=True,
+            subscription_aware=True,
+            static_subscriptions={},
+        )
+        # One occurrence per endpoint (each gets its own env block), not two.
+        self.assertEqual(
+            script.count("FLEETQOX_RMW_PEER_POLICY=subscription_aware"), len(endpoints)
+        )
+
+    def test_absent_by_default(self):
+        script = build_shell_script(
+            trace_container_path="/work/results/trace.csv",
+            endpoints=endpoint_list(1),
+            policy="fifo",
+            num_robots=1,
+            sim_duration_s=30.0,
+            start_offset_ms=2000.0,
+            drain_s=10.0,
+            results_dir_container="/tmp/fleetqox_tap_results",
+        )
+        self.assertNotIn("FLEETQOX_RMW_STATIC_MODE", script)
+
+
+class BuildStaticSubscriptionsTest(unittest.TestCase):
+    def test_maps_publisher_to_dst_flow_class_pairs(self):
+        import csv
+        import tempfile
+
+        endpoints = ["fleet_controller", "robot_0000", "robot_0001"]
+        with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False, newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=["policy", "src", "dst", "flow_class"])
+            writer.writeheader()
+            writer.writerow({"policy": "fifo", "src": "robot_0000", "dst": "fleet_controller", "flow_class": "telemetry"})
+            writer.writerow({"policy": "fifo", "src": "robot_0000", "dst": "fleet_controller", "flow_class": "telemetry"})
+            writer.writerow({"policy": "fifo", "src": "fleet_controller", "dst": "robot_0000", "flow_class": "control"})
+            writer.writerow({"policy": "static_priority", "src": "robot_0001", "dst": "fleet_controller", "flow_class": "telemetry"})
+            trace_path = Path(handle.name)
+        try:
+            result = build_static_subscriptions(trace_path, "fifo", endpoints)
+        finally:
+            trace_path.unlink()
+        self.assertEqual(result["robot_0000"], [("fleet_controller", "telemetry")])
+        self.assertEqual(result["fleet_controller"], [("robot_0000", "control")])
+        # Different policy's rows must not leak in.
+        self.assertEqual(result["robot_0001"], [])
 
 
 class BuildShellScriptTest(unittest.TestCase):
