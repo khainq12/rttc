@@ -2868,6 +2868,59 @@ rẻ hơn nên thử trước** — đang chờ phản hồi.
 (`--artificial-cpu-delay-us`), `scripts/run_ns3_docker_wifi_tap_rmw_probe.py`
 (xuyên suốt tham số này).
 
+### 12/09/2026 (tiếp) — Profiler từng giai đoạn: BÁC BỎ giả thuyết retransmit-ledger, phát hiện thủ phạm thật là transport_send (75% thời gian publish)
+
+Thêm profiler theo từng giai đoạn (env-gated qua
+`FLEETQOX_RMW_PUBLISH_STAGE_PROFILING=1`, dùng atomic sum/count/max,
+không tốn chi phí khi tắt) vào `publish_payload()`: `encode`,
+`subscription_lookup`, `mutex_wait` (thời gian CHỜ để lấy `g_bus_mutex`),
+`mutex_hold` (thời gian GIỮ mutex — bao gồm đúng đoạn quét/dọn
+retransmit ledger nghi ngờ trước đó), `transport_send` (từ sau khi thả
+lock tới khi `send_data_frame()` trả về).
+
+**Kết quả** (16-robot, seed=42/run=1, tổng hợp 2327 lần publish trên cả
+19 endpoint):
+
+| Giai đoạn | Mean | Max |
+|---|---|---|
+| encode | 10.13µs | 64.31µs |
+| subscription_lookup | 3.75µs | 42.01µs |
+| **mutex_wait** | **0.48µs** | 189.44µs |
+| **mutex_hold** | **38.89µs** | 161.03µs |
+| **transport_send** | **161.51µs** | **1718.96µs** |
+
+(Tổng mean 5 giai đoạn = 214.77µs, khớp gần đúng với 247µs đo được ở
+tầng Python trước đó.)
+
+**BÁC BỎ HOÀN TOÀN giả thuyết hàng đầu trước đó**: `mutex_wait` gần như
+bằng 0 (0.48µs) — **không có tranh chấp lock đáng kể nào**, loại trừ
+giả thuyết "background thread tranh chấp mutex". `mutex_hold` (đúng
+đoạn quét retransmit ledger nghi ngờ) chỉ 38.89µs — có thật nhưng
+KHÔNG PHẢI chi phí chủ đạo.
+
+**Thủ phạm thật**: `transport_send` chiếm **161.51µs, khoảng 75% tổng
+thời gian publish**, với max lên tới 1.72ms. Giai đoạn này bao trùm toàn
+bộ nội dung của `socket_transport().send_data_frame()` — bắt đầu bằng
+việc **DECODE LẠI chính frame vừa encode** (`decode_data_frame`, hoàn
+toàn dư thừa, chỉ để tái tạo struct `DataFrame` phục vụ routing), rồi
+`data_frame_targets()`/`subscription_aware_targets()` (khoá RIÊNG
+`peer_subscription_mutex_`, quét tuyến tính `peer_addresses_` tra cứu
+refcount topic của từng peer), rồi mới tới `sendto()` thật.
+
+**Ý nghĩa**: chi phí chủ đạo KHÔNG nằm ở tầng reliability/retransmit
+như nghi ngờ ban đầu, mà nằm ở tầng ROUTING/SEND — cụ thể là việc
+decode-lại-frame-vừa-encode dư thừa và/hoặc phần tra cứu subscription-
+aware target. Đã gửi kết quả này cho ChatGPT, đề xuất thêm profiling
+chi tiết hơn BÊN TRONG `send_data_frame()` (tách riêng decode vs
+target-lookup vs sendto() thật) trước khi sửa bất kỳ dòng code nào —
+đang chờ phản hồi.
+
+**File thay đổi**: `ros2_ws/src/rmw_fleetqox_cpp/src/rmw_pubsub.cpp`
+(`PublishStage` enum, `record_publish_stage`,
+`publish_stage_profiling_enabled`, 3 hàm export ctypes mới),
+`scripts/fleetqox_rmw_trace_endpoint.py`
+(`fleetqox_publish_stage_metrics`).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
