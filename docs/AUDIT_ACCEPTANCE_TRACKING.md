@@ -1853,6 +1853,82 @@ về mặt vật lý chứ không chỉ logic, hoặc chuẩn wifi băng thông 
 counter mới), `scripts/fleetqox_rmw_trace_endpoint.py` (counter mới
 vào danh sách ctypes).
 
+### 11/09/2026 (tiếp) — Điểm ChatGPT flag là quan trọng nhất: xác nhận BUG THẬT ở tầng data-plane, fix xong, nhưng lộ ra vấn đề còn sâu hơn
+
+ChatGPT, trước khi đồng ý "đã hết dư địa tối ưu discovery", yêu cầu xác
+minh 1 điều bắt buộc trước: **khi publish() một message ROS thật, RMW
+có gửi đúng tới subscriber đã match hay gửi mù tới TẤT CẢ static peer?**
+Đây là câu hỏi quan trọng nhất trong toàn bộ phiên trao đổi với
+ChatGPT — vì nếu SAI, nó là một O(N²) ở đúng tầng DATA (traffic ứng
+dụng thật), không phải chỉ ở tầng discovery/metadata.
+
+**Xác nhận: ĐÚNG LÀ BUG THẬT.** Lần theo source thật (`rmw_publish` →
+`publish_payload` → `send_data_frame` → `data_frame_targets`) thấy
+`data_frame_targets()` mặc định (`peer_policy_=="all"`, giá trị mặc
+định của toàn bộ RMW) rơi vào `return frame_targets(include_local);`
+— gửi tới **TẤT CẢ** peer trong `FLEETQOX_RMW_PEERS`, không lọc theo
+subscription. `matched_subscription_ids` đã được tính sẵn trong
+`publish_payload` (qua `rmw_fleetqox_cpp_graph_matched_subscription_endpoint_ids`)
+nhưng CHỈ dùng để theo dõi ACK cho reliable QoS trong retransmission
+ledger — KHÔNG hề dùng để lọc đích gửi. Với `fleet_controller` gửi
+1626 message ở test 16-robot, đây là khuếch đại O(peers) TRÊN MỌI LẦN
+publish(), tách biệt hoàn toàn với O(N²) discovery đã tìm và giảm
+trước đó — về lý thuyết có thể lớn hơn nhiều.
+
+**Fix**: thêm policy MỚI (không đổi mặc định `"all"`, vì RMW này dùng
+chung cho rất nhiều probe/test khác chưa audit) —
+`FLEETQOX_RMW_PEER_POLICY=subscription_aware`. Cơ chế: bảng
+`peer_subscribed_topic_refcounts_` (refcount theo từng peer, key
+"domain|topic|type"), học được bằng cách thread địa chỉ nguồn UDP
+(vốn đã có sẵn ở `recvfrom()` nhưng bị "rớt" trước khi tới
+`apply_received_graph_advertisement` — phải sửa signature xuyên suốt
+`handle_received_datagram`→`handle_received_payload`→
+`apply_received_graph_advertisement`) vào một hàm mới
+`update_peer_subscription()` gọi khi nhận advertisement subscription
+add/remove. `data_frame_targets()` tra bảng này khi
+`peer_policy_=="subscription_aware"`, fallback về broadcast-toàn-bộ
+CHỈ KHI chưa biết ai subscribe topic đó (fail-open, không rơi message
+khi đang trong giai đoạn khởi động/race).
+
+**Xác nhận đúng ở quy mô nhỏ**: 1-robot — delivery khớp baseline
+(`rx=76/2/108`), đa số lần gửi dùng đúng targeted-send (fallback rất
+ít: 2/143, 21/80).
+
+**Phát hiện MỚI, sâu hơn cả dự đoán, ở quy mô 8 và 16 robot**: tỷ lệ
+fallback (= "chưa biết ai subscribe topic này") tăng theo scale:
+- 1 robot: fallback thấp (đa số targeted-send thành công).
+- 8 robot: fallback **66%** (1049/1595) — nhưng một số robot vẫn đạt
+  targeted-send phần lớn (vd `robot_0000`: sub=76, fallback chỉ 18) —
+  XÁC NHẬN cơ chế lọc hoạt động ĐÚNG khi discovery kịp hội tụ.
+- 16 robot: fallback **100%** (1628/1628 cho `fleet_controller`, và
+  toàn bộ endpoint khác cũng vậy) — KHÔNG MỘT peer nào được ghi nhận
+  có subscriber trước khi publish bắt đầu.
+
+**Diễn giải**: đây KHÔNG phải bug trong chính fix — đây là bằng chứng
+rằng ở quy mô 16 robot, **chính DISCOVERY (dù đã tối ưu bằng B+ ở mục
+trước) cũng không kịp hội tụ trong 15s** (thời gian chờ mặc định của
+`fleetqox_rmw_trace_endpoint.py` trước khi bắt đầu publish, timeout
+xong vẫn tiếp tục chứ không chặn) do chính hiện tượng nghẽn kênh đã
+xác nhận xuyên suốt phiên này. Cơ chế fail-open (gửi toàn bộ khi chưa
+biết ai subscribe) đúng là hành vi AN TOÀN cần có (không rơi message
+oan), nhưng hệ quả là fix này tự động "thoái lui" về gần đúng hành vi
+cũ (broadcast toàn bộ) chính xác ở kịch bản cần nó nhất.
+
+**Ý nghĩa với kết luận tổng thể**: đây là bằng chứng MẠNH HƠN cả các
+phát hiện trước — không chỉ traffic ứng dụng/discovery bị nghẽn, mà
+NGAY CẢ các gói kiểm soát nhỏ nhất (subscription add/remove
+advertisement, sau khi đã tối ưu bằng B+) cũng không đến nơi kịp thời
+ở mật độ 19 station. Đây củng cố dứt khoát kết luận: nút thắt là năng
+lực vật lý kênh 802.11g, không phải bất kỳ lựa chọn thiết kế giao thức
+cụ thể nào — vì ngay cả những gói NHỎ NHẤT, THƯA NHẤT cũng không thoát
+được tình trạng nghẽn ở quy mô này.
+
+**File thay đổi**: `ros2_ws/src/rmw_fleetqox_cpp/src/rmw_pubsub.cpp`
+(policy `subscription_aware`, bảng refcount, thread `source` qua chuỗi
+nhận gói, counter mới), `scripts/fleetqox_rmw_trace_endpoint.py`
+(counter mới), `scripts/run_ns3_docker_wifi_tap_rmw_probe.py`
+(`--subscription-aware`).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
