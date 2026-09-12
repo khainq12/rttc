@@ -2359,6 +2359,41 @@ retry thay vì tầng discovery.
 `scripts/run_ns3_docker_wifi_tap_rmw_probe.py` (`--static-mode`,
 `build_static_subscriptions`).
 
+### 12/09/2026 (tiếp) — Kiểm tra giả thuyết "retry-storm": SAI — giảm retry làm delivery TỆ HƠN, không tốt hơn
+
+Kiểm tra nhanh giả thuyết vừa nêu ở trên (traffic retry/repair tự nó
+góp phần làm trầm trọng bão hoà). Chạy lại `--static-mode` với
+`FLEETQOX_RMW_PROACTIVE_DATA_REPEATS=0`,
+`FLEETQOX_RMW_REPAIR_RETRANSMISSION_BUDGET=0`,
+`FLEETQOX_RMW_REPAIR_MAX_ATTEMPTS_PER_SEQUENCE=0` (tắt hầu hết cơ chế
+retry chủ động) qua tham số mới `extra_rmw_env` của `run_probe()`.
+
+**Kết quả: delivery TỆ HƠN, không tốt hơn — 229/2289 (10.0%), so với
+674/2289 (29.4%) khi giữ nguyên retry mặc định.** `mac_tx_total` gần
+như không đổi so với bản có retry đầy đủ (692→18358 theo cùng pattern
+climbing), nghĩa là traffic retry/repair KHÔNG phải là traffic phụ trội
+đáng kể ở tầng airtime — nó chỉ đang làm đúng việc của nó: cứu lại một
+phần message bị mất do va chạm ban đầu. Tắt nó đi chỉ làm mất luôn cả
+phần được cứu, không giảm được va chạm.
+
+**Kết luận**: giả thuyết "retry storm" (traffic phụ trợ tự nó gây thêm
+bão hoà, giống cơ chế discovery) bị BÁC BỎ cho trường hợp retry/repair
+cụ thể này. Khoảng cách còn lại giữa `--static-mode` (29.4%) và raw-UDP
+(100%) nhiều khả năng nằm ở đặc điểm khác trong cách FleetRMW đóng gói/
+gửi dữ liệu tầng data-plane (framing, fragmentation, completion marker,
+ACK-like traffic vốn có của QoS RELIABLE) khác với cách raw-UDP gửi gói
+đơn giản khớp chính xác kích thước/thời điểm theo trace — một hướng điều
+tra kiến trúc khác, không phải một tham số có thể chỉnh nhanh.
+
+**Khuyến nghị**: giữ nguyên tham số retry/repair mặc định (KHÔNG hạ
+thấp) khi dùng `--static-mode` — 29.4% là kết quả tốt nhất đã đo được
+với cấu hình mặc định, chưa tìm được cách cải thiện thêm bằng cách chỉnh
+tham số retry.
+
+**File thay đổi**: `scripts/run_ns3_docker_wifi_tap_rmw_probe.py`
+(`extra_rmw_env` — passthrough chẩn đoán một lần, không phải flag CLI ổn
+định).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và

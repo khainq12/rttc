@@ -175,6 +175,7 @@ def build_shell_script(
     discovery_only: bool = False,
     static_mode: bool = False,
     static_subscriptions: dict[str, list[tuple[str, str]]] | None = None,
+    extra_rmw_env: dict[str, str] | None = None,
 ) -> str:
     ips = {endpoint: f"{BASE_IP_PREFIX}{i + 2}" for i, endpoint in enumerate(endpoints)}
     # ChatGPT-flagged bootstrap-feedback-loop hypothesis (see
@@ -370,6 +371,18 @@ def build_shell_script(
                     f"FLEETQOX_RMW_STATIC_SUBSCRIPTIONS="
                     f"{shlex.quote(','.join(static_subscription_entries))} "
                     if static_mode else ""
+                )
+                + (
+                    # Generic ad-hoc tuning passthrough -- e.g. dialing down
+                    # QoS-RELIABLE retry/repair aggressiveness (FLEETQOX_RMW_
+                    # REPAIR_RETRANSMISSION_BUDGET, _PROACTIVE_DATA_REPEATS,
+                    # _REPAIR_NACK_INTERVAL_MS) to test whether retry-storm
+                    # traffic is the remaining cause of --static-mode's
+                    # partial (not full) delivery recovery -- see
+                    # docs/AUDIT_ACCEPTANCE_TRACKING.md "static discovery
+                    # mode". Not exposed as its own CLI flags since these are
+                    # one-off diagnostic knobs, not a stable interface.
+                    "".join(f"{key}={value} " for key, value in (extra_rmw_env or {}).items())
                 )
             )
         elif rmw_implementation != "raw_udp":
@@ -571,6 +584,7 @@ def run_probe(
     stagger_start_ms: float = 0.0,
     discovery_only: bool = False,
     static_mode: bool = False,
+    extra_rmw_env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -612,6 +626,7 @@ def run_probe(
         discovery_only=discovery_only,
         static_mode=static_mode,
         static_subscriptions=static_subscriptions,
+        extra_rmw_env=extra_rmw_env,
     )
 
     completed = subprocess.run(
