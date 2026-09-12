@@ -2685,6 +2685,49 @@ tục giảm kích thước từng gói.
 `run_ns3_docker_wifi_tap_rmw_probe.run_probe()` trực tiếp bằng script
 Python tạm, không cần thay đổi code sản phẩm).
 
+### 12/09/2026 (tiếp) — Hướng tiếp theo từ ChatGPT: message batching/aggregation — nhưng trace thực tế KHÔNG có đủ clustering để tận dụng
+
+Sau kết quả null của `compact_v1`, ChatGPT phân tích: giảm byte/gói
+không giúp vì 802.11 DCF có overhead CỐ ĐỊNH lớn mỗi lần truyền (DIFS/
+SIFS/backoff/preamble) không phụ thuộc kích thước — nên đòn bẩy đúng là
+giảm SỐ LƯỢNG lần truyền, không phải kích thước mỗi lần. Đề xuất cụ
+thể: `FLEETQOX_RMW_BATCH_MODE` — gộp nhiều message nhỏ cùng đích thành
+1 datagram (hàng đợi theo từng peer đích, flush sau cửa sổ thời gian
+ngắn ~0.5-2ms hoặc khi đạt ngưỡng kích thước), giữ nguyên hoàn toàn
+logic phía trên (routing/QoS/retry) bằng cách bên nhận tách batch ra
+thành các frame riêng rồi cho đi qua ĐÚNG pipeline xử lý hiện có.
+
+**Trước khi xây dựng**, kiểm tra xem trace THỰC TẾ có đủ "message cùng
+nguồn-cùng đích gần nhau về thời gian" để batching có gì mà gộp hay
+không — phân tích trực tiếp file trace CSV (37 cặp (src,dst) riêng
+biệt, trung bình 61.9 message/cặp):
+
+| Cửa sổ | % message có message khác cùng (src,dst) trong cửa sổ đó |
+|---|---|
+| 1ms | 0.0% |
+| 2ms | 0.0% |
+| 5ms | 0.0% |
+| 10ms | 0.0% |
+| 50ms | 80.5% |
+
+**KHÔNG có clustering nào ở ngưỡng thời gian an toàn cho traffic control
+(dưới 10ms)** — nghĩa là cửa sổ flush ngắn (0.5-2ms) ChatGPT đề xuất ban
+đầu sẽ HẦU NHƯ KHÔNG BAO GIỜ tìm được message thứ 2 để gộp. Chỉ ở cửa sổ
+50ms mới thấy clustering (80.5%), nhưng 50ms đủ lớn để tự nó đe doạ vi
+phạm deadline của message loại control. Thêm nữa: `fleet_controller`
+(71% tổng traffic) fanout tới 16 đích khác nhau — nên ngay cả với cửa
+sổ dài, phần lớn traffic của chính publisher lớn nhất cũng không có cơ
+hội gộp (mỗi lần gửi thường tới một đích khác).
+
+**Đã gửi phát hiện này lại cho ChatGPT trước khi xây dựng cơ chế
+batching** — tránh xây một subsystem mới (hàng đợi theo đích, luồng
+flush, logic tách batch bên nhận) cho một pattern traffic mà trace thực
+tế không hỗ trợ. Đang chờ phản hồi để xác nhận batching có còn là hướng
+đúng (có thể với cửa sổ dài hơn + chỉ áp dụng cho traffic không phải
+control/không có deadline chặt) hay nên quay lại hướng CW/EDCA tuning.
+
+**File thay đổi**: không có (phân tích thuần trên trace CSV đã có).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
