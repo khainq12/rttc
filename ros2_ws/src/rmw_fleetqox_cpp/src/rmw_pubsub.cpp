@@ -402,6 +402,65 @@ std::unordered_map<const void *, std::vector<ReliableRetransmitEntry>>
 std::atomic<std::uint64_t> g_retransmit_entry_pool_hits{0};
 std::atomic<std::uint64_t> g_retransmit_entry_pool_misses{0};
 
+// Micro-profiler for publish_payload()'s hot path (see
+// docs/AUDIT_ACCEPTANCE_TRACKING.md "publish-path latency profiling"):
+// send-timing instrumentation at the Python endpoint level measured
+// FleetRMW's publish() call at ~0.247ms mean vs raw UDP's sendto() at
+// ~0.038ms, and a controlled artificial-CPU-delay experiment on raw UDP
+// (up to 1ms, well above FleetRMW's observed max) found NO delivery
+// effect -- refuting "CPU time alone" as sufficient to explain the
+// collapse. That leaves either an algorithmic hotspot inside
+// publish_payload() (e.g. the retransmit ledger's linear scan) or lock
+// CONTENTION with a background thread (reliable_retransmit_loop also
+// takes g_bus_mutex and walks the same ledger on its own timer) as the
+// remaining candidates -- indistinguishable without actually measuring
+// where the time goes, so this profiler is stage-resolved rather than a
+// single aggregate counter. Indexed by PublishStage instead of one
+// atomic triple per stage to keep the instrumentation call sites compact.
+enum class PublishStage : size_t
+{
+  kEncode = 0,
+  kSubscriptionLookup = 1,
+  kMutexWait = 2,
+  kMutexHold = 3,
+  kTransportSend = 4,
+  kCount = 5,
+};
+
+struct PublishStageStats
+{
+  std::atomic<std::uint64_t> sum_ns{0};
+  std::atomic<std::uint64_t> count{0};
+  std::atomic<std::uint64_t> max_ns{0};
+};
+
+std::array<PublishStageStats, static_cast<size_t>(PublishStage::kCount)> g_publish_stage_stats;
+
+void record_publish_stage(PublishStage stage, std::int64_t elapsed_ns)
+{
+  if (elapsed_ns < 0) {
+    return;
+  }
+  PublishStageStats & stats = g_publish_stage_stats[static_cast<size_t>(stage)];
+  const auto elapsed = static_cast<std::uint64_t>(elapsed_ns);
+  stats.sum_ns.fetch_add(elapsed, std::memory_order_relaxed);
+  stats.count.fetch_add(1, std::memory_order_relaxed);
+  std::uint64_t previous_max = stats.max_ns.load(std::memory_order_relaxed);
+  while (elapsed > previous_max &&
+    !stats.max_ns.compare_exchange_weak(previous_max, elapsed, std::memory_order_relaxed))
+  {
+  }
+}
+
+// Env-gated so the extra monotonic_timestamp_ns() calls (5-6 per publish)
+// never touch the default hot path -- this is a diagnostic tool for this
+// investigation, not a permanent per-publish cost every caller pays.
+bool publish_stage_profiling_enabled()
+{
+  static const bool enabled = std::getenv("FLEETQOX_RMW_PUBLISH_STAGE_PROFILING") != nullptr;
+  return enabled;
+}
+
 // Retires `entry` into `data`'s pool (bounded by kRetiredRetransmitEntryPoolCap)
 // instead of letting it fall out of scope and be destroyed outright. Caller
 // must hold g_bus_mutex.
@@ -12172,6 +12231,8 @@ rmw_ret_t publish_payload(FleetQoxPublisherData * data, const std::vector<std::u
   std::vector<EventCallbackNotification> deadline_callbacks;
   const auto source_sequence = data->next_source_sequence++;
   const std::int64_t now_ns = monotonic_timestamp_ns();
+  const bool profiling = publish_stage_profiling_enabled();
+  const std::int64_t stage_t0 = profiling ? monotonic_timestamp_ns() : 0;
   const rmw_fleetqox_cpp::DataFrame frame{
     local_robot_id(),
     data->topic_name,
@@ -12197,6 +12258,7 @@ rmw_ret_t publish_payload(FleetQoxPublisherData * data, const std::vector<std::u
       frame, data->frame_base64_scratch, data->frame_json_scratch);
   }
   const std::string & encoded_frame = data->frame_json_scratch;
+  const std::int64_t stage_t1 = profiling ? monotonic_timestamp_ns() : 0;
   const bool reliable = data->qos.reliability == RMW_QOS_POLICY_RELIABILITY_RELIABLE;
   const std::vector<std::string> matched_subscription_ids = reliable ?
     rmw_fleetqox_cpp_graph_matched_subscription_endpoint_ids(
@@ -12204,8 +12266,17 @@ rmw_ret_t publish_payload(FleetQoxPublisherData * data, const std::vector<std::u
     std::vector<std::string>{};
   const std::string publish_instance_key =
     compute_publish_instance_key(data->type_support, payload).value_or(std::string());
+  const std::int64_t stage_t2 = profiling ? monotonic_timestamp_ns() : 0;
+  if (profiling) {
+    record_publish_stage(PublishStage::kEncode, stage_t1 - stage_t0);
+    record_publish_stage(PublishStage::kSubscriptionLookup, stage_t2 - stage_t1);
+  }
   {
     std::lock_guard<std::mutex> lock(g_bus_mutex);
+    const std::int64_t stage_t3 = profiling ? monotonic_timestamp_ns() : 0;
+    if (profiling) {
+      record_publish_stage(PublishStage::kMutexWait, stage_t3 - stage_t2);
+    }
     record_offered_deadline_miss_locked(data, now_ns, &deadline_callbacks);
     data->last_publish_ns = now_ns;
     record_liveliness_assert_locked(data, now_ns, &deadline_callbacks);
@@ -12266,6 +12337,9 @@ rmw_ret_t publish_payload(FleetQoxPublisherData * data, const std::vector<std::u
       matched_subscription_ids);
     g_retransmit_ledger[retransmit_ledger_key(data->publisher_id, source_sequence)] =
       std::move(retransmit_entry);
+    if (profiling) {
+      record_publish_stage(PublishStage::kMutexHold, monotonic_timestamp_ns() - stage_t3);
+    }
   }
   notify_event_callbacks(deadline_callbacks);
   if (data->qos.liveliness == RMW_QOS_POLICY_LIVELINESS_MANUAL_BY_TOPIC) {
@@ -12286,8 +12360,17 @@ rmw_ret_t publish_payload(FleetQoxPublisherData * data, const std::vector<std::u
       return RMW_RET_OK;
     }
   }
+  const std::int64_t stage_t4 = profiling ? monotonic_timestamp_ns() : 0;
   const rmw_ret_t send_ret =
     socket_transport().send_data_frame(encoded_frame, data->qos);
+  if (profiling) {
+    // Folds notify_event_callbacks/maybe_renew_publisher_graph (both run
+    // after the lock is released, before the actual wire send) into this
+    // stage rather than adding a 6th named bucket -- if this stage turns
+    // out to be the dominant cost, that ambiguity is itself the signal to
+    // split it further next.
+    record_publish_stage(PublishStage::kTransportSend, monotonic_timestamp_ns() - stage_t4);
+  }
   if (send_ret != RMW_RET_OK) {
     record_fragment_async_send_failed(encoded_frame);
   }
@@ -14591,6 +14674,35 @@ bool rmw_fleetqox_cpp_waitable_subscription_has_data(const void * waitable)
 std::uint64_t rmw_fleetqox_cpp_socket_frames_sent()
 {
   return socket_transport().frames_sent();
+}
+
+// publish_payload() stage-resolved micro-profiler (see PublishStage /
+// publish_stage_profiling_enabled() -- only non-zero when
+// FLEETQOX_RMW_PUBLISH_STAGE_PROFILING is set). stage indices match
+// PublishStage's declaration order: 0=encode, 1=subscription_lookup,
+// 2=mutex_wait, 3=mutex_hold, 4=transport_send.
+std::uint64_t rmw_fleetqox_cpp_publish_stage_sum_ns(int stage)
+{
+  if (stage < 0 || stage >= static_cast<int>(PublishStage::kCount)) {
+    return 0;
+  }
+  return g_publish_stage_stats[static_cast<size_t>(stage)].sum_ns.load(std::memory_order_relaxed);
+}
+
+std::uint64_t rmw_fleetqox_cpp_publish_stage_count(int stage)
+{
+  if (stage < 0 || stage >= static_cast<int>(PublishStage::kCount)) {
+    return 0;
+  }
+  return g_publish_stage_stats[static_cast<size_t>(stage)].count.load(std::memory_order_relaxed);
+}
+
+std::uint64_t rmw_fleetqox_cpp_publish_stage_max_ns(int stage)
+{
+  if (stage < 0 || stage >= static_cast<int>(PublishStage::kCount)) {
+    return 0;
+  }
+  return g_publish_stage_stats[static_cast<size_t>(stage)].max_ns.load(std::memory_order_relaxed);
 }
 
 std::uint64_t rmw_fleetqox_cpp_socket_frames_received()

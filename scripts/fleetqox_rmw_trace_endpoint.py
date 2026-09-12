@@ -94,7 +94,38 @@ def fleetqox_transport_metrics() -> dict[str, Any]:
         symbol = getattr(library, f"rmw_fleetqox_cpp_socket_{name}")
         symbol.restype = ctypes.c_uint64
         metrics[name] = int(symbol())
+    metrics["publish_stages"] = fleetqox_publish_stage_metrics(library)
     return metrics
+
+
+def fleetqox_publish_stage_metrics(library: "ctypes.CDLL") -> dict[str, Any]:
+    """publish_payload()'s stage-resolved micro-profiler (see PublishStage
+    in rmw_pubsub.cpp) -- only non-zero when the process was launched with
+    FLEETQOX_RMW_PUBLISH_STAGE_PROFILING set, added for the causal-
+    isolation investigation into FleetRMW's ~6.4x slower publish() call
+    vs raw UDP's sendto() (see docs/AUDIT_ACCEPTANCE_TRACKING.md
+    'publish-path latency profiling')."""
+    stage_names = ("encode", "subscription_lookup", "mutex_wait", "mutex_hold", "transport_send")
+    stages: dict[str, Any] = {}
+    for index, name in enumerate(stage_names):
+        sum_fn = library.rmw_fleetqox_cpp_publish_stage_sum_ns
+        sum_fn.restype = ctypes.c_uint64
+        sum_fn.argtypes = [ctypes.c_int]
+        count_fn = library.rmw_fleetqox_cpp_publish_stage_count
+        count_fn.restype = ctypes.c_uint64
+        count_fn.argtypes = [ctypes.c_int]
+        max_fn = library.rmw_fleetqox_cpp_publish_stage_max_ns
+        max_fn.restype = ctypes.c_uint64
+        max_fn.argtypes = [ctypes.c_int]
+        sum_ns = int(sum_fn(index))
+        count = int(count_fn(index))
+        stages[name] = {
+            "sum_ns": sum_ns,
+            "count": count,
+            "max_ns": int(max_fn(index)),
+            "mean_ns": sum_ns / count if count else 0.0,
+        }
+    return stages
 
 
 def _topic_for(destination: str, flow_class: str) -> str:
