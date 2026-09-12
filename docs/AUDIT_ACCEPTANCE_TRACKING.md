@@ -3043,6 +3043,152 @@ thống kê. Cả 2 ứng viên ChatGPT đề xuất (drain PMTU, mutex chờ) �
 export mới); `scripts/fleetqox_rmw_trace_endpoint.py` (đọc 3 bộ đếm PMTU
 mới + stage `udp_send_mutex_wait` qua ctypes).
 
+### 12/09/2026 (tiếp) — Bắt gói tin thật tại biên TAP (theo đề xuất ChatGPT): phát hiện 2 khác biệt cụ thể chưa từng đo — kích thước gói 5.9-7.7x và ARP 4.9x, cộng với cơ chế khuếch đại "fallback broadcast" định lượng lần đầu
+
+Theo đúng khuyến nghị của ChatGPT ("ngừng chỉnh sửa nội bộ FleetRMW,
+hỏi xem mạng THẬT SỰ thấy gì khác nhau"), đã thêm khả năng bắt gói vào
+harness: `tcpdump` (cài on-demand trong container qua `apt-get`, không
+có sẵn trong image) chạy trên `ftapN` — chính là tap device ns-3
+TapBridge dùng cho một trạm cụ thể — từ trước khi ns-3 khởi động tới
+sau khi mọi endpoint kết thúc, dump ra text (`-nn -tt`) và lấy về qua
+cùng cơ chế marker-trong-stdout đã dùng cho kết quả JSON mỗi endpoint.
+
+**Thí nghiệm**: bắt gói tại `ftap0` (trạm `fleet_controller`) cho CẢ 2
+biến thể, cùng trace/seed=13, cùng `ns3_seed=42/run=1`, 16-robot:
+
+| | raw_udp | rmw_fleetqox_cpp (static mode) |
+|---|---|---|
+| delivery_pct | 100.0% | 23.9% |
+| fleet_controller tx (app-level) | 1626 | 1626 |
+| Tổng gói tại TAP | 1912 | 2358 |
+| UDP | 1626 | 1825 |
+| ARP | 57 | **277 (4.9x)** |
+| ICMPv6 (ND/MLD, nền OS, không liên quan app) | 229 | 256 |
+| UDP gửi ĐI từ fleet_controller | 1626 | 1662 |
+| UDP gửi ĐẾN fleet_controller | 0 | **163 (mới, không tồn tại ở raw_udp)** |
+| Kích thước UDP (byte) | 96 (1315 gói) / 192 (311 gói) | 606-736 (phần lớn 607-608) |
+
+**Phát hiện 1 — khuếch đại kích thước gói LỚN HƠN nhiều so với so sánh
+JSON/compact_v1 trước đó**: gói FleetRMW trên dây thực tế là 606-736
+byte so với 96-192 byte của raw-UDP — **5.9x-7.7x**, không phải 6.7x
+(JSON) hay 3.3x (compact_v1) đo trong nội bộ trước đó, vì so sánh lần
+này là với kích thước THẬT SỰ tối thiểu (raw-UDP), không phải so JSON
+với compact_v1 (hai biến thể ĐỀU đã có overhead framing). Điều này có
+nghĩa: dù thí nghiệm 10-cặp JSON/compact_v1 cho kết quả null (compact_v1
+KHÔNG cải thiện delivery có ý nghĩa), compact_v1 vẫn to hơn raw-UDP
+~3.3x — CHƯA đạt tới baseline airtime đã cho delivery 100%. Không thể
+kết luận "kích thước gói không quan trọng" chỉ từ null result đó; cần
+một cắt giảm SÂU HƠN nhiều (gần bằng raw-UDP) mới đủ để kiểm tra giả
+thuyết airtime một cách công bằng.
+
+**Phát hiện 2 — ARP tăng 4.9x, chưa có lời giải**: 277 gói ARP so với
+57 — trạm `fleet_controller` không tự tạo ARP nhiều hơn (nó chỉ gửi đi,
+không có logic ARP đặc biệt), nên khả năng cao đây là hệ quả gián tiếp
+của tổng lưu lượng cao hơn (nhiều gói hơn = nhiều khả năng ARP cache bị
+hết hạn/tranh chấp trên kênh 802.11 tranh chấp cao hơn). Chưa điều tra
+sâu — ghi nhận làm manh mối, không phải kết luận.
+
+**Phát hiện 3 — định lượng lần đầu chi phí thật của "fallback
+broadcast"**: 163 gói UDP THẬT SỰ đến `fleet_controller` dù trace ứng
+dụng không có dòng nào có `dst=fleet_controller` (xác nhận qua đọc trực
+tiếp CSV). Kiểm tra toàn bộ 19 endpoint bằng `fleetqox_transport_metrics`
+cho thấy **MỌI endpoint không phân biệt vai trò đều có đúng
+`subscription_aware_fallback_broadcasts=2`** (tổng 38), và
+`frames_received` (132-154 mỗi endpoint, tổng **2534**) cao hơn nhiều
+lần `rx` ở tầng ứng dụng. Đối chiếu số học: 38 lần fallback-broadcast ×
+tối đa 18 peer/lần ≈ 684 lượt nhận thêm ở tầng transport — cộng với
+~2251 lượt gửi 1-đích hợp lệ (2289 tx - 38 fallback) ≈ 2935 lượt gửi dự
+kiến, khớp hợp lý với 2534 lượt nhận thực đo được (phần chênh lệch là
+mất gói trên kênh, đã biết là ~70-76%). Cơ chế `subscription_aware_
+fallback_broadcasts` đã được biết từ trước (không phải counter mới),
+nhưng đây là lần đầu NHÂN RA để thấy quy mô thật: 38 sự kiện tưởng nhỏ
+lại tương đương gần 30% khối lượng của TOÀN BỘ trace gốc (2289 message)
+về số lượt nhận ở tầng transport — một chi phí airtime đáng kể chưa
+từng được định lượng theo cách này.
+
+**Đã KIỂM CHỨNG bằng thực nghiệm (không còn là giả thuyết)**: thêm tạm
+thời 1 dòng debug (`std::cerr`, gate bởi
+`FLEETQOX_RMW_DEBUG_LOG_FALLBACK_TOPIC`) ngay tại nhánh fallback trong
+`subscription_aware_targets()` để in ra `key` (domain_id|topic|
+type_name) mỗi lần fallback-broadcast xảy ra, build lại, chạy 1 lần
+16-robot/seed=42 với biến này bật. Kết quả: **ĐÚNG 38/38 dòng debug đều
+là cùng một key**:
+
+```
+0|/parameter_events|rcl_interfaces/msg/ParameterEvent
+```
+
+Không phải `/rosout` như nghi ngờ ban đầu — là **`/parameter_events`**,
+topic ROS2 tự động tạo bởi `rclpy.create_node()` khi gọi với
+`start_parameter_services=True` (giá trị mặc định, không phải do
+`fleetqox_rmw_trace_endpoint.py` chủ động publish). Đây KHÔNG nằm
+trong `FLEETQOX_RMW_STATIC_SUBSCRIPTIONS` (vốn chỉ liệt kê topic riêng
+của trace), nên mọi publish lên nó chắc chắn rơi vào nhánh "không biết
+subscriber nào" → fallback broadcast tới toàn bộ 18 peer khác. Xảy ra
+đúng 2 lần/endpoint × 19 endpoint = 38, độc lập hoàn toàn với nội dung
+trace — khớp chính xác với giả thuyết.
+
+**Đã revert dòng debug** (`std::cerr`/`#include <iostream>` không hợp
+phong cách diagnostic hiện có của file này — toàn bộ counter khác đều
+qua atomic + ctypes export, không phải text logging) — build lại xác
+nhận biên dịch sạch sau khi revert.
+
+**Lần thử fix đầu tiên KHÔNG hiệu quả**: `rclpy.create_node(node_name,
+start_parameter_services=False)` — chạy lại kiểm chứng cho thấy
+`fallback_broadcasts` vẫn = 38, KHÔNG đổi. Lý do: đọc
+`/opt/ros/jazzy/lib/python3.12/site-packages/rclpy/node.py` xác nhận
+`_parameter_event_publisher` được tạo VÔ ĐIỀU KIỆN trong
+`Node.__init__` (dòng 212, không nằm trong `if start_parameter_services`
+ở dòng 240), và `TimeSource.__init__` (được gọi ngay trong
+`Node.__init__`) gọi `node.declare_parameter('use_sim_time', False)`
+VÔ ĐIỀU KIỆN — chính lệnh declare này publish sự kiện, không liên quan
+gì tới `start_parameter_services`. Cả 2 việc này chạy XONG bên trong
+`rclpy.create_node()`, nên monkeypatch `.publish` trên INSTANCE sau khi
+`create_node()` trả về cũng quá trễ (đã thử, vẫn 38, không đổi).
+
+**Fix THẬT SỰ hiệu quả (đã áp dụng và đo lại)**: monkeypatch
+`rclpy.publisher.Publisher.publish` ở cấp CLASS (lọc theo
+`self.topic_name == "/parameter_events"`), thực hiện TRƯỚC khi gọi
+`rclpy.create_node()` — patch class trước khi instance nào được tạo,
+nên bắt được cả các publish xảy ra bên trong `Node.__init__` chính nó.
+Kiểm chứng qua `fleetqox_transport_metrics`: `subscription_aware_
+fallback_broadcasts` = **0/0/0** trên cả 19 endpoint (trước đó luôn là
+2/endpoint = 38 tổng), `frames_sent` giờ gần khớp `tx` ứng dụng (2296
+vs 2289, chênh 7 thay vì chênh do fallback).
+
+**Đo lại delivery sau fix (16-robot, seed=42, cùng `ns3_run`=1,2,3 với
+baseline trong thí nghiệm PMTU A/B ở trên, để so khớp cặp)**:
+
+| ns3_run | Trước fix (baseline PMTU A/B) | Sau fix (parameter_events) | Δ |
+|---|---|---|---|
+| 1 | 9.5% | 18.1% | +8.6pp |
+| 2 | 9.0% | 15.2% | +6.2pp |
+| 3 | 16.8% | 23.0% | +6.2pp |
+| **mean** | **11.8%** | **18.8%** | **+7.0pp** |
+
+Paired delta: mean=+7.0pp, stdev=1.39, n=3, **95% CI=[+3.56, +10.44]**
+— khoảng tin cậy HOÀN TOÀN DƯƠNG (không chứa 0), khác hẳn kết quả null
+của thí nghiệm JSON/compact_v1 trước đó (CI chứa 0). Cả 3/3 cặp đều
+cải thiện, độ lớn tương đối đều nhau (6.2-8.6pp) — đây là tín hiệu THẬT,
+không phải nhiễu chạy-tới-chạy, dù n=3 vẫn còn nhỏ và cần thêm rep để
+chắc chắn hơn.
+
+**Đánh giá trung thực**: đây là cải thiện tuyệt đối ~7 điểm phần trăm
+(11.8%→18.8%), một bước tiến rõ ràng theo đúng hướng, nhưng CHƯA giải
+quyết được vấn đề gốc — delivery vẫn cách xa 100% của raw-UDP rất
+nhiều. Không nên coi đây là "fix xong vấn đề", chỉ là loại bỏ được MỘT
+nguồn airtime lãng phí cụ thể, đã đo lường được, trong số nhiều nguồn
+khác (kích thước gói 5.9-7.7x, có thể còn control-plane traffic khác
+chưa phát hiện). Hướng đi đúng theo phương pháp của cả investigation
+này: tìm — đo — sửa — đo lại, từng mảnh một.
+
+**File thay đổi**: `scripts/fleetqox_rmw_trace_endpoint.py` (import
+`rclpy.publisher`, monkeypatch class-level `Publisher.publish` lọc
+`/parameter_events`, `start_parameter_services=False`);
+`scripts/run_ns3_docker_wifi_tap_rmw_probe.py` (tham số
+`capture_pcap_endpoint`, cài `tcpdump` on-demand, bắt gói trên `ftapN`,
+marker `FLEETQOX_TAP_CAPTURE_BEGIN/END`, hàm `parse_capture_text`).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và

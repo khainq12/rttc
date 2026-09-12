@@ -264,6 +264,7 @@ def main() -> int:
     args = parser.parse_args()
 
     import rclpy
+    import rclpy.publisher
     from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
     from std_msgs.msg import String
 
@@ -287,7 +288,35 @@ def main() -> int:
     node_name = "fleetqox_trace_endpoint_" + "".join(
         ch if ch.isalnum() else "_" for ch in args.endpoint
     )
-    node = rclpy.create_node(node_name)
+    # start_parameter_services=False alone does NOT stop this -- confirmed
+    # via a temporary debug print in subscription_aware_targets() (see
+    # docs/AUDIT_ACCEPTANCE_TRACKING.md "bắt gói tin thật tại biên TAP")
+    # that ALL subscription_aware_fallback_broadcasts_ (38 total, exactly
+    # 2/endpoint) are rclpy's /parameter_events topic, which isn't in
+    # FLEETQOX_RMW_STATIC_SUBSCRIPTIONS -- so every publish to it falls
+    # back to broadcasting to all 18 other peers. Node.__init__ creates
+    # _parameter_event_publisher unconditionally (rclpy/node.py), and
+    # TimeSource.__init__ unconditionally calls
+    # node.declare_parameter('use_sim_time', False) regardless of
+    # start_parameter_services -- and BOTH of those run to completion
+    # inside rclpy.create_node() itself, before it ever returns, so
+    # patching the instance's own .publish attribute afterwards is too
+    # late (confirmed empirically -- fallback_broadcasts stayed at 38
+    # with that approach). There's no public rclpy option to suppress the
+    # publish itself, so patch the Publisher CLASS before create_node()
+    # runs, filtering on topic name -- this probe has nothing that
+    # subscribes to /parameter_events and never declares/sets real
+    # parameters, so dropping these publishes changes no observed
+    # behavior.
+    _original_publisher_publish = rclpy.publisher.Publisher.publish
+
+    def _publish_suppressing_parameter_events(self, *pub_args, **pub_kwargs):
+        if self.topic_name == "/parameter_events":
+            return None
+        return _original_publisher_publish(self, *pub_args, **pub_kwargs)
+
+    rclpy.publisher.Publisher.publish = _publish_suppressing_parameter_events
+    node = rclpy.create_node(node_name, start_parameter_services=False)
     qos = QoSProfile(
         history=HistoryPolicy.KEEP_LAST,
         depth=64,

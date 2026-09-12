@@ -179,6 +179,7 @@ def build_shell_script(
     ns3_seed: int = 1,
     ns3_run: int = 1,
     artificial_cpu_delay_us: float = 0.0,
+    capture_pcap_endpoint: str | None = None,
 ) -> str:
     ips = {endpoint: f"{BASE_IP_PREFIX}{i + 2}" for i, endpoint in enumerate(endpoints)}
     # ChatGPT-flagged bootstrap-feedback-loop hypothesis (see
@@ -203,6 +204,15 @@ def build_shell_script(
         "set -e",
         f"mkdir -p {shlex.quote(results_dir_container)}",
     ]
+    if capture_pcap_endpoint is not None:
+        # tcpdump isn't in the base image (confirmed via `which tcpdump`
+        # failing) -- install on demand rather than baking it into the
+        # shared image, since this is a one-off diagnostic capture, not a
+        # standing dependency every probe run needs. Gated behind this
+        # param so ordinary runs don't pay the ~10-15s apt cost.
+        lines.append(
+            "apt-get update -qq && apt-get install -y -qq --no-install-recommends tcpdump"
+        )
     if rmw_implementation == "rmw_fleetqox_cpp":
         lines.append(
             f"test -f /work/{FLEETQOX_RMW_INSTALL}/setup.bash || "
@@ -269,6 +279,22 @@ def build_shell_script(
                 f"ip netns exec ns{i} ip link set lo up",
             ]
         )
+
+    if capture_pcap_endpoint is not None:
+        capture_index = endpoints.index(capture_pcap_endpoint)
+        # Capture on ftapN -- the actual tap device ns-3's TapBridge reads
+        # from/writes to for this station -- rather than brN or vNbr, so
+        # this sees exactly what's "presented to the TAP boundary" (see
+        # docs/AUDIT_ACCEPTANCE_TRACKING.md "packet capture comparison"),
+        # not just this station's own veth traffic. Started before ns-3
+        # attaches so it captures the whole run including any pre-app
+        # ARP/setup traffic.
+        lines.append(
+            f"tcpdump -i ftap{capture_index} -w {results_dir_container}/capture.pcap "
+            f"> {results_dir_container}/tcpdump.log 2>&1 &"
+        )
+        lines.append("TCPDUMP_PID=$!")
+        lines.append("sleep 1")  # let tcpdump attach before traffic starts
 
     lines.extend(
         [
@@ -519,6 +545,18 @@ def build_shell_script(
             "wait $NS3_PID 2>/dev/null || true",
         ]
     )
+    if capture_pcap_endpoint is not None:
+        lines.append("kill $TCPDUMP_PID 2>/dev/null || true")
+        lines.append("wait $TCPDUMP_PID 2>/dev/null || true")
+        # Dump as text rather than shipping the binary pcap back through
+        # stdout (the container is --rm, so this is the only way to get it
+        # out without `docker cp` before removal) -- -tt for absolute unix
+        # timestamps, needed to align against each endpoint's own
+        # publish_before_wall_ns/publish_after_wall_ns send-timing records.
+        lines.append(
+            f"tcpdump -r {results_dir_container}/capture.pcap -nn -tt "
+            f"> {results_dir_container}/capture.txt 2>/dev/null || true"
+        )
     # The container runs with --rm, so its filesystem (including every
     # endpoint's result JSON and log under results_dir_container)
     # disappears the moment it exits -- print each one to stdout,
@@ -541,6 +579,10 @@ def build_shell_script(
         lines.append(f"echo FLEETQOX_TAP_RESULT_BEGIN:{endpoint}")
         lines.append(f"cat {shlex.quote(result_json)} 2>/dev/null || true")
         lines.append(f"echo; echo FLEETQOX_TAP_RESULT_END:{endpoint}")
+    if capture_pcap_endpoint is not None:
+        lines.append("echo FLEETQOX_TAP_CAPTURE_BEGIN")
+        lines.append(f"cat {results_dir_container}/capture.txt 2>/dev/null || true")
+        lines.append("echo; echo FLEETQOX_TAP_CAPTURE_END")
     lines.append("echo FLEETQOX_TAP_PROBE_DONE")
     lines.append("exit $ENDPOINT_EXIT")
     return "\n".join(lines)
@@ -565,6 +607,20 @@ def parse_endpoint_results(stdout: str, endpoints: list[str]) -> dict[str, Any]:
         except json.JSONDecodeError:
             results[endpoint] = None
     return results
+
+
+def parse_capture_text(stdout: str) -> str | None:
+    """Pull the tcpdump -nn -tt text dump back out of captured stdout (see
+    build_shell_script's FLEETQOX_TAP_CAPTURE_BEGIN/END markers), or None
+    if --capture-pcap-endpoint wasn't set for this run."""
+
+    begin = "FLEETQOX_TAP_CAPTURE_BEGIN"
+    end = "FLEETQOX_TAP_CAPTURE_END"
+    begin_index = stdout.find(begin)
+    end_index = stdout.find(end)
+    if begin_index == -1 or end_index == -1 or end_index < begin_index:
+        return None
+    return stdout[begin_index + len(begin) : end_index].strip()
 
 
 def run_probe(
@@ -593,6 +649,7 @@ def run_probe(
     ns3_seed: int = 1,
     ns3_run: int = 1,
     artificial_cpu_delay_us: float = 0.0,
+    capture_pcap_endpoint: str | None = None,
 ) -> dict[str, Any]:
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -638,6 +695,7 @@ def run_probe(
         ns3_seed=ns3_seed,
         ns3_run=ns3_run,
         artificial_cpu_delay_us=artificial_cpu_delay_us,
+        capture_pcap_endpoint=capture_pcap_endpoint,
     )
 
     completed = subprocess.run(
@@ -670,7 +728,10 @@ def run_probe(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
-        timeout=max(120.0, sim_duration_s + 60.0),
+        # +30s slack for the on-demand `apt-get install tcpdump` (~10-15s
+        # measured) when a capture is requested, on top of the existing
+        # sim_duration_s-based budget.
+        timeout=max(120.0, sim_duration_s + 60.0 + (30.0 if capture_pcap_endpoint else 0.0)),
     )
 
     endpoint_results = parse_endpoint_results(completed.stdout, endpoints)
@@ -690,6 +751,7 @@ def run_probe(
         "endpoint_results_complete": all(
             endpoint_results.get(endpoint) is not None for endpoint in endpoints
         ),
+        "capture_text": parse_capture_text(completed.stdout),
     }
 
 
