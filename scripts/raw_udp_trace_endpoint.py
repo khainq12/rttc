@@ -86,6 +86,26 @@ def main() -> int:
     parser.add_argument("--summary-json", type=Path, required=True)
     parser.add_argument("--ready-file", type=Path, default=None)
     parser.add_argument("--start-file", type=Path, default=None)
+    parser.add_argument(
+        "--artificial-cpu-delay-us",
+        type=float,
+        default=0.0,
+        help=(
+            "Busy-wait this many microseconds after each sendto() before "
+            "moving to the next scheduled send, simulating FleetRMW's "
+            "measured ~0.25ms-vs-0.038ms per-publish() processing latency "
+            "on this otherwise-identical raw-UDP control. Tests whether "
+            "CPU-side pacing distortion ALONE (with everything else -- "
+            "packet count, wire format, routing -- held at raw-UDP's "
+            "already-100%-delivery baseline) is sufficient to reproduce "
+            "the delivery collapse, isolating latency from every other "
+            "confound in this investigation. See "
+            "docs/AUDIT_ACCEPTANCE_TRACKING.md 'publish-path latency'. "
+            "Uses a busy-loop (time.perf_counter()), not time.sleep(), "
+            "since sleep()'s OS-scheduler granularity (often ~1ms+) can't "
+            "reliably hit sub-millisecond delays this small."
+        ),
+    )
     args = parser.parse_args()
 
     peers = parse_peers(args.peers)
@@ -162,6 +182,10 @@ def main() -> int:
         # compared against.
         before_wall_ns = time.monotonic_ns()
         sock.sendto(payload, (dst_ip, args.port))
+        if args.artificial_cpu_delay_us > 0:
+            deadline = time.perf_counter() + args.artificial_cpu_delay_us / 1e6
+            while time.perf_counter() < deadline:
+                pass
         after_wall_ns = time.monotonic_ns()
         sent.append(row["event_id"])
         send_timing.append(

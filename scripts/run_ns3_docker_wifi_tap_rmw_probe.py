@@ -178,6 +178,7 @@ def build_shell_script(
     extra_rmw_env: dict[str, str] | None = None,
     ns3_seed: int = 1,
     ns3_run: int = 1,
+    artificial_cpu_delay_us: float = 0.0,
 ) -> str:
     ips = {endpoint: f"{BASE_IP_PREFIX}{i + 2}" for i, endpoint in enumerate(endpoints)}
     # ChatGPT-flagged bootstrap-feedback-loop hypothesis (see
@@ -414,7 +415,8 @@ def build_shell_script(
                 f"--start-wait-timeout-s={start_wait_timeout_s} "
                 f"--summary-json={shlex.quote(result_json)} "
                 f"--ready-file={shlex.quote(ready_files[i])} "
-                f"--start-file={shlex.quote(start_file)}"
+                f"--start-file={shlex.quote(start_file)} "
+                f"--artificial-cpu-delay-us={artificial_cpu_delay_us:.12g}"
             )
         else:
             inner = (
@@ -590,6 +592,7 @@ def run_probe(
     extra_rmw_env: dict[str, str] | None = None,
     ns3_seed: int = 1,
     ns3_run: int = 1,
+    artificial_cpu_delay_us: float = 0.0,
 ) -> dict[str, Any]:
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -634,6 +637,7 @@ def run_probe(
         extra_rmw_env=extra_rmw_env,
         ns3_seed=ns3_seed,
         ns3_run=ns3_run,
+        artificial_cpu_delay_us=artificial_cpu_delay_us,
     )
 
     completed = subprocess.run(
