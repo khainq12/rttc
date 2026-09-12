@@ -122,8 +122,26 @@ def build_shell_script(
     num_aps: int = 1,
     isolate_controller: bool = False,
     subscription_aware: bool = False,
+    discovery_timeout_s: float = 15.0,
 ) -> str:
     ips = {endpoint: f"{BASE_IP_PREFIX}{i + 2}" for i, endpoint in enumerate(endpoints)}
+    # ChatGPT-flagged bootstrap-feedback-loop hypothesis (see
+    # docs/AUDIT_ACCEPTANCE_TRACKING.md "discovery-convergence experiment"):
+    # subscription-aware routing's fail-open fallback (broadcast when no
+    # subscriber is known YET) means a discovery timeout that's too short
+    # for 19-endpoint wifi contention could itself be causing a self-
+    # sustaining overload -- discovery doesn't converge in time -> every
+    # publish stays a full broadcast -> more contention -> discovery
+    # converges even later. Deriving the orchestrator's own ready/start
+    # deadlines FROM discovery_timeout_s (instead of the fixed constants)
+    # lets a much longer discovery_timeout_s actually be given the room to
+    # matter, rather than being cut short by an unrelated outer timeout.
+    # +15/+30 margins match the original fixed constants exactly at the
+    # default discovery_timeout_s=15.0 (ready_deadline_s=30,
+    # start_wait_timeout_s=60), so nothing changes for any existing call
+    # site that doesn't pass a longer discovery_timeout_s explicitly.
+    ready_deadline_s = max(READY_DEADLINE_S, int(discovery_timeout_s) + 15)
+    start_wait_timeout_s = ready_deadline_s + 30
 
     lines: list[str] = [
         "set -e",
@@ -277,7 +295,8 @@ def build_shell_script(
             f"--policy={shlex.quote(policy)} "
             f"--start-offset-ms={start_offset_ms:.12g} "
             f"--drain-s={drain_s:.12g} "
-            f"--start-wait-timeout-s={START_WAIT_TIMEOUT_S} "
+            f"--discovery-timeout-s={discovery_timeout_s:.12g} "
+            f"--start-wait-timeout-s={start_wait_timeout_s} "
             f"--summary-json={shlex.quote(result_json)} "
             f"--ready-file={shlex.quote(ready_files[i])} "
             f"--start-file={shlex.quote(start_file)}"
@@ -299,7 +318,7 @@ def build_shell_script(
             # process on --start-file until all of them have signalled
             # --ready-file, then release them together.
             "# --- wait for every endpoint to finish discovery, then release them together ---",
-            f"READY_DEADLINE=$(( $(date +%s) + {READY_DEADLINE_S} ))",
+            f"READY_DEADLINE=$(( $(date +%s) + {ready_deadline_s} ))",
             "READY_TIMED_OUT=0",
             "while true; do",
             "  MISSING=0",
@@ -417,6 +436,7 @@ def run_probe(
     num_aps: int = 1,
     isolate_controller: bool = False,
     subscription_aware: bool = False,
+    discovery_timeout_s: float = 15.0,
 ) -> dict[str, Any]:
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -449,6 +469,7 @@ def run_probe(
         num_aps=num_aps,
         isolate_controller=isolate_controller,
         subscription_aware=subscription_aware,
+        discovery_timeout_s=discovery_timeout_s,
     )
 
     completed = subprocess.run(
@@ -574,6 +595,21 @@ def main() -> int:
             "See docs/AUDIT_ACCEPTANCE_TRACKING.md 'data-plane fanout'."
         ),
     )
+    parser.add_argument(
+        "--discovery-timeout-s",
+        type=float,
+        default=15.0,
+        help=(
+            "Per-endpoint max wait for its own subscription discovery to "
+            "converge before publishing starts regardless (fleetqox_rmw_"
+            "trace_endpoint.py's own flag). The orchestrator's ready/start "
+            "deadlines scale up with this automatically. Added to test a "
+            "ChatGPT-flagged bootstrap-feedback-loop hypothesis: does "
+            "delivery recover if discovery is given long enough to fully "
+            "converge before any application data is sent? See "
+            "docs/AUDIT_ACCEPTANCE_TRACKING.md."
+        ),
+    )
     args = parser.parse_args()
 
     summary = run_probe(
@@ -590,6 +626,7 @@ def main() -> int:
         num_aps=max(args.num_aps, 1),
         isolate_controller=args.isolate_controller,
         subscription_aware=args.subscription_aware,
+        discovery_timeout_s=max(args.discovery_timeout_s, 0.1),
     )
     summary_path = ROOT / args.summary_json
     summary_path.parent.mkdir(parents=True, exist_ok=True)
