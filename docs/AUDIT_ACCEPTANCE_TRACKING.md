@@ -2921,6 +2921,56 @@ target-lookup vs sendto() thật) trước khi sửa bất kỳ dòng code nào 
 `scripts/fleetqox_rmw_trace_endpoint.py`
 (`fleetqox_publish_stage_metrics`).
 
+### 12/09/2026 (tiếp) — Tách nhỏ transport_send: sendto() thật là thủ phạm (103µs vs 38µs raw-UDP); tìm ra 2 ứng viên cụ thể
+
+Tách `transport_send` thành 3 giai đoạn con: `decode` (giải mã lại
+frame vừa encode), `target_lookup` (tra cứu subscription-aware
+routing), `sendto_syscall` (vòng lặp gọi `::sendto()` thật).
+
+**Kết quả** (16-robot, seed=42/run=1, 2327 lần publish):
+- `decode`: mean=47.17µs, max=214.22µs
+- `target_lookup`: mean=3.63µs, max=42.49µs (**nhỏ — routing KHÔNG phải
+  vấn đề**)
+- `sendto_syscall`: mean=**103.53µs**, max=857.19µs
+
+**Đính chính một phép tính sai trước đó**: số liệu "trung bình 4 target
+mỗi lần gửi" ở mục trước là SAI — tính trung bình KHÔNG trọng số qua 19
+endpoint, trong khi nhiều endpoint chỉ gửi 5-8 lần (một lần fallback-
+broadcast hiếm cũng đủ kéo trung bình mẫu nhỏ lên rất cao). Tính lại có
+trọng số theo số lần gửi thực tế: trung bình toàn hệ thống là **1.23
+target/lần gửi**, và `fleet_controller` (71% tổng traffic) chỉ **1.02**
+— khớp đúng với kết luận "1.02x amplification" đã có trước đó, KHÔNG
+có gì thay đổi ở kết luận đó.
+
+**Đọc code `send_datagram_to_targets()` tìm được 2 ứng viên cụ thể cho
+103.53µs** (raw-UDP không có ứng viên nào trong 2 cái này):
+1. `drain_udp_pmtu_error_queue()` được gọi VÔ ĐIỀU KIỆN ở đầu MỖI lần
+   gửi, TRƯỚC `sendto()` thật — vòng lặp `for(;;)` gọi
+   `::recvmsg(fd_, &msg, MSG_ERRQUEUE | MSG_DONTWAIT)` cho tới khi rỗng,
+   để kiểm tra lỗi ICMP "cần fragment" từ các lần gửi trước. Dù không
+   block, đây vẫn là MỘT SYSCALL THẬT THÊM mỗi lần gửi mà raw-UDP không
+   hề có.
+2. Toàn bộ vòng lặp gửi tới từng target được bọc trong
+   `std::lock_guard<std::mutex> lock(udp_send_mutex_)` — mutex THỨ BA,
+   khác với `g_bus_mutex` và `peer_subscription_mutex_` đã profile —
+   CHƯA đo thời gian chờ mutex NÀY, có thể có tranh chấp với thread nền
+   khác (fragment sender, retransmit/repair) cũng gửi qua cùng mutex.
+
+**Đã loại trừ 1 ứng viên**: có `pace_udp_send_locked()` gọi trước mỗi
+`sendto()`, điều khiển bởi `FLEETQOX_RMW_UDP_SEND_PACING_US` — nhưng
+mặc định là 0 (tắt) và chưa từng được set trong bất kỳ cấu hình thử
+nghiệm nào phiên này, nên chắc chắn không phải nguyên nhân.
+
+**Đã gửi phát hiện này cho ChatGPT, hỏi có nên đo thời gian chờ
+`udp_send_mutex_` cụ thể trước, hay coi `drain_udp_pmtu_error_queue()`
+đã đủ bằng chứng để thử bỏ/giảm tần suất (vd: chuyển sang thread nền
+định kỳ thay vì đồng bộ mỗi lần gửi) rồi đo lại delivery** — đang chờ
+phản hồi.
+
+**File thay đổi**: `ros2_ws/src/rmw_fleetqox_cpp/src/rmw_pubsub.cpp`
+(3 `PublishStage` con mới: `kTransportDecode`, `kTransportTargetLookup`,
+`kTransportSendtoSyscall`, cùng bộ đếm target-count).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
