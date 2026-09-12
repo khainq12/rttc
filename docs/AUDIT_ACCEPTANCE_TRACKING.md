@@ -1929,6 +1929,69 @@ nhận gói, counter mới), `scripts/fleetqox_rmw_trace_endpoint.py`
 (counter mới), `scripts/run_ns3_docker_wifi_tap_rmw_probe.py`
 (`--subscription-aware`).
 
+### 11/09/2026 (tiếp) — Thí nghiệm quyết định của ChatGPT: bác bỏ giả thuyết "bootstrap feedback loop", đóng dứt điểm nhánh protocol
+
+ChatGPT đưa ra chẩn đoán sắc hơn sau khi thấy fallback=100%: nghi ngờ
+đây là **vòng lặp phản hồi dương lúc bootstrap**, không phải giới hạn
+vật lý tuyệt đối —
+
+```
+discovery chưa hội tụ → subscription-aware fail-open → broadcast toàn bộ
+→ traffic tăng → contention tăng → discovery càng khó hội tụ hơn
+→ bảng subscription vẫn rỗng → mọi publish tiếp tục broadcast
+→ tự khóa vào trạng thái quá tải vĩnh viễn
+```
+
+Đề xuất thí nghiệm "Case C": cho discovery đủ thời gian hội tụ THẬT SỰ
+(không dùng timeout cố định 15s) trước khi bật publish, rồi đo lại. Nếu
+delivery hồi phục mạnh → xác nhận đây là bug bootstrap sửa được. Nếu
+vẫn ≈0 → xác nhận dứt điểm đây là giới hạn năng lực kênh thật.
+
+**Implement**: thêm `--discovery-timeout-s` vào orchestrator, tính lại
+`ready_deadline_s`/`start_wait_timeout_s` theo giá trị này (giữ nguyên
+hành vi cũ ở mặc định 15s, chỉ thay đổi khi truyền giá trị lớn hơn).
+Chạy 16-robot với `--discovery-timeout-s=120` (gấp 8 lần), `--subscription-aware`.
+
+**Kết quả — bác bỏ giả thuyết bootstrap feedback loop**:
+- Fallback ratio giảm từ **100% → 87.8%** (2044/2327) — xác nhận
+  discovery CÓ hội tụ một phần khi cho thêm thời gian (một số robot đạt
+  targeted-send thật: `robot_0000` 27/88≈31% fallback, `robot_0003`
+  21/56≈37%, `robot_0005` 21/59≈36% — so với 100% trước đó).
+- NHƯNG **`rx` vẫn = 0 tuyệt đối trên toàn bộ 2289 message** — không
+  một tin nào tới nơi, dù chạy dài hơn nhiều (19 snapshot so với 6-7
+  trước đó) và có nhiều lần gửi ĐÚNG targeted (không phải fallback)
+  hơn hẳn.
+- `phy_rx_drop_total` tăng lên **1899236** (do chạy dài hơn ~3-4 lần)
+  nhưng tỷ lệ collision-drop (`BUSY_DECODING_PREAMBLE`+
+  `PREAMBLE_DETECT_FAILURE`) giữ nguyên **~82%** — y hệt mọi biến thể
+  đã thử trong toàn bộ phiên.
+
+**Kết luận (khớp chính xác nhánh ChatGPT tự dự đoán cho "Case C vẫn
+≈0")**: đây KHÔNG phải bootstrap feedback loop có thể sửa bằng cách
+chờ lâu hơn hay targeting tốt hơn. Cho dù discovery hội tụ tốt hơn
+(fallback giảm gần 1 nửa) và nhiều tin nhắn hơn được gửi ĐÚNG đích,
+kênh vẫn không tải nổi dù chỉ 1 trong 2289 tin. Đây là bằng chứng mạnh
+nhất, trực tiếp nhất trong toàn bộ phiên rằng **workload thực tế của
+19 endpoint vượt hẳn năng lực airtime khả dụng của kênh**, độc lập
+hoàn toàn với: retry logic, graph discovery design, data-plane fanout,
+hay tốc độ hội tụ discovery. Theo đúng lời ChatGPT: đến đây nên dừng
+tối ưu tầng protocol, chuyển hẳn sang tầng topology/capacity (nhiều AP
+cell độc lập thật + backbone có dây, chuẩn wifi băng thông rộng hơn
+802.11g, traffic admission control, QoS/class separation).
+
+**Tổng kết TOÀN BỘ nhánh "16-robot delivery collapse"** (khép lại sau
+khi đã thử: retry-fix, graph-renewal-interval, multi-AP round-robin,
+cô lập sender nặng nhất, graph-discovery B+ redesign, subscription-aware
+data-plane fanout, và thí nghiệm discovery-timeout dài — 7 hướng độc
+lập, có cộng dồn một phần, đều xác nhận qua đo đạc thật): **nút thắt
+là năng lực vật lý của kênh 802.11g đơn-AP ở workload 19-endpoint này,
+không phải bất kỳ lỗi hay thiết kế giao thức cụ thể nào đã tìm được.**
+Mọi tối ưu protocol đã thử đều giảm được tải/collision ở mức độ nào đó
+nhưng KHÔNG hướng nào (kể cả kết hợp) đưa delivery vượt quá ~0.04%.
+
+**File thay đổi**: `scripts/run_ns3_docker_wifi_tap_rmw_probe.py`
+(`--discovery-timeout-s`, tính lại ready/start deadline).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
