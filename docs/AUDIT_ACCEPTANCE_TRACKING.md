@@ -2570,6 +2570,58 @@ nhiễu lập lịch OS theo cách khác JSON, một câu hỏi mở chưa đư�
 **File thay đổi**: (đã liệt kê ở mục trước — `--seed`/`--run` thêm vào
 cùng lần với `fleetqox_trace_replay_tap.cc`).
 
+### 12/09/2026 (tiếp) — Điểm dừng (checkpoint) đã thống nhất với ChatGPT
+
+Sau chuỗi thí nghiệm dài, ChatGPT đồng ý đây là điểm dừng hợp lý cho
+phiên làm việc này, với phân loại rõ 2 nhóm kết quả:
+
+**Nhóm 1 — Kết luận nhân quả lớn, KHÔNG bị ảnh hưởng bởi variance mới
+phát hiện** (chênh lệch hiệu ứng quá lớn so với ~20 điểm % nhiễu quan
+sát được):
+- Traffic discovery/control-plane (không phải dữ liệu ứng dụng) là
+  nguyên nhân chính gây sập delivery ở quy mô 16-robot/19-endpoint.
+  Xác nhận qua chuỗi bằng chứng độc lập: raw-UDP (không discovery) đạt
+  95-100% trên ĐÚNG hạ tầng TapBridge/netns/RealtimeSimulatorImpl; cả 3
+  middleware thật (FleetRMW, Fast DDS, Cyclone DDS) đều sập về 0%; và
+  quyết định nhất — Fast DDS chạy discovery-only (zero traffic ứng
+  dụng) tái tạo gần như y hệt mức collision/mac_tx của bản đầy đủ.
+- `FLEETQOX_RMW_STATIC_MODE` (loại bỏ traffic discovery bằng cách khai
+  báo tĩnh subscription map) là FIX THẬT, đã đưa delivery ra khỏi sàn
+  0% một cách nhất quán qua nhiều lần chạy độc lập (dao động 9.5%-29.4%
+  tuỳ lần, nhưng LUÔN > 0%, không bao giờ quay lại sập hoàn toàn).
+
+**Nhóm 2 — Kết quả tinh vi hơn, CẦN xác nhận lại bằng nhiều lần lặp,
+KHÔNG nên trích dẫn con số cụ thể cho tới khi có đủ mẫu**:
+- Con số "29.4%" của static-mode không còn nên coi là con số đại diện
+  (representative) — chỉ nên nói "static-mode đưa delivery ra khỏi sàn
+  0% một cách nhất quán", không chốt một % cụ thể.
+- "Retry giúp ích" (29.4% → 10.0% khi tắt) vẫn là hướng đáng tin (tắt
+  retry luôn làm tệ hơn qua các lần thử), nhưng độ lớn chính xác của lợi
+  ích chưa được đo với đủ replicate.
+- `compact_v1` (giảm 50.4% kích thước gói tin, xác nhận chắc chắn bằng
+  đo trực tiếp): lợi ích lên delivery hiện tại là "có xu hướng dương
+  (+7.6 điểm % trung bình ở seed cố định) nhưng CHƯA đạt ý nghĩa thống
+  kê" (t~1.32, n=5 mỗi nhóm) — trạng thái đúng đắn để mô tả: **"tối ưu
+  hoá wire-format đã được chứng minh; lợi ích lên delivery đang chờ xác
+  nhận thống kê"**, không phải "đã chứng minh compact_v1 tốt hơn".
+
+**Việc còn lại cho phiên làm việc tiếp theo** (đã thống nhất, chưa làm
+trong phiên này):
+1. Chạy ≥10 cặp so khớp JSON/compact_v1 luân phiên thứ tự theo từng
+   `--run` (vd: run 1: JSON rồi compact; run 2: compact rồi JSON...) để
+   có khoảng tin cậy 95% đủ hẹp cho $\Delta$delivery trung bình.
+2. Đo riêng "first-attempt success" (thành công lần gửi đầu) tách khỏi
+   "eventual success nhờ retry" — theo ChatGPT đây có thể là tín hiệu
+   nhạy hơn để phát hiện lợi ích của compact_v1, vì retry có thể che bớt
+   khác biệt ở tầng first-attempt.
+3. Điều tra tại sao `compact_v1` co cụm variance kém hơn JSON dưới CÙNG
+   seed cố định (có thể do đường gửi nhanh hơn tương tác khác với OS
+   jitter) — ChatGPT khuyến nghị chỉ điều tra sau khi có đủ replicate
+   xác nhận hiện tượng này không phải nhiễu mẫu nhỏ (n=5 hiện tại có thể
+   chính nó là artifact).
+4. Cân nhắc thêm CPU affinity riêng cho tiến trình ns-3 và tiến trình
+   endpoint để giảm (không phải loại bỏ) nhiễu OS-jitter còn lại.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
