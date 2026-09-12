@@ -424,7 +424,18 @@ enum class PublishStage : size_t
   kMutexWait = 2,
   kMutexHold = 3,
   kTransportSend = 4,
-  kCount = 5,
+  // Sub-stages of kTransportSend, added after profiling showed it was
+  // ~75% of total publish time with no visibility into WHY -- see
+  // docs/AUDIT_ACCEPTANCE_TRACKING.md "publish-path latency profiling".
+  // Split out send_frame_with_qos()'s redundant re-decode of the frame it
+  // just encoded, the routing/subscription-aware target lookup, and the
+  // actual sendto() syscall(s), since each points at a different fix
+  // (dead code removal, an O(1) routing cache, vs kernel/socket-option
+  // differences from raw UDP).
+  kTransportDecode = 5,
+  kTransportTargetLookup = 6,
+  kTransportSendtoSyscall = 7,
+  kCount = 8,
 };
 
 struct PublishStageStats
@@ -459,6 +470,21 @@ bool publish_stage_profiling_enabled()
 {
   static const bool enabled = std::getenv("FLEETQOX_RMW_PUBLISH_STAGE_PROFILING") != nullptr;
   return enabled;
+}
+
+// Per-send target/peer counts (not a duration, so tracked separately from
+// PublishStageStats) -- ChatGPT-suggested check for whether the target-
+// lookup/send-loop cost scales with fleet size (O(peers) routing) rather
+// than being a fixed per-call cost.
+std::atomic<std::uint64_t> g_transport_target_count_sum{0};
+std::atomic<std::uint64_t> g_transport_target_count_calls{0};
+std::atomic<std::uint64_t> g_transport_peer_addresses_size{0};
+
+void record_transport_target_count(size_t target_count, size_t peer_addresses_size)
+{
+  g_transport_target_count_sum.fetch_add(target_count, std::memory_order_relaxed);
+  g_transport_target_count_calls.fetch_add(1, std::memory_order_relaxed);
+  g_transport_peer_addresses_size.store(peer_addresses_size, std::memory_order_relaxed);
 }
 
 // Retires `entry` into `data`'s pool (bounded by kRetiredRetransmitEntryPoolCap)
@@ -2549,13 +2575,22 @@ public:
       return RMW_RET_OK;
     }
 
+    const bool profiling = publish_stage_profiling_enabled();
+    const std::int64_t sub_t0 = profiling ? monotonic_timestamp_ns() : 0;
     const std::optional<rmw_fleetqox_cpp::DataFrame> data_frame =
       rmw_fleetqox_cpp::decode_data_frame(encoded_frame);
+    const std::int64_t sub_t1 = profiling ? monotonic_timestamp_ns() : 0;
     const bool is_data_frame = data_frame.has_value();
     const bool include_udp_local = !shared_memory_active();
     const std::vector<sockaddr_in> targets =
       is_data_frame ? data_frame_targets(include_udp_local, qos, data_frame) :
       frame_targets(include_udp_local);
+    const std::int64_t sub_t2 = profiling ? monotonic_timestamp_ns() : 0;
+    if (profiling) {
+      record_publish_stage(PublishStage::kTransportDecode, sub_t1 - sub_t0);
+      record_publish_stage(PublishStage::kTransportTargetLookup, sub_t2 - sub_t1);
+      record_transport_target_count(targets.size(), peer_addresses_.size());
+    }
     if (targets.empty() && !shared_memory_only() && !quic_gateway_enabled) {
       RMW_SET_ERROR_MSG("socket transport has no local or peer target for frame");
       return RMW_RET_ERROR;
@@ -2569,7 +2604,11 @@ public:
         send_ret = send_quic_gateway_payload(encoded_frame);
       }
       if (send_ret == RMW_RET_OK && !shared_memory_only()) {
+        const std::int64_t sub_t3 = profiling ? monotonic_timestamp_ns() : 0;
         send_ret = send_payload_to_targets(encoded_frame, targets, "FleetRMW frame");
+        if (profiling) {
+          record_publish_stage(PublishStage::kTransportSendtoSyscall, monotonic_timestamp_ns() - sub_t3);
+        }
       }
       if (send_ret == RMW_RET_OK) {
         frames_sent_.fetch_add(1, std::memory_order_relaxed);
@@ -14703,6 +14742,21 @@ std::uint64_t rmw_fleetqox_cpp_publish_stage_max_ns(int stage)
     return 0;
   }
   return g_publish_stage_stats[static_cast<size_t>(stage)].max_ns.load(std::memory_order_relaxed);
+}
+
+std::uint64_t rmw_fleetqox_cpp_transport_target_count_sum()
+{
+  return g_transport_target_count_sum.load(std::memory_order_relaxed);
+}
+
+std::uint64_t rmw_fleetqox_cpp_transport_target_count_calls()
+{
+  return g_transport_target_count_calls.load(std::memory_order_relaxed);
+}
+
+std::uint64_t rmw_fleetqox_cpp_transport_peer_addresses_size()
+{
+  return g_transport_peer_addresses_size.load(std::memory_order_relaxed);
 }
 
 std::uint64_t rmw_fleetqox_cpp_socket_frames_received()

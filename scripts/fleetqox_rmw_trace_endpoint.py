@@ -105,7 +105,16 @@ def fleetqox_publish_stage_metrics(library: "ctypes.CDLL") -> dict[str, Any]:
     isolation investigation into FleetRMW's ~6.4x slower publish() call
     vs raw UDP's sendto() (see docs/AUDIT_ACCEPTANCE_TRACKING.md
     'publish-path latency profiling')."""
-    stage_names = ("encode", "subscription_lookup", "mutex_wait", "mutex_hold", "transport_send")
+    stage_names = (
+        "encode",
+        "subscription_lookup",
+        "mutex_wait",
+        "mutex_hold",
+        "transport_send",
+        "transport_decode",
+        "transport_target_lookup",
+        "transport_sendto_syscall",
+    )
     stages: dict[str, Any] = {}
     for index, name in enumerate(stage_names):
         sum_fn = library.rmw_fleetqox_cpp_publish_stage_sum_ns
@@ -125,6 +134,15 @@ def fleetqox_publish_stage_metrics(library: "ctypes.CDLL") -> dict[str, Any]:
             "max_ns": int(max_fn(index)),
             "mean_ns": sum_ns / count if count else 0.0,
         }
+    target_count_sum = library.rmw_fleetqox_cpp_transport_target_count_sum
+    target_count_sum.restype = ctypes.c_uint64
+    target_count_calls = library.rmw_fleetqox_cpp_transport_target_count_calls
+    target_count_calls.restype = ctypes.c_uint64
+    peer_addresses_size = library.rmw_fleetqox_cpp_transport_peer_addresses_size
+    peer_addresses_size.restype = ctypes.c_uint64
+    calls = int(target_count_calls())
+    stages["_target_count_mean"] = (int(target_count_sum()) / calls) if calls else 0.0
+    stages["_peer_addresses_size"] = int(peer_addresses_size())
     return stages
 
 
