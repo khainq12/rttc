@@ -3294,6 +3294,115 @@ hook vào `decode_data_frame()`'s dispatch); `.../src/rmw_pubsub.cpp`
 `LoopbackSocketTransport::resolve_static_min_v1_topic_hash()`, đăng ký
 resolver trong `start()`, nhánh encode mới trong `publish_payload()`).
 
+### 13/09/2026 — Kịch bản mô phỏng theo sơ đồ tham chiếu: kiến trúc Docker-per-container + ns-3, xác nhận chạy đúng ở quy mô đầy đủ 17 endpoint (S1 baseline)
+
+Theo yêu cầu người dùng (bỏ hạ tầng 19-endpoint cũ, xây kịch bản mới
+khớp đúng sơ đồ tham chiếu: 1 Control Station (gộp Controller+Operator
+UI) + 16 robot = 17 endpoint, mỗi endpoint là 1 container Docker riêng
+(không phải network namespace bên trong 1 container chung như hạ tầng
+cũ), mạng vẫn mô phỏng bằng ns-3, đủ 4 kịch bản S1-S4).
+
+**Ràng buộc kỹ thuật cốt lõi phát hiện ngay từ đầu**: tiến trình
+orchestrator (chạy trực tiếp trên host, user thường `ubuntu`) KHÔNG có
+quyền `CAP_NET_ADMIN`/`CAP_SYS_ADMIN` — xác nhận bằng thực nghiệm
+(`ip netns add` báo lỗi "mount --make-shared /run/netns failed:
+Operation not permitted"). Vì vậy việc nối mạng CHÉO giữa các container
+Docker riêng biệt (mỗi container tự có network namespace riêng, không
+thể dùng `ip netns exec <tên>` như hạ tầng cũ) phải thực hiện qua một
+container "rigger" đặc quyền:
+
+```
+docker run -d --pid=host --cap-add=NET_ADMIN --cap-add=SYS_ADMIN \
+  --device=/dev/net/tun <image> "sleep infinity"
+```
+
+`--pid=host` cho container rigger THẤY được PID của MỌI container khác
+trên cùng host (dù chúng là container độc lập) — từ đó
+`nsenter -t <PID> -n -- <lệnh>` có thể "chui vào" network namespace của
+BẤT KỲ container nào để tạo veth/tap/bridge, giống hệt logic
+`ip netns exec` của hạ tầng cũ, chỉ khác điểm truy cập.
+
+**Kiến trúc cuối cùng** (đã xác nhận chạy đúng — xem
+`scripts/run_ns3_docker_container_fleet_probe.py`):
+- 1 container/endpoint (`control_station`, `robot_0000..15`),
+  `--network=none --init`, cài thật FleetRMW/ROS2.
+- 1 container `ns3sim` chạy binary ns-3 TapBridge đã biên dịch
+  (`fleetqox_trace_replay_tap.cc`), mô phỏng 1 AP + 17 STA.
+- 1 container `rigger` (mô tả trên) chỉ dùng để nối mạng, không chạy gì
+  khác.
+- Với mỗi endpoint: 1 cặp veth, một đầu vào netns của `ns3sim` (bridge
+  vào 1 tap riêng cho station đó), đầu kia vào netns của chính container
+  endpoint đó (đổi tên `eth0`, gán MAC/IP) — y hệt sơ đồ bridge/tap của
+  hạ tầng cũ, chỉ thực hiện qua `nsenter` thay vì `ip netns exec`.
+
+**5 lỗi thật đã gặp và sửa trong quá trình xây dựng** (ghi lại đầy đủ vì
+đây là hạ tầng hoàn toàn mới, chưa qua kiểm chứng trước đó):
+
+1. **Entrypoint quoting**: image có `ENTRYPOINT ["/bin/bash", "-lc"]`,
+   truyền `"sleep", "infinity"` như 2 tham số riêng khiến bash hiểu sai
+   (`sleep: missing operand`) — phải truyền `"sleep infinity"` như MỘT
+   chuỗi duy nhất.
+2. **tap-creator symlink**: giống hệt vấn đề đã biết ở hạ tầng cũ — path
+   baked-in trong `libns3-tap-bridge.so` không khớp nơi cài thật, cần
+   symlink động qua `strings`/`find` TRƯỚC khi chạy binary ns-3 (đã tái
+   sử dụng đúng đoạn code).
+3. **`LogDistancePropagationLossModel` sai tần số tham chiếu (lỗi nghiêm
+   trọng nhất)**: giá trị `ReferenceLoss` mặc định của ns-3 (46.6777dB)
+   được tính cho ~5.15GHz, KHÔNG phải 2.4GHz thật của 802.11g — với
+   bán kính vòng tròn 7.5m theo đúng sơ đồ (worst-case 2 trạm cách nhau
+   15m), cấu hình mặc định cho **0% delivery tuyệt đối** trong thí
+   nghiệm 2-trạm cô lập (xác nhận qua kiểm tra `/proc/net/arp` — ARP
+   không bao giờ resolve). Tính lại Friis reference loss đúng cho
+   2.4GHz (~40.05dB, thấp hơn mặc định ~6.6dB) và set tường minh — sau
+   đó gói tin đi qua bình thường ở đúng bán kính 7.5m. Đây là lỗi hoàn
+   toàn ẩn nếu không tự tay đo bằng 1 gói UDP đơn lẻ trước khi tin vào
+   kết quả quy mô lớn.
+4. **`check=False` thiếu trong vòng lặp chờ ready-gate**: lần polling
+   ĐẦU TIÊN (khi file ready chưa tồn tại) khiến lệnh `docker exec` trả
+   về exit code khác 0 → hàm `docker()` (mặc định `check=True`) NÉM lỗi
+   ngay lập tức thay vì tiếp tục vòng lặp chờ — làm mọi lần chạy tưởng
+   như "timeout" chỉ sau đúng 1 lần kiểm tra đầu tiên.
+5. **`pgrep -f` tự khớp chính nó (lỗi tinh vi nhất)**: `wait_for_completion()`
+   ban đầu dùng `docker exec <container> bash -lc "pgrep -f
+   fleetqox_rmw_trace_endpoint.py && echo RUNNING"` để kiểm tra tiến
+   trình còn sống — nhưng CHÍNH chuỗi lệnh kiểm tra đó (đối số `-lc` của
+   bash) CHỨA nguyên văn "fleetqox_rmw_trace_endpoint.py", nên `pgrep -f`
+   (khớp theo toàn bộ cmdline) khớp luôn với tiến trình bash ĐANG CHẠY
+   LỆNH KIỂM TRA — báo "RUNNING" vĩnh viễn dù tiến trình thật đã kết
+   thúc từ lâu (xác nhận trực tiếp: chạy `pgrep -f
+   fleetqox_rmw_trace_endpoint.py` trong container chỉ có
+   `python3 -c "sleep(2)"` đang chạy — không liên quan gì — vẫn in ra
+   "RUNNING"). Sửa bằng cách kiểm tra sự tồn tại của file
+   `--summary-json` (tín hiệu hoàn thành thật) thay vì dò tiến trình.
+
+**Kết quả xác nhận cuối cùng**:
+- Quy mô nhỏ (3 container: control_station + 2 robot): tx=284/rx=142,
+  tx=89/rx=108, tx=67/rx=98 — pass sạch, `status: ok`.
+- **Quy mô đầy đủ (17 container: control_station + 16 robot, S1
+  baseline, seed=42/run=1, cùng trace 2289 message đã dùng suốt phiên
+  này)**: `status: ok`, `tx_total=2289` (khớp chính xác), **delivery =
+  25.1%** (575/2289) — cùng bậc độ lớn với mọi kết quả đo được ở hạ tầng
+  CŨ sau các fix đã áp dụng trong phiên này (~18-25%), một phép đối
+  chiếu chéo tốt cho thấy kiến trúc MỚI hoạt động nhất quán, không phải
+  ngẫu nhiên may mắn.
+
+**Còn thiếu (chưa làm, không tự nhận là xong)**: kịch bản S2 (thay đổi
+khoảng cách), S3 (di chuyển waypoint thật — hiện `fleetqox_trace_replay_tap.cc`
+mới chỉ có chuyển động tiếp tuyến đặt chỗ, ghi rõ trong code là CHƯA
+phải waypoint mobility theo đúng sơ đồ), S4 (stress test tải cao), và
+các metrics latency percentile (p50/p95/p99)/channel utilization theo
+đúng bảng "Metrics Collected" của sơ đồ — đây là các mục việc riêng,
+CHƯA bắt đầu.
+
+**File thay đổi**: `scripts/run_ns3_docker_container_fleet_probe.py`
+(mới — toàn bộ orchestrator kiến trúc container-riêng);
+`external/ns3/fleetqox_trace_replay_tap.cc` (endpoint 1 control_station
+thay 3 vai trò cũ, layout vòng tròn, `pathLossExponent`/`txPowerDbm`/
+`rxSensitivityDbm`/2.4GHz `ReferenceLoss`); `fleetqox/trace.py` (tham số
+`merge_control_station` — remap opt-in, KHÔNG đổi hành vi mặc định của
+các script/test khác đang phụ thuộc 3-role cũ); `tests/test_ns3_docker_container_fleet_probe.py`
+(mới, 11 test cho các hàm thuần Python).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và

@@ -28,12 +28,13 @@
 // devices are named "<tapPrefix><index>" (short, numeric) rather than
 // embedding the endpoint name -- "fleetqox-tap-robot0000" alone would
 // already be 22 characters. Index-to-endpoint order is fixed and must be
-// mirrored exactly by the orchestration script: 0=controller, 1=fleet_router,
-// 2=operator_ui, 3..numRobots+2=robot_0000..robot_{numRobots-1} (matching
-// fleetqox/trace.py's naming). The AP gets no tap device at all (see
-// below). Printed to stdout at startup so the orchestrator can verify agreement
-// instead of relying on two hardcoded copies of the same order staying in
-// sync silently.
+// mirrored exactly by the orchestration script: 0=control_station,
+// 1..numRobots=robot_0000..robot_{numRobots-1} (matching the reference
+// topology's 1 control station + N robots, and fleetqox/trace.py's robot
+// naming). The AP gets no tap device at all (see below). Printed to
+// stdout at startup so the orchestrator can verify agreement instead of
+// relying on two hardcoded copies of the same order staying in sync
+// silently.
 //
 // Copy this file into an ns-3 workspace under scratch/ and run it with:
 //   ./ns3 run "scratch/fleetqox_trace_replay_tap --numRobots=8 --tapPrefix=ftap"
@@ -290,6 +291,17 @@ main(int argc, char* argv[])
   uint32_t numAps = 1;
   uint32_t seed = 1;
   uint32_t run = 1;
+  // Reference-topology PHY/layout parameters (see docs/AUDIT_ACCEPTANCE_TRACKING.md
+  // "kịch bản mô phỏng theo sơ đồ tham chiếu") -- defaults match the
+  // reference diagram's own Simulation Parameters table exactly rather
+  // than ns-3's own WifiPhy defaults (which are a different, unrelated
+  // set of values), so a plain invocation with no PHY flags already
+  // reproduces the documented scenario.
+  std::string layout = "circle";
+  double circleRadius = 7.5;
+  double pathLossExponent = 2.7;
+  double txPowerDbm = 15.0;
+  double rxSensitivityDbm = -82.0;
 
   CommandLine cmd(__FILE__);
   cmd.AddValue("numRobots", "Number of robot stations (plus 3 fixed endpoints)", numRobots);
@@ -363,7 +375,47 @@ main(int argc, char* argv[])
       "get independent statistical replications, per ns-3's own RNG "
       "documentation.",
       run);
+  cmd.AddValue(
+      "layout",
+      "Station placement: 'grid' (original stationSpacing-based grid) or "
+      "'circle' (reference-diagram layout: every station, including the "
+      "control station, placed evenly around a circle of radius "
+      "--circleRadius centered on the AP -- see 'Node Placement' in the "
+      "reference topology diagram).",
+      layout);
+  cmd.AddValue(
+      "circleRadius",
+      "Circle radius in meters when --layout=circle (reference diagram "
+      "specifies 5-10m; only meaningful with --layout=circle).",
+      circleRadius);
+  cmd.AddValue(
+      "pathLossExponent",
+      "LogDistancePropagationLossModel exponent (reference diagram: 2.7 "
+      "for an indoor environment) -- explicitly set rather than left at "
+      "ns-3's own YansWifiChannelHelper::Default() propagation model, "
+      "which is a different model entirely (RangePropagationLossModel), "
+      "not just a different exponent value.",
+      pathLossExponent);
+  cmd.AddValue(
+      "txPowerDbm",
+      "WifiPhy TxPowerStart/TxPowerEnd in dBm (reference diagram: 15 dBm "
+      "for both STA and AP) -- set to a single fixed value on both ends "
+      "of the range since this program never uses ns-3's power-control "
+      "rate-adaptation feature.",
+      txPowerDbm);
+  cmd.AddValue(
+      "rxSensitivityDbm",
+      "WifiPhy RxSensitivity in dBm (reference diagram: -82 dBm).",
+      rxSensitivityDbm);
   cmd.Parse(argc, argv);
+  if (layout != "grid" && layout != "circle")
+  {
+    NS_FATAL_ERROR("--layout must be 'grid' or 'circle', got '" << layout << "'");
+  }
+  if (layout == "circle" && circleRadius <= 0.0)
+  {
+    NS_FATAL_ERROR("--circleRadius must be positive when --layout=circle");
+  }
 
   // Must happen before ANY ns-3 random variable is constructed (every
   // Wifi PHY/MAC backoff/collision random draw included) -- ns-3's own
@@ -397,7 +449,12 @@ main(int argc, char* argv[])
   GlobalValue::Bind("SimulatorImplementationType", StringValue("ns3::RealtimeSimulatorImpl"));
   GlobalValue::Bind("ChecksumEnabled", BooleanValue(true));
 
-  std::vector<std::string> stationEndpointLabels = {"fleet_controller", "fleet_router", "operator_ui"};
+  // Reference-topology endpoint set: ONE control_station (merges the old
+  // fleet_controller/operator_ui roles -- see docs/AUDIT_ACCEPTANCE_TRACKING.md
+  // "kịch bản mô phỏng theo sơ đồ tham chiếu") plus numRobots robots,
+  // matching the diagram's "16 robots + 1 control station, 17 total
+  // endpoints" exactly, instead of the old 3-fixed-role+robots layout.
+  std::vector<std::string> stationEndpointLabels = {"control_station"};
   for (uint32_t i = 0; i < numRobots; ++i)
   {
     char suffix[16];
@@ -512,9 +569,38 @@ main(int argc, char* argv[])
     // top), so distinct channel objects are exactly "fully
     // non-interfering channels," the best case a real multi-AP/
     // multi-channel deployment can achieve.
-    YansWifiChannelHelper channelHelper = YansWifiChannelHelper::Default();
+    // Explicit LogDistancePropagationLossModel rather than
+    // YansWifiChannelHelper::Default()'s own propagation model (a
+    // different model entirely, RangePropagationLossModel -- Default()
+    // only supplies a ConstantSpeedPropagationDelayModel, no loss model
+    // suitable for this scenario), matching the reference diagram's
+    // indoor path-loss exponent exactly.
+    // LogDistancePropagationLossModel's own default ReferenceLoss
+    // (46.6777 dB) is a Friis free-space loss AT 1m calculated for
+    // ~5.15 GHz, not 802.11g's actual 2.4 GHz carrier -- confirmed as a
+    // real bug via a 2-station link-budget test: circleRadius=7.5m (15m
+    // worst-case station separation) delivered ZERO packets with the
+    // default ReferenceLoss, but worked once this was corrected.
+    // Friis reference loss at 1m for 2.4 GHz: 20*log10(4*pi*f/c) =
+    // 20*log10(4*pi*2.4e9/3e8) ~= 40.05 dB -- about 6.6 dB LOWER than
+    // the 5.15 GHz default, meaning every link in this scenario was
+    // suffering ~6.6 dB of unrealistic extra loss versus a physically
+    // accurate 2.4 GHz deployment.
+    constexpr double kReferenceLoss2_4GhzDb = 40.05;
+    YansWifiChannelHelper channelHelper;
+    channelHelper.SetPropagationDelay("ns3::ConstantSpeedPropagationDelayModel");
+    channelHelper.AddPropagationLoss(
+        "ns3::LogDistancePropagationLossModel", "Exponent", DoubleValue(pathLossExponent),
+        "ReferenceLoss", DoubleValue(kReferenceLoss2_4GhzDb));
     YansWifiPhyHelper phy;
     phy.SetChannel(channelHelper.Create());
+    // Reference diagram: Tx power 15 dBm (STA and AP), Rx sensitivity
+    // -82 dBm -- explicit rather than ns-3's own WifiPhy defaults (a
+    // different, unrelated set of values with no connection to this
+    // scenario's spec).
+    phy.Set("TxPowerStart", DoubleValue(txPowerDbm));
+    phy.Set("TxPowerEnd", DoubleValue(txPowerDbm));
+    phy.Set("RxSensitivity", DoubleValue(rxSensitivityDbm));
 
     Ssid ssid = Ssid("fleetqox-wifi-" + std::to_string(g));
     WifiMacHelper mac;
@@ -577,22 +663,69 @@ main(int argc, char* argv[])
     }
   }
 
-  // Same grid-position formula as fleetqox_trace_replay.cc's non-roaming
-  // wifi branch, so station density stays comparable to the raw-UDP test.
   MobilityHelper stationMobility;
-  stationMobility.SetPositionAllocator(
-      "ns3::GridPositionAllocator", "MinX", DoubleValue(0.0), "MinY", DoubleValue(0.0), "DeltaX",
-      DoubleValue(stationSpacing), "DeltaY", DoubleValue(stationSpacing), "GridWidth",
-      UintegerValue(static_cast<uint32_t>(std::ceil(std::sqrt(totalStations)))), "LayoutType",
-      StringValue("RowFirst"));
-  stationMobility.SetMobilityModel("ns3::ConstantVelocityMobilityModel");
-  stationMobility.Install(stations);
-  for (uint32_t i = 0; i < stations.GetN(); ++i)
+  double apX = 0.0;
+  double apY = 0.0;
+  if (layout == "circle")
   {
-    Ptr<ConstantVelocityMobilityModel> model =
-        stations.Get(i)->GetObject<ConstantVelocityMobilityModel>();
-    const double direction = (i % 2 == 0) ? 1.0 : -1.0;
-    model->SetVelocity(Vector(direction * mobilitySpeed, 0.0, 0.0));
+    // Reference-diagram layout: every station (control_station AND every
+    // robot) placed evenly around a circle of --circleRadius centered on
+    // the AP at the origin -- "all nodes within Wi-Fi coverage, robots
+    // placed on a circle" per the diagram's Node Placement panel. Unlike
+    // the grid layout, position here doesn't depend on totalStations'
+    // square root, so density stays constant (same radius) as the fleet
+    // scales, matching a fixed physical deployment radius rather than a
+    // layout that spreads out further for a bigger fleet.
+    Ptr<ListPositionAllocator> circlePositions = CreateObject<ListPositionAllocator>();
+    for (uint32_t i = 0; i < totalStations; ++i)
+    {
+      const double angle = 2.0 * M_PI * static_cast<double>(i) / static_cast<double>(totalStations);
+      circlePositions->Add(
+          Vector(circleRadius * std::cos(angle), circleRadius * std::sin(angle), 0.0));
+    }
+    stationMobility.SetPositionAllocator(circlePositions);
+    stationMobility.SetMobilityModel("ns3::ConstantVelocityMobilityModel");
+    stationMobility.Install(stations);
+    for (uint32_t i = 0; i < stations.GetN(); ++i)
+    {
+      Ptr<ConstantVelocityMobilityModel> model =
+          stations.Get(i)->GetObject<ConstantVelocityMobilityModel>();
+      // Tangential velocity (perpendicular to the station's own radius
+      // vector) rather than grid layout's fixed +/-X direction -- an
+      // outward/inward radial direction would immediately change every
+      // station's distance-to-AP in lockstep, which isn't a meaningful
+      // "stations moving" scenario; tangential motion is the natural
+      // choice for a circular deployment (see kịch bản S3 -- this is a
+      // simple placeholder motion model, not yet the diagram's own
+      // waypoint mobility, which is separate follow-up work).
+      const double angle = 2.0 * M_PI * static_cast<double>(i) / static_cast<double>(totalStations);
+      const double direction = (i % 2 == 0) ? 1.0 : -1.0;
+      model->SetVelocity(Vector(
+          -std::sin(angle) * direction * mobilitySpeed, std::cos(angle) * direction * mobilitySpeed,
+          0.0));
+    }
+  }
+  else
+  {
+    // Original grid-position formula (see fleetqox_trace_replay.cc's
+    // non-roaming wifi branch), kept as an opt-in fallback via
+    // --layout=grid for anything that depended on the old topology.
+    stationMobility.SetPositionAllocator(
+        "ns3::GridPositionAllocator", "MinX", DoubleValue(0.0), "MinY", DoubleValue(0.0), "DeltaX",
+        DoubleValue(stationSpacing), "DeltaY", DoubleValue(stationSpacing), "GridWidth",
+        UintegerValue(static_cast<uint32_t>(std::ceil(std::sqrt(totalStations)))), "LayoutType",
+        StringValue("RowFirst"));
+    stationMobility.SetMobilityModel("ns3::ConstantVelocityMobilityModel");
+    stationMobility.Install(stations);
+    for (uint32_t i = 0; i < stations.GetN(); ++i)
+    {
+      Ptr<ConstantVelocityMobilityModel> model =
+          stations.Get(i)->GetObject<ConstantVelocityMobilityModel>();
+      const double direction = (i % 2 == 0) ? 1.0 : -1.0;
+      model->SetVelocity(Vector(direction * mobilitySpeed, 0.0, 0.0));
+    }
+    apX = std::ceil(std::sqrt(static_cast<double>(totalStations))) * stationSpacing / 2.0;
+    apY = apX;
   }
 
   // All APs sit at the same physical position -- each is on its OWN
@@ -600,15 +733,14 @@ main(int argc, char* argv[])
   // co-location is a realistic dense-deployment pattern here (multiple
   // APs in one room on different channels), and physical placement only
   // matters for propagation loss WITHIN a channel, not across channels.
+  // Circle layout centers the AP at the origin (apX=apY=0.0, set above);
+  // grid layout keeps its original grid-center placement.
   MobilityHelper apMobility;
   apMobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
   apMobility.Install(accessPoints);
-  const double gridWidth =
-      std::ceil(std::sqrt(static_cast<double>(totalStations))) * stationSpacing;
   for (uint32_t g = 0; g < accessPoints.GetN(); ++g)
   {
-    accessPoints.Get(g)->GetObject<MobilityModel>()->SetPosition(
-        Vector(gridWidth / 2.0, gridWidth / 2.0, 0.0));
+    accessPoints.Get(g)->GetObject<MobilityModel>()->SetPosition(Vector(apX, apY, 0.0));
   }
 
   // The AP deliberately gets NO TapBridge: its only job is relaying

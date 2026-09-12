@@ -80,6 +80,7 @@ def generate_trace_events(
     capacity_packets_per_second: int | None = None,
     policies: Iterable[str] | None = None,
     include_non_sent: bool = False,
+    merge_control_station: bool = False,
 ) -> list[dict[str, object]]:
     """Generate trace events for one T0-style workload scenario.
 
@@ -142,6 +143,23 @@ def generate_trace_events(
                 include_non_sent=include_non_sent,
             )
         )
+    if merge_control_station:
+        # Opt-in remap for the reference-topology scenario (see
+        # docs/AUDIT_ACCEPTANCE_TRACKING.md "kịch bản mô phỏng theo sơ đồ
+        # tham chiếu"), which has ONE control station instead of the
+        # original 3 separate fixed roles (fleet_controller/fleet_router/
+        # operator_ui) -- implemented as a post-generation string remap
+        # rather than changing _source_for()/_destination_for() directly,
+        # since those feed the default (non-merged) topology every other
+        # existing script/test in this repo still depends on; this keeps
+        # that default path byte-for-byte unchanged and only affects
+        # callers that explicitly opt in.
+        merged_names = {"fleet_controller", "fleet_router", "operator_ui"}
+        for event in events:
+            if event.get("src") in merged_names:
+                event["src"] = "control_station"
+            if event.get("dst") in merged_names:
+                event["dst"] = "control_station"
     return events
 
 
