@@ -2820,6 +2820,54 @@ sửa). Đang chờ phản hồi.
 `scripts/raw_udp_trace_endpoint.py` (thêm `send_timing` vào kết quả
 JSON — đã liệt kê ở mục trước).
 
+### 12/09/2026 (tiếp) — Thí nghiệm nhân quả sạch nhất: tiêm độ trễ CPU nhân tạo vào raw-UDP — BÁC BỎ giả thuyết "chỉ cần latency là đủ"
+
+ChatGPT đề xuất thí nghiệm rẻ và quyết định nhất: thêm độ trễ CPU nhân
+tạo (busy-wait bằng `time.perf_counter()`, KHÔNG dùng `time.sleep()` vì
+độ chính xác của hệ điều hành cho sleep thường ~1ms+, không đủ mịn cho
+độ trễ nhỏ này) ngay sau `sendto()` trong `raw_udp_trace_endpoint.py`
+(baseline đã đạt 100%), giữ NGUYÊN mọi thứ khác — số lượng gói, định
+dạng gói, routing — chỉ thêm độ trễ xử lý CPU đơn thuần mô phỏng đúng
+mức chênh lệch `publish()` của FleetRMW đã đo (0.247ms trung bình so
+với 0.038ms của raw-UDP).
+
+Thêm `--artificial-cpu-delay-us` vào `raw_udp_trace_endpoint.py`, chạy
+sweep với CÙNG seed=42/run=1:
+
+| Độ trễ thêm | Delivery |
+|---|---|
+| 0µs (baseline) | 100% |
+| 100µs | 100% (2289/2289) |
+| 250µs | 100% (2289/2289) |
+| 500µs | 100% (2289/2289) |
+| **1000µs** | **100% (2289/2289)** |
+
+**Kết quả null hoàn toàn phẳng — BÁC BỎ giả thuyết H1 (độ trễ CPU đơn
+thuần đủ để gây sập)**. Ngay cả 1000µs — gấp 4 lần độ trễ trung bình đo
+được của FleetRMW (0.247ms) và LỚN HƠN cả độ trễ tối đa quan sát được
+(1.472ms) — cũng không ảnh hưởng gì tới delivery của raw-UDP. Nghĩa là
+bản thân việc "giữ CPU lâu hơn trước khi gửi" (dù đúng bằng hoặc hơn
+mức FleetRMW đo được) KHÔNG đủ để tái tạo hiện tượng sập.
+
+**Ý nghĩa**: giả thuyết "publish-path processing latency đơn thuần làm
+méo timing" bị bác bỏ theo cách sạch nhất có thể (thí nghiệm chỉ đổi
+đúng 1 biến). Nghi vấn giờ chuyển sang: có thể không phải "tốn thời
+gian CPU" mà là "tốn thời gian CPU dưới dạng LOCK CONTENTION thực sự"
+(thí nghiệm delay nhân tạo là busy-wait đơn luồng, không tạo tranh chấp
+mutex nào, trong khi FleetRMW thực có `g_bus_mutex` dùng chung — cần
+kiểm tra xem có thread nền nào khác (repair worker, qos_deadline_
+monitor_thread...) vẫn chạy và tranh chấp mutex này ngay cả ở static
+mode hay không) — hoặc một cơ chế hoàn toàn khác chưa được nhắm tới.
+
+**Đã gửi kết quả này cho ChatGPT, hỏi có nên profiling từng giai đoạn
+bên trong `publish_payload()` (mutex wait/hold riêng biệt, ledger scan,
+subscription lookup, encode, syscall) ngay bây giờ hay còn thí nghiệm
+rẻ hơn nên thử trước** — đang chờ phản hồi.
+
+**File thay đổi**: `scripts/raw_udp_trace_endpoint.py`
+(`--artificial-cpu-delay-us`), `scripts/run_ns3_docker_wifi_tap_rmw_probe.py`
+(xuyên suốt tham số này).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
