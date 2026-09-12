@@ -123,6 +123,7 @@ def build_shell_script(
     isolate_controller: bool = False,
     subscription_aware: bool = False,
     discovery_timeout_s: float = 15.0,
+    rmw_implementation: str = "rmw_fleetqox_cpp",
 ) -> str:
     ips = {endpoint: f"{BASE_IP_PREFIX}{i + 2}" for i, endpoint in enumerate(endpoints)}
     # ChatGPT-flagged bootstrap-feedback-loop hypothesis (see
@@ -146,12 +147,15 @@ def build_shell_script(
     lines: list[str] = [
         "set -e",
         f"mkdir -p {shlex.quote(results_dir_container)}",
-        (
+    ]
+    if rmw_implementation == "rmw_fleetqox_cpp":
+        lines.append(
             f"test -f /work/{FLEETQOX_RMW_INSTALL}/setup.bash || "
             f"(echo 'missing {FLEETQOX_RMW_INSTALL}/setup.bash -- run "
             "scripts/run_ros2_relay_rmw_netem_probe.py once first to build "
             "the rmw_fleetqox_cpp colcon install this reuses' >&2 && exit 1)"
-        ),
+        )
+    lines += [
         # Build the ns-3 tap-bridge program fresh every run, matching the
         # existing wifi-parity scripts' compile-on-each-invocation pattern
         # (ns3-tap-bridge is confirmed present in this image already, no
@@ -246,48 +250,64 @@ def build_shell_script(
         # install's setup.bash sourced first (confirmed by the first real
         # run failing with ModuleNotFoundError: No module named 'rclpy'),
         # so wrap everything in an inner `bash -c` to source them.
+        if rmw_implementation == "rmw_fleetqox_cpp":
+            rmw_setup = (
+                f"source /work/{FLEETQOX_RMW_INSTALL}/setup.bash && "
+                "export RMW_IMPLEMENTATION=rmw_fleetqox_cpp "
+                f"FLEETQOX_RMW_BIND=0.0.0.0:{RMW_PORT} FLEETQOX_RMW_PEERS={peers} "
+                # Without these, a first real run showed sends for
+                # oversized payloads (>1472B, e.g. the 2200B perception /
+                # 3500-9000B human_qoe flows) failing outright with
+                # "FleetRMW UDP payload exceeds automatically discovered
+                # path MTU" -- this synthetic bridged-L2 topology has no
+                # real IP router to generate the ICMP "fragmentation
+                # needed" feedback real PMTU discovery relies on, so
+                # explicitly enabling loss-resilient chunking (rather than
+                # relying on reactive PMTU discovery to eventually trigger
+                # it) is required, not just an optimization.
+                f"FLEETQOX_RMW_LOSS_RESILIENT_FRAGMENT_CHUNK_BYTES={fragment_chunk_bytes} "
+                f"FLEETQOX_RMW_UDP_DATAGRAM_BUDGET_BYTES={udp_datagram_budget_bytes} "
+                + (
+                    # Diagnostic knob for the 16-robot-scale delivery-collapse
+                    # investigation (see docs/AUDIT_ACCEPTANCE_TRACKING.md):
+                    # rmw_fleetqox_cpp's own graph-advertisement renewal loop
+                    # re-broadcasts every publisher/subscription to every peer
+                    # on this interval (500ms default), an O(publishers x
+                    # peers) cost per tick and O(N^2) system-wide as peer
+                    # count grows -- unset leaves the RMW's own default.
+                    f"FLEETQOX_RMW_GRAPH_RENEW_INTERVAL_MS={graph_renew_interval_ms} "
+                    if graph_renew_interval_ms is not None else ""
+                )
+                + (
+                    # Opt-in fix for a ChatGPT-flagged gap (see
+                    # docs/AUDIT_ACCEPTANCE_TRACKING.md "data-plane fanout"):
+                    # every OTHER peer_policy_ value, including the RMW's
+                    # default ("all"), sends every published message to every
+                    # configured peer regardless of subscription interest --
+                    # a real O(peers) fanout on every single publish(), not
+                    # just the O(N^2) graph-discovery traffic already reduced.
+                    # A new named policy rather than a changed default, since
+                    # this RMW is shared by many other probes/tests this
+                    # investigation hasn't audited.
+                    "FLEETQOX_RMW_PEER_POLICY=subscription_aware "
+                    if subscription_aware else ""
+                )
+            )
+        else:
+            # Standard ROS2 RMW (e.g. rmw_fastrtps_cpp/Fast DDS,
+            # rmw_cyclonedds_cpp/Cyclone DDS) -- comparison baseline for the
+            # 16-robot-scale wifi investigation (see
+            # docs/AUDIT_ACCEPTANCE_TRACKING.md "DDS comparison"). Already
+            # present in this base ROS2 image, no colcon build needed.
+            # Discovers peers via its own DDS discovery protocol (typically
+            # multicast) instead of a static FLEETQOX_RMW_PEERS list --
+            # this synthetic bridged-L2 TapBridge topology relays multicast
+            # the same way it relays any other broadcast traffic, already
+            # confirmed working for ARP earlier in this investigation.
+            rmw_setup = f"export RMW_IMPLEMENTATION={rmw_implementation} "
         inner = (
             "source /opt/ros/jazzy/setup.bash && "
-            f"source /work/{FLEETQOX_RMW_INSTALL}/setup.bash && "
-            "export RMW_IMPLEMENTATION=rmw_fleetqox_cpp "
-            f"FLEETQOX_RMW_BIND=0.0.0.0:{RMW_PORT} FLEETQOX_RMW_PEERS={peers} "
-            # Without these, a first real run showed sends for
-            # oversized payloads (>1472B, e.g. the 2200B perception /
-            # 3500-9000B human_qoe flows) failing outright with
-            # "FleetRMW UDP payload exceeds automatically discovered
-            # path MTU" -- this synthetic bridged-L2 topology has no
-            # real IP router to generate the ICMP "fragmentation
-            # needed" feedback real PMTU discovery relies on, so
-            # explicitly enabling loss-resilient chunking (rather than
-            # relying on reactive PMTU discovery to eventually trigger
-            # it) is required, not just an optimization.
-            f"FLEETQOX_RMW_LOSS_RESILIENT_FRAGMENT_CHUNK_BYTES={fragment_chunk_bytes} "
-            f"FLEETQOX_RMW_UDP_DATAGRAM_BUDGET_BYTES={udp_datagram_budget_bytes} "
-            + (
-                # Diagnostic knob for the 16-robot-scale delivery-collapse
-                # investigation (see docs/AUDIT_ACCEPTANCE_TRACKING.md):
-                # rmw_fleetqox_cpp's own graph-advertisement renewal loop
-                # re-broadcasts every publisher/subscription to every peer
-                # on this interval (500ms default), an O(publishers x
-                # peers) cost per tick and O(N^2) system-wide as peer
-                # count grows -- unset leaves the RMW's own default.
-                f"FLEETQOX_RMW_GRAPH_RENEW_INTERVAL_MS={graph_renew_interval_ms} "
-                if graph_renew_interval_ms is not None else ""
-            )
-            + (
-                # Opt-in fix for a ChatGPT-flagged gap (see
-                # docs/AUDIT_ACCEPTANCE_TRACKING.md "data-plane fanout"):
-                # every OTHER peer_policy_ value, including the RMW's
-                # default ("all"), sends every published message to every
-                # configured peer regardless of subscription interest --
-                # a real O(peers) fanout on every single publish(), not
-                # just the O(N^2) graph-discovery traffic already reduced.
-                # A new named policy rather than a changed default, since
-                # this RMW is shared by many other probes/tests this
-                # investigation hasn't audited.
-                "FLEETQOX_RMW_PEER_POLICY=subscription_aware "
-                if subscription_aware else ""
-            )
+            + rmw_setup
             + "&& "
             f"python3 {_container_path(ROOT / 'scripts' / 'fleetqox_rmw_trace_endpoint.py')} "
             f"--trace={shlex.quote(trace_container_path)} "
@@ -437,6 +457,7 @@ def run_probe(
     isolate_controller: bool = False,
     subscription_aware: bool = False,
     discovery_timeout_s: float = 15.0,
+    rmw_implementation: str = "rmw_fleetqox_cpp",
 ) -> dict[str, Any]:
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -470,6 +491,7 @@ def run_probe(
         isolate_controller=isolate_controller,
         subscription_aware=subscription_aware,
         discovery_timeout_s=discovery_timeout_s,
+        rmw_implementation=rmw_implementation,
     )
 
     completed = subprocess.run(
@@ -610,6 +632,22 @@ def main() -> int:
             "docs/AUDIT_ACCEPTANCE_TRACKING.md."
         ),
     )
+    parser.add_argument(
+        "--rmw-implementation",
+        default="rmw_fleetqox_cpp",
+        help=(
+            "RMW_IMPLEMENTATION to run inside every endpoint. Default is "
+            "this project's own custom RMW; pass rmw_fastrtps_cpp (Fast "
+            "DDS) or rmw_cyclonedds_cpp (Cyclone DDS) to compare a "
+            "traditional DDS implementation's discovery/data-plane "
+            "behavior against the same real ns-3 802.11g TapBridge "
+            "topology and traffic this investigation used throughout --"
+            "see docs/AUDIT_ACCEPTANCE_TRACKING.md 'DDS comparison'. "
+            "Any value other than rmw_fleetqox_cpp skips the "
+            "FLEETQOX_RMW_* colcon-install/env-var setup entirely and "
+            "relies on the RMW's own discovery (typically multicast)."
+        ),
+    )
     args = parser.parse_args()
 
     summary = run_probe(
@@ -627,6 +665,7 @@ def main() -> int:
         isolate_controller=args.isolate_controller,
         subscription_aware=args.subscription_aware,
         discovery_timeout_s=max(args.discovery_timeout_s, 0.1),
+        rmw_implementation=args.rmw_implementation,
     )
     summary_path = ROOT / args.summary_json
     summary_path.parent.mkdir(parents=True, exist_ok=True)
