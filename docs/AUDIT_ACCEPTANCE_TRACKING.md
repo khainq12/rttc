@@ -1772,6 +1772,87 @@ về: nút thắt chính là tổng tải hệ thống (traffic nền O(N²) + t
 ứng dụng) vượt năng lực ngay cả khi đã chia 4 kênh, chứ không phải do
 1 station bị đặt sai kênh.
 
+### 11/09/2026 (tiếp) — Hỏi ChatGPT Plus + implement redesign B+ cho graph discovery: xác nhận thêm nút thắt là data-plane, không phải discovery
+
+Theo yêu cầu người dùng thiết lập quy trình cộng tác: người dùng đăng
+nhập ChatGPT Plus vào Browser pane, tôi soạn câu hỏi đầy đủ bối cảnh
+(toàn bộ bằng chứng đã thu thập: 82% PHY drop là collision thật, retry
+loop + fragment/repair đã bị loại, `pubsub_graph_renewal_loop()` O(N²)
+là contributor thật nhưng chưa đủ, multi-AP cải thiện nhỏ), ChatGPT
+phân tích và xếp hạng 4 hướng (A: delta-only, B: event-driven + heartbeat
++ versioned snapshot repair, C: gossip fan-out, D: discovery coordinator
+tập trung) — khuyến nghị **B+ (event-driven delta đã có sẵn + heartbeat
+nhẹ + incarnation/version + snapshot repair theo yêu cầu)**, xếp D
+(coordinator qua fleet_controller) là #2 cho dài hạn.
+
+**Implement (scope rút gọn có chủ đích so với B+ đầy đủ)**: đọc kỹ
+source hiện có, phát hiện phần "event-driven" ChatGPT đề xuất THỰC RA
+ĐÃ TỒN TẠI SẴN — `send_publisher_graph_advertisement`/
+`send_subscription_graph_advertisement` đã được gọi NGAY LẬP TỨC tại
+đúng chỗ tạo/hủy publisher/subscription (không phải chỉ trong vòng lặp
+định kỳ). Vòng lặp định kỳ (`pubsub_graph_renewal_loop`) chỉ là lớp AN
+TOÀN dự phòng chống mất gói/late-joiner, gửi LẶP LẠI toàn bộ danh sách
+mỗi 500ms — đây chính là phần O(N²) cần cắt, không cần xây lại phần
+event-driven từ đầu.
+
+Đã làm:
+- Thêm `incarnation_id` (random, sinh 1 lần lúc process khởi động) +
+  `graph_version` (counter tăng dần mỗi lần add/remove thật) vào
+  `GraphAdvertisement` (đặt ở CUỐI struct với giá trị mặc định — không
+  cần sửa hàng chục chỗ aggregate-initialization positional có sẵn).
+- Vòng lặp định kỳ giờ gửi **heartbeat nhỏ** (chỉ incarnation+version,
+  KHÔNG có field publisher/subscription nào) mỗi
+  `FLEETQOX_RMW_GRAPH_HEARTBEAT_INTERVAL_MS` (mặc định 1500ms), và chỉ
+  gửi lại TOÀN BỘ danh sách (hành vi cũ) mỗi
+  `FLEETQOX_RMW_GRAPH_RENEW_INTERVAL_MS` (đổi mặc định từ 500ms/max 4s
+  → 10s/max 60s — vai trò đổi từ "cơ chế discovery chính" thành "an
+  toàn dự phòng hiếm khi chạy").
+- Phía nhận: heartbeat (`entity_kind=="node"`) được chặn sớm, không đi
+  qua logic publisher/subscription — CHƯA implement phần "phát hiện
+  version-gap → yêu cầu snapshot" (để dành cho vòng sau nếu cần, vì
+  kết quả đo được đã đủ trả lời câu hỏi chính).
+- Thêm counter đo riêng: `graph_heartbeats_sent/received`,
+  `graph_full_resyncs_sent`.
+
+**Kết quả đo (16 robot, single-AP baseline)**: delivery vẫn giữ đúng ở
+quy mô nhỏ (1-robot: `rx=76/2/106`, khớp baseline). Ở quy mô 16 robot:
+`mac_tx_total` giảm **~37%** (92484 → 58112) — XẤP XỈ mức giảm đã đạt
+được trước đó chỉ bằng cách giãn interval đơn giản (33%), KHÔNG vượt
+trội hơn nhiều dù kiến trúc phức tạp hơn hẳn. **`rx` vẫn = 0 tuyệt
+đối**, và tỷ lệ PHY collision-drop KHÔNG đổi (~82%) — bằng chứng trực
+tiếp thêm rằng traffic discovery (dù đã redesign đúng) chưa bao giờ là
+nguyên nhân chính của collapse.
+
+**Kết hợp graph-redesign + 4-AP (static relay đã fix trước đó)**:
+`phy_rx_drop_total` giảm thêm đáng kể so với chỉ 4-AP đơn thuần
+(164600 → **92802**, giảm thêm ~44%) — 2 cải tiến CÓ cộng dồn về mặt
+giảm collision. Nhưng `rx` vẫn = 0 (so với 1 message ở lần đo 4-AP đơn
+thuần trước đó — chênh lệch 0 so với 1 tin nhắn trên tổng 2289 không
+đủ ý nghĩa thống kê để kết luận gì thêm).
+
+**Kết luận tổng hợp toàn bộ phiên điều tra 16-robot-scale**: đã thử và
+đo đạc nghiêm túc 5 hướng khác nhau (retry-fix, graph-renewal-interval,
+multi-AP round-robin, cô lập station nặng nhất, graph-discovery
+redesign kiến trúc mới) — TẤT CẢ đều giảm được traffic/collision ở mức
+độ nào đó (33-62% tuỳ hướng, có cộng dồn), NHƯNG KHÔNG hướng nào (kể cả
+kết hợp) đưa delivery vượt quá vài phần nghìn phần trăm. Tỷ lệ PHY
+collision-drop (BUSY_DECODING_PREAMBLE + PREAMBLE_DETECT_FAILURE) giữ
+nguyên ~66-82% xuyên suốt MỌI biến thể đã thử — đây là bằng chứng mạnh
+và nhất quán rằng nút thắt là **năng lực vật lý của topology 802.11g ở
+mật độ 19 station**, một giới hạn không thể giải quyết bằng tối ưu
+tầng giao thức (dù đúng đắn và đáng làm vì lý do kiến trúc/latency
+riêng) — cần thay đổi topology căn bản hơn (nhiều AP KHÔNG chia sẻ
+station nào — tức < 19 station toàn hệ thống mỗi kênh thực sự độc lập
+về mặt vật lý chứ không chỉ logic, hoặc chuẩn wifi băng thông rộng hơn
+802.11g) mới có cơ hội thay đổi kết quả về chất, không chỉ về lượng.
+
+**File thay đổi**: `ros2_ws/src/rmw_fleetqox_cpp/include/rmw_fleetqox_cpp/data_frame.hpp`
+(`incarnation_id`/`graph_version`), `ros2_ws/src/rmw_fleetqox_cpp/src/data_frame.cpp`
+(encode/decode), `ros2_ws/src/rmw_fleetqox_cpp/src/rmw_pubsub.cpp`
+(`send_graph_heartbeat`, vòng lặp renewal 2 tầng, guard nhận heartbeat,
+counter mới), `scripts/fleetqox_rmw_trace_endpoint.py` (counter mới
+vào danh sách ctypes).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
