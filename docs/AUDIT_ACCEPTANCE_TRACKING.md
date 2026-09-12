@@ -2394,6 +2394,48 @@ tham số retry.
 (`extra_rmw_env` — passthrough chẩn đoán một lần, không phải flag CLI ổn
 định).
 
+### 12/09/2026 (tiếp) — Phân rã delivery theo kích thước message: xác nhận cơ chế còn lại — airtime dài hơn = collision cao hơn, KHÔNG chỉ do fragmentation
+
+Theo đề xuất ChatGPT: đối chiếu `sent_event_ids`/`received` trong kết
+quả `--static-mode` với cột `bytes` trong trace CSV gốc theo từng
+khoảng kích thước.
+
+| Kích thước | Sent | Recv | Delivery |
+|---|---|---|---|
+| 0–128B | 1315 | 507 | 38.6% |
+| 128–256B | 678 | 151 | 22.3% |
+| 256–512B | 84 | 6 | 7.1% |
+| 512–1024B | 152 | 8 | 5.3% |
+| 1024–2048B | 58 | 2 | 3.4% |
+| 2048–4096B | 2 | 0 | 0.0% |
+
+Giảm gần như đơn điệu theo kích thước — khớp đúng dự đoán của ChatGPT.
+Nhưng có một điểm bất ngờ: `FLEETQOX_RMW_LOSS_RESILIENT_FRAGMENT_CHUNK_BYTES`
+mặc định là 1024 bytes, nghĩa là 4 khoảng đầu tiên (0–128 đến 512–1024)
+đều là **1 datagram UDP duy nhất, KHÔNG fragment**. Vậy mà delivery vẫn
+giảm từ 38.6% xuống 5.3% ngay trong vùng KHÔNG fragment — nghĩa là công
+thức "xác suất mất = 1 − thành_công^số_fragment" (ChatGPT đề xuất ban
+đầu) KHÔNG giải thích được phần này của đường cong, vì số fragment = 1
+xuyên suốt 4 khoảng đó.
+
+**Giả thuyết đã gửi lại ChatGPT để xác nhận**: kênh 802.11 DCF này đã ở
+trạng thái collision-nặng sẵn (~85%+ collision đo được kể cả ở static
+mode) — một khung truyền DÀI HƠN (airtime lâu hơn) có "cửa sổ dễ bị va
+chạm" (vulnerable period) dài hơn, nên xác suất một trạm khác bắt đầu
+truyền chồng lên nó cũng cao hơn, HOÀN TOÀN ĐỘC LẬP với việc có
+fragment hay không. Sau ngưỡng 1024B (bắt đầu fragment thật), 2 cơ chế
+(airtime dài hơn MỖI gói + số gói độc lập tăng) cộng dồn, giải thích tại
+sao đường cong còn dốc hơn nữa ở 2 khoảng cuối (3.4%, 0%).
+
+**Chưa có câu trả lời từ ChatGPT về hướng khắc phục tiếp theo tại thời
+điểm ghi chú này** (đã gửi câu hỏi, đang chờ). Hai hướng khả dĩ đã đề
+xuất: (1) giảm kích thước payload/header để đẩy nhiều traffic hơn vào
+khoảng an toàn nhất, (2) can thiệp sâu hơn vào tham số MAC (contention
+window, backoff, hoặc ép MTU nhỏ hơn).
+
+**File thay đổi**: không có (phân tích thuần dữ liệu từ kết quả
+`--static-mode` đã chạy, không cần script mới).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
