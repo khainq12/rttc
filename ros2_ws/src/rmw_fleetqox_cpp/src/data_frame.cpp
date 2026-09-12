@@ -3,9 +3,11 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <sstream>
+#include <type_traits>
 
 namespace rmw_fleetqox_cpp
 {
@@ -530,6 +532,70 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> json_uint_pair_array_value(
   return ranges;
 }
 
+// --- compact_v1 binary helpers -------------------------------------------
+// Fixed-width integers are appended host-endian (memcpy, no htole64/etc.):
+// safe because every process on both ends of this wire format runs on the
+// same x86_64 host for every environment this RMW is deployed/tested in
+// (see docs/AUDIT_ACCEPTANCE_TRACKING.md "compact data-frame encoding") --
+// not a general-purpose cross-architecture wire format.
+template<typename T>
+void append_fixed(std::string & out, const T & value)
+{
+  static_assert(std::is_trivially_copyable<T>::value, "append_fixed requires a POD type");
+  const char * bytes = reinterpret_cast<const char *>(&value);
+  out.append(bytes, sizeof(T));
+}
+
+template<typename T>
+bool read_fixed(const std::string & payload, std::size_t & offset, T & out_value)
+{
+  static_assert(std::is_trivially_copyable<T>::value, "read_fixed requires a POD type");
+  if (offset + sizeof(T) > payload.size()) {
+    return false;
+  }
+  std::memcpy(&out_value, payload.data() + offset, sizeof(T));
+  offset += sizeof(T);
+  return true;
+}
+
+// uint32 length prefix -- generous enough for the largest fragment chunk
+// this RMW ever hands to a single frame, unlike a uint16 (65535-byte) cap
+// that could silently truncate a large unfragmented payload.
+void append_length_prefixed(std::string & out, const std::string & value)
+{
+  append_fixed<std::uint32_t>(out, static_cast<std::uint32_t>(value.size()));
+  out.append(value);
+}
+
+void append_length_prefixed(std::string & out, const std::vector<std::uint8_t> & value)
+{
+  append_fixed<std::uint32_t>(out, static_cast<std::uint32_t>(value.size()));
+  out.append(reinterpret_cast<const char *>(value.data()), value.size());
+}
+
+bool read_length_prefixed_string(const std::string & payload, std::size_t & offset, std::string & out_value)
+{
+  std::uint32_t length = 0;
+  if (!read_fixed(payload, offset, length) || offset + length > payload.size()) {
+    return false;
+  }
+  out_value.assign(payload, offset, length);
+  offset += length;
+  return true;
+}
+
+bool read_length_prefixed_bytes(
+  const std::string & payload, std::size_t & offset, std::vector<std::uint8_t> & out_value)
+{
+  std::uint32_t length = 0;
+  if (!read_fixed(payload, offset, length) || offset + length > payload.size()) {
+    return false;
+  }
+  out_value.assign(payload.begin() + offset, payload.begin() + offset + length);
+  offset += length;
+  return true;
+}
+
 }  // namespace
 
 std::string stream_key(const DataFrame & frame)
@@ -668,8 +734,81 @@ std::string encode_data_frame(const DataFrame & frame)
   return encode_data_frame(frame, base64_scratch);
 }
 
+// See kDataFrameCompactV1Magic's comment in data_frame.hpp. Every field of
+// DataFrame is carried (same semantic content as the JSON path), just
+// without the JSON's field-name text, punctuation, base64 payload
+// expansion, or robot_id/topic duplication -- one copy of each string,
+// fixed-width binary for every numeric field, and the raw payload bytes
+// appended directly instead of base64.
+void encode_data_frame_compact_v1_append(const DataFrame & frame, std::string & out)
+{
+  out.clear();
+  out += kDataFrameCompactV1Magic;
+  append_length_prefixed(out, frame.robot_id);
+  append_length_prefixed(out, frame.topic);
+  append_length_prefixed(out, frame.publisher_id);
+  append_fixed(out, frame.source_sequence_number);
+  append_fixed(out, frame.source_timestamp_ns);
+  append_fixed(out, frame.domain_id);
+  append_length_prefixed(out, frame.type_name);
+  append_length_prefixed(out, frame.flow_class);
+  append_fixed(out, frame.deadline_ms);
+  append_fixed(out, frame.age_ms);
+  append_fixed(out, frame.qoe_debt);
+  append_fixed(out, frame.task_criticality);
+  const std::uint8_t repair_requested = frame.repair_requested ? 1 : 0;
+  append_fixed(out, repair_requested);
+  append_fixed(out, frame.prior_repair_attempts);
+  append_length_prefixed(out, frame.partitions_csv);
+  append_fixed(out, frame.ownership_strength);
+  append_length_prefixed(out, frame.coherent_set_id);
+  append_fixed(out, frame.coherent_set_total);
+  append_fixed(out, frame.coherent_set_index);
+  append_length_prefixed(out, frame.serialized_payload);
+}
+
+std::optional<DataFrame> decode_data_frame_compact_v1(const std::string & payload)
+{
+  const std::string magic = kDataFrameCompactV1Magic;
+  if (payload.rfind(magic, 0) != 0) {
+    return std::nullopt;
+  }
+  std::size_t offset = magic.size();
+  DataFrame frame;
+  std::uint8_t repair_requested = 0;
+  const bool ok =
+    read_length_prefixed_string(payload, offset, frame.robot_id) &&
+    read_length_prefixed_string(payload, offset, frame.topic) &&
+    read_length_prefixed_string(payload, offset, frame.publisher_id) &&
+    read_fixed(payload, offset, frame.source_sequence_number) &&
+    read_fixed(payload, offset, frame.source_timestamp_ns) &&
+    read_fixed(payload, offset, frame.domain_id) &&
+    read_length_prefixed_string(payload, offset, frame.type_name) &&
+    read_length_prefixed_string(payload, offset, frame.flow_class) &&
+    read_fixed(payload, offset, frame.deadline_ms) &&
+    read_fixed(payload, offset, frame.age_ms) &&
+    read_fixed(payload, offset, frame.qoe_debt) &&
+    read_fixed(payload, offset, frame.task_criticality) &&
+    read_fixed(payload, offset, repair_requested) &&
+    read_fixed(payload, offset, frame.prior_repair_attempts) &&
+    read_length_prefixed_string(payload, offset, frame.partitions_csv) &&
+    read_fixed(payload, offset, frame.ownership_strength) &&
+    read_length_prefixed_string(payload, offset, frame.coherent_set_id) &&
+    read_fixed(payload, offset, frame.coherent_set_total) &&
+    read_fixed(payload, offset, frame.coherent_set_index) &&
+    read_length_prefixed_bytes(payload, offset, frame.serialized_payload);
+  if (!ok) {
+    return std::nullopt;
+  }
+  frame.repair_requested = repair_requested != 0;
+  return frame;
+}
+
 std::optional<DataFrame> decode_data_frame(const std::string & payload)
 {
+  if (payload.rfind(kDataFrameCompactV1Magic, 0) == 0) {
+    return decode_data_frame_compact_v1(payload);
+  }
   const std::string stripped = strip_padding(payload);
   const std::string magic = kDataFrameMagic;
   if (stripped.rfind(magic, 0) != 0) {

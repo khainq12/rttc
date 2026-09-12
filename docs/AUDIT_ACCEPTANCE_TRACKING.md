@@ -2436,6 +2436,92 @@ window, backoff, hoặc ép MTU nhỏ hơn).
 **File thay đổi**: không có (phân tích thuần dữ liệu từ kết quả
 `--static-mode` đã chạy, không cần script mới).
 
+### 12/09/2026 (tiếp) — Fix thật thứ 2: FLEETQOX_RMW_DATA_FRAME_ENCODING=compact_v1 (JSON+base64 → binary compact), NHƯNG phát hiện methodological gap nghiêm trọng: harness KHÔNG có RNG seed cố định cho ns-3, kết quả 1 lần chạy không đáng tin
+
+Theo phân tích wire-format thực tế (không dùng `bytes` trong trace, mà
+dựng lại đúng format `encode_data_frame_append` tạo ra): message control
+96B thực tế lên dây **643 bytes** (JSON+base64, đo trực tiếp bằng
+`encode_data_frame()` thật — không phải ước lượng tay), do lặp
+`robot_id`/`topic` (route + sample_envelope), field name JSON, và base64
+(+33%).
+
+**Fix**: thêm `FLEETQOX_RMW_DATA_FRAME_ENCODING=compact_v1` — định dạng
+nhị phân length-prefixed, giữ NGUYÊN mọi field ngữ nghĩa của `DataFrame`
+(routing/QoS/retry/subscription-matching phía sau không đổi gì), bỏ
+base64 (payload thô), bỏ lặp field, opt-in qua env var (mặc định JSON
+giữ nguyên y hệt cho mọi probe/test khác trong dự án). Có magic prefix
+riêng (`FRMWC1\n` so với `FRMW1\n`) để `decode_data_frame()` tự phân biệt
+định dạng nhận được — publisher compact + subscriber JSON (hoặc ngược
+lại) vẫn tương thích, không cần sửa ~15 call site gọi `decode_data_frame`
+rải khắp `rmw_pubsub.cpp`.
+
+**Đã kiểm chứng đúng đắn kỹ trước khi đo hiệu năng**: viết bộ test
+round-trip riêng (`/tmp/test_compact_v1_roundtrip.cpp`, biên dịch độc lập
+với `g++` thẳng vào `data_frame.cpp`, không cần ROS2) — round-trip mọi
+field, payload rỗng, payload biên (1B/1023B/1024B/1025B), 20 payload
+nhị phân ngẫu nhiên (kể cả cố tình để byte cuối = 0x20 để kiểm tra không
+bị lọt qua `strip_padding()` — hàm này cắt trailing space, chỉ áp dụng
+nhánh JSON, đã xác nhận nhánh compact bỏ qua nó hoàn toàn), phân biệt
+JSON/compact hai chiều, và 219 điểm cắt ngắn (truncation) để xác nhận
+decode luôn trả `nullopt` thay vì crash/đọc tràn bộ nhớ — chạy sạch dưới
+AddressSanitizer + UndefinedBehaviorSanitizer. Đo kích thước thật:
+**96B → 643B (JSON) so với 96B → 319B (compact_v1), giảm 50.4%**.
+
+**Nhưng khi chạy thử nghiệm 16-robot thật để đo tác động lên delivery,
+phát hiện một lỗ hổng phương pháp luận nghiêm trọng**: chạy LẶP LẠI
+CHÍNH XÁC cùng 1 cấu hình (`--static-mode`, JSON mặc định, không đổi gì)
+4 lần liên tiếp cho kết quả rất khác nhau:
+
+| Lần chạy | Delivery |
+|---|---|
+| 1 | 29.4% |
+| 2 | 10.3% |
+| 3 | 22.7% |
+| 4 | 18.3% |
+
+**Mean = 20.2%, độ lệch chuẩn = 8.0 điểm phần trăm, khoảng dao động
+10.3%–29.4% — TRÊN CÙNG MỘT CẤU HÌNH, không đổi bất kỳ dòng code nào
+giữa các lần chạy.** Nguyên nhân: `external/ns3/fleetqox_trace_replay_tap.cc`
+KHÔNG có bất kỳ cơ chế `RngSeedManager`/`--seed`/`--run`/`AssignStreams`
+nào — không giống `fleetqox_trace_replay.cc` (baseline raw-UDP thuần
+simulation, đã được thêm `--seed`/`--run`/`AssignStreams` xác định từ
+trước, xem mục RNG parity 2 kiến trúc ns-3/INET). Vì hạ tầng TapBridge
+này chạy qua Linux netns/tiến trình thật + `RealtimeSimulatorImpl` (thời
+gian thực), nhiễu định thời hệ điều hành thực (CPU scheduling, Docker
+container contention...) tự nó cũng là một nguồn variance độc lập với
+RNG của ns-3, không thể loại bỏ chỉ bằng cách pin seed.
+
+Chạy `compact_v1` 3 lần cho: 14.7%, 16.4%, 11.3% (mean 14.1%, độ lệch
+chuẩn 2.6). Khoảng dao động của JSON (10.3–29.4%) và compact_v1
+(11.3–16.4%) **CHỒNG LẤN ĐÁNG KỂ** — với cỡ mẫu nhỏ này (n=4 và n=3),
+KHÔNG thể kết luận compact_v1 tốt hơn hay tệ hơn JSON một cách đáng tin
+cậy, dù wire size giảm 50.4% đã được đo chính xác.
+
+**Hệ quả quan trọng**: TOÀN BỘ so sánh single-run trước đó trong
+investigation này (0% discovery-mode luôn ổn định vì đó là sàn/floor
+— không có "room" để dao động — nhưng các con số static-mode 29.4%,
+retry-disabled 10.0%, v.v. đều có thể mang variance chưa định lượng).
+May mắn là các kết luận NHÂN QUẢ CHÍNH (discovery traffic → sập hoàn
+toàn; raw-UDP/no-discovery → ~95-100%) đều dựa trên khoảng cách RẤT LỚN
+(0% vs 95-100%), lớn hơn nhiều so với biên độ variance quan sát được ở
+đây (~20 điểm phần trăm) — nên các kết luận đó vẫn đứng vững. Nhưng các
+so sánh TINH VI hơn ở vùng static-mode (29.4% vs 10.0% khi tắt retry,
+và bây giờ là JSON vs compact_v1) cần được xác nhận lại bằng NHIỀU lần
+lặp lại thay vì 1 lần chạy đơn.
+
+**Việc còn lại (đã gửi ChatGPT hỏi hướng xử lý, đang chờ)**: cần chạy
+nhiều lần lặp lại hơn (n≥10 mỗi cấu hình) để có thống kê đáng tin, hoặc
+tìm cách giảm nguồn nhiễu (không chỉ RNG ns-3 mà cả jitter OS thực) để
+so sánh 1 lần chạy trở nên đáng tin cậy hơn.
+
+**File thay đổi**: `ros2_ws/src/rmw_fleetqox_cpp/include/rmw_fleetqox_cpp/data_frame.hpp`,
+`ros2_ws/src/rmw_fleetqox_cpp/src/data_frame.cpp`
+(`encode_data_frame_compact_v1_append`, `decode_data_frame_compact_v1`,
+`kDataFrameCompactV1Magic`), `ros2_ws/src/rmw_fleetqox_cpp/src/rmw_pubsub.cpp`
+(`FLEETQOX_RMW_DATA_FRAME_ENCODING=compact_v1`,
+`compact_v1_data_frame_encoding_enabled()`), `scripts/fleetqox_rmw_trace_endpoint.py`
+(`frames_sent`/`frames_received` added to exposed transport metrics).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và

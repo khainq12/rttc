@@ -2309,6 +2309,22 @@ bool static_discovery_mode_from_env()
   return text == "1" || text == "true" || text == "yes";
 }
 
+// Opt-in compact_v1 data-frame wire format (see kDataFrameCompactV1Magic's
+// comment in data_frame.hpp and docs/AUDIT_ACCEPTANCE_TRACKING.md "compact
+// data-frame encoding"): default (unset) leaves the existing JSON+base64
+// encoder completely untouched, matching every other probe/test in this
+// project that has always assumed that wire format. FLEETQOX_RMW_DATA_
+// FRAME_ENCODING=compact_v1 opts a single process into the smaller binary
+// format on the data-frame publish hot path only -- decode_data_frame()
+// already dispatches on the received datagram's own magic prefix
+// regardless of this flag, so a compact-encoding publisher and a JSON-
+// encoding subscriber (or vice versa) still interoperate correctly.
+bool compact_v1_data_frame_encoding_enabled()
+{
+  const char * value = std::getenv("FLEETQOX_RMW_DATA_FRAME_ENCODING");
+  return value != nullptr && trim_copy(value) == "compact_v1";
+}
+
 std::uint64_t fnv1a64(const std::string & text, std::uint64_t seed)
 {
   std::uint64_t hash = seed;
@@ -12174,8 +12190,12 @@ rmw_ret_t publish_payload(FleetQoxPublisherData * data, const std::vector<std::u
     std::uint64_t{0},
     encode_partitions_csv(data->partitions),
     data->ownership_strength};
-  rmw_fleetqox_cpp::encode_data_frame_append(
-    frame, data->frame_base64_scratch, data->frame_json_scratch);
+  if (compact_v1_data_frame_encoding_enabled()) {
+    rmw_fleetqox_cpp::encode_data_frame_compact_v1_append(frame, data->frame_json_scratch);
+  } else {
+    rmw_fleetqox_cpp::encode_data_frame_append(
+      frame, data->frame_base64_scratch, data->frame_json_scratch);
+  }
   const std::string & encoded_frame = data->frame_json_scratch;
   const bool reliable = data->qos.reliability == RMW_QOS_POLICY_RELIABILITY_RELIABLE;
   const std::vector<std::string> matched_subscription_ids = reliable ?

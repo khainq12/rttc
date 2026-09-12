@@ -68,6 +68,8 @@ def fleetqox_transport_metrics() -> dict[str, Any]:
     except OSError:
         return {"available": False}
     names = (
+        "frames_sent",
+        "frames_received",
         "fragment_nacks_sent",
         "fragment_nacks_received",
         "fragments_selectively_retransmitted",

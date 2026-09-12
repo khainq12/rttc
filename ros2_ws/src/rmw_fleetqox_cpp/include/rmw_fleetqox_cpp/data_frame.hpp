@@ -285,6 +285,27 @@ void encode_data_frame_append(
 
 std::optional<DataFrame> decode_data_frame(const std::string & payload);
 
+// Opt-in compact binary data-frame wire format (see
+// docs/AUDIT_ACCEPTANCE_TRACKING.md "compact data-frame encoding"):
+// encode_data_frame_append's JSON+base64 format measured at ~6x wire-size
+// amplification for a small (96-byte) sample -- duplicated robot_id/topic
+// fields (once under "route", once under "sample_envelope"), JSON
+// punctuation/field-name text, and base64's +33% payload expansion all
+// contribute. This format keeps the exact same semantic DataFrame fields
+// (so routing/QoS/retry/subscription-matching logic downstream is
+// unaffected) but as a flat length-prefixed binary layout with the raw
+// payload appended directly, no base64. Distinct magic
+// (kDataFrameCompactV1Magic, not kDataFrameMagic) so decode_data_frame()
+// can dispatch to whichever format a given datagram is actually in
+// without needing every one of decode_data_frame's ~15 call sites
+// touched -- the JSON path remains byte-for-byte unchanged as the
+// default; this is purely additive.
+constexpr const char * kDataFrameCompactV1Magic = "FRMWC1\n";
+
+void encode_data_frame_compact_v1_append(const DataFrame & frame, std::string & out);
+
+std::optional<DataFrame> decode_data_frame_compact_v1(const std::string & payload);
+
 std::string encode_route_advertisement(const RouteAdvertisement & advertisement);
 
 std::optional<RouteAdvertisement> decode_route_advertisement(const std::string & payload);
