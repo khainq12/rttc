@@ -186,6 +186,19 @@ def main() -> int:
     parser.add_argument("--summary-json", type=Path, required=True)
     parser.add_argument("--ready-file", type=Path, default=None)
     parser.add_argument("--start-file", type=Path, default=None)
+    parser.add_argument(
+        "--discovery-only",
+        action="store_true",
+        help=(
+            "Create every publisher/subscription and go through the "
+            "normal discovery-convergence + ready/start gate, but send NO "
+            "application data at all -- isolates whether the middleware's "
+            "own discovery/control-plane traffic is sufficient by itself "
+            "to saturate the wifi medium, independent of any application "
+            "workload on top of it. See docs/AUDIT_ACCEPTANCE_TRACKING.md "
+            "'causal isolation: discovery-only'."
+        ),
+    )
     args = parser.parse_args()
 
     import rclpy
@@ -275,7 +288,13 @@ def main() -> int:
 
     start_wall = time.monotonic()
     sent: list[str] = []
-    for row in outgoing:
+    # --discovery-only: every publisher/subscription above was still
+    # created and matched normally (so discovery/control-plane traffic is
+    # unaffected), but the send loop itself is skipped entirely -- isolates
+    # whether discovery traffic ALONE is enough to saturate the medium,
+    # independent of any application data on top of it.
+    replay_rows = [] if args.discovery_only else outgoing
+    for row in replay_rows:
         target_offset_s = (float(row["timestamp_ms"]) + args.start_offset_ms) / 1000.0
         now_offset = time.monotonic() - start_wall
         if target_offset_s > now_offset:

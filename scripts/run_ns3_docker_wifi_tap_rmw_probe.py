@@ -125,6 +125,7 @@ def build_shell_script(
     discovery_timeout_s: float = 15.0,
     rmw_implementation: str = "rmw_fleetqox_cpp",
     stagger_start_ms: float = 0.0,
+    discovery_only: bool = False,
 ) -> str:
     ips = {endpoint: f"{BASE_IP_PREFIX}{i + 2}" for i, endpoint in enumerate(endpoints)}
     # ChatGPT-flagged bootstrap-feedback-loop hypothesis (see
@@ -338,6 +339,7 @@ def build_shell_script(
                 f"--summary-json={shlex.quote(result_json)} "
                 f"--ready-file={shlex.quote(ready_files[i])} "
                 f"--start-file={shlex.quote(start_file)}"
+                + (" --discovery-only" if discovery_only else "")
             )
         if stagger_start_ms > 0 and i > 0:
             # ChatGPT's synchronized-discovery-burst hypothesis (see
@@ -490,6 +492,7 @@ def run_probe(
     discovery_timeout_s: float = 15.0,
     rmw_implementation: str = "rmw_fleetqox_cpp",
     stagger_start_ms: float = 0.0,
+    discovery_only: bool = False,
 ) -> dict[str, Any]:
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -525,6 +528,7 @@ def run_probe(
         discovery_timeout_s=discovery_timeout_s,
         rmw_implementation=rmw_implementation,
         stagger_start_ms=stagger_start_ms,
+        discovery_only=discovery_only,
     )
 
     completed = subprocess.run(
@@ -709,6 +713,19 @@ def main() -> int:
             "all. See docs/AUDIT_ACCEPTANCE_TRACKING.md 'causal isolation'."
         ),
     )
+    parser.add_argument(
+        "--discovery-only",
+        action="store_true",
+        help=(
+            "Create every publisher/subscription and let discovery "
+            "converge normally, but send ZERO application data. Isolates "
+            "whether the middleware's own discovery/control-plane traffic "
+            "is sufficient by itself to saturate the wifi medium. No-op "
+            "for --rmw-implementation=raw_udp (it has no discovery step). "
+            "See docs/AUDIT_ACCEPTANCE_TRACKING.md 'causal isolation: "
+            "discovery-only'."
+        ),
+    )
     args = parser.parse_args()
 
     summary = run_probe(
@@ -728,6 +745,7 @@ def main() -> int:
         discovery_timeout_s=max(args.discovery_timeout_s, 0.1),
         rmw_implementation=args.rmw_implementation,
         stagger_start_ms=max(args.stagger_start_ms, 0.0),
+        discovery_only=args.discovery_only,
     )
     summary_path = ROOT / args.summary_json
     summary_path.parent.mkdir(parents=True, exist_ok=True)

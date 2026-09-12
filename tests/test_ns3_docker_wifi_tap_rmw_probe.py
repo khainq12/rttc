@@ -97,6 +97,50 @@ class BuildShellScriptStaggerStartTest(unittest.TestCase):
         self.assertIn("sleep 0.300000", script)
 
 
+class BuildShellScriptDiscoveryOnlyTest(unittest.TestCase):
+    def test_appends_discovery_only_flag_for_ros2_endpoint(self):
+        script = build_shell_script(
+            trace_container_path="/work/results/trace.csv",
+            endpoints=endpoint_list(1),
+            policy="fifo",
+            num_robots=1,
+            sim_duration_s=30.0,
+            start_offset_ms=2000.0,
+            drain_s=10.0,
+            results_dir_container="/tmp/fleetqox_tap_results",
+            discovery_only=True,
+        )
+        self.assertIn("--discovery-only", script)
+
+    def test_absent_by_default(self):
+        script = build_shell_script(
+            trace_container_path="/work/results/trace.csv",
+            endpoints=endpoint_list(1),
+            policy="fifo",
+            num_robots=1,
+            sim_duration_s=30.0,
+            start_offset_ms=2000.0,
+            drain_s=10.0,
+            results_dir_container="/tmp/fleetqox_tap_results",
+        )
+        self.assertNotIn("--discovery-only", script)
+
+    def test_no_op_for_raw_udp(self):
+        script = build_shell_script(
+            trace_container_path="/work/results/trace.csv",
+            endpoints=endpoint_list(1),
+            policy="fifo",
+            num_robots=1,
+            sim_duration_s=30.0,
+            start_offset_ms=2000.0,
+            drain_s=10.0,
+            results_dir_container="/tmp/fleetqox_tap_results",
+            rmw_implementation="raw_udp",
+            discovery_only=True,
+        )
+        self.assertNotIn("--discovery-only", script)
+
+
 class BuildShellScriptTest(unittest.TestCase):
     def setUp(self):
         self.endpoints = endpoint_list(1)
