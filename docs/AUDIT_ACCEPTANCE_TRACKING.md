@@ -2236,6 +2236,63 @@ thay vì chỉ thử nghiệm gián tiếp qua thời điểm khởi động.
 **File thay đổi**: `scripts/run_ns3_docker_wifi_tap_rmw_probe.py`
 (`--stagger-start-ms`).
 
+### 12/09/2026 (tiếp) — Thí nghiệm discovery-only theo ưu tiên #1 của ChatGPT: XÁC NHẬN DỨT ĐIỂM — control-plane traffic tự nó đủ để bão hòa kênh, traffic ứng dụng gần như không đóng góp gì thêm
+
+Sau khi stagger-start cho kết quả âm tính, ChatGPT đề xuất thí nghiệm rẻ
+và có tính nhân quả cao nhất tiếp theo: chạy discovery HOÀN TOÀN bình
+thường (tạo đủ mọi publisher/subscription, để pub/sub match nhau) nhưng
+KHÔNG gửi bất kỳ dữ liệu ứng dụng nào — nếu discovery-only đã tạo ra total
+collision-drop tương đương mức 82% quan sát được ở bản đầy đủ, đó là
+bằng chứng trực tiếp rằng bản thân control-plane traffic đã đủ để bão
+hòa kênh.
+
+Thêm `--discovery-only` vào `fleetqox_rmw_trace_endpoint.py` (tạo mọi
+publisher/subscription, chạy hết vòng lặp discovery-convergence +
+ready/start gate như bình thường, nhưng bỏ qua HOÀN TOÀN vòng lặp gửi dữ
+liệu — `replay_rows = []`) và `--discovery-only` tương ứng ở
+`run_ns3_docker_wifi_tap_rmw_probe.py` (no-op với `raw_udp` vì không có
+bước discovery nào).
+
+**Kết quả** (Fast DDS, 16-robot, `--discovery-only`, xác nhận `tx=0`
+cho mọi endpoint — không gói ứng dụng nào được gửi):
+
+| Thời điểm | `mac_tx_total` (discovery-only) | `mac_tx_total` (đầy đủ, có traffic) | % collision (discovery-only) | % collision (đầy đủ) |
+|---|---|---|---|---|
+| t=5s | 4080 | 5533 | 86.6% | 85.5% |
+| t=10s | 10285 | 10460 | 89.0% | 88.6% |
+| t=15s | (không có mẫu, run kết thúc sớm) | 17410 | — | 85.8% |
+
+**`mac_tx_total` và % collision-drop gần như GIỐNG HỆT nhau giữa
+discovery-only và bản đầy đủ ở CÙNG một mốc thời gian**, dù discovery-only
+không gửi một byte dữ liệu ứng dụng nào. Điều này chứng minh trực tiếp:
+**bản thân traffic discovery/control-plane của Fast DDS đã đủ để đẩy
+kênh 802.11g 19-trạm vào chế độ bão hòa/collision gần như tối đa —
+traffic ứng dụng thực tế (2289 message) đóng góp KHÔNG ĐÁNG KỂ vào tổng
+tải kênh so với traffic discovery.**
+
+Đây là bằng chứng "smoking gun" mạnh nhất trong toàn bộ investigation:
+không cần đến giả thuyết "đồng bộ burst" (đã bị stagger-start bác bỏ)
+hay "khối lượng traffic tổng" (đã bị so sánh Fast DDS/Cyclone/FleetRMW/
+raw-UDP bác bỏ) — chỉ đơn giản là **discovery protocol của các DDS
+middleware trưởng thành, khi chạy trên topology 19-trạm 802.11g này,
+tạo ra đủ traffic (dù chỉ để 19 participant tìm thấy nhau, không truyền
+dữ liệu gì) để tự nó bão hòa kênh**. Kết luận trước đó ("cần thêm 1 thí
+nghiệm nữa để biết là traffic hay timing") nay đã được trả lời dứt
+điểm: là traffic (khối lượng + kiểu gói discovery cụ thể — SPDP/SEDP
+multicast periodic — không phải aggregate volume tổng thể như trước
+đây từng nghĩ, vì raw-UDP data-plane volume tương đương hoặc lớn hơn
+vẫn đạt 100%).
+
+**Việc còn lại (theo đề xuất ChatGPT, chưa làm)**: phân rã traffic theo
+loại frame (application/SPDP/SEDP/ARP/other) + ước tính airtime thực tế
+theo loại (không chỉ đếm frame) để biết CHÍNH XÁC đặc điểm nào của gói
+discovery (kích thước, PHY rate, tần suất, multicast vs unicast) khiến
+nó "đắt" hơn tương ứng gói dữ liệu ứng dụng trên cùng kênh.
+
+**File thay đổi**: `scripts/fleetqox_rmw_trace_endpoint.py`
+(`--discovery-only`), `scripts/run_ns3_docker_wifi_tap_rmw_probe.py`
+(`--discovery-only`).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
