@@ -288,6 +288,8 @@ main(int argc, char* argv[])
   double simDuration = 30.0;
   bool wifiQos = false;
   uint32_t numAps = 1;
+  uint32_t seed = 1;
+  uint32_t run = 1;
 
   CommandLine cmd(__FILE__);
   cmd.AddValue("numRobots", "Number of robot stations (plus 3 fixed endpoints)", numRobots);
@@ -341,7 +343,40 @@ main(int argc, char* argv[])
       "docs/AUDIT_ACCEPTANCE_TRACKING.md. No-op when numAps == 1 or "
       "false (the default).",
       isolateController);
+  cmd.AddValue(
+      "seed",
+      "ns-3 RngSeedManager seed (see docs/AUDIT_ACCEPTANCE_TRACKING.md "
+      "'compact data-frame encoding' -- this program previously had NO "
+      "RNG seed control at all, unlike fleetqox_trace_replay.cc's "
+      "--seed/--run/AssignStreams, meaning repeated runs of the exact "
+      "same config were never actually comparable: rerunning one "
+      "unchanged JSON --static-mode config 4 times measured 29.4%, "
+      "10.3%, 22.7%, 18.3% delivery. ns-3's own guidance is a FIXED seed "
+      "with a VARYING --run for independent statistical replications, "
+      "not a fresh seed per run -- match that convention rather than "
+      "picking a new --seed value per invocation.",
+      seed);
+  cmd.AddValue(
+      "run",
+      "ns-3 RngSeedManager run number -- vary this (keeping --seed "
+      "fixed) across repeated invocations of the same configuration to "
+      "get independent statistical replications, per ns-3's own RNG "
+      "documentation.",
+      run);
   cmd.Parse(argc, argv);
+
+  // Must happen before ANY ns-3 random variable is constructed (every
+  // Wifi PHY/MAC backoff/collision random draw included) -- ns-3's own
+  // documentation requires SetSeed()/SetRun() to run first. This does
+  // NOT eliminate this harness's full run-to-run variance by itself: it
+  // only controls ns-3's own RNG stream, not the real-Linux-process/
+  // RealtimeSimulatorImpl wall-clock scheduling jitter this TapBridge
+  // pipeline is also subject to (see fleetqox_trace_replay.cc's
+  // --realtime flag and the causal-isolation tests using it) -- see the
+  // tracking doc for the same-seed/same-run repeatability sanity check
+  // this was added to enable.
+  RngSeedManager::SetSeed(seed);
+  RngSeedManager::SetRun(run);
 
   if (numRobots == 0)
   {

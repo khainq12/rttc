@@ -176,6 +176,8 @@ def build_shell_script(
     static_mode: bool = False,
     static_subscriptions: dict[str, list[tuple[str, str]]] | None = None,
     extra_rmw_env: dict[str, str] | None = None,
+    ns3_seed: int = 1,
+    ns3_run: int = 1,
 ) -> str:
     ips = {endpoint: f"{BASE_IP_PREFIX}{i + 2}" for i, endpoint in enumerate(endpoints)}
     # ChatGPT-flagged bootstrap-feedback-loop hypothesis (see
@@ -273,6 +275,7 @@ def build_shell_script(
             (
                 f"/tmp/fleetqox_tap_bridge --numRobots={num_robots} --tapPrefix=ftap "
                 f"--simDuration={sim_duration_s:.12g} --numAps={num_aps} "
+                f"--seed={ns3_seed} --run={ns3_run} "
                 + ("--isolateController=1 " if isolate_controller else "")
                 + f"> {results_dir_container}/ns3_tap.log 2>&1 &"
             ),
@@ -585,6 +588,8 @@ def run_probe(
     discovery_only: bool = False,
     static_mode: bool = False,
     extra_rmw_env: dict[str, str] | None = None,
+    ns3_seed: int = 1,
+    ns3_run: int = 1,
 ) -> dict[str, Any]:
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -627,6 +632,8 @@ def run_probe(
         static_mode=static_mode,
         static_subscriptions=static_subscriptions,
         extra_rmw_env=extra_rmw_env,
+        ns3_seed=ns3_seed,
+        ns3_run=ns3_run,
     )
 
     completed = subprocess.run(

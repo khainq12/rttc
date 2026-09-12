@@ -229,6 +229,36 @@ class BuildStaticSubscriptionsTest(unittest.TestCase):
         self.assertEqual(result["robot_0001"], [])
 
 
+class BuildShellScriptNs3SeedTest(unittest.TestCase):
+    def test_default_seed_and_run_are_one(self):
+        script = build_shell_script(
+            trace_container_path="/work/results/trace.csv",
+            endpoints=endpoint_list(1),
+            policy="fifo",
+            num_robots=1,
+            sim_duration_s=30.0,
+            start_offset_ms=2000.0,
+            drain_s=10.0,
+            results_dir_container="/tmp/fleetqox_tap_results",
+        )
+        self.assertIn("--seed=1 --run=1", script)
+
+    def test_custom_seed_and_run_passed_through(self):
+        script = build_shell_script(
+            trace_container_path="/work/results/trace.csv",
+            endpoints=endpoint_list(1),
+            policy="fifo",
+            num_robots=1,
+            sim_duration_s=30.0,
+            start_offset_ms=2000.0,
+            drain_s=10.0,
+            results_dir_container="/tmp/fleetqox_tap_results",
+            ns3_seed=12345,
+            ns3_run=7,
+        )
+        self.assertIn("--seed=12345 --run=7", script)
+
+
 class BuildShellScriptTest(unittest.TestCase):
     def setUp(self):
         self.endpoints = endpoint_list(1)
