@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <set>
 #include <string>
@@ -305,6 +306,76 @@ constexpr const char * kDataFrameCompactV1Magic = "FRMWC1\n";
 void encode_data_frame_compact_v1_append(const DataFrame & frame, std::string & out);
 
 std::optional<DataFrame> decode_data_frame_compact_v1(const std::string & payload);
+
+// Opt-in static-mode-only minimal data-frame wire format (see
+// docs/AUDIT_ACCEPTANCE_TRACKING.md "wire-frame tối giản cho static mode"):
+// a pcap capture during this investigation showed FleetRMW's actual
+// on-wire packets running 5.9-7.7x bigger than raw UDP's true minimum for
+// the same logical payload, dwarfing the ~2x gap the JSON-vs-compact_v1
+// comparison covered -- compact_v1 still carries every DataFrame field
+// (robot_id, topic, publisher_id, type_name, flow_class, 4 QoS-extension
+// doubles, partitions_csv, ownership_strength, coherent_set_* -- all
+// length-prefixed strings even when empty) verbatim. This format instead
+// carries ONLY what a receiver can't already know: a topic identity, a
+// publisher identity, a sequence number, a timestamp, and the raw
+// payload -- everything else (topic/type_name strings, robot_id,
+// QoS-extension fields, partitions, ownership, coherent-set fields) is
+// either reconstructed via the hash resolver below or left at its struct
+// default, which is safe ONLY because those extension fields are already
+// always their zero/empty default in any frame this harness produces
+// (verified by reading publish_payload()'s DataFrame construction --
+// flow_class/partitions_csv/coherent_set_id are always {}, the 4 QoS
+// doubles and ownership_strength are always 0). This format is NOT a
+// general-purpose replacement for compact_v1 -- it is meaningless without
+// FLEETQOX_RMW_STATIC_MODE, whose whole premise (every peer already knows
+// the full (topic, subscriber) map ahead of time) is what makes omitting
+// the topic string from the wire safe to do at all.
+constexpr const char * kDataFrameStaticMinV1Magic = "FRMWM1\n";
+
+// A topic/type/domain identity a process already knows locally (as either
+// a local subscription's own registration, or a publisher's own static
+// routing table entry) is looked up by a 32-bit hash of
+// "<domain_id>|<topic>|<type_name>" (the same string LoopbackSocketTransport
+// already uses as subscription_topic_key -- computed there, not here, to
+// keep this file's fnv1a64-free and dependency-free as before). Returns
+// false if the hash isn't recognized (unlike JSON/compact_v1, this format
+// can genuinely fail to decode on a process that doesn't already know the
+// topic -- there is no string to fall back to).
+using StaticMinV1TopicResolver = std::function<
+  bool (std::uint32_t topic_key_hash, std::uint64_t & domain_id,
+    std::string & topic, std::string & type_name)>;
+
+// Registers the process-wide resolver decode_data_frame() calls internally
+// when it recognizes kDataFrameStaticMinV1Magic -- set once at transport
+// startup (see LoopbackSocketTransport::start()) rather than threaded
+// through all ~15 decode_data_frame() call sites, so every existing call
+// site gets static_min_v1 support for free. Passing an empty
+// std::function (the default before this is called, and always the case
+// in the standalone unit test binary that doesn't link rmw_pubsub.cpp)
+// makes decode_data_frame() treat this format as always-undecodable,
+// which is the correct safe default.
+void set_static_min_v1_topic_resolver(StaticMinV1TopicResolver resolver);
+
+void encode_data_frame_static_min_v1_append(
+  std::uint32_t topic_key_hash,
+  std::uint32_t publisher_hash,
+  std::uint32_t sequence32,
+  std::int64_t source_timestamp_ns,
+  const std::vector<std::uint8_t> & payload,
+  std::string & out);
+
+// Only usable after set_static_min_v1_topic_resolver() has been called
+// with a resolver that recognizes this frame's topic_key_hash -- returns
+// std::nullopt otherwise (same failure signature as an unparseable
+// JSON/compact_v1 payload, so every existing decode_data_frame() call
+// site's std::optional-checking code already handles this correctly).
+// robot_id/publisher_id are reconstructed as "h<8 hex digits of
+// publisher_hash>" rather than the original strings -- they are only ever
+// used downstream for opaque per-publisher stream-key uniqueness (gap
+// tracking) and ownership arbitration, never compared against a specific
+// expected literal, so a stable synthetic identifier is semantically
+// equivalent for every consumer of a decoded DataFrame.
+std::optional<DataFrame> decode_data_frame_static_min_v1(const std::string & payload);
 
 std::string encode_route_advertisement(const RouteAdvertisement & advertisement);
 

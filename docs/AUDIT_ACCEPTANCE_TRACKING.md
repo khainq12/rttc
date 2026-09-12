@@ -3189,6 +3189,111 @@ này: tìm — đo — sửa — đo lại, từng mảnh một.
 `capture_pcap_endpoint`, cài `tcpdump` on-demand, bắt gói trên `ftapN`,
 marker `FLEETQOX_TAP_CAPTURE_BEGIN/END`, hàm `parse_capture_text`).
 
+### 12/09/2026 (tiếp) — Wire-frame tối giản cho static mode (`static_min_v1`): giảm kích thước gói xuống gần bằng raw-UDP, nhưng KẾT QUẢ DELIVERY VÔ ĐỊNH (không có ý nghĩa thống kê)
+
+Theo yêu cầu người dùng ("thử viết wire-frame gọn hơn") và đề xuất của
+ChatGPT, đã thiết kế và cài đặt format nhị phân mới **CHỈ dùng được
+trong static mode**: `kDataFrameStaticMinV1Magic = "FRMWM1\n"`, bật qua
+`FLEETQOX_RMW_DATA_FRAME_ENCODING=static_min_v1` (cùng cơ chế env với
+`compact_v1` đã có).
+
+**Thiết kế**: thay vì mang theo TOÀN BỘ field của `DataFrame` như
+`compact_v1` (robot_id, topic, publisher_id, type_name, flow_class, 4
+double QoS-extension, partitions_csv, ownership_strength, coherent_set_*
+— tất cả đều length-prefixed dù rỗng), format mới chỉ mang:
+`topic_key_hash` (uint32, hash của `domain_id|topic|type_name`),
+`publisher_hash` (uint32, hash của `robot_id|publisher_id`),
+`sequence32` (uint32), `source_timestamp_ns` (int64), và payload thô —
+tổng overhead cố định 31 byte (so với ~223 byte của `compact_v1` cho
+cùng nội dung).
+
+**Vấn đề kỹ thuật cốt lõi cần giải**: bên nhận phải "giải" được
+`topic_key_hash` trở lại thành `(domain_id, topic, type_name)` thật để
+logic downstream (khớp subscription tại dòng
+`subscription->topic_name == decoded_frame->topic`) không đổi. Giải
+pháp: một **resolver hook** (`std::function`) đăng ký MỘT LẦN lúc
+`LoopbackSocketTransport::start()`, được `decode_data_frame()` (trong
+`data_frame.cpp`, file không phụ thuộc gì vào `rmw_pubsub.cpp`) tự động
+gọi khi gặp magic mới — nhờ vậy **cả ~15 call site hiện có của
+`decode_data_frame()` đều tự động hỗ trợ format mới mà KHÔNG cần sửa
+từng chỗ một** (rủi ro thấp hơn nhiều so với sửa rải rác 15 nơi).
+Resolver quét tuần tự (không index thường trực, tránh nguy cơ lệch dữ
+liệu) 2 nguồn tri thức tĩnh đã có sẵn trong mọi tiến trình static mode:
+`g_subscriptions` (vai trò subscriber) và `peer_subscribed_topic_refcounts_`
+(vai trò publisher — cần cho chính `send_frame_with_qos()` tự giải mã
+lại frame nó vừa mã hoá để tìm target). `robot_id`/`publisher_id` không
+cần giải ngược — chỉ dùng để phân biệt luồng (stream-key uniqueness),
+nên tái tạo trực tiếp thành chuỗi tổng hợp ổn định `"h" + hex(publisher_hash)`.
+
+**Kiểm chứng round-trip độc lập** (g++ + ASan/UBSan, không cần ROS2,
+theo đúng phương pháp đã dùng cho `compact_v1`): 9 nhóm test — frame cơ
+bản, domain_id/type_name khác 0, payload rỗng, 5 kích thước biên (1B
+đến 2200B), 20 payload nhị phân ngẫu nhiên, hash lạ phải fail-closed,
+KHÔNG có resolver đăng ký phải fail-closed (không crash), phân biệt 3
+magic (JSON/compact_v1/static_min_v1) đúng cả 2 chiều, 81 điểm cắt
+truncation phải an toàn — **TẤT CẢ PASS**.
+
+**Đo kích thước gói thật** (tcpdump tại `ftap0` của `fleet_controller`,
+16-robot, seed=42/run=1): lọc riêng gói ĐI (outbound, tránh lẫn với
+traffic ack/nack ĐẾN — xem phát hiện phụ bên dưới) cho kết quả **CHỈ 2
+giá trị duy nhất, sạch, không lẫn kích thước cũ**: **143B** (855 gói) và
+**239B** (218 gói) — so với raw-UDP cùng payload là 96B/192B (tỷ lệ chỉ
+còn **~1.24-1.49x**, so với 5.9-7.7x của JSON mặc định đo trước đó).
+Chênh lệch +16B so với tính tay (31B overhead + 96/192B payload =
+127/223B dự kiến) nhiều khả năng là overhead serialize CDR của ROS2 cho
+kiểu `std_msgs/msg/String` (header encapsulation 4B + length-prefix 4B +
+null-terminator + padding 4-byte-align) — một chi phí CỐ HỮU của việc
+dùng message ROS2, không phải lỗi của format mới, và raw-UDP (socket
+thuần, không qua rclpy) không phải trả chi phí này nên không thể so
+sánh tuyệt đối 1:1 được.
+
+**Phát hiện phụ (không phải lỗi)**: gói ĐẾN `fleet_controller` (559-673B,
+port giống) hoá ra là **AckNackFrame** — phản hồi reliability từ các
+subscriber bị mất gói, một kênh JSON riêng biệt hoàn toàn không bị ảnh
+hưởng bởi thay đổi này (chỉ tối ưu `DataFrame`, không đụng tới AckNack).
+Việc lọc theo hướng gói (đi/đến) là cần thiết để không hiểu nhầm đây là
+lỗi trộn định dạng.
+
+**Đo lại delivery** (paired, 16-robot, seed=42, cùng `ns3_run`=1,2,3,
+so với JSON mặc định — CẢ HAI đã có fix `/parameter_events`):
+
+| ns3_run | json_default | static_min_v1 | Δ |
+|---|---|---|---|
+| 1 | 13.5% | 24.6% | +11.1pp |
+| 2 | 16.6% | 13.3% | −3.3pp |
+| 3 | 17.6% | 15.2% | −2.5pp |
+| **mean** | **15.9%** | **17.7%** | **+1.78pp** |
+
+Paired delta: mean=+1.78pp, stdev=8.08, n=3, **95% CI = [−18.30,
++21.86]** — khoảng tin cậy RẤT RỘNG, bao trùm cả 0 lẫn cả 2 dấu. **KẾT
+LUẬN TRUNG THỰC: KHÔNG có bằng chứng cải thiện delivery có ý nghĩa
+thống kê**, giống hệt tính chất null-result của thí nghiệm JSON/
+compact_v1 trước đó — dù lần này mức giảm kích thước gói LỚN HƠN NHIỀU
+(xuống gần bằng raw-UDP) so với compact_v1 (chỉ còn ~3.3x so với
+raw-UDP). Đây là kết quả bất ngờ và QUAN TRỌNG: giả thuyết "kích thước
+gói/airtime là nút thắt chính còn lại" — vốn được cả ChatGPT và người
+dùng ủng hộ sau phân tích pcap — **CHƯA được xác nhận bằng số liệu**,
+dù đã test với mức giảm kích thước gần tối đa có thể đạt được. Không
+loại trừ khả năng cần thêm rep (n=3 quá nhỏ so với phương sai run-to-run
+đã biết là lớn — xem "RealtimeSimulatorImpl jitter" ghi nhận nhiều lần
+trước đó), nhưng với số liệu hiện có, KHÔNG thể khẳng định wire-size là
+nguyên nhân chính của phần delivery gap còn lại.
+
+**Bài học phương pháp**: khác với fix `/parameter_events` (bug rõ ràng,
+CI dương hoàn toàn, hiệu ứng nhất quán cả 3/3 cặp), thí nghiệm này cho
+kết quả TRỘN LẪN (1 cặp cải thiện mạnh, 2 cặp giảm nhẹ) — đúng loại tín
+hiệu mà phương pháp paired-run của investigation này được thiết kế để
+phát hiện và KHÔNG bị đánh lừa bởi.
+
+**File thay đổi**: `ros2_ws/src/rmw_fleetqox_cpp/include/rmw_fleetqox_cpp/data_frame.hpp`
+(`kDataFrameStaticMinV1Magic`, `StaticMinV1TopicResolver`,
+`set_static_min_v1_topic_resolver()`, `encode_data_frame_static_min_v1_append()`,
+`decode_data_frame_static_min_v1()`); `.../src/data_frame.cpp` (cài đặt,
+hook vào `decode_data_frame()`'s dispatch); `.../src/rmw_pubsub.cpp`
+(`static_min_v1_data_frame_encoding_enabled()`, `kStaticMinV1TopicHashSeed`,
+`LoopbackSocketTransport::resolve_static_min_v1_topic_hash()`, đăng ký
+resolver trong `start()`, nhánh encode mới trong `publish_payload()`).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và

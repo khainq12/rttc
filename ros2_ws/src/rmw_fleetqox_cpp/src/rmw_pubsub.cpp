@@ -2424,6 +2424,20 @@ bool compact_v1_data_frame_encoding_enabled()
   return value != nullptr && trim_copy(value) == "compact_v1";
 }
 
+// See kDataFrameStaticMinV1Magic's comment in data_frame.hpp -- only
+// meaningful under FLEETQOX_RMW_STATIC_MODE, since it omits the topic/type
+// strings from the wire entirely in favor of a hash a peer can only
+// resolve if it already knows the full static (topic, subscriber) map.
+// Not enforced here (this function is a pure env-string check, matching
+// compact_v1_data_frame_encoding_enabled()'s style) -- enabling it without
+// static mode just means every frame fails to resolve on decode and gets
+// silently dropped, which is safe (fails closed) but useless, not unsafe.
+bool static_min_v1_data_frame_encoding_enabled()
+{
+  const char * value = std::getenv("FLEETQOX_RMW_DATA_FRAME_ENCODING");
+  return value != nullptr && trim_copy(value) == "static_min_v1";
+}
+
 std::uint64_t fnv1a64(const std::string & text, std::uint64_t seed)
 {
   std::uint64_t hash = seed;
@@ -2433,6 +2447,16 @@ std::uint64_t fnv1a64(const std::string & text, std::uint64_t seed)
   }
   return hash;
 }
+
+// Standard FNV-1a 64-bit offset basis -- used (truncated to the low 32
+// bits) to compute the wire-carried topic_key_hash for
+// kDataFrameStaticMinV1Magic frames, both when encoding (publish_payload())
+// and when resolving on decode (resolve_static_min_v1_topic_hash()). A
+// fixed constant rather than reusing fnv1a64's default-argument seed
+// elsewhere in this file (e.g. make_endpoint_gid's per-block seed) keeps
+// this hash's collision behavior independent of unrelated call sites that
+// happen to also use fnv1a64.
+constexpr std::uint64_t kStaticMinV1TopicHashSeed = 14695981039346656037ULL;
 
 std::array<std::uint8_t, RMW_GID_STORAGE_SIZE> make_endpoint_gid(const std::string & endpoint_id)
 {
@@ -3954,6 +3978,61 @@ private:
     std::uint64_t domain_id, const std::string & topic, const std::string & type_name)
   {
     return std::to_string(domain_id) + "|" + topic + "|" + type_name;
+  }
+
+  // Resolver registered with data_frame.cpp's decode_data_frame() for
+  // kDataFrameStaticMinV1Magic frames (see set_static_min_v1_topic_resolver()
+  // call in start()). Scans, rather than indexes, the two places a static-
+  // mode process already knows a (domain_id, topic, type_name) tuple: its
+  // own local subscriptions (g_subscriptions, the receiver role) and its
+  // own outgoing static routing table (peer_subscribed_topic_refcounts_,
+  // the publisher role -- needed because send_frame_with_qos() re-decodes
+  // a frame this same process just encoded, to get routing targets). Both
+  // sets are small (a handful of topics per process in any fleet this RMW
+  // targets), so a linear scan avoids maintaining a separate persistent
+  // hash index that could silently go stale relative to g_subscriptions/
+  // peer_subscribed_topic_refcounts_ if a future change updates one but
+  // not the other.
+  bool resolve_static_min_v1_topic_hash(
+    std::uint32_t topic_key_hash,
+    std::uint64_t & out_domain_id,
+    std::string & out_topic,
+    std::string & out_type_name) const
+  {
+    for (const FleetQoxSubscriptionData * subscription : g_subscriptions) {
+      if (subscription == nullptr) {
+        continue;
+      }
+      const std::string key = subscription_topic_key(
+        subscription->domain_id, subscription->topic_name, subscription->type_name);
+      if (static_cast<std::uint32_t>(fnv1a64(key, kStaticMinV1TopicHashSeed)) == topic_key_hash) {
+        out_domain_id = subscription->domain_id;
+        out_topic = subscription->topic_name;
+        out_type_name = subscription->type_name;
+        return true;
+      }
+    }
+    for (const auto & refcounts : peer_subscribed_topic_refcounts_) {
+      for (const auto & entry : refcounts) {
+        if (static_cast<std::uint32_t>(fnv1a64(entry.first, kStaticMinV1TopicHashSeed)) ==
+          topic_key_hash)
+        {
+          const std::vector<std::string> parts = split_nonempty(entry.first, '|');
+          if (parts.size() == 3) {
+            char * end = nullptr;
+            errno = 0;
+            const unsigned long long domain_id = std::strtoull(parts[0].c_str(), &end, 10);
+            if (errno == 0 && end != parts[0].c_str() && *end == '\0') {
+              out_domain_id = domain_id;
+              out_topic = parts[1];
+              out_type_name = parts[2];
+              return true;
+            }
+          }
+        }
+      }
+    }
+    return false;
   }
 
   // Returns -1 if `source` doesn't match any configured peer -- e.g. a
@@ -7192,6 +7271,18 @@ private:
     if (static_discovery_mode_) {
       seed_static_subscriptions(std::getenv("FLEETQOX_RMW_STATIC_SUBSCRIPTIONS"));
     }
+    // Registered unconditionally (not just under static_discovery_mode_)
+    // since it's harmless when static_min_v1 encoding is never used --
+    // decode_data_frame() only ever calls it for kDataFrameStaticMinV1Magic
+    // frames, which this process will never produce/receive unless
+    // FLEETQOX_RMW_DATA_FRAME_ENCODING=static_min_v1 was also set.
+    rmw_fleetqox_cpp::set_static_min_v1_topic_resolver(
+      [this](
+        std::uint32_t topic_key_hash, std::uint64_t & out_domain_id,
+        std::string & out_topic, std::string & out_type_name) {
+        return resolve_static_min_v1_topic_hash(
+          topic_key_hash, out_domain_id, out_topic, out_type_name);
+      });
     if (!quic_gateway_transport_.configure_from_environment()) {
       init_error_ = quic_gateway_transport_.error();
       ::close(fd_);
@@ -12335,7 +12426,20 @@ rmw_ret_t publish_payload(FleetQoxPublisherData * data, const std::vector<std::u
     std::uint64_t{0},
     encode_partitions_csv(data->partitions),
     data->ownership_strength};
-  if (compact_v1_data_frame_encoding_enabled()) {
+  if (static_min_v1_data_frame_encoding_enabled()) {
+    // Matches LoopbackSocketTransport::subscription_topic_key() exactly
+    // (private to that class, so duplicated here rather than exposed
+    // solely for this one free-function call site).
+    const std::string topic_key =
+      std::to_string(frame.domain_id) + "|" + frame.topic + "|" + frame.type_name;
+    const std::uint32_t topic_key_hash = static_cast<std::uint32_t>(
+      fnv1a64(topic_key, kStaticMinV1TopicHashSeed));
+    const std::uint32_t publisher_hash = static_cast<std::uint32_t>(fnv1a64(
+      frame.robot_id + "|" + frame.publisher_id, kStaticMinV1TopicHashSeed));
+    rmw_fleetqox_cpp::encode_data_frame_static_min_v1_append(
+      topic_key_hash, publisher_hash, static_cast<std::uint32_t>(source_sequence),
+      now_ns, payload, data->frame_json_scratch);
+  } else if (compact_v1_data_frame_encoding_enabled()) {
     rmw_fleetqox_cpp::encode_data_frame_compact_v1_append(frame, data->frame_json_scratch);
   } else {
     rmw_fleetqox_cpp::encode_data_frame_append(

@@ -596,7 +596,27 @@ bool read_length_prefixed_bytes(
   return true;
 }
 
+// --- static_min_v1 helpers ------------------------------------------------
+// Not a std::atomic<std::function<...>> -- this is set exactly once at
+// process startup (LoopbackSocketTransport::start(), long before any
+// decode_data_frame() call can race it) and never reassigned afterward, so
+// a plain global avoids pulling in <atomic> here for a value type that
+// isn't atomic-capable anyway.
+StaticMinV1TopicResolver g_static_min_v1_topic_resolver;
+
+std::string hex8(std::uint32_t value)
+{
+  char buffer[9];
+  std::snprintf(buffer, sizeof(buffer), "%08x", value);
+  return std::string(buffer, 8);
+}
+
 }  // namespace
+
+void set_static_min_v1_topic_resolver(StaticMinV1TopicResolver resolver)
+{
+  g_static_min_v1_topic_resolver = std::move(resolver);
+}
 
 std::string stream_key(const DataFrame & frame)
 {
@@ -804,8 +824,61 @@ std::optional<DataFrame> decode_data_frame_compact_v1(const std::string & payloa
   return frame;
 }
 
+void encode_data_frame_static_min_v1_append(
+  std::uint32_t topic_key_hash,
+  std::uint32_t publisher_hash,
+  std::uint32_t sequence32,
+  std::int64_t source_timestamp_ns,
+  const std::vector<std::uint8_t> & payload,
+  std::string & out)
+{
+  out.clear();
+  out += kDataFrameStaticMinV1Magic;
+  append_fixed(out, topic_key_hash);
+  append_fixed(out, publisher_hash);
+  append_fixed(out, sequence32);
+  append_fixed(out, source_timestamp_ns);
+  append_length_prefixed(out, payload);
+}
+
+std::optional<DataFrame> decode_data_frame_static_min_v1(const std::string & payload)
+{
+  const std::string magic = kDataFrameStaticMinV1Magic;
+  if (payload.rfind(magic, 0) != 0) {
+    return std::nullopt;
+  }
+  std::size_t offset = magic.size();
+  std::uint32_t topic_key_hash = 0;
+  std::uint32_t publisher_hash = 0;
+  std::uint32_t sequence32 = 0;
+  std::int64_t source_timestamp_ns = 0;
+  std::vector<std::uint8_t> raw_payload;
+  const bool ok =
+    read_fixed(payload, offset, topic_key_hash) &&
+    read_fixed(payload, offset, publisher_hash) &&
+    read_fixed(payload, offset, sequence32) &&
+    read_fixed(payload, offset, source_timestamp_ns) &&
+    read_length_prefixed_bytes(payload, offset, raw_payload);
+  if (!ok || !g_static_min_v1_topic_resolver) {
+    return std::nullopt;
+  }
+  DataFrame frame;
+  if (!g_static_min_v1_topic_resolver(topic_key_hash, frame.domain_id, frame.topic, frame.type_name)) {
+    return std::nullopt;
+  }
+  frame.robot_id = "h" + hex8(publisher_hash);
+  frame.publisher_id = frame.robot_id;
+  frame.source_sequence_number = sequence32;
+  frame.source_timestamp_ns = source_timestamp_ns;
+  frame.serialized_payload = std::move(raw_payload);
+  return frame;
+}
+
 std::optional<DataFrame> decode_data_frame(const std::string & payload)
 {
+  if (payload.rfind(kDataFrameStaticMinV1Magic, 0) == 0) {
+    return decode_data_frame_static_min_v1(payload);
+  }
   if (payload.rfind(kDataFrameCompactV1Magic, 0) == 0) {
     return decode_data_frame_compact_v1(payload);
   }
