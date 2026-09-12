@@ -395,7 +395,27 @@ main(int argc, char* argv[])
       "AC_BE, debug/bulk -> AC_BK), instead of a single best-effort DCF "
       "queue for all traffic",
       wifiQos);
+  bool realtime = false;
+  cmd.AddValue(
+      "realtime",
+      "Bind ns3::RealtimeSimulatorImpl instead of the default discrete-"
+      "event simulator, with checksums enabled -- matches the mode "
+      "fleetqox_trace_replay_tap.cc's TapBridge pipeline is forced to use "
+      "(TapBridge requires it to interoperate with real Linux processes). "
+      "Added for the ChatGPT-suggested causal-isolation experiment (see "
+      "docs/AUDIT_ACCEPTANCE_TRACKING.md 'realtime vs TAP vs middleware'): "
+      "this program otherwise has NO TapBridge and NO real Linux "
+      "processes at all, so toggling just this flag isolates whether "
+      "realtime scheduling ALONE (independent of TapBridge/real-OS "
+      "integration) changes the 802.11 delivery outcome.",
+      realtime);
   cmd.Parse(argc, argv);
+
+  if (realtime)
+  {
+    GlobalValue::Bind("SimulatorImplementationType", StringValue("ns3::RealtimeSimulatorImpl"));
+    GlobalValue::Bind("ChecksumEnabled", BooleanValue(true));
+  }
 
   if (tracePath.empty())
   {

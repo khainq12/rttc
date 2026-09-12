@@ -23,6 +23,41 @@ class EndpointListTest(unittest.TestCase):
         self.assertEqual(endpoints[3:], ["robot_0000", "robot_0001", "robot_0002"])
 
 
+class BuildShellScriptRawUdpTest(unittest.TestCase):
+    def setUp(self):
+        self.endpoints = endpoint_list(1)
+        self.script = build_shell_script(
+            trace_container_path="/work/results/trace.csv",
+            endpoints=self.endpoints,
+            policy="fifo",
+            num_robots=1,
+            sim_duration_s=30.0,
+            start_offset_ms=2000.0,
+            drain_s=10.0,
+            results_dir_container="/tmp/fleetqox_tap_results",
+            rmw_implementation="raw_udp",
+        )
+
+    def test_skips_ros2_and_fleetqox_install_check(self):
+        self.assertNotIn(f"setup.bash || ", self.script)
+        self.assertNotIn("source /opt/ros/jazzy/setup.bash", self.script)
+        self.assertNotIn("RMW_IMPLEMENTATION", self.script)
+
+    def test_launches_raw_udp_endpoint_with_full_peer_map(self):
+        self.assertIn("raw_udp_trace_endpoint.py", self.script)
+        # fleet_controller (index 0) -> 10.50.0.2, including itself --
+        # the receiver just never looks itself up as a send target.
+        self.assertIn("fleet_controller=10.50.0.2", self.script)
+        self.assertIn("fleet_router=10.50.0.3", self.script)
+        self.assertIn("operator_ui=10.50.0.4", self.script)
+        self.assertIn("robot_0000=10.50.0.5", self.script)
+
+    def test_result_markers_present_per_endpoint(self):
+        for endpoint in self.endpoints:
+            self.assertIn(f"FLEETQOX_TAP_RESULT_BEGIN:{endpoint}", self.script)
+            self.assertIn(f"FLEETQOX_TAP_RESULT_END:{endpoint}", self.script)
+
+
 class BuildShellScriptTest(unittest.TestCase):
     def setUp(self):
         self.endpoints = endpoint_list(1)

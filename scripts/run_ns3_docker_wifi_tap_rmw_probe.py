@@ -293,7 +293,7 @@ def build_shell_script(
                     if subscription_aware else ""
                 )
             )
-        else:
+        elif rmw_implementation != "raw_udp":
             # Standard ROS2 RMW (e.g. rmw_fastrtps_cpp/Fast DDS,
             # rmw_cyclonedds_cpp/Cyclone DDS) -- comparison baseline for the
             # 16-robot-scale wifi investigation (see
@@ -305,22 +305,39 @@ def build_shell_script(
             # the same way it relays any other broadcast traffic, already
             # confirmed working for ARP earlier in this investigation.
             rmw_setup = f"export RMW_IMPLEMENTATION={rmw_implementation} "
-        inner = (
-            "source /opt/ros/jazzy/setup.bash && "
-            + rmw_setup
-            + "&& "
-            f"python3 {_container_path(ROOT / 'scripts' / 'fleetqox_rmw_trace_endpoint.py')} "
-            f"--trace={shlex.quote(trace_container_path)} "
-            f"--endpoint={shlex.quote(endpoint)} "
-            f"--policy={shlex.quote(policy)} "
-            f"--start-offset-ms={start_offset_ms:.12g} "
-            f"--drain-s={drain_s:.12g} "
-            f"--discovery-timeout-s={discovery_timeout_s:.12g} "
-            f"--start-wait-timeout-s={start_wait_timeout_s} "
-            f"--summary-json={shlex.quote(result_json)} "
-            f"--ready-file={shlex.quote(ready_files[i])} "
-            f"--start-file={shlex.quote(start_file)}"
-        )
+        if rmw_implementation == "raw_udp":
+            all_peers = ",".join(f"{name}={ips[name]}" for name in endpoints)
+            inner = (
+                f"python3 {_container_path(ROOT / 'scripts' / 'raw_udp_trace_endpoint.py')} "
+                f"--trace={shlex.quote(trace_container_path)} "
+                f"--endpoint={shlex.quote(endpoint)} "
+                f"--policy={shlex.quote(policy)} "
+                f"--peers={shlex.quote(all_peers)} "
+                f"--port={RMW_PORT} "
+                f"--start-offset-ms={start_offset_ms:.12g} "
+                f"--drain-s={drain_s:.12g} "
+                f"--start-wait-timeout-s={start_wait_timeout_s} "
+                f"--summary-json={shlex.quote(result_json)} "
+                f"--ready-file={shlex.quote(ready_files[i])} "
+                f"--start-file={shlex.quote(start_file)}"
+            )
+        else:
+            inner = (
+                "source /opt/ros/jazzy/setup.bash && "
+                + rmw_setup
+                + "&& "
+                f"python3 {_container_path(ROOT / 'scripts' / 'fleetqox_rmw_trace_endpoint.py')} "
+                f"--trace={shlex.quote(trace_container_path)} "
+                f"--endpoint={shlex.quote(endpoint)} "
+                f"--policy={shlex.quote(policy)} "
+                f"--start-offset-ms={start_offset_ms:.12g} "
+                f"--drain-s={drain_s:.12g} "
+                f"--discovery-timeout-s={discovery_timeout_s:.12g} "
+                f"--start-wait-timeout-s={start_wait_timeout_s} "
+                f"--summary-json={shlex.quote(result_json)} "
+                f"--ready-file={shlex.quote(ready_files[i])} "
+                f"--start-file={shlex.quote(start_file)}"
+            )
         cmd = (
             f"ip netns exec ns{i} bash -c {shlex.quote(inner)} "
             f"> {shlex.quote(log_file)} 2>&1 &"
@@ -643,9 +660,16 @@ def main() -> int:
             "behavior against the same real ns-3 802.11g TapBridge "
             "topology and traffic this investigation used throughout --"
             "see docs/AUDIT_ACCEPTANCE_TRACKING.md 'DDS comparison'. "
-            "Any value other than rmw_fleetqox_cpp skips the "
-            "FLEETQOX_RMW_* colcon-install/env-var setup entirely and "
-            "relies on the RMW's own discovery (typically multicast)."
+            "Pass raw_udp for the causal-isolation Test 3 -- no ROS2/"
+            "rclpy/RMW/discovery at all, plain socket.sendto()/recvfrom() "
+            "against a static peer map over the exact same TapBridge/"
+            "netns pipeline, see scripts/raw_udp_trace_endpoint.py and "
+            "docs/AUDIT_ACCEPTANCE_TRACKING.md 'causal isolation: "
+            "middleware vs TapBridge'. Any value other than "
+            "rmw_fleetqox_cpp skips the FLEETQOX_RMW_* colcon-install/"
+            "env-var setup entirely; raw_udp additionally skips ROS2 "
+            "sourcing altogether, and every other value relies on the "
+            "RMW's own discovery (typically multicast)."
         ),
     )
     args = parser.parse_args()
