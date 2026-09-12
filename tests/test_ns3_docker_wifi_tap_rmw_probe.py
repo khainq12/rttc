@@ -58,6 +58,45 @@ class BuildShellScriptRawUdpTest(unittest.TestCase):
             self.assertIn(f"FLEETQOX_TAP_RESULT_END:{endpoint}", self.script)
 
 
+class BuildShellScriptStaggerStartTest(unittest.TestCase):
+    def test_no_sleep_lines_when_stagger_is_zero(self):
+        script = build_shell_script(
+            trace_container_path="/work/results/trace.csv",
+            endpoints=endpoint_list(1),
+            policy="fifo",
+            num_robots=1,
+            sim_duration_s=30.0,
+            start_offset_ms=2000.0,
+            drain_s=10.0,
+            results_dir_container="/tmp/fleetqox_tap_results",
+            stagger_start_ms=0.0,
+        )
+        sleep_lines = [line for line in script.splitlines() if line.startswith("sleep ")]
+        # Only the fixed NS3_ATTACH_WAIT_S sleep should remain, none of the
+        # per-endpoint stagger sleeps.
+        self.assertEqual(len(sleep_lines), 1)
+
+    def test_cumulative_per_endpoint_delay_when_staggered(self):
+        endpoints = endpoint_list(1)  # 4 endpoints: index 0..3
+        script = build_shell_script(
+            trace_container_path="/work/results/trace.csv",
+            endpoints=endpoints,
+            policy="fifo",
+            num_robots=1,
+            sim_duration_s=30.0,
+            start_offset_ms=2000.0,
+            drain_s=10.0,
+            results_dir_container="/tmp/fleetqox_tap_results",
+            stagger_start_ms=100.0,
+        )
+        # Endpoint 0 launches immediately (no sleep before it); endpoints
+        # 1-3 get i * 100ms of additional sequential (non-backgrounded)
+        # delay, so ns-3 attach's own sleep plus 3 more distinct values.
+        self.assertIn("sleep 0.100000", script)
+        self.assertIn("sleep 0.200000", script)
+        self.assertIn("sleep 0.300000", script)
+
+
 class BuildShellScriptTest(unittest.TestCase):
     def setUp(self):
         self.endpoints = endpoint_list(1)

@@ -124,6 +124,7 @@ def build_shell_script(
     subscription_aware: bool = False,
     discovery_timeout_s: float = 15.0,
     rmw_implementation: str = "rmw_fleetqox_cpp",
+    stagger_start_ms: float = 0.0,
 ) -> str:
     ips = {endpoint: f"{BASE_IP_PREFIX}{i + 2}" for i, endpoint in enumerate(endpoints)}
     # ChatGPT-flagged bootstrap-feedback-loop hypothesis (see
@@ -338,6 +339,19 @@ def build_shell_script(
                 f"--ready-file={shlex.quote(ready_files[i])} "
                 f"--start-file={shlex.quote(start_file)}"
             )
+        if stagger_start_ms > 0 and i > 0:
+            # ChatGPT's synchronized-discovery-burst hypothesis (see
+            # docs/AUDIT_ACCEPTANCE_TRACKING.md "causal isolation"): all 19
+            # endpoints currently launch back-to-back with no gap, so every
+            # middleware's startup-time discovery announcements (DDS SPDP/
+            # SEDP, or FleetRMW's own initial graph advertisement) go out
+            # in a tight cluster -- a plausible 802.11 DCF collision-burst
+            # trigger independent of total traffic volume. A plain
+            # sequential `sleep` here (not backgrounded) delays launching
+            # endpoint i by i * stagger_start_ms from when the loop
+            # started, spreading startup announcements out in real time
+            # without changing anything else about the workload.
+            lines.append(f"sleep {i * stagger_start_ms / 1000.0:.6f}")
         cmd = (
             f"ip netns exec ns{i} bash -c {shlex.quote(inner)} "
             f"> {shlex.quote(log_file)} 2>&1 &"
@@ -475,6 +489,7 @@ def run_probe(
     subscription_aware: bool = False,
     discovery_timeout_s: float = 15.0,
     rmw_implementation: str = "rmw_fleetqox_cpp",
+    stagger_start_ms: float = 0.0,
 ) -> dict[str, Any]:
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -509,6 +524,7 @@ def run_probe(
         subscription_aware=subscription_aware,
         discovery_timeout_s=discovery_timeout_s,
         rmw_implementation=rmw_implementation,
+        stagger_start_ms=stagger_start_ms,
     )
 
     completed = subprocess.run(
@@ -672,6 +688,27 @@ def main() -> int:
             "RMW's own discovery (typically multicast)."
         ),
     )
+    parser.add_argument(
+        "--stagger-start-ms",
+        type=float,
+        default=0.0,
+        help=(
+            "Delay launching endpoint i by i * this many ms after the "
+            "previous one, instead of launching all endpoints back-to-back "
+            "with no gap. Tests ChatGPT's synchronized-discovery-burst "
+            "hypothesis for the 16-robot-scale collapse: startup-time "
+            "discovery announcements (DDS SPDP/SEDP, or FleetRMW's initial "
+            "graph advertisement) from all 19 endpoints currently cluster "
+            "within a few hundred ms of each other, a plausible 802.11 DCF "
+            "collision-burst trigger independent of total traffic volume. "
+            "Only affects when each endpoint's process STARTS (and thus "
+            "when its discovery/startup traffic happens) -- the actual "
+            "trace replay still begins for every endpoint at the same "
+            "synchronized instant via the existing ready/start file gate, "
+            "so this does not change the application workload's timing at "
+            "all. See docs/AUDIT_ACCEPTANCE_TRACKING.md 'causal isolation'."
+        ),
+    )
     args = parser.parse_args()
 
     summary = run_probe(
@@ -690,6 +727,7 @@ def main() -> int:
         subscription_aware=args.subscription_aware,
         discovery_timeout_s=max(args.discovery_timeout_s, 0.1),
         rmw_implementation=args.rmw_implementation,
+        stagger_start_ms=max(args.stagger_start_ms, 0.0),
     )
     summary_path = ROOT / args.summary_json
     summary_path.parent.mkdir(parents=True, exist_ok=True)
