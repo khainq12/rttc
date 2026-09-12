@@ -2728,6 +2728,46 @@ control/không có deadline chặt) hay nên quay lại hướng CW/EDCA tuning.
 
 **File thay đổi**: không có (phân tích thuần trên trace CSV đã có).
 
+### 12/09/2026 (tiếp) — ChatGPT đổi hướng khuyến nghị: KHÔNG xây batching cho trace này; đo số lượng sendto() thực tế trước — kết quả: KHÔNG có khuếch đại số lượng gói (1.02x)
+
+ChatGPT đồng ý huỷ hướng batching cho trace này (do phát hiện thiếu
+clustering ở trên), chuyển sang ưu tiên đo **số lượng UDP sendto() thực
+tế** so với số message logic — không phải `mac_tx_total` (đã đo, có thể
+bị ảnh hưởng bởi retry/collision ở tầng dưới) mà là số lần gọi
+`sendto()` ở tầng ứng dụng/transport, để biết FleetRMW có "khuếch đại"
+số lượng gói tin so với 1:1 (như raw-UDP) hay không.
+
+May mắn, counter cần dùng (`frames_sent`/`frames_received` — đếm số
+lần gọi `sendto()` thật ở tầng transport, KHÁC với `mac_tx_total` ở
+tầng MAC/PHY của ns-3) đã được thêm vào `fleetqox_rmw_trace_endpoint.py`
+từ trước (lúc làm `compact_v1`) mà chưa dùng tới. Lấy thẳng từ 1 kết quả
+static-mode đã chạy trước đó:
+
+- Số message logic đã gửi (tx): 2289
+- Tổng `frames_sent` thực tế (tất cả 19 endpoint cộng lại): 2327
+- **Tỉ lệ khuếch đại: 1.02x — GẦN NHƯ 1:1, không có khuếch đại đáng kể**
+
+**Kết luận**: giả thuyết "FleetRMW gửi nhiều gói hơn logic cho mỗi
+message" (do NACK/repair/fragment storm) bị BÁC BỎ ở mức tổng hợp —
+khớp với kết quả retry-disabled trước đó cho thấy khối lượng retry thấp
+nhưng quan trọng cho việc phục hồi, không phải nguồn khuếch đại. Điều
+này ĐẨY nghi vấn còn lại về hướng **thời điểm gửi thực tế (timing/
+burstiness)** — có thể FleetRMW gửi các gói ở cùng logic-schedule
+nhưng dồn cục hơn về mặt wall-clock thực tế (do overhead xử lý nội bộ:
+encode, khoá mutex, ghi retransmit ledger...) so với raw-UDP vốn
+`sendto()` gần như ngay lập tức không qua lớp trung gian nào.
+
+**Việc tiếp theo (đã hỏi ChatGPT xác nhận, đang chờ)**: thêm log thời
+điểm gửi thực tế (wall-clock, không phải timestamp lịch trình trong
+trace) cho từng message ở cả `fleetqox_rmw_trace_endpoint.py` và
+`raw_udp_trace_endpoint.py`, so sánh phân phối khoảng cách giữa các lần
+gửi liên tiếp — đặc biệt cho `fleet_controller` (71% traffic, fanout 16
+đích) để xem FleetRMW có "dồn cục" (burst) các lần gửi hơn schedule gốc
+so với raw-UDP hay không.
+
+**File thay đổi**: không có (dùng lại counter `frames_sent`/
+`frames_received` đã thêm từ trước, chỉ đọc dữ liệu đã có).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
