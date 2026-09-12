@@ -2293,6 +2293,72 @@ nó "đắt" hơn tương ứng gói dữ liệu ứng dụng trên cùng kênh.
 (`--discovery-only`), `scripts/run_ns3_docker_wifi_tap_rmw_probe.py`
 (`--discovery-only`).
 
+### 12/09/2026 (tiếp) — FIX THẬT (không chỉ chẩn đoán): FLEETQOX_RMW_STATIC_MODE — loại bỏ hoàn toàn traffic discovery, delivery từ 0% lên ~29%
+
+Theo yêu cầu trực tiếp của người dùng ("cố gắng fix đi chưa, bạn cứ đề
+xuất đúng vậy??") — chuyển từ chẩn đoán sang sửa thật. Fast DDS/Cyclone
+DDS là thư viện bên thứ ba (không sửa được), nhưng `rmw_fleetqox_cpp` là
+code của chính dự án, và nó ĐÃ biết trước toàn bộ danh sách peer qua
+`FLEETQOX_RMW_PEERS` (tĩnh, không cần discovery để tìm địa chỉ) — lý do
+DUY NHẤT nó vẫn gửi traffic discovery là để học "peer nào subscribe
+topic nào" cho subscription-aware routing. Với harness này, ánh xạ
+(topic → subscriber) là XÁC ĐỊNH TRƯỚC hoàn toàn từ trace (tên topic
+`/fleetqox_trace/{dst}/{flow_class}` chỉ có đúng 1 subscriber khả dĩ:
+endpoint tên `{dst}`).
+
+Thêm vào `rmw_pubsub.cpp`:
+- `FLEETQOX_RMW_STATIC_MODE=1`: vô hiệu hoá hoàn toàn
+  `send_graph_advertisement`/`send_graph_heartbeat`/
+  `send_subscription_advertisement` (trả về ngay, không gửi gói nào lên
+  dây) và không khởi động `pubsub_graph_renewal_loop` (thread heartbeat/
+  full-resync) — ZERO traffic control-plane, không phải giảm tần suất
+  như các lần tối ưu trước.
+- `FLEETQOX_RMW_STATIC_SUBSCRIPTIONS`: nạp sẵn
+  `peer_subscribed_topic_refcounts_` từ danh sách
+  `ip:port|domain|topic|type` do caller cung cấp — đóng đúng vai trò mà
+  `update_peer_subscription()` đáng lẽ học được từ graph advertisement
+  nhận qua mạng, nhưng học TRƯỚC (từ config), không cần một gói nào.
+
+Thêm `--static-mode` vào `run_ns3_docker_wifi_tap_rmw_probe.py`
+(`build_static_subscriptions()` tự suy ra map từ trace CSV — không cần
+sửa gì ở `fleetqox_rmw_trace_endpoint.py`, vì ánh xạ suy ra thẳng từ
+`(src, dst, flow_class)` trong CSV).
+
+**Kết quả** (`rmw_fleetqox_cpp`, 16-robot, `--static-mode`,
+so với 0/2289 của cấu hình mặc định trước đó):
+
+| | `mac_tx_total` (đỉnh) | `rx` |
+|---|---|---|
+| `rmw_fleetqox_cpp` mặc định (B+ + subscription-aware, có discovery) | ~58000 | **0/2289** |
+| `rmw_fleetqox_cpp` + `--static-mode` (KHÔNG discovery traffic) | ~11430 (đợt cuối, do retry) | **674/2289 (29.4%)** |
+
+Xác nhận sạch: 674 event_id nhận được là DUY NHẤT (0 trùng lặp), khớp
+đối chiếu với trace gốc.
+
+**Đây là bằng chứng thực nghiệm trực tiếp cho kết luận nhân quả**: loại
+bỏ traffic discovery đưa delivery từ SẬP HOÀN TOÀN (0%) lên gần 30% —
+không phải 95-100% như raw-UDP, vì `mac_tx_total` ở mẫu cuối vẫn nhảy
+vọt lên 11430 kèm `mac_rx_drop_total` tăng vọt (233399) — dấu hiệu của
+retry/reliability-repair traffic (QoS RELIABLE, NACK/fragment-repair đã
+có sẵn trong RMW) tự nó tạo ra một vòng lặp tương tự: một phần va chạm
+ban đầu → retransmit → thêm traffic → thêm va chạm. Cơ chế "traffic phụ
+trợ (không phải dữ liệu ứng dụng thực) tự nó đủ để làm trầm trọng bão
+hoà kênh" xuất hiện LẦN THỨ HAI, lần này ở tầng reliability-retry thay
+vì discovery.
+
+**Việc còn lại (hướng tiếp theo khả thi, chưa làm)**: giảm độ "hào
+phóng" của cơ chế reliability-retry khi ở static mode (hạ
+`FLEETQOX_RMW_REPAIR_RETRANSMISSION_BUDGET`/
+`FLEETQOX_RMW_PROACTIVE_DATA_REPEATS`/tần suất NACK) để kiểm tra xem có
+đẩy tiếp delivery lên gần mức raw-UDP (95-100%) hay không — cùng logic
+"traffic phụ trợ, không phải data, gây bão hoà" nhưng áp dụng cho tầng
+retry thay vì tầng discovery.
+
+**File thay đổi**: `ros2_ws/src/rmw_fleetqox_cpp/src/rmw_pubsub.cpp`
+(`FLEETQOX_RMW_STATIC_MODE`, `FLEETQOX_RMW_STATIC_SUBSCRIPTIONS`),
+`scripts/run_ns3_docker_wifi_tap_rmw_probe.py` (`--static-mode`,
+`build_static_subscriptions`).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
