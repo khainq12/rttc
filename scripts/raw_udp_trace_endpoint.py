@@ -146,6 +146,7 @@ def main() -> int:
 
     start_wall = time.monotonic()
     sent: list[str] = []
+    send_timing: list[dict[str, Any]] = []
     for row in outgoing:
         target_offset_s = (float(row["timestamp_ms"]) + args.start_offset_ms) / 1000.0
         now_offset = time.monotonic() - start_wall
@@ -154,8 +155,23 @@ def main() -> int:
         target_bytes = max(1, int(row["bytes"]))
         payload = build_payload(row, target_bytes)
         dst_ip = peers[row["dst"]]
+        # Timing instrumentation added for the causal-isolation investigation
+        # (see docs/AUDIT_ACCEPTANCE_TRACKING.md "send-timing burstiness") --
+        # this raw-UDP control's sendto() is the near-immediate, unbuffered
+        # baseline fleetqox_rmw_trace_endpoint.py's publish()-call timing is
+        # compared against.
+        before_wall_ns = time.monotonic_ns()
         sock.sendto(payload, (dst_ip, args.port))
+        after_wall_ns = time.monotonic_ns()
         sent.append(row["event_id"])
+        send_timing.append(
+            {
+                "event_id": row["event_id"],
+                "scheduled_offset_s": target_offset_s,
+                "publish_before_wall_ns": before_wall_ns,
+                "publish_after_wall_ns": after_wall_ns,
+            }
+        )
 
     drain_deadline = time.monotonic() + args.drain_s
     while time.monotonic() < drain_deadline:
@@ -172,6 +188,7 @@ def main() -> int:
         "tx": len(sent),
         "rx": len(received),
         "sent_event_ids": sent,
+        "send_timing": send_timing,
         "received": received,
     }
     args.summary_json.parent.mkdir(parents=True, exist_ok=True)

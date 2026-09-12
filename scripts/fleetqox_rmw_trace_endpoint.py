@@ -290,6 +290,7 @@ def main() -> int:
 
     start_wall = time.monotonic()
     sent: list[str] = []
+    send_timing: list[dict[str, Any]] = []
     # --discovery-only: every publisher/subscription above was still
     # created and matched normally (so discovery/control-plane traffic is
     # unaffected), but the send loop itself is skipped entirely -- isolates
@@ -305,8 +306,29 @@ def main() -> int:
         target_bytes = max(1, int(row["bytes"]))
         msg = String()
         msg.data = build_payload(row, target_bytes)
+        # Timing instrumentation added for the causal-isolation investigation
+        # (see docs/AUDIT_ACCEPTANCE_TRACKING.md "send-timing burstiness"):
+        # packet-count amplification was ruled out (1.02x, essentially 1:1
+        # vs logical messages), so the remaining hypothesis is that
+        # FleetRMW's actual publish()/sendto() calls cluster tighter in
+        # wall-clock time than the trace's scheduled timestamps imply,
+        # unlike raw_udp_trace_endpoint.py's near-immediate unbuffered
+        # sendto(). before_wall_ns/after_wall_ns bracket the actual
+        # publish() call (which synchronously performs encode + sendto()
+        # inside this RMW), not just the scheduled offset already captured
+        # by scheduled_offset_s.
+        before_wall_ns = time.monotonic_ns()
         publishers[_topic_for(row["dst"], row["flow_class"])].publish(msg)
+        after_wall_ns = time.monotonic_ns()
         sent.append(row["event_id"])
+        send_timing.append(
+            {
+                "event_id": row["event_id"],
+                "scheduled_offset_s": target_offset_s,
+                "publish_before_wall_ns": before_wall_ns,
+                "publish_after_wall_ns": after_wall_ns,
+            }
+        )
 
     drain_deadline = time.monotonic() + args.drain_s
     while time.monotonic() < drain_deadline:
@@ -319,6 +341,7 @@ def main() -> int:
         "tx": len(sent),
         "rx": len(received),
         "sent_event_ids": sent,
+        "send_timing": send_timing,
         "received": received,
         "fleetqox_transport_metrics": fleetqox_transport_metrics(),
     }
