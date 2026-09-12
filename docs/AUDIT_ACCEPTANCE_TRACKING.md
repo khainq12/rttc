@@ -2768,6 +2768,58 @@ so với raw-UDP hay không.
 **File thay đổi**: không có (dùng lại counter `frames_sent`/
 `frames_received` đã thêm từ trước, chỉ đọc dữ liệu đã có).
 
+### 12/09/2026 (tiếp) — Đo timing thực tế: phát hiện publish() của FleetRMW chậm hơn raw-UDP 6.4 lần, gây "lag cushion" 5-14ms suốt cả run
+
+Thêm log `publish_before_wall_ns`/`publish_after_wall_ns` quanh mỗi lệnh
+gửi thực tế (`publisher.publish()` cho FleetRMW, `sock.sendto()` cho
+raw-UDP) vào cả `fleetqox_rmw_trace_endpoint.py` và
+`raw_udp_trace_endpoint.py`. Chạy lại 16-robot với CÙNG seed=42/run=1
+cho cả 2 (FleetRMW static-mode: 25.2% delivery; raw-UDP: 100%), phân
+tích riêng cho `fleet_controller` (1626 lần gửi, 71% tổng traffic).
+
+**Thời gian bản thân lệnh gửi (không phải khoảng cách giữa các lần
+gửi)**:
+- raw UDP: mean=0.038ms, max=0.121ms, p95=0.070ms
+- FleetRMW: mean=0.247ms, max=1.472ms, p95=0.351ms
+- **FleetRMW chậm hơn raw-UDP 6.4 lần MỖI LẦN gọi `publish()`**
+
+**Khoảng cách giữa các lần gửi liên tiếp** (trace có nhiều message được
+lên lịch gửi CÙNG THỜI ĐIỂM, tức khoảng cách lịch trình = 0ms):
+- raw UDP: median=0.088ms, 63.5% dưới 0.1ms, 90.8% dưới 0.5ms
+- FleetRMW: median=1.101ms, 0% dưới 0.5ms, chỉ 33.7% dưới 1ms
+
+**Độ trễ lịch trình tuyệt đối** (thời gian thực đã trôi qua trừ thời
+gian lịch trình dự kiến, lấy mẫu mỗi ~100 lần gửi xuyên suốt run):
+- raw UDP: luôn dưới ~1.3ms suốt cả run (+0.00, +0.46, +0.17, −0.03,
+  +0.67, +0.44...ms)
+- FleetRMW: dao động trong khoảng **+4ms đến +14ms suốt cả run**,
+  không bao giờ về gần 0, nhưng cũng KHÔNG drift tăng dần không giới
+  hạn (+6.92, +3.55, +4.92, +12.26, +5.84, +8.18, +4.96, +5.57,
+  +13.66, +7.28ms...)
+
+**Diễn giải**: đây không phải drift tích luỹ chạy trốn (runaway), mà là
+một "đệm trễ" (lag cushion) khoảng 5-14ms mà FleetRMW MANG THEO suốt cả
+run — lớn hơn độ chính xác dưới-mili-giây của raw-UDP tới 2 bậc độ lớn.
+Xem code `publish_payload()`: mỗi lần gọi đều khoá `g_bus_mutex` và
+QUÉT TUYẾN TÍNH toàn bộ `g_retransmit_ledger` (map dùng chung TOÀN HỆ
+THỐNG, không đánh index theo publisher) để tìm/dọn entry của publisher
+hiện tại, cộng thêm tra cứu subscription-matching cho QoS RELIABLE —
+đây là ứng viên hàng đầu cho nguồn overhead 0.25ms/lần gọi. Với 19 trạm
+độc lập, mỗi trạm mang một độ trễ ngẫu nhiên ~5-14ms riêng so với lịch
+trình gốc, các message mà trace THIẾT KẾ để giãn cách nhau vẫn có thể
+VÔ TÌNH rơi vào cùng cửa sổ thời gian thực — làm mất tác dụng của việc
+giãn cách lịch trình cẩn thận trong trace gốc.
+
+**Đã gửi phát hiện này cho ChatGPT để xác nhận cơ chế và hỏi hướng sửa**
+(nghi ngờ hàng đầu: tối ưu retransmit ledger — đánh index theo
+publisher thay vì quét tuyến tính toàn bộ map — nhưng cần xác nhận
+bằng profiling thực tế thay vì chỉ suy luận từ đọc code, trước khi
+sửa). Đang chờ phản hồi.
+
+**File thay đổi**: `scripts/fleetqox_rmw_trace_endpoint.py`,
+`scripts/raw_udp_trace_endpoint.py` (thêm `send_timing` vào kết quả
+JSON — đã liệt kê ở mục trước).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
