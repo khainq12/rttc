@@ -2622,6 +2622,69 @@ trong phiên này):
 4. Cân nhắc thêm CPU affinity riêng cho tiến trình ns-3 và tiến trình
    endpoint để giảm (không phải loại bỏ) nhiễu OS-jitter còn lại.
 
+### 12/09/2026 (tiếp) — KẾT QUẢ CUỐI: 10 cặp so khớp JSON/compact_v1 — KHÔNG có khác biệt có ý nghĩa thống kê
+
+Theo yêu cầu người dùng, chạy đúng thiết kế ChatGPT đề xuất: 10 cặp
+JSON/compact_v1, mỗi cặp dùng CÙNG `--run` (1 đến 10, `--seed=42` cố
+định xuyên suốt), đảo thứ tự chạy trong cặp luân phiên (run lẻ: JSON
+trước; run chẵn: compact_v1 trước) để tránh thiên vị do trôi tải/nhiệt
+hệ thống theo thời gian.
+
+**Kết quả 10 cặp** (delivery %, theo thứ tự run 1→10):
+
+| Run | JSON | compact_v1 | Δ (compact − JSON) |
+|---|---|---|---|
+| 1 | 29.9 | 9.8 | −20.1 |
+| 2 | 14.3 | 29.9 | +15.6 |
+| 3 | 24.9 | 16.0 | −8.9 |
+| 4 | 32.9 | 18.6 | −14.3 |
+| 5 | 27.9 | 23.3 | −4.6 |
+| 6 | 12.3 | 14.3 | +2.0 |
+| 7 | 16.9 | 26.0 | +9.1 |
+| 8 | 10.6 | 30.8 | +20.1 |
+| 9 | 14.8 | 26.1 | +11.4 |
+| 10 | 12.0 | 11.7 | −0.3 |
+
+- JSON: n=10, mean=19.6%, độ lệch chuẩn=8.4
+- compact_v1: n=10, mean=20.6%, độ lệch chuẩn=7.6
+- **Chênh lệch trung bình theo cặp (compact − JSON) = +1.0 điểm phần
+  trăm, độ lệch chuẩn 13.2, khoảng tin cậy 95% = [−8.4, +10.4]**
+
+**Kết luận dứt điểm, trung thực**: khoảng tin cậy 95% CHỨA số 0 và khá
+rộng — **KHÔNG có bằng chứng thống kê cho thấy `compact_v1` cải thiện
+delivery so với JSON** ở quy mô/topology này, dù việc giảm 50.4% kích
+thước gói tin trên dây là có thật và đã đo chính xác. Chênh lệch từng
+cặp dao động cả hai chiều gần như ngẫu nhiên (−20.1 đến +20.1), không
+có xu hướng hệ thống nào theo thứ tự chạy (loại trừ được thiên vị do
+trôi tải hệ thống theo thời gian, vì đã đảo thứ tự).
+
+**Diễn giải khả dĩ** (chưa kiểm chứng thêm, nêu để tham khảo): kênh
+802.11 DCF có overhead CỐ ĐỊNH đáng kể trên mỗi lần truyền (DIFS, SIFS,
+backoff slot, PHY preamble) không phụ thuộc kích thước payload — ở dải
+kích thước gói tin nhỏ (96B–1KB) của workload này, phần airtime tỉ lệ
+thuận với payload có thể chỉ là một phần nhỏ so với overhead cố định
+này, nên giảm 50% kích thước payload không giảm tương ứng tổng airtime
+mỗi gói, và do đó không giảm đáng kể xác suất va chạm. Nói cách khác:
+bài toán bão hoà kênh ở quy mô 19-trạm này có thể bị chi phối bởi **số
+lượng lần truyền** (số gói, số lần contend kênh) hơn là **kích thước
+mỗi gói** — khớp với nhận định ChatGPT nêu trước đó ("not too many
+frames, but too much channel time per control frame" áp dụng ngược lại
+ở đây: với data-plane frame nhỏ, chi phí KHÔNG chủ yếu đến từ kích
+thước).
+
+**Khuyến nghị cuối cùng cho `compact_v1`**: giữ nguyên như một tính
+năng opt-in đã được kiểm chứng đúng đắn về mặt kỹ thuật (round-trip an
+toàn, giảm wire size xác nhận), nhưng **KHÔNG khuyến nghị chuyển thành
+mặc định** dựa trên bằng chứng delivery hiện có — lợi ích (nếu có) quá
+nhỏ để phân biệt với nhiễu ở quy mô thử nghiệm này. Nếu muốn tiếp tục
+theo hướng này, cần nhắm vào **giảm số lượng gói/lần contend kênh**
+(vd: gộp nhiều message nhỏ vào 1 gói, giảm tần suất gửi) thay vì tiếp
+tục giảm kích thước từng gói.
+
+**File thay đổi**: không có (chạy 20 lần thử qua
+`run_ns3_docker_wifi_tap_rmw_probe.run_probe()` trực tiếp bằng script
+Python tạm, không cần thay đổi code sản phẩm).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
