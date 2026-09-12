@@ -1992,6 +1992,92 @@ nhưng KHÔNG hướng nào (kể cả kết hợp) đưa delivery vượt quá 
 **File thay đổi**: `scripts/run_ns3_docker_wifi_tap_rmw_probe.py`
 (`--discovery-timeout-s`, tính lại ready/start deadline).
 
+### 11/09/2026 (tiếp) — KẾT LUẬN CHÍNH THỨC, khép lại nhánh điều tra 16-robot-scale (đã được ChatGPT Plus review)
+
+Gửi toàn bộ 7-bước bằng chứng cho ChatGPT Plus review lần cuối trước khi
+chốt kết luận. ChatGPT xác nhận đây là kết luận công bằng, có căn cứ,
+với 2 điều chỉnh câu chữ quan trọng cho tính khoa học:
+1. Dùng "**nút thắt chi phối** (dominant bottleneck)" thay vì ngụ ý đã
+   loại trừ MỌI khả năng kém hiệu quả ở tầng protocol.
+2. TRÁNH khẳng định tổng quát "802.11g không hỗ trợ được 19 station"
+   — bằng chứng chỉ đúng cho ĐÚNG workload/topology/traffic pattern đã
+   đánh giá, không phải một giới hạn tuyệt đối của chuẩn 802.11g.
+
+**Kết luận chính thức (bản ChatGPT đề xuất, đã dịch/thích nghi)**:
+
+> Bằng chứng thực nghiệm cho thấy nút thắt chi phối ở quy mô 16-robot/
+> 19-endpoint là tình trạng bão hòa (saturation) của kênh không dây
+> IEEE 802.11g dùng chung, dưới workload đã đánh giá — chứ không phải
+> một lỗi cụ thể còn sót lại ở tầng middleware.
+>
+> Bảy thí nghiệm giảm thiểu độc lập đã được đánh giá: lỗi socket
+> tạm thời (EHOSTUNREACH), overhead graph-advertisement định kỳ, tranh
+> chấp kênh không dây (multi-AP), cô lập sender chi phối, graph
+> discovery event-driven (B+), data-plane routing theo subscription,
+> và kéo dài thời gian hội tụ discovery. Các can thiệp này đều tạo cải
+> thiện đo được ở chỉ số trung gian — giảm đáng kể khối lượng truyền
+> MAC và PHY receive drop, cải thiện tốc độ hội tụ discovery, targeting
+> đích chọn lọc hơn. TUY NHIÊN, không can thiệp nào tạo cải thiện có ý
+> nghĩa ở delivery đầu-cuối, vốn giữ nguyên ở mức xấp xỉ 0% tại quy mô
+> 19-endpoint.
+>
+> Thí nghiệm discovery-convergence cuối cùng là bằng chứng thuyết phục
+> nhất. Kéo dài cửa sổ discovery từ 15s lên 120s giảm fallback-broadcast
+> từ 100% xuống 87.8%, với một số endpoint đạt phần lớn gửi đúng đích
+> theo subscription. Dù vậy, delivery ứng dụng vẫn giữ nguyên CHÍNH XÁC
+> 0/2289 message, trong khi PHY receive failure do collision vẫn chiếm
+> ~82% tổng số PHY drop. Vì vậy, cả discovery hội tụ chưa đầy đủ LẪN
+> data-plane fan-out vô điều kiện đều KHÔNG đủ để giải thích hiện tượng
+> sập delivery quan sát được.
+>
+> Tổng hợp lại, các bất cập ở tầng middleware là contributor THẬT cho
+> tải/tranh chấp, nhưng KHÔNG phải nguyên nhân chi phối của lỗi hệ
+> thống. Dưới workload đã đánh giá, kênh 802.11g dùng chung vẫn ở chế
+> độ tranh chấp/bão hòa nghiêm trọng ngay cả sau khi đã giảm đáng kể
+> traffic do middleware sinh ra.
+>
+> Do đó, việc tiếp tục tối ưu graph renewal, thời gian discovery, hành
+> vi retry, hay logic chọn peer được kỳ vọng sẽ cho lợi ích giảm dần
+> (diminishing returns) ở kịch bản này. Thí nghiệm tiếp theo nên nhắm
+> thẳng vào năng lực mạng và topology: các cell không dây thực sự độc
+> lập nối qua backbone có dây (hoặc không giới hạn băng thông khác),
+> cấu hình PHY/MAC 802.11 băng thông cao hơn, và cơ chế admission/ưu
+> tiên traffic giữ tải airtime trong giới hạn bền vững.
+>
+> **Các kết luận này CHỈ đúng cho workload 19-endpoint và cấu hình
+> 802.11g mô phỏng đã đánh giá — KHÔNG nên diễn giải thành khẳng định
+> tổng quát rằng IEEE 802.11g không hỗ trợ được 19 station.**
+
+**Toàn bộ chuỗi bằng chứng (không suy luận từ 1 số liệu đơn lẻ — tấn
+công độc lập từng nguyên nhân khả dĩ, quan sát chỉ số trung gian cải
+thiện, và LẶP LẠI cùng kết quả đầu-cuối)**:
+
+```
+socket retry issue ──────────────► fixed       ┐
+graph flooding ──────────────────► reduced     │
+RF contention via 4 channels ────► reduced     │
+dominant sender ─────────────────► isolated    ├──► delivery ≈ 0
+graph control traffic ────────────► reduced     │
+data-plane broadcast fanout ──────► reduced     │
+discovery convergence time ───────► improved   ┘
+
+                           +
+        collision-related PHY drops remain dominant (~66-82%)
+                           ↓
+            shared-medium saturation
+              = dominant explanation
+```
+
+**Bước tiếp theo đã thống nhất với ChatGPT** (nếu tiếp tục dự án theo
+hướng này — CHƯA làm, cần quyết định của người dùng): thử nghiệm giữ
+nguyên application/RMW workload, chỉ thay đổi năng lực mạng/topology —
+nhiều AP cell thực sự độc lập nối qua backbone có dây (không phải
+static relay wireless như đã thử), hoặc chuẩn wifi băng thông cao hơn
+(802.11n/ac/ax). Nếu delivery hồi phục đáng kể khi đổi 1 trong 2 biến
+này (giữ nguyên middleware), đó là bằng chứng nhân quả cuối cùng xác
+nhận kết luận saturation, thay vì tiếp tục dồn thêm một (thứ 8) can
+thiệp middleware nữa.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
