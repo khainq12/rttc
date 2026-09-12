@@ -121,6 +121,7 @@ def build_shell_script(
     graph_renew_interval_ms: int | None = None,
     num_aps: int = 1,
     isolate_controller: bool = False,
+    subscription_aware: bool = False,
 ) -> str:
     ips = {endpoint: f"{BASE_IP_PREFIX}{i + 2}" for i, endpoint in enumerate(endpoints)}
 
@@ -254,6 +255,20 @@ def build_shell_script(
                 # count grows -- unset leaves the RMW's own default.
                 f"FLEETQOX_RMW_GRAPH_RENEW_INTERVAL_MS={graph_renew_interval_ms} "
                 if graph_renew_interval_ms is not None else ""
+            )
+            + (
+                # Opt-in fix for a ChatGPT-flagged gap (see
+                # docs/AUDIT_ACCEPTANCE_TRACKING.md "data-plane fanout"):
+                # every OTHER peer_policy_ value, including the RMW's
+                # default ("all"), sends every published message to every
+                # configured peer regardless of subscription interest --
+                # a real O(peers) fanout on every single publish(), not
+                # just the O(N^2) graph-discovery traffic already reduced.
+                # A new named policy rather than a changed default, since
+                # this RMW is shared by many other probes/tests this
+                # investigation hasn't audited.
+                "FLEETQOX_RMW_PEER_POLICY=subscription_aware "
+                if subscription_aware else ""
             )
             + "&& "
             f"python3 {_container_path(ROOT / 'scripts' / 'fleetqox_rmw_trace_endpoint.py')} "
@@ -401,6 +416,7 @@ def run_probe(
     graph_renew_interval_ms: int | None = None,
     num_aps: int = 1,
     isolate_controller: bool = False,
+    subscription_aware: bool = False,
 ) -> dict[str, Any]:
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -432,6 +448,7 @@ def run_probe(
         graph_renew_interval_ms=graph_renew_interval_ms,
         num_aps=num_aps,
         isolate_controller=isolate_controller,
+        subscription_aware=subscription_aware,
     )
 
     completed = subprocess.run(
@@ -546,6 +563,17 @@ def main() -> int:
             "when --num-aps is 1."
         ),
     )
+    parser.add_argument(
+        "--subscription-aware",
+        action="store_true",
+        help=(
+            "Sets FLEETQOX_RMW_PEER_POLICY=subscription_aware -- ChatGPT-"
+            "flagged gap: every OTHER peer_policy_ value, including the "
+            "RMW's own \"all\" default, sends every published message to "
+            "every configured peer regardless of subscription interest. "
+            "See docs/AUDIT_ACCEPTANCE_TRACKING.md 'data-plane fanout'."
+        ),
+    )
     args = parser.parse_args()
 
     summary = run_probe(
@@ -561,6 +589,7 @@ def main() -> int:
         graph_renew_interval_ms=args.graph_renew_interval_ms,
         num_aps=max(args.num_aps, 1),
         isolate_controller=args.isolate_controller,
+        subscription_aware=args.subscription_aware,
     )
     summary_path = ROOT / args.summary_json
     summary_path.parent.mkdir(parents=True, exist_ok=True)

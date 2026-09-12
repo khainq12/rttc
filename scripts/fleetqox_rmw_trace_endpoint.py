@@ -84,6 +84,8 @@ def fleetqox_transport_metrics() -> dict[str, Any]:
         "graph_heartbeats_sent",
         "graph_heartbeats_received",
         "graph_full_resyncs_sent",
+        "subscription_aware_frames",
+        "subscription_aware_fallback_broadcasts",
     )
     metrics: dict[str, Any] = {"available": True}
     for name in names:

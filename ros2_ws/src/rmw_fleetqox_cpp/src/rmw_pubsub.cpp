@@ -644,7 +644,8 @@ std::atomic<std::uint64_t> g_loan_fresh_allocations{0};
 std::atomic<std::uint64_t> g_loan_pool_reuses{0};
 
 void enqueue_received_frame(const std::string & encoded_frame);
-bool apply_received_graph_advertisement(const std::string & encoded_frame);
+bool apply_received_graph_advertisement(
+  const std::string & encoded_frame, const sockaddr_in * source);
 bool handle_ack_nack_feedback(const std::string & encoded_frame);
 bool handle_unrecoverable_loss_notice(const std::string & encoded_frame);
 void record_fragment_repair_observation(const std::string & encoded_frame);
@@ -3143,6 +3144,16 @@ public:
     return adaptive_unicast_frames_.load(std::memory_order_relaxed);
   }
 
+  std::uint64_t subscription_aware_frames() const
+  {
+    return subscription_aware_frames_.load(std::memory_order_relaxed);
+  }
+
+  std::uint64_t subscription_aware_fallback_broadcasts() const
+  {
+    return subscription_aware_fallback_broadcasts_.load(std::memory_order_relaxed);
+  }
+
   std::uint64_t adaptive_redundant_frames() const
   {
     return adaptive_redundant_frames_.load(std::memory_order_relaxed);
@@ -3656,6 +3667,34 @@ public:
     return send_to_peers(rmw_fleetqox_cpp::encode_graph_advertisement(heartbeat));
   }
 
+  // Called from apply_received_graph_advertisement (a free function) for
+  // entity_kind=="subscription" add/remove -- see
+  // peer_subscribed_topic_refcounts_'s declaration for why. Public because
+  // that free function isn't a member of this class. Reference-counted
+  // (not a plain set) because one peer process can own several independent
+  // subscription objects on the very same topic+type, each added/removed
+  // on its own lifecycle.
+  void update_peer_subscription(
+    const sockaddr_in & source, const std::string & action,
+    std::uint64_t domain_id, const std::string & topic, const std::string & type_name)
+  {
+    const int peer_index = peer_index_for_address(source);
+    if (peer_index < 0) {
+      return;
+    }
+    const std::string key = subscription_topic_key(domain_id, topic, type_name);
+    std::lock_guard<std::mutex> lock(peer_subscription_mutex_);
+    auto & refcounts = peer_subscribed_topic_refcounts_[static_cast<size_t>(peer_index)];
+    if (action == "add") {
+      ++refcounts[key];
+    } else if (action == "remove") {
+      auto it = refcounts.find(key);
+      if (it != refcounts.end() && --(it->second) <= 0) {
+        refcounts.erase(it);
+      }
+    }
+  }
+
 private:
   static constexpr size_t kMaxUdpPayloadBytes = 65507;
   static constexpr int kSendRetryLimit = 20;
@@ -3758,6 +3797,71 @@ private:
     return targets;
   }
 
+  static std::string subscription_topic_key(
+    std::uint64_t domain_id, const std::string & topic, const std::string & type_name)
+  {
+    return std::to_string(domain_id) + "|" + topic + "|" + type_name;
+  }
+
+  // Returns -1 if `source` doesn't match any configured peer -- e.g. a
+  // stray/spoofed packet, or (in test harnesses without full peer-address
+  // symmetry) a peer reachable via an address this process wasn't told
+  // about.
+  int peer_index_for_address(const sockaddr_in & source) const
+  {
+    for (size_t i = 0; i < peer_addresses_.size(); ++i) {
+      if (endpoints_match(source, peer_addresses_[i])) {
+        return static_cast<int>(i);
+      }
+    }
+    return -1;
+  }
+
+  // peer_policy_=="subscription_aware": only the peers with a currently
+  // live matching subscription, instead of every configured peer. Falls
+  // back to frame_targets() (every peer) if we don't yet know about ANY
+  // remote subscriber for this exact topic key -- a topic with a genuine
+  // zero subscribers system-wide would also hit this path and get sent to
+  // everyone, but every real caller in this codebase already waits for
+  // get_subscription_count() > 0 before publishing (see
+  // fleetqox_rmw_trace_endpoint.py), so this fallback should not be the
+  // steady-state path; it exists so a subscriber that hasn't been learned
+  // about YET (a startup race) fails open (extra sends) rather than
+  // closed (silently dropped messages).
+  std::vector<sockaddr_in> subscription_aware_targets(
+    bool include_local, const rmw_fleetqox_cpp::DataFrame & frame)
+  {
+    const std::string key = subscription_topic_key(frame.domain_id, frame.topic, frame.type_name);
+    bool any_known_subscriber = false;
+    std::vector<sockaddr_in> targets;
+    if (include_local && address_.sin_addr.s_addr != htonl(INADDR_ANY)) {
+      targets.push_back(address_);
+    }
+    {
+      std::lock_guard<std::mutex> lock(peer_subscription_mutex_);
+      for (size_t i = 0; i < peer_addresses_.size(); ++i) {
+        const auto & refcounts = peer_subscribed_topic_refcounts_[i];
+        const auto it = refcounts.find(key);
+        if (it == refcounts.end() || it->second <= 0) {
+          continue;
+        }
+        any_known_subscriber = true;
+        const sockaddr_in & peer = peer_addresses_[i];
+        if (std::none_of(targets.begin(), targets.end(), [&](const sockaddr_in & target) {
+            return endpoints_match(target, peer);
+          }))
+        {
+          targets.push_back(peer);
+        }
+      }
+    }
+    if (!any_known_subscriber) {
+      subscription_aware_fallback_broadcasts_.fetch_add(1, std::memory_order_relaxed);
+      return frame_targets(include_local);
+    }
+    return targets;
+  }
+
   std::vector<sockaddr_in> data_frame_targets(
     bool include_local,
     const rmw_qos_profile_t * qos,
@@ -3787,6 +3891,10 @@ private:
       }
       adaptive_unicast_frames_.fetch_add(1, std::memory_order_relaxed);
       return std::vector<sockaddr_in>{peer_addresses_[selected]};
+    }
+    if (peer_policy_ == "subscription_aware" && frame.has_value()) {
+      subscription_aware_frames_.fetch_add(1, std::memory_order_relaxed);
+      return subscription_aware_targets(include_local, *frame);
     }
     return frame_targets(include_local);
   }
@@ -6850,6 +6958,7 @@ private:
       }
     }
     adaptive_peer_scores_.assign(peer_addresses_.size(), 0);
+    peer_subscribed_topic_refcounts_.assign(peer_addresses_.size(), {});
     if (!quic_gateway_transport_.configure_from_environment()) {
       init_error_ = quic_gateway_transport_.error();
       ::close(fd_);
@@ -7852,7 +7961,7 @@ private:
       wire_payload = datagram;
     }
     if (!udp_wire_payload) {
-      handle_received_payload(wire_payload);
+      handle_received_payload(wire_payload, nullptr);
       return;
     }
     std::string authenticated_content;
@@ -7885,13 +7994,13 @@ private:
       if (repaired_payload.empty()) {
         return;
       }
-      handle_received_payload(repaired_payload);
+      handle_received_payload(repaired_payload, source);
       return;
     }
-    handle_received_payload(plaintext);
+    handle_received_payload(plaintext, source);
   }
 
-  void handle_received_payload(const std::string & encoded_frame)
+  void handle_received_payload(const std::string & encoded_frame, const sockaddr_in * source)
   {
     frames_received_.fetch_add(1, std::memory_order_relaxed);
     if (handle_unrecoverable_loss_notice(encoded_frame)) {
@@ -7900,7 +8009,7 @@ private:
     if (handle_ack_nack_feedback(encoded_frame)) {
       return;
     }
-    if (apply_received_graph_advertisement(encoded_frame)) {
+    if (apply_received_graph_advertisement(encoded_frame, source)) {
       return;
     }
     if (rmw_fleetqox_cpp_handle_service_frame(encoded_frame.data(), encoded_frame.size())) {
@@ -8081,6 +8190,8 @@ private:
   std::atomic<std::uint64_t> test_dropped_frames_{0};
   std::atomic<std::uint64_t> adaptive_failovers_{0};
   std::atomic<std::uint64_t> adaptive_unicast_frames_{0};
+  std::atomic<std::uint64_t> subscription_aware_frames_{0};
+  std::atomic<std::uint64_t> subscription_aware_fallback_broadcasts_{0};
   std::atomic<std::uint64_t> adaptive_redundant_frames_{0};
   std::atomic<std::uint64_t> fleet_plan_frames_{0};
   std::atomic<std::uint64_t> fleet_plan_redundant_frames_{0};
@@ -8147,6 +8258,25 @@ private:
   std::string peer_policy_{"all"};
   std::vector<sockaddr_in> peer_addresses_;
   std::vector<std::string> peer_path_ids_;
+  // peer_policy_=="subscription_aware": per-peer refcount of "topic key ->
+  // how many still-live remote subscriptions at this peer match it",
+  // indexed in parallel with peer_addresses_. Added 11/09/2026 (see
+  // docs/AUDIT_ACCEPTANCE_TRACKING.md "ChatGPT-flagged data-plane fanout
+  // gap"): every OTHER peer_policy_ value (including the "all" default)
+  // sends every data frame to every configured peer regardless of
+  // subscription interest -- confirmed as a real, previously-unmeasured
+  // O(peers) fanout on every single publish(), not just the O(N^2) graph
+  // discovery traffic already found and reduced. A brand new named policy
+  // rather than changing "all"'s behavior, since this RMW is shared by
+  // many other probes/tests in this codebase this investigation hasn't
+  // audited -- opt in explicitly via FLEETQOX_RMW_PEER_POLICY=subscription_aware.
+  std::vector<std::unordered_map<std::string, int>> peer_subscribed_topic_refcounts_;
+  // Guards peer_subscribed_topic_refcounts_ -- written from the receive
+  // thread (apply_received_graph_advertisement), read from whichever
+  // thread calls rmw_publish(); a dedicated mutex rather than reusing an
+  // existing one, to avoid introducing a new lock-ordering dependency with
+  // unrelated subsystems.
+  mutable std::mutex peer_subscription_mutex_;
   mutable std::vector<FleetPathPlanRule> fleet_path_plan_;
   mutable std::string fleet_path_plan_file_;
   mutable std::string fleet_path_plan_file_contents_;
@@ -13929,7 +14059,8 @@ void enqueue_received_frame(const std::string & encoded_frame)
   notify_event_callbacks(event_callbacks);
 }
 
-bool apply_received_graph_advertisement(const std::string & encoded_frame)
+bool apply_received_graph_advertisement(
+  const std::string & encoded_frame, const sockaddr_in * source)
 {
   const auto advertisement = rmw_fleetqox_cpp::decode_graph_advertisement(encoded_frame);
   if (!advertisement) {
@@ -13952,6 +14083,18 @@ bool apply_received_graph_advertisement(const std::string & encoded_frame)
     if (local_endpoint_id_exists_locked(topic_publisher, advertisement->endpoint_id)) {
       return true;
     }
+  }
+  // peer_policy_=="subscription_aware" (see the peer_subscribed_topic_refcounts_
+  // member comment): learn which static peer a remote subscription lives
+  // behind from the packet's own UDP source address, so publish() can send
+  // data frames only to peers with a matching subscriber instead of every
+  // configured peer. Harmless no-op for every other peer_policy_ value.
+  if (topic_subscription && source != nullptr &&
+    (advertisement->action == "add" || advertisement->action == "remove"))
+  {
+    socket_transport().update_peer_subscription(
+      *source, advertisement->action, advertisement->domain_id,
+      advertisement->topic, advertisement->type_name);
   }
   const std::array<std::uint8_t, RMW_GID_STORAGE_SIZE> endpoint_gid =
     endpoint_gid_from_hex(advertisement->endpoint_gid, advertisement->endpoint_id);
@@ -14659,6 +14802,16 @@ std::uint64_t rmw_fleetqox_cpp_socket_graph_heartbeats_received()
 std::uint64_t rmw_fleetqox_cpp_socket_graph_full_resyncs_sent()
 {
   return g_graph_full_resyncs_sent.load(std::memory_order_relaxed);
+}
+
+std::uint64_t rmw_fleetqox_cpp_socket_subscription_aware_frames()
+{
+  return socket_transport().subscription_aware_frames();
+}
+
+std::uint64_t rmw_fleetqox_cpp_socket_subscription_aware_fallback_broadcasts()
+{
+  return socket_transport().subscription_aware_fallback_broadcasts();
 }
 
 std::uint64_t rmw_fleetqox_cpp_socket_udp_pmtu_discovery_events()
