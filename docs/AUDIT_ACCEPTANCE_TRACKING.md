@@ -2078,6 +2078,71 @@ này (giữ nguyên middleware), đó là bằng chứng nhân quả cuối cùn
 nhận kết luận saturation, thay vì tiếp tục dồn thêm một (thứ 8) can
 thiệp middleware nữa.
 
+### 11/09/2026 (tiếp) — So sánh với DDS truyền thống: xác nhận KHÔNG PHẢI vấn đề riêng của rmw_fleetqox_cpp, nhưng lộ ra 1 biến số chưa kiểm soát
+
+Theo yêu cầu người dùng: so sánh với "các DDS truyền thống" (Fast DDS,
+Cyclone DDS) thay vì chỉ raw-UDP baseline. Thêm `--rmw-implementation`
+vào `run_ns3_docker_wifi_tap_rmw_probe.py`: cho phép chạy ĐÚNG hạ tầng
+thật (ns-3 TapBridge, real Linux netns/process, RealtimeSimulatorImpl,
+cùng 1 trace CSV) nhưng thay `RMW_IMPLEMENTATION` sang `rmw_fastrtps_cpp`
+hoặc `rmw_cyclonedds_cpp` — bỏ qua hoàn toàn phần setup/env-var riêng
+của `rmw_fleetqox_cpp` (2 DDS này đã có sẵn trong image, dùng discovery
+riêng qua multicast, được relay qua TapBridge giống broadcast/ARP đã
+xác nhận trước đó).
+
+**Test sanity 1-robot**: Fast DDS hoạt động đúng (`rx=76/2/103`, khớp
+CHÍNH XÁC baseline khỏe mạnh) — xác nhận multicast DDS discovery hoạt
+động bình thường qua topology TapBridge ở quy mô nhỏ.
+
+**Kết quả 16-robot — CẢ 3 middleware đều sập giống hệt nhau**:
+
+| Middleware | `mac_tx_total` | `phy_rx_drop_total` | % collision | `rx` |
+|---|---|---|---|---|
+| rmw_fleetqox_cpp (đã tối ưu B+ + subscription-aware) | ~58000 | ~406000 | ~82% | **0/2289** |
+| rmw_fastrtps_cpp (Fast DDS) | 17410 | 152483 | ~82% | **0/2289** |
+| rmw_cyclonedds_cpp (Cyclone DDS) | 18490 | 173503 | ~83% | **0/2289** |
+
+Đáng chú ý: Fast DDS và Cyclone DDS tạo ÍT traffic hơn hẳn (17410-18490
+so với ~58000 của bản fleetqox_cpp đã tối ưu) nhưng VẪN sập y hệt 0%
+— củng cố mạnh mẽ rằng đây KHÔNG PHẢI vấn đề riêng của thiết kế
+discovery trong `rmw_fleetqox_cpp`. Hai middleware DDS trưởng thành,
+được dùng rộng rãi nhất trong ROS2 thật (hàng nghìn triển khai robot
+thực tế) chịu chung số phận trên ĐÚNG topology này.
+
+**NHƯNG — phát hiện một biến số CHƯA kiểm soát, cần làm rõ**: baseline
+raw-UDP gốc của Group 6 (`run_ns3_docker_wifi_mobility_matrix.py`,
+dùng `fleetqox_trace_replay.cc --topology=wifi`, CÙNG mật độ 19 trạm,
+CÙNG chuẩn 802.11g) cho kết quả **~95% delivery** ở quy mô 16 robot —
+khác biệt CỰC LỚN so với 0% của cả 3 middleware thật vừa đo. Baseline
+này khác ở nhiều điểm CÙNG LÚC, chưa tách bạch được nguyên nhân:
+1. Chạy HOÀN TOÀN trong ns-3 simulated-time (không phải
+   `RealtimeSimulatorImpl`) — không có TapBridge, không có Linux
+   netns/process thật, không có real Linux kernel networking stack.
+2. KHÔNG có bất kỳ traffic discovery/control-plane nào — gửi trực
+   tiếp theo địa chỉ đã biết trước trong C++, không cần handshake.
+3. Cả 3 middleware vừa đo (fleetqox_cpp, Fast DDS, Cyclone DDS) đều
+   chạy qua TapBridge + Linux netns thật + RealtimeSimulatorImpl +
+   CÓ traffic discovery riêng (dù khối lượng khác nhau khá nhiều giữa
+   3 middleware, tất cả vẫn sập y hệt).
+
+Vì CẢ 3 middleware — dù mức traffic discovery khác nhau tới ~3.3 lần
+(17410 vs 58000) — đều sập y hệt nhau, trong khi baseline hoàn toàn
+không có discovery lại đạt 95%, đây là bằng chứng gợi ý (CHƯA xác nhận
+dứt điểm) rằng bản thân traffic discovery/control-plane (bất kể
+middleware nào, bất kể khối lượng cụ thể) mới là yếu tố QUYẾT ĐỊNH đẩy
+hệ thống qua ngưỡng bão hòa — không đơn thuần là "băng thông airtime
+vật lý không đủ cho traffic ứng dụng" như kết luận trước đó ngụ ý.
+CHƯA loại trừ được khả năng TapBridge/RealtimeSimulatorImpl/real-OS
+overhead tự nó cũng là một phần nguyên nhân (khác biệt kiến trúc #1 ở
+trên) — cần thí nghiệm tách bạch thêm (vd: viết 1 sender raw-UDP thật
+chạy qua ĐÚNG TapBridge + real netns + RealtimeSimulatorImpl, bỏ qua
+hoàn toàn ROS2/RMW/rclpy, để xem có sập hay không) trước khi kết luận
+chắc chắn đây là do discovery traffic hay do bản thân hạ tầng
+TapBridge/realtime.
+
+**File thay đổi**: `scripts/run_ns3_docker_wifi_tap_rmw_probe.py`
+(`--rmw-implementation`).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
