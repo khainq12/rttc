@@ -2143,6 +2143,62 @@ TapBridge/realtime.
 **File thay đổi**: `scripts/run_ns3_docker_wifi_tap_rmw_probe.py`
 (`--rmw-implementation`).
 
+### 12/09/2026 — Thí nghiệm tách nhân quả (theo ma trận 4 test của ChatGPT): xác định dứt điểm KHÔNG PHẢI TapBridge/realtime, mà là traffic middleware/discovery
+
+Theo yêu cầu người dùng ("bàn với chatgpt để giải quyết vấn đề đi"): mang
+biến số chưa kiểm soát ở trên (raw-UDP 95% vs middleware 0%, 2 điểm khác
+biệt cùng lúc) sang hỏi ChatGPT. ChatGPT đề xuất ma trận 4 test để tách
+bạch 3 nguyên nhân khả dĩ — (A) traffic middleware/discovery, (B) tích
+hợp TapBridge/Linux netns thật, (C) hiệu ứng lịch trình realtime-scheduler:
+
+| Test | Mô tả | Kết quả |
+|---|---|---|
+| 1. ns-3 raw-UDP thuần, scheduler thường | Baseline gốc của Group 6 | ~95% (đã có từ trước) |
+| 2. ns-3 raw-UDP thuần + `RealtimeSimulatorImpl`, KHÔNG TapBridge | Cờ `--realtime` mới thêm vào `fleetqox_trace_replay.cc` | **~96.3% (2204/2289)** |
+| 3. raw-UDP thật qua ĐÚNG TapBridge + netns + `RealtimeSimulatorImpl`, KHÔNG ROS2/RMW/discovery | `scripts/raw_udp_trace_endpoint.py` mới, chạy qua `--rmw-implementation=raw_udp` | **100% (2289/2289), xác nhận 0 trùng lặp, 0 thiếu sót khi đối chiếu event_id với trace CSV** |
+| 4. rmw_fleetqox_cpp / Fast DDS / Cyclone DDS (đã có) | — | **0/2289 cả 3** |
+
+**Test 2** (chỉ thêm `GlobalValue::Bind("SimulatorImplementationType",
+StringValue("ns3::RealtimeSimulatorImpl"))` + bật checksum, KHÔNG có
+TapBridge/Linux process nào) cho kết quả gần như giống hệt Test 1 (~95%
+vs ~96.3%) → **loại trừ**: bản thân việc chạy dưới realtime scheduler
+(thay vì discrete-event thường) KHÔNG đủ để gây sập.
+
+**Test 3** (`scripts/raw_udp_trace_endpoint.py`: socket UDP thuần,
+KHÔNG rclpy/RMW/discovery nào, dùng bảng ánh xạ tên→IP tĩnh truyền qua
+`--peers`, chạy qua ĐÚNG cùng 1 hạ tầng TapBridge + netns thật +
+RealtimeSimulatorImpl mà cả 3 middleware ở Test 4 đã dùng) cho kết quả
+**100% delivery (2289/2289)**, đối chiếu chặt với trace CSV gốc (không
+duplicate, không thiếu) → **loại trừ**: bản thân tích hợp TapBridge/
+Linux-netns thật/RealtimeSimulatorImpl KHÔNG phải nguyên nhân — hạ tầng
+đó, khi không có traffic discovery/control-plane nào chồng lên, vẫn xử
+lý được toàn bộ traffic ứng dụng của workload 19-endpoint mà không mất
+gói nào.
+
+**Kết luận (thay thế "802.11g saturation" trước đó)**: với cả (B) và (C)
+đã bị loại trừ bằng thực nghiệm trực tiếp, nguyên nhân còn lại duy nhất
+được ủng hộ bởi toàn bộ chuỗi bằng chứng là **(A) — bản thân traffic
+middleware/discovery control-plane**, không phải do khối lượng dữ liệu
+ứng dụng vượt quá năng lực airtime vật lý (điều này từng được kết luận
+"dominant bottleneck" nhưng nay đã bị Test 3 bác bỏ trực tiếp). Đáng chú
+ý: Fast DDS chỉ tạo 17410 `mac_tx_total` (còn Test 3's raw-UDP data-plane
+riêng đã tạo 2755 trong 1 mẫu 5s) — nghĩa là KHÔNG phải "quá nhiều gói
+tin nói chung" là vấn đề, mà là **đặc tính riêng của traffic discovery**
+(khả năng: multicast định kỳ đồng bộ giữa 19 node cùng lúc, gây collision
+tập trung vào những thời điểm cụ thể, thay vì rải đều theo lịch trình
+ứng dụng như raw-UDP) mới là yếu tố quyết định đẩy hệ thống qua ngưỡng
+sập — khớp với nhận định ChatGPT đã đưa ra trước khi Test 3 chạy.
+
+**Việc còn lại (chưa làm, hướng tiếp theo nếu tiếp tục dự án)**: đo trực
+tiếp đặc tính burst của traffic discovery (khoảng cách thời gian giữa
+các gói discovery liên tiếp, có đồng bộ giữa các node hay không) để xác
+nhận cơ chế chính xác, thay vì chỉ suy luận gián tiếp qua tổng số gói.
+
+**File thay đổi**: `external/ns3/fleetqox_trace_replay.cc` (cờ
+`--realtime`), `scripts/raw_udp_trace_endpoint.py` (mới),
+`scripts/run_ns3_docker_wifi_tap_rmw_probe.py`
+(`--rmw-implementation=raw_udp`).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
