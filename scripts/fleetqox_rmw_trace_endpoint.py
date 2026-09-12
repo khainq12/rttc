@@ -114,6 +114,7 @@ def fleetqox_publish_stage_metrics(library: "ctypes.CDLL") -> dict[str, Any]:
         "transport_decode",
         "transport_target_lookup",
         "transport_sendto_syscall",
+        "udp_send_mutex_wait",
     )
     stages: dict[str, Any] = {}
     for index, name in enumerate(stage_names):
@@ -143,6 +144,16 @@ def fleetqox_publish_stage_metrics(library: "ctypes.CDLL") -> dict[str, Any]:
     calls = int(target_count_calls())
     stages["_target_count_mean"] = (int(target_count_sum()) / calls) if calls else 0.0
     stages["_peer_addresses_size"] = int(peer_addresses_size())
+
+    pmtu_drain_calls = library.rmw_fleetqox_cpp_pmtu_drain_calls
+    pmtu_drain_calls.restype = ctypes.c_uint64
+    pmtu_drain_recvmsg_calls = library.rmw_fleetqox_cpp_pmtu_drain_recvmsg_calls
+    pmtu_drain_recvmsg_calls.restype = ctypes.c_uint64
+    pmtu_drain_messages_consumed = library.rmw_fleetqox_cpp_pmtu_drain_messages_consumed
+    pmtu_drain_messages_consumed.restype = ctypes.c_uint64
+    stages["_pmtu_drain_calls"] = int(pmtu_drain_calls())
+    stages["_pmtu_drain_recvmsg_calls"] = int(pmtu_drain_recvmsg_calls())
+    stages["_pmtu_drain_messages_consumed"] = int(pmtu_drain_messages_consumed())
     return stages
 
 

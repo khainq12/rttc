@@ -435,7 +435,14 @@ enum class PublishStage : size_t
   kTransportDecode = 5,
   kTransportTargetLookup = 6,
   kTransportSendtoSyscall = 7,
-  kCount = 8,
+  // Time spent blocked acquiring udp_send_mutex_ in
+  // send_datagram_to_targets(), separate from kTransportSendtoSyscall
+  // (which only covers the syscall(s) once the lock is already held) --
+  // ChatGPT's explicit ask, since this mutex directly serializes the
+  // operation that ultimately releases packets to the kernel and could
+  // hide contention that per-syscall timing alone wouldn't show.
+  kUdpSendMutexWait = 8,
+  kCount = 9,
 };
 
 struct PublishStageStats
@@ -479,6 +486,13 @@ bool publish_stage_profiling_enabled()
 std::atomic<std::uint64_t> g_transport_target_count_sum{0};
 std::atomic<std::uint64_t> g_transport_target_count_calls{0};
 std::atomic<std::uint64_t> g_transport_peer_addresses_size{0};
+
+// drain_udp_pmtu_error_queue() hit-rate counters -- quantifies how often
+// the per-send speculative ICMP-error check actually finds anything (see
+// should_drain_pmtu_error_queue_this_send()'s comment).
+std::atomic<std::uint64_t> g_pmtu_drain_calls{0};
+std::atomic<std::uint64_t> g_pmtu_drain_recvmsg_calls{0};
+std::atomic<std::uint64_t> g_pmtu_drain_messages_consumed{0};
 
 void record_transport_target_count(size_t target_count, size_t peer_addresses_size)
 {
@@ -6589,6 +6603,7 @@ private:
   // synchronous EMSGSIZE case handled at the sendto() call site below.
   void drain_udp_pmtu_error_queue()
   {
+    g_pmtu_drain_calls.fetch_add(1, std::memory_order_relaxed);
     for (;;) {
       char control[512];
       char discard[1];
@@ -6601,10 +6616,12 @@ private:
       msg.msg_iovlen = 1;
       msg.msg_control = control;
       msg.msg_controllen = sizeof(control);
+      g_pmtu_drain_recvmsg_calls.fetch_add(1, std::memory_order_relaxed);
       const ssize_t received = ::recvmsg(fd_, &msg, MSG_ERRQUEUE | MSG_DONTWAIT);
       if (received < 0) {
         break;
       }
+      g_pmtu_drain_messages_consumed.fetch_add(1, std::memory_order_relaxed);
       for (cmsghdr * cmsg = CMSG_FIRSTHDR(&msg); cmsg != nullptr;
         cmsg = CMSG_NXTHDR(&msg, cmsg))
       {
@@ -6621,6 +6638,23 @@ private:
         record_discovered_path_mtu(offender, static_cast<int>(serr->ee_info));
       }
     }
+  }
+
+  // FLEETQOX_RMW_PMTU_DRAIN_INTERVAL_SENDS (see docs/AUDIT_ACCEPTANCE_
+  // TRACKING.md "publish-path latency profiling"): drain_udp_pmtu_error_
+  // queue() was measured making an unconditional ::recvmsg(MSG_ERRQUEUE)
+  // syscall on EVERY send_datagram_to_targets() call, whether or not the
+  // kernel ever actually queued an ICMP error -- a real syscall raw UDP's
+  // plain sendto() path never pays. Default 1 preserves the exact
+  // original per-send behavior; set higher to only proactively drain
+  // every Nth send. The synchronous EMSGSIZE handling in
+  // send_datagram_to_targets (a real, immediate PMTU problem) is
+  // completely unaffected either way -- this only throttles the
+  // speculative "maybe an async ICMP error arrived" check.
+  bool should_drain_pmtu_error_queue_this_send()
+  {
+    const int interval = std::max(1, udp_pmtu_drain_interval_sends_);
+    return udp_pmtu_drain_send_counter_.fetch_add(1, std::memory_order_relaxed) % interval == 0;
   }
 
   // Handles the synchronous case: the payload does not even fit this
@@ -6675,7 +6709,9 @@ private:
       RMW_SET_ERROR_MSG("FleetRMW UDP payload exceeds configured datagram budget");
       return RMW_RET_ERROR;
     }
-    drain_udp_pmtu_error_queue();
+    if (should_drain_pmtu_error_queue_this_send()) {
+      drain_udp_pmtu_error_queue();
+    }
     if (udp_datagram_budget_bytes_ <= 0) {
       // No manual budget configured: fall back to whichever path MTU has
       // already been auto-discovered for these destinations, instead of
@@ -6693,7 +6729,12 @@ private:
         }
       }
     }
+    const bool profiling = publish_stage_profiling_enabled();
+    const std::int64_t mutex_wait_t0 = profiling ? monotonic_timestamp_ns() : 0;
     std::lock_guard<std::mutex> lock(udp_send_mutex_);
+    if (profiling) {
+      record_publish_stage(PublishStage::kUdpSendMutexWait, monotonic_timestamp_ns() - mutex_wait_t0);
+    }
     for (const sockaddr_in & target : targets) {
       pace_udp_send_locked();
       const auto sent = ::sendto(
@@ -6970,6 +7011,8 @@ private:
     }
     udp_send_pacing_us_ = parse_nonnegative_int_env(
       "FLEETQOX_RMW_UDP_SEND_PACING_US", 0, 100000);
+    udp_pmtu_drain_interval_sends_ = std::max(
+      1, parse_nonnegative_int_env("FLEETQOX_RMW_PMTU_DRAIN_INTERVAL_SENDS", 1, 100000));
     udp_datagram_budget_bytes_ = parse_nonnegative_int_env(
       "FLEETQOX_RMW_UDP_DATAGRAM_BUDGET_BYTES", 0,
       static_cast<int>(kMaxUdpPayloadBytes));
@@ -8428,6 +8471,8 @@ private:
   std::chrono::steady_clock::time_point next_udp_send_time_{};
   int udp_socket_buffer_bytes_{0};
   int udp_send_pacing_us_{0};
+  int udp_pmtu_drain_interval_sends_{1};
+  std::atomic<std::uint64_t> udp_pmtu_drain_send_counter_{0};
   int udp_datagram_budget_bytes_{0};
   int loss_resilient_fragment_chunk_bytes_{0};
   int fragment_nack_interval_ms_{50};
@@ -14757,6 +14802,25 @@ std::uint64_t rmw_fleetqox_cpp_transport_target_count_calls()
 std::uint64_t rmw_fleetqox_cpp_transport_peer_addresses_size()
 {
   return g_transport_peer_addresses_size.load(std::memory_order_relaxed);
+}
+
+// drain_udp_pmtu_error_queue() hit-rate counters (see
+// should_drain_pmtu_error_queue_this_send() / g_pmtu_drain_calls) -- lets
+// the Python harness verify the drain's actual ICMP hit rate quantitatively
+// instead of relying on a code-reading estimate.
+std::uint64_t rmw_fleetqox_cpp_pmtu_drain_calls()
+{
+  return g_pmtu_drain_calls.load(std::memory_order_relaxed);
+}
+
+std::uint64_t rmw_fleetqox_cpp_pmtu_drain_recvmsg_calls()
+{
+  return g_pmtu_drain_recvmsg_calls.load(std::memory_order_relaxed);
+}
+
+std::uint64_t rmw_fleetqox_cpp_pmtu_drain_messages_consumed()
+{
+  return g_pmtu_drain_messages_consumed.load(std::memory_order_relaxed);
 }
 
 std::uint64_t rmw_fleetqox_cpp_socket_frames_received()

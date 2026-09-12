@@ -2971,6 +2971,78 @@ phản hồi.
 (3 `PublishStage` con mới: `kTransportDecode`, `kTransportTargetLookup`,
 `kTransportSendtoSyscall`, cùng bộ đếm target-count).
 
+### 12/09/2026 (tiếp) — Đo `udp_send_mutex_` + hit-rate `drain_udp_pmtu_error_queue()`, A/B throttle: kết quả nhỏ, KHÔNG giải thích được collapse
+
+Theo đúng khuyến nghị của ChatGPT ("đừng chọn giữa profile và bỏ drain —
+làm cả hai: instrument 3 thứ còn lại, RỒI chạy A/B env-gated ngay"), đã
+thêm:
+1. `PublishStage::kUdpSendMutexWait` — đo thời gian chờ (không phải thời
+   gian giữ) `udp_send_mutex_` trong `send_datagram_to_targets()`.
+2. 3 bộ đếm hit-rate cho `drain_udp_pmtu_error_queue()`:
+   `g_pmtu_drain_calls` (số lần hàm được gọi), `g_pmtu_drain_recvmsg_calls`
+   (số lần `::recvmsg()` thực sự chạy trong vòng `for(;;)`),
+   `g_pmtu_drain_messages_consumed` (số ICMP message thật sự lấy được).
+3. `FLEETQOX_RMW_PMTU_DRAIN_INTERVAL_SENDS` (mặc định 1 = mỗi lần gửi,
+   giống hành vi cũ) — cổng throttle qua
+   `should_drain_pmtu_error_queue_this_send()` (đếm bằng
+   `fetch_add`-modulo), gọi `drain_udp_pmtu_error_queue()` chỉ 1 lần mỗi
+   N lần gửi thay vì mỗi lần.
+
+**Thí nghiệm A/B** (16-robot, static-mode, seed=42, 3 rep mỗi nhánh, thứ
+tự xen kẽ để kiểm soát trôi thời gian/nhiệt độ — giống thiết kế JSON/
+compact_v1 trước đó): baseline (`INTERVAL_SENDS=1`, hành vi mặc định cũ)
+vs throttled (`INTERVAL_SENDS=32`).
+
+| | baseline (interval=1) | throttled (interval=32) |
+|---|---|---|
+| `delivery_pct` (3 rep) | 9.5 / 9.0 / 16.8 (mean 11.8) | 27.7 / 11.5 / 10.6 (mean 16.6) |
+| `sendto_syscall` mean | 106.84µs | 100.69µs |
+| `udp_send_mutex_wait` mean | 0.42µs | 68.22µs (nhiễu, xem dưới) |
+| `pmtu_drain_calls` (tổng 3 rep) | 13831 | 497 (giảm ~28x, đúng ~1/32 kỳ vọng) |
+| `pmtu_drain_messages_consumed` (tổng) | 103 | 106 |
+| hit-rate thật | **0.745%** | 21.3% (vì mẫu số nhỏ hơn 28x, không phải vì bắt được nhiều ICMP hơn) |
+
+**Diễn giải**:
+- **Hit-rate xác nhận đúng dự đoán của ChatGPT**: baseline drain 13831
+  lần fleet-wide nhưng chỉ 103 lần thật sự có ICMP message (<1%) — tuyệt
+  đại đa số là `recvmsg()` gọi vô ích trả về rỗng ngay. Throttle xuống
+  interval=32 giảm số lần gọi ~28 lần (13831→497) mà số message ICMP
+  THẬT sự lấy được gần như không đổi (103→106) — nghĩa là throttle KHÔNG
+  làm mất tín hiệu PMTU thật, chỉ cắt phần lãng phí.
+- **`sendto_syscall` giảm nhẹ nhưng thật**: 106.84µs → 100.69µs (~5.8%
+  nhanh hơn) — nhất quán với việc bớt 1 syscall `recvmsg()` mỗi ~32 lần
+  gửi thay vì mỗi lần. Đây là tối ưu CPU hợp lệ nhưng KHÔNG đủ lớn để
+  giải thích khoảng cách 103µs vs 38µs raw-UDP (~2.7x) — phần lớn chênh
+  lệch đó vẫn CHƯA có lời giải.
+- **`udp_send_mutex_wait` chủ yếu ~0, ngoại trừ 1 outlier**: 5/6 lần
+  chạy đo được <1µs (không có tranh chấp mutex đáng kể); riêng
+  `throttled_run1` đo được 204.23µs VÀ CŨNG LÀ lần có delivery cao nhất
+  (27.7%, gần gấp 3 các lần khác) — không nhất quán với giả thuyết
+  "mutex chờ lâu hơn = delivery tệ hơn", nên đọc đây là nhiễu
+  RealtimeSimulatorImpl (jitter thời gian thực đã ghi nhận là biến số
+  chưa kiểm soát được kể cả khi đã cố định RNG seed — xem mục "kiểm tra
+  lại độ lặp lại" phía trên), KHÔNG phải hiệu ứng thật của biến throttle.
+- **Delivery giữa 2 nhánh KHÔNG có khác biệt đáng tin cậy**: mean 11.8%
+  vs 16.6% nhưng phương sai giữa các lần chạy CÙNG nhánh (9.0–16.8% ở
+  baseline, 10.6–27.7% ở throttled) đã lớn hơn khoảng cách giữa 2 nhánh
+  — với n=3 mỗi bên, không thể phân biệt "throttle giúp delivery" khỏi
+  nhiễu chạy-tới-chạy (giống kết luận null của thí nghiệm JSON/
+  compact_v1 trước đó).
+
+**Kết luận**: Việc throttle `drain_udp_pmtu_error_queue()` là một tối ưu
+CPU nhỏ, hợp lệ, rủi ro thấp (hit-rate thật không đổi) — có thể giữ lại
+— nhưng KHÔNG phải nguyên nhân chính của `sendto_syscall` chậm hơn
+raw-UDP 2.7x, và KHÔNG chứng minh được cải thiện delivery có ý nghĩa
+thống kê. Cả 2 ứng viên ChatGPT đề xuất (drain PMTU, mutex chờ) đều đã
+được đo và đều KHÔNG phải thủ phạm chính — cần tìm thêm.
+
+**File thay đổi**: `ros2_ws/src/rmw_fleetqox_cpp/src/rmw_pubsub.cpp`
+(`PublishStage::kUdpSendMutexWait`, 3 atomic hit-rate mới, throttle gate
+`should_drain_pmtu_error_queue_this_send()` + env
+`FLEETQOX_RMW_PMTU_DRAIN_INTERVAL_SENDS`, 6 hàm `extern "C"` ctypes
+export mới); `scripts/fleetqox_rmw_trace_endpoint.py` (đọc 3 bộ đếm PMTU
+mới + stage `udp_send_mutex_wait` qua ctypes).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
