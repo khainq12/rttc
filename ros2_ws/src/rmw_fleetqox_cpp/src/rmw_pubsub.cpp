@@ -20,6 +20,7 @@
 #include <mutex>
 #include <new>
 #include <optional>
+#include <random>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -496,6 +497,34 @@ std::unordered_map<
 std::unordered_map<std::string, std::vector<std::pair<rmw_fleetqox_cpp::DataFrame, std::string>>>
   g_coherent_receive_buffers;
 std::atomic<std::uint64_t> g_coherent_set_sequence{0};
+// O(N^2) discovery-traffic reduction (ChatGPT-assisted B+ redesign,
+// 11/09/2026, see docs/AUDIT_ACCEPTANCE_TRACKING.md). g_local_graph_version
+// increments on every real publisher/subscription add/remove (NOT on
+// liveliness_assert, which doesn't change the endpoint set) -- see
+// local_incarnation_id() and pubsub_graph_renewal_loop() below.
+std::atomic<std::uint64_t> g_local_graph_version{0};
+std::atomic<std::uint64_t> g_graph_heartbeats_sent{0};
+std::atomic<std::uint64_t> g_graph_heartbeats_received{0};
+std::atomic<std::uint64_t> g_graph_full_resyncs_sent{0};
+
+std::uint64_t local_incarnation_id()
+{
+  // A random, non-zero value generated once per process boot -- changes
+  // across a restart, which a future receiver-side repair pass can use to
+  // tell "this peer restarted" apart from "this peer just has an old
+  // graph_version because a delta was lost." Not yet consumed by any
+  // receive-side logic in this pass (see the GraphAdvertisement struct
+  // comment for the full plan) -- generated and sent now so that follow-up
+  // work doesn't need another wire-format change.
+  static const std::uint64_t id = [] {
+    std::random_device rd;
+    std::mt19937_64 gen(rd());
+    std::uniform_int_distribution<std::uint64_t> dist(
+      1, std::numeric_limits<std::uint64_t>::max());
+    return dist(gen);
+  }();
+  return id;
+}
 std::atomic<std::uint64_t> g_next_publisher_id{1};
 std::atomic<std::uint64_t> g_next_subscription_id{1};
 std::atomic<bool> g_pubsub_graph_renewal_started{false};
@@ -3569,7 +3598,15 @@ public:
     if (peer_addresses_.empty()) {
       return RMW_RET_OK;
     }
-    const rmw_fleetqox_cpp::GraphAdvertisement advertisement{
+    // "add"/"remove" change the actual endpoint set -- bump graph_version so
+    // a heartbeat alone (see send_graph_heartbeat()) tells a receiver
+    // whether it has seen every change so far. "liveliness_assert" re-sends
+    // an EXISTING endpoint's advertisement without changing the set, so it
+    // must not bump this counter.
+    if (action == "add" || action == "remove") {
+      g_local_graph_version.fetch_add(1, std::memory_order_relaxed);
+    }
+    rmw_fleetqox_cpp::GraphAdvertisement advertisement{
       endpoint_id,
       action,
       entity_kind,
@@ -3583,7 +3620,40 @@ public:
       domain_id,
       type_hash_hex,
       partitions_csv};
+    advertisement.incarnation_id = local_incarnation_id();
+    advertisement.graph_version = g_local_graph_version.load(std::memory_order_relaxed);
     return send_to_peers(rmw_fleetqox_cpp::encode_graph_advertisement(advertisement));
+  }
+
+  // O(N^2) discovery-traffic reduction (see the GraphAdvertisement struct
+  // comment in data_frame.hpp for the full design). Sends ONE tiny
+  // node-level message per tick instead of resending every publisher's and
+  // every subscription's full advertisement -- pubsub_graph_renewal_loop()
+  // now calls this on a short interval and only does the expensive full
+  // resend occasionally, as a slow safety-net fallback.
+  rmw_ret_t send_graph_heartbeat()
+  {
+    if (peer_addresses_.empty()) {
+      return RMW_RET_OK;
+    }
+    rmw_fleetqox_cpp::GraphAdvertisement heartbeat{
+      std::string(),
+      "heartbeat",
+      "node",
+      std::string(),
+      std::string(),
+      std::string(),
+      std::string(),
+      std::string(),
+      rmw_fleetqox_cpp::GraphQosProfile{},
+      0u,
+      0u,
+      std::string(),
+      std::string()};
+    heartbeat.incarnation_id = local_incarnation_id();
+    heartbeat.graph_version = g_local_graph_version.load(std::memory_order_relaxed);
+    g_graph_heartbeats_sent.fetch_add(1, std::memory_order_relaxed);
+    return send_to_peers(rmw_fleetqox_cpp::encode_graph_advertisement(heartbeat));
   }
 
 private:
@@ -13461,14 +13531,42 @@ void send_subscription_graph_advertisement(const FleetQoxSubscriptionData * data
 
 void pubsub_graph_renewal_loop()
 {
-  const auto renew_interval = std::chrono::milliseconds(std::max(
+  // REDESIGNED (11/09/2026, ChatGPT-assisted B+ discovery redesign -- see
+  // docs/AUDIT_ACCEPTANCE_TRACKING.md). This loop used to resend EVERY
+  // publisher's and EVERY subscription's full graph advertisement to EVERY
+  // peer on EVERY tick (default 500ms): O(publishers+subscriptions x peers)
+  // traffic per node per tick, O(N^2) system-wide as fleet size grows.
+  // Confirmed as a real, measurable contributor to a 16-robot-scale wifi
+  // delivery collapse (slowing this one interval 8x cut total wifi
+  // MAC-layer transmit volume by only ~33%, since it was never the ONLY
+  // O(N^2) source -- see the tracking doc for the full investigation).
+  //
+  // Real per-endpoint ADD/REMOVE events are already sent immediately at
+  // their actual call sites (send_publisher_graph_advertisement /
+  // send_subscription_graph_advertisement on create/destroy) -- this loop's
+  // job was always just a safety net against packet loss and late joiners,
+  // not the primary discovery path. It now sends a tiny per-process
+  // heartbeat (node identity + incarnation + graph version, NOT the full
+  // endpoint list) on a short interval, and only pays for the expensive
+  // full resend occasionally, as a slow fallback resync.
+  const auto heartbeat_interval = std::chrono::milliseconds(std::max(
       100,
-      parse_nonnegative_int_env("FLEETQOX_RMW_GRAPH_RENEW_INTERVAL_MS", 500, 4000)));
+      parse_nonnegative_int_env("FLEETQOX_RMW_GRAPH_HEARTBEAT_INTERVAL_MS", 1500, 10000)));
+  const auto full_resync_interval = std::chrono::milliseconds(std::max(
+      static_cast<int>(heartbeat_interval.count()),
+      parse_nonnegative_int_env("FLEETQOX_RMW_GRAPH_RENEW_INTERVAL_MS", 10000, 60000)));
+  auto last_full_resync = std::chrono::steady_clock::now();
   while (g_pubsub_graph_renewal_running.load(std::memory_order_acquire)) {
-    std::this_thread::sleep_for(renew_interval);
+    std::this_thread::sleep_for(heartbeat_interval);
     if (!g_pubsub_graph_renewal_running.load(std::memory_order_acquire)) {
       break;
     }
+    socket_transport().send_graph_heartbeat();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_full_resync < full_resync_interval) {
+      continue;
+    }
+    last_full_resync = now;
     std::lock_guard<std::mutex> lock(g_bus_mutex);
     for (const FleetQoxPublisherData * data : g_publishers) {
       send_publisher_graph_advertisement(data, "add");
@@ -13476,6 +13574,7 @@ void pubsub_graph_renewal_loop()
     for (const FleetQoxSubscriptionData * data : g_subscriptions) {
       send_subscription_graph_advertisement(data, "add");
     }
+    g_graph_full_resyncs_sent.fetch_add(1, std::memory_order_relaxed);
   }
 }
 
@@ -13835,6 +13934,16 @@ bool apply_received_graph_advertisement(const std::string & encoded_frame)
   const auto advertisement = rmw_fleetqox_cpp::decode_graph_advertisement(encoded_frame);
   if (!advertisement) {
     return false;
+  }
+  if (advertisement->entity_kind == "node") {
+    // Tiny per-process heartbeat from send_graph_heartbeat() -- carries no
+    // publisher/subscription fields, so it must not fall through to the
+    // per-endpoint handling below. Just counted for now; a future pass can
+    // compare advertisement->incarnation_id/graph_version against the last
+    // value seen from this peer and trigger an on-demand resync on a gap
+    // (see the GraphAdvertisement struct comment in data_frame.hpp).
+    g_graph_heartbeats_received.fetch_add(1, std::memory_order_relaxed);
+    return true;
   }
   const bool topic_publisher = advertisement->entity_kind == "publisher";
   const bool topic_subscription = advertisement->entity_kind == "subscription";
@@ -14535,6 +14644,21 @@ std::uint64_t rmw_fleetqox_cpp_socket_unreachable_retry_attempts()
 std::uint64_t rmw_fleetqox_cpp_socket_unreachable_retry_giveups()
 {
   return socket_transport().unreachable_retry_giveups();
+}
+
+std::uint64_t rmw_fleetqox_cpp_socket_graph_heartbeats_sent()
+{
+  return g_graph_heartbeats_sent.load(std::memory_order_relaxed);
+}
+
+std::uint64_t rmw_fleetqox_cpp_socket_graph_heartbeats_received()
+{
+  return g_graph_heartbeats_received.load(std::memory_order_relaxed);
+}
+
+std::uint64_t rmw_fleetqox_cpp_socket_graph_full_resyncs_sent()
+{
+  return g_graph_full_resyncs_sent.load(std::memory_order_relaxed);
 }
 
 std::uint64_t rmw_fleetqox_cpp_socket_udp_pmtu_discovery_events()

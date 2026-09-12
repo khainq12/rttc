@@ -803,7 +803,9 @@ std::string encode_graph_advertisement(const GraphAdvertisement & advertisement)
   out << ",";
   out << "\"lease_ms\":" << advertisement.lease_ms << ",";
   out << "\"type_hash\":\"" << json_escape(advertisement.type_hash_hex) << "\",";
-  out << "\"partitions\":\"" << json_escape(advertisement.partitions_csv) << "\"";
+  out << "\"partitions\":\"" << json_escape(advertisement.partitions_csv) << "\",";
+  out << "\"incarnation_id\":" << advertisement.incarnation_id << ",";
+  out << "\"graph_version\":" << advertisement.graph_version;
   out << "}";
   return out.str();
 }
@@ -841,6 +843,8 @@ std::optional<GraphAdvertisement> decode_graph_advertisement(const std::string &
   advertisement.domain_id = json_uint_value(body, "domain_id").value_or(0);
   advertisement.type_hash_hex = json_string_value(body, "type_hash").value_or("");
   advertisement.partitions_csv = json_string_value(body, "partitions").value_or("");
+  advertisement.incarnation_id = json_uint_value(body, "incarnation_id").value_or(0);
+  advertisement.graph_version = json_uint_value(body, "graph_version").value_or(0);
   return advertisement;
 }
 

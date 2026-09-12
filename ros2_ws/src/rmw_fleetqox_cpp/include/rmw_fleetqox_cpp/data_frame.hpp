@@ -213,6 +213,23 @@ struct GraphAdvertisement
   // partition names containing a comma are not supported. Empty means the
   // default partition.
   std::string partitions_csv;
+  // Added for the O(N^2) discovery-traffic reduction (ChatGPT-assisted B+
+  // redesign, 11/09/2026, see docs/AUDIT_ACCEPTANCE_TRACKING.md).
+  // incarnation_id is a random value generated once per process boot
+  // (changes on restart -- lets a future receiver tell "peer restarted"
+  // apart from "normal churn"). graph_version is a monotonic per-process
+  // counter incremented on every real add/remove event, so a lightweight
+  // periodic heartbeat carrying just these two fields (entity_kind=="node",
+  // action=="heartbeat") can substitute for resending the full endpoint
+  // list on every tick -- a receiver noticing its last-seen graph_version
+  // for a peer is behind the heartbeat's could trigger an on-demand
+  // resync (not yet implemented; this pass only stops the O(N^2) full
+  // periodic resend and adds the fields needed for that follow-up).
+  // Default-initialized here (not touching the many existing positional
+  // aggregate-initializations of this struct throughout rmw_pubsub.cpp,
+  // which simply pick up these defaults for the two new trailing members).
+  std::uint64_t incarnation_id = 0;
+  std::uint64_t graph_version = 0;
 };
 
 struct ServiceFrame
