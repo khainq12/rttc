@@ -2522,6 +2522,54 @@ so sánh 1 lần chạy trở nên đáng tin cậy hơn.
 `compact_v1_data_frame_encoding_enabled()`), `scripts/fleetqox_rmw_trace_endpoint.py`
 (`frames_sent`/`frames_received` added to exposed transport metrics).
 
+### 12/09/2026 (tiếp) — Đã thêm RNG seed cố định cho ns-3, kiểm tra lại độ lặp lại + so sánh JSON/compact_v1 có kiểm soát
+
+Theo đề xuất ChatGPT: thêm `RngSeedManager::SetSeed()`/`SetRun()` vào
+`fleetqox_trace_replay_tap.cc` (trước đây HOÀN TOÀN không có — khác với
+`fleetqox_trace_replay.cc` đã có `--seed`/`--run`/`AssignStreams` xác
+định từ sớm hơn trong investigation). Thêm `--seed`/`--run` (mặc định
+1/1, không đổi hành vi ns-3 mặc định) và `ns3_seed`/`ns3_run` xuyên suốt
+`run_ns3_docker_wifi_tap_rmw_probe.py`.
+
+**Kiểm tra lặp lại với seed/run CỐ ĐỊNH (seed=42, run=1), JSON mặc định,
+5 lần chạy**: 9.6%, 10.8%, 9.5%, 24.6%, 10.4%.
+
+4/5 lần **co cụm rất chặt** (9.5%–10.8%, độ lệch chuẩn chỉ 0.63 điểm) —
+xác nhận trực tiếp: **thiếu RNG seed của ns-3 từng là nguồn nhiễu chính**
+gây ra dao động 10.3%–29.4% quan sát trước đó. Nhưng có **1/5 lần vẫn
+lệch mạnh (24.6%)** — xác nhận cảnh báo của ChatGPT: pin RNG của ns-3
+không loại bỏ hết nhiễu, vì hạ tầng TapBridge chạy qua tiến trình Linux
+thật + `RealtimeSimulatorImpl` (thời gian thực), nên jitter lập lịch hệ
+điều hành vẫn là nguồn nhiễu độc lập, thỉnh thoảng vẫn gây lệch lớn.
+
+**So sánh có kiểm soát**: chạy `compact_v1` với CÙNG seed=42/run=1, 5
+lần: 35.0%, 10.9%, 29.0%, 17.9%, 10.1% (mean 20.6%, độ lệch chuẩn 11.1)
+so với JSON mean 13.0% (độ lệch chuẩn 6.5%). Chênh lệch trung bình
++7.6 điểm phần trăm nghiêng về compact_v1, nhưng t~1.32 (chưa đạt
+ngưỡng có ý nghĩa thống kê ở mức tin cậy 95% với n=5 mỗi nhóm) —
+**đảo ngược ấn tượng ban đầu** (khi chưa pin seed, compact_v1 trông có
+vẻ TỆ hơn JSON) thành **có thể tốt hơn nhưng chưa đủ bằng chứng chắc
+chắn**. Đáng chú ý: compact_v1 vẫn dao động khá lớn ngay cả khi RNG
+ns-3 đã cố định giống hệt JSON — gợi ý rằng thời gian xử lý/gửi thực tế
+(vốn nhanh hơn với compact_v1 do payload nhỏ hơn) có thể tương tác với
+nhiễu lập lịch OS theo cách khác JSON, một câu hỏi mở chưa được giải
+đáp.
+
+**Kết luận tạm thời (trung thực, KHÔNG khẳng định quá mức)**:
+1. Giảm kích thước wire-frame (compact_v1) là fix ĐÚNG HƯỚNG, có bằng
+   chứng thống kê yếu-vừa nghiêng về cải thiện delivery, nhưng CHƯA đủ
+   mạnh để khẳng định chắc chắn với cỡ mẫu hiện tại.
+2. Việc pin RNG seed của ns-3 tự nó đã là một cải tiến hạ tầng có giá
+   trị thực (giảm gần hết nhiễu ở 4/5 trường hợp), nên giữ lại vĩnh
+   viễn cho mọi thử nghiệm `fleetqox_trace_replay_tap.cc` sau này.
+3. Cần thêm nhiều lần lặp lại hơn (ChatGPT gợi ý ≥10 cặp so khớp
+   JSON/compact_v1 luân phiên theo từng `--run`) để có khoảng tin cậy
+   95% đủ hẹp trước khi đưa compact_v1 vào bất kỳ khuyến nghị chính
+   thức nào.
+
+**File thay đổi**: (đã liệt kê ở mục trước — `--seed`/`--run` thêm vào
+cùng lần với `fleetqox_trace_replay_tap.cc`).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
