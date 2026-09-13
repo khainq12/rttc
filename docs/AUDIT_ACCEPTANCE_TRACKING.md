@@ -4598,6 +4598,39 @@ như giả thuyết ban đầu.
 `/tmp/.../scratchpad/lan_bang5_16robot_n3.py` (script đo, không thuộc
 repo).
 
+### 13/09/2026 (tiếp) — Build THÀNH CÔNG image ns-3 + 5G-LENA (module "nr") — mới xong hạ tầng, CHƯA có chương trình mô phỏng 5G
+
+Sau 2 lần thử (lần 1 fail ở object 583/933 do lỗi biên dịch thật —
+`-Werror=array-bounds` false-positive của GCC mới hơn với code cũ của
+`nr-gnb-mac.cc`, cùng LOẠI vấn đề với 2 patch GCC-compat đã có sẵn cho
+ns-3 core — sửa bằng `-Wno-error=array-bounds -Wno-error=stringop-overflow`
+trong cmake flags), **image mới `localhost/fleetrmw/rmw-netem:jazzy-nr`
+build THÀNH CÔNG** (933/933 object, ~9 phút build sau khi restart từ
+đầu do Docker không cache được tiến trình dở dang trong 1 RUN
+instruction).
+
+- **Module**: NR-v3.0 (branch `5g-lena-v3.0.y`) — xác nhận qua chính
+  RELEASE_NOTES.md của module là bản DUY NHẤT tương thích chính xác với
+  ns-3.41 (bản đang dùng trong toàn bộ investigation này).
+- **Xác nhận hoạt động**: `pkg-config --list-all` cho thấy `ns3-nr` và
+  `ns3-lte` đã có; header `nr-helper.h`, `nr-gnb-mac.h`,
+  `nr-gnb-net-device.h`, `nr-gnb-phy.h` đều tồn tại trong
+  `/usr/include/ns3/`.
+- **File mới**: `external/rmw-netem/Dockerfile.nr` — image RIÊNG, KHÔNG
+  ghi đè `Dockerfile` gốc, để mọi thí nghiệm wifi đã validate trước đó
+  (toàn bộ Bảng A-V ở các mục trên) vẫn dùng ĐÚNG image gốc không đổi.
+
+**QUAN TRỌNG — đây MỚI LÀ HẠ TẦNG, CHƯA PHẢI kịch bản 5G thật**: build
+xong image chỉ có nghĩa là thư viện NR đã sẵn sàng để gọi từ C++. Vẫn
+CẦN viết một chương trình mô phỏng MỚI (tương tự
+`fleetqox_trace_replay_tap.cc` nhưng dùng `NrHelper`/gNB/UE thay vì
+`WifiHelper`/AP/STA) — đây là khối lượng kỹ thuật riêng, đáng kể: cấu
+hình numerology, bandwidth part, scheduler MAC, gắn TapBridge cho từng
+UE để kiến trúc Docker-per-container hiện có có thể cắm vào được. CHƯA
+BẮT ĐẦU viết chương trình này — cần xác nhận với người dùng trước khi
+đầu tư tiếp (khối lượng công việc này tương đương với việc đã bỏ ra
+cho toàn bộ phần wifi `fleetqox_trace_replay_tap.cc` ban đầu).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
