@@ -3756,6 +3756,52 @@ trung bình, với ý nghĩa thống kê ở n=10 — nhưng đi kèm cái giá 
 ổn định kém hơn nhiều so với FleetRMW, và cơ chế là "gửi nhiều hơn"
 chứ không phải "hiệu quả hơn".
 
+### 13/09/2026 (tiếp) — Truy vết chỗ FleetRMW mất gói: KHÔNG PHẢI bug phần mềm, xác nhận bằng bộ đếm nội bộ `fleetqox_transport_metrics`
+
+Người dùng hỏi thẳng: code đã tối ưu cho multi-robot rồi, vậy tại sao
+delivery vẫn thấp — cần xác định chính xác đứt ở khâu nào (phần mềm
+FleetRMW hay tầng mạng). Không cần chạy lại container mới — dùng lại
+dữ liệu đã có sẵn từ 10 lần chạy paired ở trên (mỗi lần chạy đã lưu đủ
+`fleetqox_transport_metrics` per-endpoint trong
+`results_rmw_socket/.paired17_fleetqox_runN/container_results/result_*.json`).
+
+Đối chiếu tổng số tin app-level gửi đi (`tx`/`frames_sent`) với số tin
+thực sự nhận được (`rx`) và các bộ đếm lỗi phần mềm, trên 3 lần chạy có
+kết quả khác biệt rõ rệt nhất (tốt/trung bình/tệ nhất trong 10 lần):
+
+| Run | tx (app gửi) | delivered | delivery% | udp_datagram_budget_failures | fragment_send_failures | unreachable_retry_giveups |
+|---|---|---|---|---|---|---|
+| run1 | 2289 | 713 | 31.1% | 0 | 0 | 0 |
+| run5 | 2289 | 596 | 26.0% | 0 | 0 | 0 |
+| run10 | 2289 | 348 | 15.2% | 0 | 0 | 0 |
+
+**Kết luận: code FleetRMW không có lỗi phần mềm.** Ở CẢ 3 lần chạy
+(kể cả lần tệ nhất, 15.2%), tầng transport của FleetRMW gửi đủ 100%
+(2289/2289) số tin app yêu cầu, **0 lần thất bại ở tầng phần mềm** (0
+`udp_datagram_budget_failures`, 0 `fragment_send_failures`, 0
+`unreachable_retry_giveups`). `subscription_aware_fallback_broadcasts`
+và `graph_heartbeats_sent/received` đều = 0 ở mọi endpoint — xác nhận
+static mode thực sự loại bỏ hoàn toàn overhead discovery như thiết kế,
+không có traffic control-plane ẩn nào góp phần vào mất mát.
+
+Đối chiếu với `FLEETQOX_WIFI_STATS` của ns-3 cho cùng run (ví dụ
+run1): `phy_tx_begin_total≈2267` (gần khớp 2289 — tầng PHY thực sự cố
+gắng phát gần hết số gói FleetRMW đưa xuống), nhưng `mac_tx_total` chỉ
+còn **~610** — nghĩa là **~73% số lần phát PHY bị thất bại ở tầng MAC**
+(hết số lần retry mà không nhận được ACK, do va chạm sóng khi 17 trạm
+cùng tranh chấp 1 kênh 802.11g).
+
+**Vị trí đứt gãy chính xác**: KHÔNG nằm trong code FleetRMW (0 lỗi
+phần mềm ở mọi run) mà nằm ở **tầng PHY/MAC của kênh wifi mô phỏng**,
+do 2 yếu tố cộng hưởng đã biết từ trước trong investigation này: (1)
+giới hạn vật lý cố hữu của 17 trạm chia sẻ 1 kênh 802.11g, và (2) gói
+tin FleetRMW (JSON) to hơn raw-UDP/DDS 5.9-7.7 lần (đo bằng pcap ở mục
+trước) → tốn nhiều airtime hơn mỗi lần phát → tăng xác suất va chạm.
+Đây là lý do thí nghiệm `static_min_v1` (giảm kích thước gói) là hướng
+đúng để cải thiện — kết quả trước đó (đo bằng 1 lần chạy) chưa có ý
+nghĩa thống kê, cần đo lại bằng phương pháp paired n≥10 tương tự mục
+trên nếu muốn kết luận chắc chắn.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
