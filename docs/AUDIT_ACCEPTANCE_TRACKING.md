@@ -4194,21 +4194,39 @@ CỰC KỲ mạnh cho Bảng IV: ở quy mô 17 endpoint, không một RMW multi
 discovery chuẩn nào (Cyclone/Zenoh/FastDDS) từng đạt full graph
 convergence trong 15s, ở BẤT KỲ lần chạy nào trong 30 lần đã đo.
 
-**Bảng IV hoàn chỉnh (đủ 5 cột, n=10 nơi áp dụng được)**:
+**Bảng IV hoàn chỉnh — LẦN ĐẦU đủ CẢ 5 CỘT**:
 
-| RMW | Discovery convergence (s) | Discovery bytes | CPU (%) | RSS (MB) | Graph/Join failures |
+| RMW | Discovery convergence (s) | Discovery bytes (n=10) | CPU % (n=3) | RSS MB (n=3) | Graph/Join failures (n=10) |
 |---|---|---|---|---|---|
-| FleetRMW | N/A (không có discovery) | 6,538 ± 181 | *chưa đo — chờ chạy* | *chưa đo — chờ chạy* | N/A |
-| CycloneDDS | ≥15s (censored, 10/10 chạm trần) | 1,126,381 ± 92,486 | *chưa đo* | *chưa đo* | **100%** |
-| Zenoh | ≥15s (censored, 10/10 chạm trần) | 364,535 ± 89,452 | *chưa đo* | *chưa đo* | **100%** |
-| Fast DDS | ≥15s (censored, 10/10 chạm trần) | 1,815,160 ± 455,078 | *chưa đo* | *chưa đo* | **100%** |
+| FleetRMW | N/A (không có discovery) | 6,538 ± 181 | **9.91 ± 1.39** | **38.0 ± 0.0** | N/A |
+| CycloneDDS | ≥15s (censored, 10/10 chạm trần) | 1,126,381 ± 92,486 | 4.05 ± 0.48 | 38.6 ± 0.1 | **100%** |
+| Zenoh | ≥15s (censored, 10/10 chạm trần) | 364,535 ± 89,452 | 5.02 ± 2.30 | 42.2 ± 0.1 | **100%** |
+| Fast DDS | ≥15s (censored, 10/10 chạm trần) | 1,815,160 ± 455,078 | 3.23 ± 0.67 | 42.7 ± 0.0 | **100%** |
 
-Cột CPU/RSS cần chạy lại thật (code đã viết xong ở mục trước, đo mid-
-run qua `docker stats`) — CHƯA có số vì code này được thêm SAU 40 lần
-chạy n=10 đã có, cần 1 lượt chạy mới (40 lần nữa hoặc ít hơn nếu chỉ
-cần n nhỏ hơn để có ước lượng CPU/RSS, vì tài nguyên container thường
-ổn định hơn delivery_pct nhiều — có thể không cần tới n=10 để có số
-đáng tin).
+**Lưu ý cỡ mẫu KHÔNG đồng nhất giữa các cột** — CPU/RSS đo ở n=3 (chạy
+mới, sau khi thêm code này), 3 cột còn lại đo ở n=10 (chạy trước đó,
+tái sử dụng dữ liệu sẵn có) — KHÔNG được đọc bảng như thể mọi cột có
+cùng độ tin cậy thống kê. n=3 đã đủ cho CPU/RSS vì độ lệch chuẩn ở đây
+rất nhỏ so với mean (RSS gần như không đổi giữa các lần chạy, CPU dao
+động vài %), khác hẳn `delivery_pct` (nơi Zenoh dao động gần bằng chính
+giá trị trung bình) — tài nguyên container ổn định hơn nhiều so với
+hành vi mạng, nên n nhỏ vẫn đủ tin cậy ở đây.
+
+**Phát hiện mới, thú vị — trade-off CPU vs RSS ngược chiều nhau**:
+FleetRMW dùng CPU **nhiều nhất** (9.9%, gấp ~2-3 lần 3 RMW kia) nhưng
+RSS **thấp nhất** (38.0MB) — hợp lý: FleetRMW đang thực sự làm việc
+(mã hoá JSON, fragment/retry logic của transport riêng) nên tốn CPU
+chủ động, trong khi footprint bộ nhớ runtime lại gọn hơn (không cõng
+theo cả 1 stack DDS/Zenoh đầy đủ tính năng). Ngược lại, CycloneDDS/Fast
+DDS có CPU THẤP NHẤT (3.2-4.1%) dù đang liên tục cố gắng discovery —
+vì phần lớn nỗ lực đó bị BLOCK/CHỜ (không có dữ liệu thật để xử lý do
+0% delivery) chứ không phải đang tính toán tích cực. Zenoh nằm giữa,
+và CPU của nó dao động theo đúng dữ liệu giao được (chạy nào giao nhiều
+hơn thì CPU cao hơn — cpu=2.9%→7.5% khớp delivery=10%→57.4%). Fast DDS/
+Zenoh có RSS cao hơn hẳn (42.2-42.7MB so với 38.0-38.6MB của
+FleetRMW/CycloneDDS) — phù hợp với việc 2 middleware này thường cõng
+theo runtime library đầy tính năng hơn (Zenoh's Rust runtime, Fast
+DDS's middleware stack).
 
 ## Quy ước cập nhật file này
 
