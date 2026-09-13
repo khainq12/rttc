@@ -3403,6 +3403,74 @@ thay 3 vai trò cũ, layout vòng tròn, `pathLossExponent`/`txPowerDbm`/
 các script/test khác đang phụ thuộc 3-role cũ); `tests/test_ns3_docker_container_fleet_probe.py`
 (mới, 11 test cho các hàm thuần Python).
 
+### 13/09/2026 (tiếp) — So sánh baseline DDS truyền thống (CycloneDDS, Zenoh) trên cùng kịch bản mới: phát hiện lỗi thiếu route multicast, và 1 giới hạn CHƯA giải quyết được ở tầng discovery
+
+Theo yêu cầu người dùng (chạy CycloneDDS/Zenoh làm baseline trên cùng
+kịch bản tham chiếu 17-endpoint mới). Đã thêm tham số `rmw_implementation`
+vào `run_ns3_docker_container_fleet_probe.py` (mặc định vẫn
+`rmw_fleetqox_cpp` với static mode; RMW khác chỉ set
+`RMW_IMPLEMENTATION` và để tự discovery, không set biến `FLEETQOX_RMW_*`).
+
+**Lỗi hạ tầng thật tìm được ngay lần chạy đầu (đã sửa)**: chạy
+CycloneDDS lần 1 cho kết quả **sạch 0%** (không phải thấp, mà TUYỆT ĐỐI
+0/2289) — dấu hiệu bất thường vì ngay cả khi kênh nghẽn nặng, FleetRMW
+vẫn có 25.1%, không bao giờ về đúng 0 tuyệt đối. Kiểm tra trực tiếp
+bằng socket thô: `sendto(('239.255.0.1', 7400))` báo lỗi **"Network is
+unreachable"** — `ip addr add <ip>/24 dev eth0` chỉ tự tạo route cho
+subnet cục bộ, KHÔNG tạo route cho dải multicast (224.0.0.0/4). Đây là
+lỗi CÓ THẬT trong `wire_network()`, ảnh hưởng MỌI RMW dùng multicast để
+discovery (FleetRMW static mode không bị ảnh hưởng vì không bao giờ
+dùng multicast). Đã sửa: thêm `ip route add 224.0.0.0/4 dev eth0` vào
+mỗi endpoint trong `wire_network()`.
+
+**Sau khi sửa route, multicast thô (socket Python thuần, join group +
+sendto) đã xác nhận truyền được HAI CHIỀU đúng qua toàn bộ topology
+thật** (kể cả qua ns-3 TapBridge mô phỏng wifi thật, không chỉ bridge
+Linux thường) — kiểm chứng bằng thử nghiệm 2-trạm độc lập.
+
+**Nhưng CycloneDDS vẫn KHÔNG discover được nhau dù multicast thô đã
+chạy được**: kiểm tra bằng rclpy thuần (không qua `ros2` CLI daemon, để
+loại trừ nghi ngờ cache) — publisher chạy 60 giây liên tục,
+`subscription_count` **luôn luôn = 0** trong suốt >55 giây (vượt xa
+`SPDPInterval` mặc định 30s của CycloneDDS, loại trừ khả năng chỉ là
+chờ chưa đủ lâu). Đây là **giới hạn/lỗi CHƯA xác định được nguyên nhân
+gốc** — multicast tầng socket hoạt động, nhưng cơ chế SPDP
+(Simple Participant Discovery Protocol) của CycloneDDS thì không, dù
+đã thử cấu hình tường minh interface `eth0` qua `CYCLONEDDS_URI`. KHÔNG
+tiếp tục đào sâu thêm trong phiên này (đã tốn khá nhiều thời gian cho
+nhánh phụ này) — ghi nhận trung thực là CHƯA GIẢI QUYẾT, không cố gán
+cho nguyên nhân "kênh wifi nghẽn" khi thực ra chưa hề chứng minh được
+điều đó (2 trạm cô lập, không có traffic cạnh tranh, vẫn 0%).
+
+**Zenoh thất bại vì lý do KHÁC, đã biết rõ (không phải bí ẩn)**: log
+báo rõ ràng `"Unable to connect to a Zenoh router. Have you started a
+router with 'ros2 run rmw_zenoh_cpp rmw_zenohd'?"` — `rmw_zenoh_cpp`
+trong ROS2 Jazzy mặc định cần một tiến trình router riêng
+(`rmw_zenohd`) mà harness này CHƯA khởi động — đây là bước cấu hình
+còn thiếu, không phải lỗi mạng bí ẩn như CycloneDDS. Chưa triển khai
+(cần thêm 1 container router + logic chờ nó sẵn sàng trước khi launch
+endpoint).
+
+**Kết quả so sánh (S1 baseline, 17 endpoint, cùng trace/seed)**:
+
+| RMW | Kết quả | Ghi chú |
+|---|---|---|
+| `rmw_fleetqox_cpp` (static mode) | **25.1%** | Hoạt động đúng, đã kiểm chứng kỹ (xem mục trước) |
+| `rmw_cyclonedds_cpp` | **0%** (chưa rõ nguyên nhân gốc) | Discovery SPDP không hội tụ dù multicast thô hoạt động — CẦN điều tra thêm, KHÔNG kết luận vội |
+| `rmw_zenoh_cpp` | Chưa chạy được (thiếu router) | Cần thêm `rmw_zenohd` — việc cấu hình, không phải bug |
+
+**Kết luận trung thực**: chưa thể so sánh "FleetRMW vs DDS truyền
+thống" một cách công bằng trên kiến trúc container MỚI này, vì 2
+baseline DDS còn đang bị chặn ở tầng discovery (nguyên nhân KHÁC
+nhau, cả hai đều CHƯA phải là bằng chứng về hành vi dưới tải wifi thật
+— chúng chưa bao giờ tới được bước gửi dữ liệu ứng dụng). Đây KHÔNG
+phải kết luận "FleetRMW tốt hơn DDS truyền thống" — chỉ là "chưa đo
+được DDS truyền thống trên kiến trúc mới, cần thêm việc".
+
+**File thay đổi**: `scripts/run_ns3_docker_container_fleet_probe.py`
+(tham số `rmw_implementation`, route multicast `224.0.0.0/4` trong
+`wire_network()`).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và

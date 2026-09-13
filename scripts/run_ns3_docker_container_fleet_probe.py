@@ -273,6 +273,21 @@ class ReferenceTopologyProbe:
                     f"nsenter -t {endpoint_pid} -n -- ip addr add {self.ips[endpoint]}/24 dev eth0",
                     f"nsenter -t {endpoint_pid} -n -- ip link set eth0 up",
                     f"nsenter -t {endpoint_pid} -n -- ip link set lo up",
+                    # `ip addr add` only auto-creates a route for the
+                    # local /24 subnet, NOT for the multicast range --
+                    # confirmed via a real 2-container proof of concept:
+                    # sendto(('239.255.0.1', port)) failed with "Network
+                    # is unreachable" without this route, and succeeded
+                    # once added. Standard DDS/Zenoh discovery relies on
+                    # multicast (e.g. CycloneDDS's SPDP), so without this
+                    # route every non-fleetqox rmw_implementation would
+                    # silently fail ALL discovery -- not a wifi-congestion
+                    # finding, just a missing route (see
+                    # docs/AUDIT_ACCEPTANCE_TRACKING.md "so sánh baseline
+                    # DDS truyền thống" for the full trail: a first
+                    # CycloneDDS run measured a suspicious clean 0%
+                    # delivery, traced back to exactly this).
+                    f"nsenter -t {endpoint_pid} -n -- ip route add 224.0.0.0/4 dev eth0",
                 ]
             )
         commands.append("echo WIRE_NETWORK_OK")
@@ -323,6 +338,7 @@ class ReferenceTopologyProbe:
         extra_rmw_env: dict[str, str] | None,
         results_dir_container: str,
         start_wait_timeout_s: float,
+        rmw_implementation: str = "rmw_fleetqox_cpp",
     ) -> None:
         docker("exec", self.rigger_name, "mkdir", "-p", f"/work/{results_dir_container}")
         self._ready_files = [f"{results_dir_container}/ready_{i}" for i in range(len(self.endpoints))]
@@ -333,22 +349,41 @@ class ReferenceTopologyProbe:
             )
             result_json = f"{results_dir_container}/result_{i}.json"
             log_file = f"{results_dir_container}/endpoint_{i}.log"
-            static_subscription_entries = [
-                f"{self.ips[dst]}:{RMW_PORT}|0|{topic_for(dst, flow_class)}|"
-                f"{STATIC_SUBSCRIPTION_TYPE_NAME}"
-                for dst, flow_class in (static_subscriptions or {}).get(endpoint, [])
-            ]
-            env_prefix = (
-                f"RMW_IMPLEMENTATION=rmw_fleetqox_cpp FLEETQOX_RMW_BIND=0.0.0.0:{RMW_PORT} "
-                f"FLEETQOX_RMW_PEERS={peers} "
-            )
-            if static_mode:
-                env_prefix += (
-                    "FLEETQOX_RMW_PEER_POLICY=subscription_aware FLEETQOX_RMW_STATIC_MODE=1 "
-                    f"FLEETQOX_RMW_STATIC_SUBSCRIPTIONS="
-                    f"{shlex.quote(','.join(static_subscription_entries))} "
+            if rmw_implementation == "rmw_fleetqox_cpp":
+                static_subscription_entries = [
+                    f"{self.ips[dst]}:{RMW_PORT}|0|{topic_for(dst, flow_class)}|"
+                    f"{STATIC_SUBSCRIPTION_TYPE_NAME}"
+                    for dst, flow_class in (static_subscriptions or {}).get(endpoint, [])
+                ]
+                env_prefix = (
+                    f"RMW_IMPLEMENTATION=rmw_fleetqox_cpp FLEETQOX_RMW_BIND=0.0.0.0:{RMW_PORT} "
+                    f"FLEETQOX_RMW_PEERS={peers} "
                 )
-            env_prefix += "".join(f"{key}={value} " for key, value in (extra_rmw_env or {}).items())
+                if static_mode:
+                    env_prefix += (
+                        "FLEETQOX_RMW_PEER_POLICY=subscription_aware FLEETQOX_RMW_STATIC_MODE=1 "
+                        f"FLEETQOX_RMW_STATIC_SUBSCRIPTIONS="
+                        f"{shlex.quote(','.join(static_subscription_entries))} "
+                    )
+                env_prefix += "".join(
+                    f"{key}={value} " for key, value in (extra_rmw_env or {}).items()
+                )
+                rmw_setup = f"source /work/{FLEETQOX_RMW_INSTALL}/setup.bash && export {env_prefix}"
+            else:
+                # Standard ROS2 RMW (rmw_cyclonedds_cpp, rmw_zenoh_cpp, ...)
+                # -- already present in this base ROS2 image, no colcon
+                # build needed. Discovers peers via its own protocol
+                # (typically multicast for DDS; Zenoh's own discovery for
+                # rmw_zenoh_cpp) instead of a static FLEETQOX_RMW_PEERS
+                # list -- the per-station bridge/tap topology this probe
+                # sets up already relays broadcast/multicast the same way
+                # run_ns3_docker_wifi_tap_rmw_probe.py's confirmed working
+                # for ARP, so this should reach every station the same way.
+                env_prefix = f"RMW_IMPLEMENTATION={rmw_implementation} "
+                env_prefix += "".join(
+                    f"{key}={value} " for key, value in (extra_rmw_env or {}).items()
+                )
+                rmw_setup = f"export {env_prefix}"
             # Same ready/start double-gate as run_ns3_docker_wifi_tap_rmw_probe.py's
             # build_shell_script -- every endpoint sets its own wall-clock
             # "t=0" right after its own discovery finishes, so without a
@@ -359,8 +394,7 @@ class ReferenceTopologyProbe:
             # across every container -- no extra IPC mechanism needed.
             inner = (
                 "source /opt/ros/jazzy/setup.bash && "
-                f"source /work/{FLEETQOX_RMW_INSTALL}/setup.bash && "
-                f"export {env_prefix}&& "
+                f"{rmw_setup}&& "
                 f"python3 /work/scripts/fleetqox_rmw_trace_endpoint.py "
                 f"--trace={shlex.quote(trace_container_path)} "
                 f"--endpoint={shlex.quote(endpoint)} "
@@ -475,6 +509,7 @@ def run_probe(
     rx_sensitivity_dbm: float = -82.0,
     mobility_speed: float = 0.0,
     num_aps: int = 1,
+    rmw_implementation: str = "rmw_fleetqox_cpp",
 ) -> dict[str, Any]:
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -494,8 +529,12 @@ def run_probe(
     trace_container_path = f"/work/{trace_path.relative_to(ROOT)}"
 
     endpoints = endpoint_list(num_robots)
+    # static_mode/FLEETQOX_RMW_STATIC_SUBSCRIPTIONS is a rmw_fleetqox_cpp-
+    # specific mechanism -- meaningless (and not read) by standard DDS/
+    # Zenoh RMWs, which discover peers via their own protocol instead.
+    effective_static_mode = static_mode and rmw_implementation == "rmw_fleetqox_cpp"
     static_subscriptions = (
-        build_static_subscriptions(trace_path, policy, endpoints) if static_mode else None
+        build_static_subscriptions(trace_path, policy, endpoints) if effective_static_mode else None
     )
     results_dir_container = f"{output_dir.relative_to(ROOT)}/container_results"
     (ROOT / results_dir_container).mkdir(parents=True, exist_ok=True)
@@ -531,11 +570,12 @@ def run_probe(
             start_offset_ms=start_offset_ms,
             drain_s=drain_s,
             discovery_timeout_s=discovery_timeout_s,
-            static_mode=static_mode,
+            static_mode=effective_static_mode,
             static_subscriptions=static_subscriptions,
             extra_rmw_env=extra_rmw_env,
             results_dir_container=results_dir_container,
             start_wait_timeout_s=start_wait_timeout_s,
+            rmw_implementation=rmw_implementation,
         )
         probe.wait_for_ready_then_start(ready_deadline_s=ready_deadline_s)
         probe.wait_for_completion(
@@ -588,6 +628,11 @@ def main() -> int:
     parser.add_argument("--tx-power-dbm", type=float, default=15.0)
     parser.add_argument("--rx-sensitivity-dbm", type=float, default=-82.0)
     parser.add_argument("--mobility-speed", type=float, default=0.0)
+    parser.add_argument(
+        "--rmw-implementation",
+        default="rmw_fleetqox_cpp",
+        help="e.g. rmw_fleetqox_cpp (default, uses static_mode), rmw_cyclonedds_cpp, rmw_zenoh_cpp",
+    )
     parser.add_argument("--summary-json", type=Path, default=None)
     args = parser.parse_args()
 
@@ -607,6 +652,7 @@ def main() -> int:
         tx_power_dbm=args.tx_power_dbm,
         rx_sensitivity_dbm=args.rx_sensitivity_dbm,
         mobility_speed=args.mobility_speed,
+        rmw_implementation=args.rmw_implementation,
     )
     if args.summary_json:
         args.summary_json.parent.mkdir(parents=True, exist_ok=True)
