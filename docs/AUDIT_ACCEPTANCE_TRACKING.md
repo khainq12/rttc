@@ -4914,6 +4914,56 @@ THÀNH.
 repo — script đo cũng ở scratchpad, không commit, theo đúng quy ước đã
 dùng cho các bảng đo trước).
 
+### 13/09/2026 (tiếp) — Test quy mô nhỏ Bảng VI (Ricart-Agrawala zone-mutex): 1 bug thật đã sửa, 1 endpoint vẫn "cô lập" chưa rõ nguyên nhân
+
+Theo yêu cầu "test quy mô nhỏ trước": chạy `run_coordination_probe()`
+với 2 robot (3 endpoint) trên profile Wi-Fi. Kết quả ban đầu: **100%
+"forced entry"** (không endpoint nào đạt đồng thuận thật trong 60s,
+`navigation_recovery_count` luôn kịch trần).
+
+**Bug thật đã tìm và sửa**: mỗi lần retry, code tạo `req_id` MỚI và
+RESET `replies_received` về rỗng. Do FleetRMW trên Wi-Fi có độ trễ
+biến thiên rất mạnh (đã ghi nhận ở Bảng V: p50=5.5s/p95=9.9s/**p99=
+10.9s** cho đúng RMW/profile này), 2 reply cần thiết thường đến
+KHÔNG ĐỒNG THỜI trong cùng 1 cửa sổ `--reply-timeout-s` — reply đến
+"muộn" bị tính vào `req_id` retry MỚI (không khớp `req_id` retry đang
+chờ) nên bị loại bỏ, dù bản chất đã "thành công". **Sửa**: giữ
+NGUYÊN `req_id`/timestamp trong suốt 1 lần crossing, chỉ re-broadcast
+lại (phòng gói bị mất), tích luỹ `replies_received` qua các lần retry
+thay vì reset. Xác nhận cải thiện rõ rệt cho 1 endpoint (matched
+replies từ 1 → 5-10 trong cùng 1 kịch bản).
+
+Cũng thử 2 giả thuyết khác (đã LOẠI TRỪ qua test cô lập, không phải
+nguyên nhân chính nhưng giữ lại vì vô hại/hợp lý):
+- Thiếu `FLEETQOX_RMW_STATIC_MODE=1` → khiến FleetRMW chạy discovery
+  thật (heartbeat định kỳ, giống SPDP) mà code lại bỏ qua bước chờ —
+  đã bật lại đúng theo quy ước đã dùng ở mọi nơi khác trong session.
+- Gọi `publish()` ĐỒNG BỘ từ bên trong callback nhận tin — đã chuyển
+  sang hàng đợi, xả từ vòng lặp chính.
+- Gộp 2 topic (request/reply) thành 1 topic chung.
+
+**CHƯA giải quyết**: trong MỌI lần chạy thử (kể cả sau khi sửa bug
+trên), **endpoint được khởi chạy CUỐI CÙNG** (robot_0001, thứ tự
+control_station → robot_0000 → robot_0001) nhận được **0 reply** trong
+suốt toàn bộ kịch bản (6 lần retry × 15s = 90s) — không phải mất gói
+ngẫu nhiên thông thường, mà giống bị cô lập gần như hoàn toàn. Hình
+dạng triệu chứng này TRÙNG với 1 lỗi phụ thuộc-thứ-tự-khởi-chạy đã
+từng ghi nhận trước đây trong dự án này (CycloneDDS, mục "beacon
+discovery convergence" — "endpoint khởi chạy cuối cùng không bao giờ
+thấy peer nào") — nhưng CHƯA xác nhận đây là CÙNG nguyên nhân gốc cho
+FleetRMW, cần điều tra thêm (ví dụ: thử đổi thứ tự khởi chạy xem lỗi
+có "theo" endpoint cuối cùng hay theo tên/IP cụ thể của robot_0001).
+
+**Instrumentation debug mới** (tạm thời nhưng rẻ, giữ lại):
+`debug_counters` (đếm request/reply gửi/nhận/khớp) và
+`raw_received_log` (log thô mọi tin nhắn nhận được) trong summary JSON
+của mỗi endpoint — giúp chẩn đoán trực tiếp từ JSON thay vì phải thêm
+print statement mỗi lần.
+
+**Trạng thái**: đã sửa 1 bug thật, có cải thiện rõ rệt nhưng CHƯA đạt
+được 1 lần đồng thuận "sạch" nào trong test 2-3 endpoint. Cần quyết
+định hướng đi tiếp trước khi chạy batch N=8/16/32 đầy đủ.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
