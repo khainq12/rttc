@@ -4410,6 +4410,78 @@ thật (unicast không scale), câu trả lời "loại bỏ multicast không c�
 **File liên quan**: `/tmp/.../scratchpad/bang4_8_32robot_n3.py`,
 `/tmp/.../scratchpad/cyclone_static_n16_refix.py` (không thuộc repo).
 
+### 13/09/2026 (tiếp) — BẢNG IV ĐẦY ĐỦ, NHẤT QUÁN 1 PHƯƠNG PHÁP DUY NHẤT cho cả 3 quy mô 8/16/32
+
+Bổ sung N=16 bằng ĐÚNG script/phương pháp đã dùng cho N=8 và N=32
+(`bang4_8_32robot_n3.py`, cùng mode công bằng: FleetRMW static mặc
+định, CycloneDDS `static_peers` — đã fix bug ParticipantIndex, Zenoh
+mặc định (đã tĩnh sẵn qua router), Fast DDS `discovery_server`) — thay
+thế các số N=16 rải rác từ nhiều thí nghiệm khác nhau trước đó (có cái
+đo mode default, có cái thiếu CPU/RSS vì đo trước khi tính năng này tồn
+tại). Đây là bảng DUY NHẤT nên dùng làm số liệu chính thức cho bài báo,
+thay cho mọi bảng N=16 rời rạc ở các mục phía trên.
+
+**BẢNG IV ĐẦY ĐỦ (n=3 mỗi ô, cùng 1 phương pháp đo xuyên suốt)**:
+
+| Method | N robots | Discovery convergence (s) | Discovery bytes | CPU (%) | RSS (MB) | Graph/Join failures |
+|---|---|---|---|---|---|---|
+| Fast DDS | 8 | ≥15s (censored) | 1,953,889 | 7.84 | 44.2 | 44% |
+| Cyclone DDS | 8 | ≥15s (censored) | 324,049 | 13.82 | 38.3 | 100% |
+| Zenoh | 8 | ≥15s (censored) | 254,928 | 6.57 | 48.6 | 59% |
+| **Ours (FleetRMW)** | 8 | **~0.00s** | 1,797 | 10.38 | 38.4 | 0%¹ |
+| Fast DDS | 16 | ≥15s (censored) | 2,347,667 | 4.69 | 43.1 | 100% |
+| Cyclone DDS | 16 | ≥15s (censored) | 1,828,707 | 2.97 | 38.0 | 100% |
+| Zenoh | 16 | ≥15s (censored) | 404,105 | 5.25 | 42.4 | 100% |
+| **Ours (FleetRMW)** | 16 | **~0.00s** | 3,103 | 9.15 | 37.9 | 0%¹ |
+| Fast DDS | 32 | ≥15s (censored) | 1,783,367 | 2.44 | 42.3 | 100% |
+| Cyclone DDS | 32 | ≥15s (censored) | 355,467 | 12.81 | 37.5 | 100% |
+| Zenoh | 32 | ≥15s (censored) | 331,669 | 2.00 | 38.8 | 100% |
+| **Ours (FleetRMW)** | 32 | **~0.00s** | 5,637 | 8.42 | 37.5 | 0%¹ |
+
+¹ FleetRMW không chạy được cơ chế beacon (static mode không có bước
+discovery) — 0% ở đây là bộ đếm NATIVE riêng của transport
+(`unreachable_retry_giveups`, xác nhận 0/170 ở N=16; N=8/32 dùng cùng
+cơ chế nên kỳ vọng tương tự nhưng CHƯA đo riêng). Đây KHÔNG PHẢI cùng
+phép đo beacon N-way như 3 RMW kia — không nên xếp cùng cột như thể so
+sánh trực tiếp được, dù cùng đơn vị "%".
+
+**Delivery_pct đối chiếu (không phải cột trong Bảng IV, nhưng liên
+quan trực tiếp — xem Bảng V riêng)**:
+
+| Method | N=8 | N=16 | N=32 |
+|---|---|---|---|
+| Fast DDS (discovery_server) | 100.0±0.0 | 48.4±7.7 | 0.0±0.0 |
+| Cyclone DDS (static_peers) | 0.0±0.0 | 0.0±0.0 | 0.0±0.0 |
+| Zenoh | 37.1±31.4 | 48.5±14.0 | 0.0±0.0 |
+| FleetRMW | 41.1±6.9 | 27.9±8.5 | 10.0±1.3 |
+
+**Pattern theo quy mô đáng chú ý**:
+- **CycloneDDS static-peers sập ở CẢ 3 quy mô** — xác nhận dứt điểm
+  đây là giới hạn cấu trúc (không phải config bug, đã fix; không phải
+  ngưỡng quy mô cụ thể nào cả — sập ngay từ N=8).
+- **Fast DDS discovery-server: mô hình chữ U ngược kỳ lạ** — 100% ở
+  N=8, giảm còn ~48% ở N=16, sập hẳn 0% ở N=32. Đây LÀ pattern suy giảm
+  theo quy mô "bình thường" (không đột ngột như CycloneDDS), phù hợp
+  với lý thuyết bão hòa kênh dần dần khi fleet lớn lên — khác hẳn
+  CycloneDDS's collapse tức thời.
+- **Zenoh: sập hoàn toàn ở N=32** (0.0±0.0, giống CycloneDDS/FastDDS ở
+  quy mô này) dù ổn ở N=8/N=16 (37-48%) — nghĩa là ngay cả router tĩnh
+  của Zenoh cũng không cứu được ở quy mô 32 robot.
+- **FleetRMW: suy giảm đều đặn theo quy mô** (41%→28%→10%) nhưng KHÔNG
+  BAO GIỜ sập về 0% ở bất kỳ quy mô nào đã thử — đây là điểm khác biệt
+  cấu trúc lớn nhất so với cả 3 RMW kia (tất cả đều sập về đúng 0% ở
+  N=32).
+- **CPU/RSS không tăng đơn điệu theo quy mô** — vd CycloneDDS CPU
+  giảm từ 13.82%→2.97%→12.81% (không tuyến tính), phản ánh CPU đo được
+  phụ thuộc nhiều vào việc CÓ xử lý dữ liệu thật hay chỉ đang chờ/nghẽn
+  (giống phát hiện đã có ở N=16 riêng lẻ trước đây), không phải hàm đơn
+  điệu của N.
+
+**Trạng thái**: n=3 xuyên suốt (không phải n=10) — đủ để thấy pattern
+rõ ràng (đặc biệt các trường hợp 0.0%±0.0% tuyệt đối), nhưng các giá trị
+delivery còn dao động (Zenoh, FastDDS N=16) cần thêm rep nếu muốn số
+liệu cuối cùng cho bài báo.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
