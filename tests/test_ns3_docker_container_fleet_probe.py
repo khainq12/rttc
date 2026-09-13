@@ -8,8 +8,10 @@ from scripts.run_ns3_docker_container_fleet_probe import (
     RMW_PORT,
     STATIC_SUBSCRIPTION_TYPE_NAME,
     build_static_subscriptions,
+    compute_graph_join_failures,
     compute_latency_stats_ms,
     endpoint_list,
+    parse_docker_mem_usage_mb,
     station_mac,
     topic_for,
 )
@@ -125,6 +127,54 @@ class ComputeLatencyStatsMsTest(unittest.TestCase):
         self.assertAlmostEqual(stats["p50_ms"], 50, delta=1)
         self.assertAlmostEqual(stats["p99_ms"], 99, delta=1)
         self.assertAlmostEqual(stats["max_ms"], 100, delta=0.001)
+
+
+class ComputeGraphJoinFailuresTest(unittest.TestCase):
+    def test_none_when_no_endpoint_ran_the_beacon(self):
+        # e.g. an all-rmw_fleetqox_cpp run -- static mode has no discovery
+        # step by design, so expected_peers is 0/absent everywhere.
+        endpoint_results = {
+            "control_station": {"discovery_expected_peers": 0, "discovery_peers_seen": 0},
+            "robot_0000": {"discovery_expected_peers": 0, "discovery_peers_seen": 0},
+        }
+        self.assertIsNone(compute_graph_join_failures(endpoint_results))
+
+    def test_counts_endpoints_that_never_reached_full_peer_count(self):
+        endpoint_results = {
+            "control_station": {"discovery_expected_peers": 2, "discovery_peers_seen": 2},
+            "robot_0000": {"discovery_expected_peers": 2, "discovery_peers_seen": 2},
+            "robot_0001": {"discovery_expected_peers": 2, "discovery_peers_seen": 0},
+        }
+        result = compute_graph_join_failures(endpoint_results)
+        self.assertEqual(result["total_endpoints"], 3)
+        self.assertEqual(result["failures"], 1)
+        self.assertAlmostEqual(result["failure_rate"], 1 / 3)
+        self.assertTrue(result["per_endpoint"]["robot_0001"]["failed"])
+        self.assertFalse(result["per_endpoint"]["control_station"]["failed"])
+
+    def test_skips_endpoints_with_no_result(self):
+        endpoint_results = {
+            "control_station": {"discovery_expected_peers": 1, "discovery_peers_seen": 1},
+            "robot_0000": None,
+        }
+        result = compute_graph_join_failures(endpoint_results)
+        self.assertEqual(result["total_endpoints"], 1)
+
+
+class ParseDockerMemUsageMbTest(unittest.TestCase):
+    def test_parses_mib_used_side(self):
+        self.assertAlmostEqual(
+            parse_docker_mem_usage_mb("45.2MiB / 3.678GiB"), 45.2 * 1024**2 / 1e6, places=3
+        )
+
+    def test_parses_gib_used_side(self):
+        self.assertAlmostEqual(
+            parse_docker_mem_usage_mb("1.5GiB / 3.678GiB"), 1.5 * 1024**3 / 1e6, places=3
+        )
+
+    def test_rejects_unrecognized_format(self):
+        with self.assertRaises(ValueError):
+            parse_docker_mem_usage_mb("not a mem string")
 
 
 class ConstantsTest(unittest.TestCase):

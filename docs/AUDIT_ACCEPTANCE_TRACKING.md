@@ -4121,6 +4121,58 @@ thay vì con số cụ thể) và cột discovery convergence của FleetRMW (gh
 **File liên quan**: `/tmp/.../scratchpad/paired_4rmw_17endpoint_n10.py`
 (script đo, không thuộc repo, có resume-safety qua file JSON kết quả).
 
+### 13/09/2026 (tiếp) — Thêm 3 cột còn thiếu của Bảng IV: CPU (%), RSS (MB), Graph/Join failures
+
+Người dùng chỉ ra Bảng IV (`FleetRMW_paper.docx`) còn 3 cột chưa có số
+đo: `CPU (%)`, `RSS (MB)`, `Graph/Join failures`. Đã viết code cho cả 3
+(CHƯA chạy — chờ tín hiệu "chạy"):
+
+**CPU (%) / RSS (MB)** — đo bằng `docker stats --no-stream` cho TOÀN
+BỘ container endpoint cùng lúc (method mới
+`ReferenceTopologyProbe.sample_resource_usage()`), không cần vào tận
+`/proc/<pid>` bên trong container vì kiến trúc này vốn đã là "1
+container = 1 endpoint", nên CPU/RSS của cả container CHÍNH LÀ CPU/RSS
+của endpoint đó. Điểm lấy mẫu: **giữa lúc đang gửi dữ liệu thật**, KHÔNG
+phải sau khi đã vào drain (lúc đó process đã rảnh, CPU đọc được sẽ gần
+0, đánh giá thấp tải thật) — cụ thể là `start_offset_ms + seconds/2`
+giây sau khi start-gate mở, đúng giữa cửa sổ gửi thật (LƯU Ý: cửa sổ
+gửi thật CHỈ dài khoảng `seconds` giây theo trace, KHÔNG phải
+`sim_duration_s` — cái đó chỉ là thời gian tiến trình ns-3 nền chạy,
+không liên quan tới lúc nào trace phát xong; ban đầu suýt viết nhầm
+sleep theo `sim_duration_s*0.5`, sẽ làm MỖI lần chạy chậm thêm tới 90s
+vô ích — đã sửa trước khi commit). Kết quả gộp thành
+`cpu_pct_mean`/`rss_mb_mean` (trung bình qua mọi endpoint) cộng chi
+tiết từng endpoint trong `resource_usage`. Có helper
+`parse_docker_mem_usage_mb()` chuyển "{{.MemUsage}}" (vd "45.2MiB /
+3.678GiB") sang MB thập phân (1e6 byte) để cột "RSS (MB)" không mập mờ
+đơn vị.
+
+**Graph/Join failures** — tận dụng LUÔN cơ chế beacon đã xây cho
+discovery convergence (mục trước): 1 endpoint "join failure" = endpoint
+đó KHÔNG thấy đủ `discovery_expected_peers` trong ngân sách
+`discovery_timeout_s`. Hàm mới `compute_graph_join_failures()` đếm số
+endpoint như vậy trên tổng số endpoint CÓ chạy beacon, trả `None` nếu
+không có endpoint nào chạy beacon (vd 1 run toàn `rmw_fleetqox_cpp` —
+static mode không có khái niệm "join" nên không tính, không phải bằng
+0). Dữ liệu n=1 và n=10 đã đo trước đó (mục "Chạy thử thật 4
+baseline"/"Bảng A") ĐÃ ĐỦ để tính lại cột này ngay mà không cần chạy
+thêm gì — dự kiến CycloneDDS/Zenoh/FastDDS sẽ có failure_rate rất cao
+ở 17 endpoint (khớp với per-endpoint breakdown đã thấy: nhiều endpoint
+launch muộn thấy đúng 0/16 peer).
+
+**Trạng thái**: code mới + 6 unit test mới
+(`ComputeGraphJoinFailuresTest` x3, `ParseDockerMemUsageMbTest` x3) đều
+PASS, tổng 19 test trong file này. CHƯA chạy qua Docker/ns-3 thật —
+chờ tín hiệu "chạy" để verify `docker stats --format` hoạt động đúng
+trong pipeline thật (đã verify cú pháp bằng 1 container throwaway đơn
+giản ngoài pipeline, KHÔNG phải chạy probe thật).
+
+**File thay đổi**: `scripts/run_ns3_docker_container_fleet_probe.py`
+(`compute_graph_join_failures()`, `parse_docker_mem_usage_mb()`,
+`ReferenceTopologyProbe.sample_resource_usage()`, wiring vào
+`run_probe()`), `tests/test_ns3_docker_container_fleet_probe.py` (6
+test mới).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và

@@ -60,6 +60,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import shlex
 import subprocess
 import sys
@@ -169,6 +170,56 @@ def compute_latency_stats_ms(endpoint_results: dict[str, Any]) -> dict[str, Any]
         "mean_ms": sum(samples_ns) / len(samples_ns) / 1e6,
         "max_ms": samples_ns[-1] / 1e6,
     }
+
+
+def compute_graph_join_failures(endpoint_results: dict[str, Any]) -> dict[str, Any] | None:
+    """Count endpoints whose discovery beacon (see
+    fleetqox_rmw_trace_endpoint.py's --expected-peer-count) did NOT reach
+    its full expected peer count within --discovery-timeout-s -- i.e. the
+    paper's "Graph/Join failures" column (Bảng IV). Returns None when no
+    endpoint ran the beacon at all (discovery_expected_peers is 0/absent
+    for every one, e.g. an all-rmw_fleetqox_cpp run -- static mode has no
+    discovery step by design, so "join failure" isn't a meaningful concept
+    there, not simply zero of them)."""
+    total_with_beacon = 0
+    failures = 0
+    per_endpoint: dict[str, Any] = {}
+    for endpoint, result in endpoint_results.items():
+        if not result:
+            continue
+        expected = result.get("discovery_expected_peers") or 0
+        if expected <= 0:
+            continue
+        total_with_beacon += 1
+        seen = result.get("discovery_peers_seen") or 0
+        failed = seen < expected
+        failures += int(failed)
+        per_endpoint[endpoint] = {"peers_seen": seen, "expected_peers": expected, "failed": failed}
+    if total_with_beacon == 0:
+        return None
+    return {
+        "total_endpoints": total_with_beacon,
+        "failures": failures,
+        "failure_rate": failures / total_with_beacon,
+        "per_endpoint": per_endpoint,
+    }
+
+
+def parse_docker_mem_usage_mb(mem_usage: str) -> float:
+    """Parse docker stats' "{{.MemUsage}}" field, e.g. "45.2MiB / 3.678GiB",
+    into the "used" side as decimal MB. Docker reports binary units (Ki/Mi/Gi
+    = 1024^n bytes) but the paper's Bảng IV column is just labeled "RSS (MB)"
+    -- converting to decimal MB (1e6 bytes) rather than leaving it in MiB
+    keeps that column's units unambiguous regardless of which convention a
+    reader assumes "MB" means."""
+    used = mem_usage.split("/")[0].strip()
+    match = re.match(r"([\d.]+)\s*([KMGT]?i?B)", used)
+    if not match:
+        raise ValueError(f"unrecognized docker MemUsage format: {mem_usage!r}")
+    value, unit = float(match.group(1)), match.group(2)
+    multipliers_binary = {"B": 1, "KiB": 1024, "MiB": 1024**2, "GiB": 1024**3, "TiB": 1024**4}
+    bytes_used = value * multipliers_binary[unit]
+    return bytes_used / 1e6
 
 
 def docker(*args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -619,6 +670,42 @@ class ReferenceTopologyProbe:
                 tx_bytes = int(lines[idx + 1].split()[0])
         return rx_bytes + tx_bytes
 
+    def sample_resource_usage(self) -> dict[str, dict[str, float]]:
+        """One-shot `docker stats --no-stream` snapshot of CPU%/RSS for
+        EVERY endpoint container at once (Bảng IV's "CPU (%)"/"RSS (MB)"
+        columns) -- container-level, not per-process, since this
+        architecture is already 1 container == 1 endpoint, so a
+        container's total footprint IS that endpoint's footprint (no
+        separate process to isolate inside it the way a shared-container
+        harness would need). `--no-stream` makes docker itself take one
+        quick internal before/after CPU-time sample rather than requiring
+        this method to bracket two calls itself. Call mid-run (see
+        run_probe()) rather than after the process has gone idle in the
+        drain phase, or CPU% would read near-zero and understate real
+        load."""
+        result = docker(
+            "stats", *self.endpoint_container_names, "--no-stream",
+            "--format", "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}",
+            check=False,
+        )
+        usage: dict[str, dict[str, float]] = {}
+        name_to_endpoint = dict(zip(self.endpoint_container_names, self.endpoints))
+        for line in result.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) != 3:
+                continue
+            container_name, cpu_str, mem_str = parts
+            endpoint = name_to_endpoint.get(container_name)
+            if endpoint is None:
+                continue
+            try:
+                cpu_pct = float(cpu_str.rstrip("%"))
+                rss_mb = parse_docker_mem_usage_mb(mem_str)
+            except ValueError:
+                continue
+            usage[endpoint] = {"cpu_pct": cpu_pct, "rss_mb": rss_mb}
+        return usage
+
     def teardown(self) -> None:
         docker(
             "rm", "-f", self.rigger_name, self.ns3sim_name, *self.endpoint_container_names,
@@ -689,6 +776,7 @@ def run_probe(
     endpoint_results: dict[str, Any] = {}
     ns3_log_text = ""
     discovery_bytes_ftap0: int | None = None
+    resource_usage: dict[str, dict[str, float]] = {}
     try:
         probe.start_containers()
         probe.build_ns3_binary()
@@ -731,6 +819,18 @@ def run_probe(
         # control-plane cost paid before any application data flows. Only
         # covers control_station's tap (ftap0) -- see tap_byte_counter().
         discovery_bytes_ftap0 = probe.tap_byte_counter() - discovery_bytes_before
+        # Sample CPU%/RSS while endpoints are actively sending, not after
+        # the drain phase once they've gone idle (which would read near-
+        # zero CPU and understate real load). The real send window is
+        # short -- it starts start_offset_ms after this gate releases and
+        # spans roughly `seconds` of trace time -- NOT sim_duration_s
+        # (that's just how long the background ns-3 process keeps running,
+        # unrelated to how long the trace replay itself takes), so this
+        # sleep targets the middle of that actual window instead of
+        # scaling with sim_duration_s, which would otherwise add tens of
+        # seconds of pure dead time to every run for no benefit.
+        time.sleep(start_offset_ms / 1000.0 + max(seconds, 1) / 2.0)
+        resource_usage = probe.sample_resource_usage()
         probe.wait_for_completion(
             timeout_s=sim_duration_s + drain_s + start_offset_ms / 1000.0 + 60.0,
             results_dir_container=results_dir_container,
@@ -752,6 +852,8 @@ def run_probe(
         for result in endpoint_results.values()
         if result is not None and result.get("discovery_convergence_s") is not None
     ]
+    cpu_samples = [v["cpu_pct"] for v in resource_usage.values()]
+    rss_samples = [v["rss_mb"] for v in resource_usage.values()]
 
     return {
         "schema_version": "fleetqox.ns3_docker_container_fleet_probe.v1",
@@ -776,6 +878,10 @@ def run_probe(
         "discovery_convergence_max_s": (
             max(discovery_convergence_samples_s) if discovery_convergence_samples_s else None
         ),
+        "resource_usage": resource_usage,
+        "cpu_pct_mean": (sum(cpu_samples) / len(cpu_samples)) if cpu_samples else None,
+        "rss_mb_mean": (sum(rss_samples) / len(rss_samples)) if rss_samples else None,
+        "graph_join_failures": compute_graph_join_failures(endpoint_results),
     }
 
 
