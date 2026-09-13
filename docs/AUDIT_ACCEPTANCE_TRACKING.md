@@ -3541,9 +3541,26 @@ hơn hẳn so với CycloneDDS.
 
 | RMW | Quy mô nhỏ (7 endpoint) | Quy mô đầy đủ (17 endpoint) |
 |---|---|---|
-| `rmw_fleetqox_cpp` (static mode) | — (chưa đo riêng ở quy mô nhỏ) | **25.1%** |
+| `rmw_fleetqox_cpp` (static mode) | **35.9%** | **25.1%** |
 | `rmw_cyclonedds_cpp` | 82.7% | **0%** (sập hoàn toàn khi >~7-11 trạm) |
 | `rmw_zenoh_cpp` (có router, cấu hình tĩnh) | 81.9% | **60.6%** (tốt nhất trong 3) |
+
+**Phát hiện thêm khi đo đủ FleetRMW ở quy mô nhỏ (bất ngờ theo chiều
+ngược lại)**: ở 7 endpoint, FleetRMW (35.9%) THẤP HƠN NHIỀU so với cả
+CycloneDDS (82.7%) và Zenoh (81.9%) — dù kênh chưa hề nghẽn nặng ở quy
+mô này. Diễn giải hợp lý (khớp với phát hiện đã có từ trước trong
+investigation này, xem mục "kịch bản mô phỏng theo sơ đồ tham chiếu"
+và phần đo pcap so với raw-UDP): gói tin FleetRMW (JSON) to hơn
+raw-UDP/DDS thực tế 5.9-7.7 lần — ở quy mô nhỏ, kênh KHÔNG nghẽn nên
+yếu tố quyết định là airtime/gói (FleetRMW tốn nhiều airtime hơn hẳn
+mỗi lần gửi), trong khi ở quy mô lớn thì traffic discovery lặp lại của
+CycloneDDS mới là yếu tố áp đảo (FleetRMW không có discovery nên không
+bị đúng cơ chế đó). Tức là: **FleetRMW đổi "chậm hơn ở quy mô nhỏ" lấy
+"ổn định hơn ở quy mô lớn"** — hai RMW kia thì ngược lại (nhanh khi
+nhỏ, một cái sập hẳn khi lớn). Đây là gợi ý mạnh cho hướng tối ưu
+`static_min_v1` (đã thử trong mục trước, kết quả delivery chưa rõ ràng
+thống kê) — nếu giảm được kích thước gói FleetRMW gần bằng raw-UDP,
+có thể cải thiện CẢ quy mô nhỏ lẫn lớn cùng lúc.
 
 **Bài học phương pháp quan trọng**: kết luận "CycloneDDS discovery bug
 bí ẩn" ở phiên trước là kết luận VỘI, dựa trên 1 API chẩn đoán sai —
