@@ -62,6 +62,7 @@ import csv
 import json
 import re
 import shlex
+import statistics
 import subprocess
 import sys
 import time
@@ -173,6 +174,76 @@ def compute_latency_stats_ms(endpoint_results: dict[str, Any]) -> dict[str, Any]
         "p99_ms": _percentile(99),
         "mean_ms": sum(samples_ns) / len(samples_ns) / 1e6,
         "max_ms": samples_ns[-1] / 1e6,
+    }
+
+
+def compute_jitter_stale_repair_stats(endpoint_results: dict[str, Any]) -> dict[str, Any]:
+    """Bảng V's Jitter / Stale ratio / Repair amp. columns.
+
+    - jitter_ms: stdev of end-to-end latency across every delivered
+      message (a standard networking-paper proxy for jitter -- NOT the
+      RFC 3550 running-average formula, which needs strict per-flow
+      packet ORDER that this aggregate cross-endpoint view doesn't
+      preserve; stdev over the same recv_wall_ns-sent_wall_ns samples
+      compute_latency_stats_ms already uses is the defensible choice
+      here). None if fewer than 2 messages delivered.
+    - stale_ratio: fraction of DELIVERED messages whose end-to-end
+      latency exceeded their own deadline_ms (embedded in the payload by
+      the sender -- RMW-agnostic, same field compute_latency_stats_ms
+      draws sent_wall_ns/recv_wall_ns from). Computable for all 4 RMWs
+      from data already being collected, no new instrumentation needed.
+    - repair_amp: FleetRMW-ONLY, via fleetqox_transport_metrics' own
+      NACK/retransmission counters (nack_retransmissions +
+      fragments_selectively_retransmitted + reliable_timeout_retransmissions,
+      as a fraction of frames_sent). CycloneDDS/Zenoh/FastDDS are
+      black-box RMWs with no equivalent introspection reachable through
+      this harness -- estimating their repair amplification would need
+      packet-capture-based counting of duplicate/retransmitted sequence
+      numbers, a separate, much larger undertaking not attempted here.
+      repair_amp_available is False (repair_amp is None) whenever no
+      endpoint in this run carries fleetqox_transport_metrics at all.
+    """
+    latency_samples_ms: list[float] = []
+    stale_count = 0
+    for result in endpoint_results.values():
+        if not result:
+            continue
+        for msg in result.get("received", []):
+            latency_ms = (msg["recv_wall_ns"] - msg["sent_wall_ns"]) / 1e6
+            latency_samples_ms.append(latency_ms)
+            if latency_ms > msg["deadline_ms"]:
+                stale_count += 1
+
+    jitter_ms = statistics.stdev(latency_samples_ms) if len(latency_samples_ms) > 1 else None
+    stale_ratio = (stale_count / len(latency_samples_ms)) if latency_samples_ms else None
+
+    repair_numerator = 0
+    repair_denominator = 0
+    repair_amp_available = False
+    for result in endpoint_results.values():
+        if not result:
+            continue
+        metrics = result.get("fleetqox_transport_metrics")
+        if not metrics:
+            continue
+        repair_amp_available = True
+        repair_numerator += (
+            metrics.get("nack_retransmissions", 0)
+            + metrics.get("fragments_selectively_retransmitted", 0)
+            + metrics.get("reliable_timeout_retransmissions", 0)
+        )
+        repair_denominator += metrics.get("frames_sent", 0)
+    repair_amp = (
+        (repair_numerator / repair_denominator if repair_denominator else 0.0)
+        if repair_amp_available
+        else None
+    )
+
+    return {
+        "jitter_ms": jitter_ms,
+        "stale_ratio": stale_ratio,
+        "repair_amp": repair_amp,
+        "repair_amp_available": repair_amp_available,
     }
 
 
@@ -980,6 +1051,7 @@ def run_probe(
         ),
         "ns3_log": ns3_log_text,
         "latency_stats_ms": compute_latency_stats_ms(endpoint_results),
+        "jitter_stale_repair_stats": compute_jitter_stale_repair_stats(endpoint_results),
         "discovery_bytes_ftap0": discovery_bytes_ftap0,
         # max, not mean: the paper's own definition ("đến khi graph đạt
         # trạng thái quan sát ổn định") is a whole-fleet property -- the

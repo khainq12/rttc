@@ -9,6 +9,7 @@ from scripts.run_ns3_docker_container_fleet_probe import (
     STATIC_SUBSCRIPTION_TYPE_NAME,
     build_static_subscriptions,
     compute_graph_join_failures,
+    compute_jitter_stale_repair_stats,
     compute_latency_stats_ms,
     endpoint_list,
     parse_docker_mem_usage_mb,
@@ -127,6 +128,54 @@ class ComputeLatencyStatsMsTest(unittest.TestCase):
         self.assertAlmostEqual(stats["p50_ms"], 50, delta=1)
         self.assertAlmostEqual(stats["p99_ms"], 99, delta=1)
         self.assertAlmostEqual(stats["max_ms"], 100, delta=0.001)
+
+
+class ComputeJitterStaleRepairStatsTest(unittest.TestCase):
+    def test_empty_gives_none_everywhere(self):
+        stats = compute_jitter_stale_repair_stats({"robot_0000": {"received": []}})
+        self.assertIsNone(stats["jitter_ms"])
+        self.assertIsNone(stats["stale_ratio"])
+        self.assertIsNone(stats["repair_amp"])
+        self.assertFalse(stats["repair_amp_available"])
+
+    def test_stale_ratio_counts_late_messages_only(self):
+        endpoint_results = {
+            "control_station": {
+                "received": [
+                    # on-time: 50ms latency, 100ms deadline
+                    {"sent_wall_ns": 0, "recv_wall_ns": 50_000_000, "deadline_ms": 100.0},
+                    # late: 150ms latency, 100ms deadline
+                    {"sent_wall_ns": 0, "recv_wall_ns": 150_000_000, "deadline_ms": 100.0},
+                ]
+            }
+        }
+        stats = compute_jitter_stale_repair_stats(endpoint_results)
+        self.assertEqual(stats["stale_ratio"], 0.5)
+        self.assertIsNotNone(stats["jitter_ms"])
+
+    def test_repair_amp_only_available_with_fleetqox_metrics(self):
+        endpoint_results = {
+            "control_station": {
+                "received": [],
+                "fleetqox_transport_metrics": {
+                    "frames_sent": 100,
+                    "nack_retransmissions": 5,
+                    "fragments_selectively_retransmitted": 3,
+                    "reliable_timeout_retransmissions": 2,
+                },
+            },
+        }
+        stats = compute_jitter_stale_repair_stats(endpoint_results)
+        self.assertTrue(stats["repair_amp_available"])
+        self.assertAlmostEqual(stats["repair_amp"], 10 / 100)
+
+    def test_repair_amp_none_for_non_fleetqox_rmws(self):
+        # e.g. a CycloneDDS/Zenoh/FastDDS run -- no fleetqox_transport_metrics
+        # key at all, since that's FleetRMW-specific instrumentation.
+        endpoint_results = {"control_station": {"received": []}}
+        stats = compute_jitter_stale_repair_stats(endpoint_results)
+        self.assertFalse(stats["repair_amp_available"])
+        self.assertIsNone(stats["repair_amp"])
 
 
 class ComputeGraphJoinFailuresTest(unittest.TestCase):

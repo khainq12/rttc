@@ -4482,6 +4482,65 @@ rõ ràng (đặc biệt các trường hợp 0.0%±0.0% tuyệt đối), nhưng
 delivery còn dao động (Zenoh, FastDDS N=16) cần thêm rep nếu muốn số
 liệu cuối cùng cho bài báo.
 
+### 13/09/2026 (tiếp) — Bảng V (profile Wi-Fi): thêm Jitter/Stale ratio/Repair amp.; phát hiện CHẤN ĐỘNG — Stale ratio ~99-100% ở MỌI RMW
+
+Thêm hàm `compute_jitter_stale_repair_stats()`
+(`scripts/run_ns3_docker_container_fleet_probe.py`) tính 3 cột còn thiếu
+của Bảng V, áp dụng lại lên dữ liệu N=16 (n=3) ĐÃ CÓ SẴN trên đĩa —
+KHÔNG cần chạy Docker mới cho phần này:
+
+- **Jitter**: stdev của latency end-to-end trên MỌI tin đã giao (proxy
+  chuẩn trong paper mạng, không phải công thức RFC 3550 vì công thức đó
+  cần thứ tự gói theo từng luồng riêng mà view tổng hợp cross-endpoint
+  này không giữ được).
+- **Stale ratio**: tỷ lệ tin ĐÃ GIAO nhưng đến SAU deadline riêng của nó
+  (`deadline_ms`, nhúng sẵn trong payload, không phụ thuộc RMW nào) —
+  tính được cho CẢ 4 RMW từ dữ liệu đã có, không cần thêm gì.
+- **Repair amp.**: CHỈ đo được cho FleetRMW (qua
+  `fleetqox_transport_metrics`'s NACK/retransmission counters) — 3 RMW
+  kia là hộp đen, không có introspection qua harness này (muốn đo cần
+  bắt gói phân tích retransmit ở tầng RTPS/Zenoh, việc lớn hơn nhiều,
+  CHƯA làm).
+- **Queue HWM**: CHƯA đo được cho BẤT KỲ RMW nào — không RMW nào lộ ra
+  bộ đếm đỉnh hàng đợi qua harness hiện tại.
+
+**BẢNG V — profile Wi-Fi (N=16, n=3, ns3_seed=42, run=1-3)**:
+
+| Method | Profile | p50 (ms) | p95 (ms) | p99 (ms) | Jitter (ms) | Delivery ratio | Repair amp. | Stale ratio | Queue HWM | Run/seed |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Fast DDS | Wi-Fi | 8452.9 | 9641.9 | 9703.2 | 514.4 | 48.4% | N/A¹ | **100%** | N/A² | seed42/run1-3 |
+| Cyclone DDS | Wi-Fi | — | — | — | — | 0.0% | N/A¹ | — (0 tin) | N/A² | seed42/run1-3 |
+| Zenoh | Wi-Fi | 2692.5 | 4298.5 | 4812.3 | 842.5 | 48.5% | N/A¹ | **99.9%** | N/A² | seed42/run1-3 |
+| **Ours** | Wi-Fi | 5515.9 | 9947.6 | 10907.0 | 3071.0 | 27.9% | **0.0%** | **99.0%** | N/A² | seed42/run1-3 |
+
+¹ Chỉ FleetRMW đo được (hộp đen với 3 RMW kia).
+² Chưa có instrumentation cho bất kỳ RMW nào.
+
+**PHÁT HIỆN QUAN TRỌNG NHẤT của toàn bộ mục này**: **Stale ratio xấp xỉ
+99-100% ở MỌI RMW có giao tin được** (Fast DDS 100%, Zenoh 99.9%,
+FleetRMW 99.0%). Nghĩa là: dù "delivery ratio" báo có 27-48% tin đến
+nơi, gần như TOÀN BỘ số đó đến SAU deadline của chính nó — tức là VÔ
+DỤNG cho một ứng dụng điều khiển robot thời gian thực dù về mặt kỹ
+thuật vẫn được RMW xác nhận "đã giao". Đây là bằng chứng THỰC NGHIỆM
+TRỰC TIẾP, mạnh nhất từ đầu investigation tới giờ, cho đúng luận điểm
+trung tâm của bài báo (`FleetRMW_paper.docx` phần I: "giá trị của từng
+luồng dữ liệu còn phụ thuộc vào nhiệm vụ hiện tại", và toàn bộ triết lý
+task-aware/freshness-aware communication) — **"delivery ratio" một mình
+nó gây HIỂU LẦM nghiêm trọng** về chất lượng thực sự của hệ thống ở quy
+mô 17 endpoint; cần luôn đọc CÙNG với stale ratio.
+
+**Repair amp. của FleetRMW = 0.0%** ở N=16 — khớp với phát hiện trước
+đó (`unreachable_retry_giveups=0/170`): ở quy mô này, transport KHÔNG
+kích hoạt cơ chế NACK/retransmit nội bộ (có thể do kích thước message
+trong trace chưa vượt ngưỡng cần fragment, hoặc do cơ chế repair không
+phù hợp với kiểu mất gói do nghẽn kênh vật lý thay vì mất gói ngẫu
+nhiên) — một hướng điều tra tiềm năng khác cho tương lai.
+
+**File thay đổi**: `scripts/run_ns3_docker_container_fleet_probe.py`
+(`compute_jitter_stale_repair_stats()`, wiring vào `run_probe()`),
+`tests/test_ns3_docker_container_fleet_probe.py` (4 test mới,
+`ComputeJitterStaleRepairStatsTest`).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
