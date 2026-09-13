@@ -267,6 +267,24 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--skip-discovery-wait",
+        action="store_true",
+        help=(
+            "Skip the discovery-wait loop entirely and report "
+            "discovery_convergence_s as the (near-zero) time to reach that "
+            "point -- for rmw_fleetqox_cpp's static mode, which has no "
+            "discovery step by design (peers are known at launch via "
+            "FLEETQOX_RMW_PEERS, nothing to wait for). Without this flag, "
+            "static-mode runs fell through to the get_subscription_count()"
+            "-based fallback loop below, which FleetRMW's custom transport "
+            "doesn't populate meaningfully (get_subscription_count() never "
+            "returns >0 for it), so every static-mode run silently burned "
+            "the full --discovery-timeout-s (~15s) before proceeding --"
+            "see docs/AUDIT_ACCEPTANCE_TRACKING.md 'FleetRMW N/A' for the "
+            "measurement this replaces."
+        ),
+    )
+    parser.add_argument(
         "--discovery-only",
         action="store_true",
         help=(
@@ -410,33 +428,34 @@ def main() -> int:
     discovery_start = time.monotonic()
     discovery_deadline = discovery_start + args.discovery_timeout_s
     last_beacon_sent = 0.0
-    while time.monotonic() < discovery_deadline:
-        if beacon_pub is not None:
-            now = time.monotonic()
-            if now - last_beacon_sent >= 0.1:
-                beacon_pub.publish(beacon_msg)
-                last_beacon_sent = now
-        # spin_once() services only ONE ready wait-set entity per call, so
-        # drain everything ready each iteration rather than relying on one
-        # call to eventually get to a specific subscription. Confirmed via
-        # a beacon_pub_subscription_count/beacon_raw_seen_count diagnostic
-        # (see the DISCOVERY_TIMEOUT_DEBUG print below) that this alone
-        # does NOT fully explain the discovery-timeout cases seen in
-        # practice -- the deeper cause turned out to be real, timing-
-        # dependent CycloneDDS discovery flakiness between launch-order-
-        # distant peers (see docs/AUDIT_ACCEPTANCE_TRACKING.md "beacon
-        # discovery convergence"), not starvation -- but this is still a
-        # correct fix for the starvation class of bug on its own, so kept.
-        for _ in range(20):
-            rclpy.spin_once(node, timeout_sec=0.0)
-        rclpy.spin_once(node, timeout_sec=0.1)
-        if beacon_pub is not None:
-            if len(discovery_peers_seen) >= args.expected_peer_count:
+    if not args.skip_discovery_wait:
+        while time.monotonic() < discovery_deadline:
+            if beacon_pub is not None:
+                now = time.monotonic()
+                if now - last_beacon_sent >= 0.1:
+                    beacon_pub.publish(beacon_msg)
+                    last_beacon_sent = now
+            # spin_once() services only ONE ready wait-set entity per call, so
+            # drain everything ready each iteration rather than relying on one
+            # call to eventually get to a specific subscription. Confirmed via
+            # a beacon_pub_subscription_count/beacon_raw_seen_count diagnostic
+            # (see the DISCOVERY_TIMEOUT_DEBUG print below) that this alone
+            # does NOT fully explain the discovery-timeout cases seen in
+            # practice -- the deeper cause turned out to be real, timing-
+            # dependent CycloneDDS discovery flakiness between launch-order-
+            # distant peers (see docs/AUDIT_ACCEPTANCE_TRACKING.md "beacon
+            # discovery convergence"), not starvation -- but this is still a
+            # correct fix for the starvation class of bug on its own, so kept.
+            for _ in range(20):
+                rclpy.spin_once(node, timeout_sec=0.0)
+            rclpy.spin_once(node, timeout_sec=0.1)
+            if beacon_pub is not None:
+                if len(discovery_peers_seen) >= args.expected_peer_count:
+                    break
+            elif not publishers or all(
+                pub.get_subscription_count() > 0 for pub in publishers.values()
+            ):
                 break
-        elif not publishers or all(
-            pub.get_subscription_count() > 0 for pub in publishers.values()
-        ):
-            break
     discovery_convergence_s = time.monotonic() - discovery_start
     if beacon_pub is not None and len(discovery_peers_seen) < args.expected_peer_count:
         # TEMPORARY diagnostic for the "last-launched endpoint never sees

@@ -4194,14 +4194,29 @@ CỰC KỲ mạnh cho Bảng IV: ở quy mô 17 endpoint, không một RMW multi
 discovery chuẩn nào (Cyclone/Zenoh/FastDDS) từng đạt full graph
 convergence trong 15s, ở BẤT KỲ lần chạy nào trong 30 lần đã đo.
 
-**Bảng IV hoàn chỉnh — LẦN ĐẦU đủ CẢ 5 CỘT**:
+**Bảng IV hoàn chỉnh — LẦN ĐẦU đủ CẢ 5 CỘT, KHÔNG CÒN Ô "N/A"**:
 
 | RMW | Discovery convergence (s) | Discovery bytes (n=10) | CPU % (n=3) | RSS MB (n=3) | Graph/Join failures (n=10) |
 |---|---|---|---|---|---|
-| FleetRMW | N/A (không có discovery) | 6,538 ± 181 | **9.91 ± 1.39** | **38.0 ± 0.0** | N/A |
+| FleetRMW | **~0.00s (thực đo, n=3: 4.6µs/14.3µs/15.0µs)** | 6,538 ± 181 | **9.91 ± 1.39** | **38.0 ± 0.0** | **0%** (0/170, `unreachable_retry_giveups`) |
 | CycloneDDS | ≥15s (censored, 10/10 chạm trần) | 1,126,381 ± 92,486 | 4.05 ± 0.48 | 38.6 ± 0.1 | **100%** |
 | Zenoh | ≥15s (censored, 10/10 chạm trần) | 364,535 ± 89,452 | 5.02 ± 2.30 | 42.2 ± 0.1 | **100%** |
 | Fast DDS | ≥15s (censored, 10/10 chạm trần) | 1,815,160 ± 455,078 | 3.23 ± 0.67 | 42.7 ± 0.0 | **100%** |
+
+**Sửa xong "N/A" của FleetRMW ở cột Discovery convergence**: trước đó
+cột này bị bỏ trống vì static mode không chạy cơ chế beacon — nhưng
+code cũ vẫn vô tình đo được 1 con số SAI (~15.1s), do rơi vào nhánh
+fallback `get_subscription_count()` cũ (không đáng tin với transport
+riêng của FleetRMW, không bao giờ trả về >0 nên vòng lặp luôn chạy hết
+giờ). Đã thêm cờ `--skip-discovery-wait`: khi static mode bật, bỏ qua
+hẳn vòng lặp chờ (không có gì để chờ — peer đã biết ngay lúc khởi động
+qua `FLEETQOX_RMW_PEERS`), đo `discovery_convergence_s` là khoảng thời
+gian TỪ LÚC BẮT ĐẦU tới lúc thoát ra ngay lập tức — con số này giờ phản
+ánh ĐÚNG bản chất kiến trúc: **~0 giây, không phải do đo thiếu mà do
+THẬT SỰ không có bước discovery nào phải chờ**. Xác nhận ở cả quy mô
+nhỏ (2.8µs) lẫn quy mô đầy đủ 17 endpoint (4.6-15.0µs qua 3 lần, delivery
+19.7-32.4% khớp đúng baseline n=10 cũ ~24.8%±5.5 — xác nhận sửa lỗi
+KHÔNG làm thay đổi hành vi gửi/nhận thực tế, chỉ sửa đúng phép đo).
 
 **Lưu ý cỡ mẫu KHÔNG đồng nhất giữa các cột** — CPU/RSS đo ở n=3 (chạy
 mới, sau khi thêm code này), 3 cột còn lại đo ở n=10 (chạy trước đó,

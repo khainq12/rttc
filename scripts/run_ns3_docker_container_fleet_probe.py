@@ -640,6 +640,14 @@ class ReferenceTopologyProbe:
             # discovery_convergence_s is definitionally ~0 by construction,
             # not something that needs measuring).
             expected_peer_count = 0 if rmw_implementation == "rmw_fleetqox_cpp" else len(self.endpoints) - 1
+            # Static mode has no discovery step by design -- skip the
+            # get_subscription_count()-based fallback loop entirely rather
+            # than let it silently burn the full --discovery-timeout-s
+            # (FleetRMW's custom transport doesn't populate that API
+            # meaningfully, so the loop never broke out early; see
+            # docs/AUDIT_ACCEPTANCE_TRACKING.md "FleetRMW N/A" for the
+            # ~15.1s artifact this replaces with a real near-zero number).
+            skip_discovery_wait_flag = " --skip-discovery-wait" if static_mode else ""
             inner = (
                 "source /opt/ros/jazzy/setup.bash && "
                 f"{rmw_setup}&& "
@@ -651,7 +659,8 @@ class ReferenceTopologyProbe:
                 f"--drain-s={drain_s:.12g} "
                 f"--discovery-timeout-s={discovery_timeout_s:.12g} "
                 f"--start-wait-timeout-s={start_wait_timeout_s} "
-                f"--expected-peer-count={expected_peer_count} "
+                f"--expected-peer-count={expected_peer_count}"
+                f"{skip_discovery_wait_flag} "
                 f"--summary-json=/work/{result_json} "
                 f"--ready-file=/work/{self._ready_files[i]} "
                 f"--start-file=/work/{self._start_file}"
