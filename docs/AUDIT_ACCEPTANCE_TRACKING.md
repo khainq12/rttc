@@ -4631,6 +4631,93 @@ BẮT ĐẦU viết chương trình này — cần xác nhận với người d�
 đầu tư tiếp (khối lượng công việc này tương đương với việc đã bỏ ra
 cho toàn bộ phần wifi `fleetqox_trace_replay_tap.cc` ban đầu).
 
+### 13/09/2026 (tiếp) — Kiến trúc "ghost node" cho profile 5G: phát hiện giới hạn kiến trúc + viết chương trình mô phỏng + nối vào orchestrator
+
+**Phát hiện quan trọng (chặn đường đơn giản nhất)**: đọc trực tiếp
+source `contrib/nr/model/nr-net-device.cc` xác nhận `NrNetDevice`
+KHÔNG BAO GIỜ hỗ trợ những gì `TapBridge` cần để gắn trực tiếp:
+
+```cpp
+bool NrNetDevice::SupportsSendFrom() const { return false; }
+void NrNetDevice::SetPromiscReceiveCallback(...) { /* no-op */ }
+```
+
+Đây là thuộc tính KIẾN TRÚC của module (khớp với phần cứng 5G thật —
+processor ứng dụng của một UE thật cũng không có "tap" L2 vào chính
+modem của nó), không phải bug có thể sửa bằng cách code thêm theo
+hướng "copy y hệt cách làm của wifi". Nghĩa là KHÔNG THỂ đơn giản đổi
+`WifiHelper` → `NrHelper` trong `fleetqox_trace_replay_tap.cc` như kế
+hoạch ban đầu.
+
+**Giải pháp "ghost node"** (đề xuất của người dùng, đã xác nhận hợp lệ
+bằng cách đọc `examples/tap-csma-virtual-machine.cc` của chính ns-3
+core — cùng pattern): chèn thêm 1 Node ns-3 thuần túy ("ghost") giữa
+container Docker thật và UE mô phỏng:
+
+```
+Docker Robot → TAP → Ghost Node (CsmaNetDevice) → (point-to-point) → UE → gNB → EPC/Core
+```
+
+`TapBridge` chỉ gắn vào `CsmaNetDevice` bình thường của Ghost (CÓ hỗ
+trợ `SendFrom`/promiscuous, xác nhận qua chính ns-3 core) — KHÔNG BAO
+GIỜ chạm vào `NrNetDevice`. Chặng Ghost↔UE và UE↔gNB dùng IP forwarding
+chuẩn + mô phỏng NR thật, không có mẹo giả mạo nào cả. Mỗi endpoint
+(kể cả `control_station`) có 1 cặp Ghost+UE riêng, đối xứng — giữ đúng
+quy ước "mọi trạm đối xứng" đã dùng cho profile wifi/LAN, để 3 hàng của
+Bảng V (Wi-Fi/LAN/5G) so sánh ngang hàng được với nhau.
+
+**Địa chỉ IP** — vấn đề: IP overlay thật của UE (`7.0.0.x`, do
+`NrPointToPointEpcHelper::AssignUeIpv4Address()` cấp NỘI BỘ, không thể
+tính trước) khác với IP link-local mà container thật cần để nói
+chuyện với Ghost của nó. Đã kiểm tra: **ns-3 KHÔNG có module NAT**
+(`pkg-config --list-all | grep -i nat` trên image `jazzy-nr` không ra
+kết quả liên quan) nên không dùng NAT/masquerade được. Giải pháp cuối
+cùng: mỗi container thật gán thêm địa chỉ overlay đó dưới dạng `/32`
+trên `eth0`, cộng với 1 default route ĐƯỢC CHỈ ĐỊNH SRC tường minh
+(`ip route replace default via <ghost_ip> dev eth0 src <overlay_ip>`)
+— buộc mọi traffic đi ra mang đúng "danh tính 5G thật" làm nguồn, bất
+kể địa chỉ link-local "tự nhiên" của `eth0`. Phía Ghost dùng
+`Ipv4StaticRouting::AddHostRouteTo()` định tuyến chính xác theo IP đích
+(không cần khớp subnet).
+
+**File mới**: `external/ns3/fleetqox_trace_replay_nr.cc` — chương
+trình ns-3 hoàn chỉnh: 1 gNB + N cặp Ghost/UE (bố trí vòng tròn quanh
+gNB, cùng quy ước với profile wifi), dùng `NrHelper`/
+`NrPointToPointEpcHelper`/`IdealBeamformingHelper`/`CcBwpCreator` theo
+đúng pattern tham chiếu của `examples/cttc-nr-demo.cc` (module `nr`,
+đã `git clone` để đọc trực tiếp). In ra
+`FLEETQOX_NR_MAPPING station_index,endpoint,tap_device,ue_overlay_ip,
+ghost_link_local_ip` cho từng endpoint TRƯỚC KHI `Simulator::Run()`
+chạy (việc gán IP EPC + `TapBridge::Install()` đều xảy ra ở bước
+setup) — đây là kênh DUY NHẤT để orchestrator Python biết IP overlay
+thật.
+
+**File sửa**: `scripts/run_ns3_docker_container_fleet_probe.py` — thêm
+`build_ns3_nr_binary()`, `wire_network_nr_l2()` (nối tap/bridge/veth y
+hệt tinh thần `wire_network()`, nhưng CHỈ gán IP link-local, chưa biết
+IP overlay), `start_ns3_nr()` + `_parse_nr_mapping()` (chạy binary,
+poll log tới khi đủ dòng `FLEETQOX_NR_MAPPING`), `finish_wire_network_nr()`
+(gán `/32` + default route theo src, rồi GHI ĐÈ `probe.ips` bằng IP
+overlay thật — nhờ vậy mọi logic downstream có sẵn trong
+`launch_endpoints()` — `FLEETQOX_RMW_PEERS`, Zenoh router, Fast DDS
+discovery server, CycloneDDS static peers — dùng ĐÚNG địa chỉ 5G thật
+mà KHÔNG cần rẽ nhánh riêng cho profile này), `run_nr_probe()` (điểm
+gọi đầu-cuối, cùng schema trả về với `run_probe()`/`run_lan_probe()`).
+
+3 test mới trong `tests/test_ns3_docker_container_fleet_probe.py`
+(`ParseNrMappingTest`) — tổng 26 test, tất cả PASS
+(`python3 -m unittest discover -s tests -p "test_ns3_docker_container_fleet_probe.py"`).
+
+**CHƯA build/chạy thật** — mới chỉ viết code + test logic parsing
+thuần Python, chưa hề `docker build`/`docker run`/`g++` (đúng quy ước
+"chờ tín hiệu chạy"). Bước tiếp theo khi có tín hiệu "chạy": biên dịch
+thử `fleetqox_trace_replay_nr.cc` trong image `jazzy-nr` (kiểm tra
+link pkg-config `ns3-nr`/`ns3-antenna` có đủ không), rồi test ở quy mô
+nhỏ (2 endpoint) trước khi chạy batch N=8/16/32 cho Bảng V hàng "5G".
+
+**Trạng thái**: task viết chương trình mô phỏng 5G — hạ tầng code đã
+xong, CHƯA validate bằng chạy thật.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
