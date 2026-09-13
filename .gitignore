@@ -20,3 +20,4 @@ ubsan*.log
 .venv/
 .multihost_vm/
 .ns3-build-tmp/
+.tcpdump_portable/

@@ -249,6 +249,24 @@ def main() -> int:
     parser.add_argument("--ready-file", type=Path, default=None)
     parser.add_argument("--start-file", type=Path, default=None)
     parser.add_argument(
+        "--expected-peer-count",
+        type=int,
+        default=0,
+        help=(
+            "Number of OTHER endpoints this one should observe before "
+            "declaring discovery converged. 0 (default) preserves the old "
+            "behavior (get_subscription_count()-based check only, no "
+            "discovery_convergence_s in the summary) -- opt-in because "
+            "get_subscription_count() was confirmed unreliable for judging "
+            "match state on some RMWs (see docs/AUDIT_ACCEPTANCE_TRACKING.md "
+            "'CycloneDDS discovery bug bí ẩn'), so measuring real discovery "
+            "convergence time needs an independent, RMW-agnostic signal: a "
+            "small beacon each endpoint publishes/subscribes on a shared "
+            "topic, counting DISTINCT senders seen rather than trusting any "
+            "single RMW's own introspection API."
+        ),
+    )
+    parser.add_argument(
         "--discovery-only",
         action="store_true",
         help=(
@@ -359,13 +377,51 @@ def main() -> int:
     # is already fully discovered by the time --start-file releases them
     # all together, so start_wall can be set immediately at that shared
     # release point with no further per-endpoint variance.
-    discovery_deadline = time.monotonic() + args.discovery_timeout_s
+    # Beacon-based discovery detection (opt-in via --expected-peer-count):
+    # each endpoint publishes its own name on a shared topic and counts
+    # DISTINCT senders seen, independent of any single RMW's own match-state
+    # introspection. Needed because pub.get_subscription_count() (used
+    # below as the fallback) was confirmed to under-report matches on some
+    # RMWs while data was still being delivered correctly (see
+    # docs/AUDIT_ACCEPTANCE_TRACKING.md "CycloneDDS discovery bug bí ẩn") --
+    # trusting it here would have made "discovery convergence time" either
+    # always equal --discovery-timeout-s (if it never fires) or wrong (if
+    # it fires late/early), not a real measurement.
+    discovery_peers_seen: set[str] = set()
+    beacon_pub = None
+    if args.expected_peer_count > 0:
+        beacon_topic = "/fleetqox_trace/_discovery_probe"
+        beacon_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST, depth=1, reliability=ReliabilityPolicy.RELIABLE
+        )
+        beacon_pub = node.create_publisher(String, beacon_topic, beacon_qos)
+        beacon_msg = String()
+        beacon_msg.data = args.endpoint
+
+        def on_beacon(msg: String) -> None:
+            discovery_peers_seen.add(msg.data)
+
+        node.create_subscription(String, beacon_topic, on_beacon, beacon_qos)
+
+    discovery_start = time.monotonic()
+    discovery_deadline = discovery_start + args.discovery_timeout_s
+    last_beacon_sent = 0.0
     while time.monotonic() < discovery_deadline:
+        if beacon_pub is not None:
+            now = time.monotonic()
+            if now - last_beacon_sent >= 0.1:
+                beacon_pub.publish(beacon_msg)
+                last_beacon_sent = now
+            discovery_peers_seen.discard(args.endpoint)  # a beacon can loop back on some RMWs
         rclpy.spin_once(node, timeout_sec=0.1)
-        if not publishers or all(
+        if beacon_pub is not None:
+            if len(discovery_peers_seen) >= args.expected_peer_count:
+                break
+        elif not publishers or all(
             pub.get_subscription_count() > 0 for pub in publishers.values()
         ):
             break
+    discovery_convergence_s = time.monotonic() - discovery_start
 
     if args.ready_file:
         args.ready_file.parent.mkdir(parents=True, exist_ok=True)
@@ -433,6 +489,9 @@ def main() -> int:
         "send_timing": send_timing,
         "received": received,
         "fleetqox_transport_metrics": fleetqox_transport_metrics(),
+        "discovery_convergence_s": discovery_convergence_s,
+        "discovery_peers_seen": len(discovery_peers_seen),
+        "discovery_expected_peers": args.expected_peer_count,
     }
     args.summary_json.parent.mkdir(parents=True, exist_ok=True)
     args.summary_json.write_text(json.dumps(result, sort_keys=True), encoding="utf-8")

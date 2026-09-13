@@ -3882,6 +3882,94 @@ KHÔNG kỳ vọng đạt được toàn bộ mức cải thiện 5.9-7.7x đã 
 `ReferenceTopologyProbe` từ `scripts/run_ns3_docker_container_fleet_probe.py`
 với 1 bước bổ sung (tcpdump portable + capture trên `ftap0`).
 
+### 13/09/2026 (tiếp) — Thêm Fast DDS baseline + latency percentile + discovery convergence/bytes (theo yêu cầu đối chiếu với FleetRMW_paper.docx)
+
+Đối chiếu với bản thảo bài báo (`FleetRMW_paper.docx`, người dùng cung
+cấp) cho thấy 3 khoảng trống lớn nhất so với "Minimum baselines"/Bảng
+IV-V của bài: thiếu Fast DDS, thiếu p50/p95/p99 latency, thiếu
+discovery convergence time/bytes. Đã bổ sung CẢ 3 (code, CHƯA chạy thật
+— chờ tín hiệu "chạy"):
+
+**1. Fast DDS (`rmw_fastrtps_cpp`)** — xác nhận đã có sẵn trong image
+(`ros2 pkg list | grep fastrtps` ra `rmw_fastrtps_cpp`), và
+`run_ns3_docker_container_fleet_probe.py`'s `--rmw-implementation`
+không giới hạn `choices` — dùng ngay được, không cần sửa code, chỉ cần
+gọi `--rmw-implementation rmw_fastrtps_cpp` (đi qua đúng nhánh "standard
+RMW" đã có sẵn route multicast fix, giống CycloneDDS).
+
+**2. Latency percentile (p50/p95/p99)** — hóa ra dữ liệu cần thiết đã
+có sẵn từ trước, chỉ chưa được tổng hợp: mỗi entry trong `received[]`
+của mọi endpoint đã có cả `sent_wall_ns` (nhúng trong payload bởi
+publisher, không phụ thuộc RMW) và `recv_wall_ns` (subscriber tự stamp
+lúc nhận) — chỉ là chưa có script nào tính percentile từ đó. Thêm hàm
+`compute_latency_stats_ms()` trong
+`scripts/run_ns3_docker_container_fleet_probe.py`, gộp toàn bộ latency
+(recv-sent) từ MỌI endpoint của 1 run, trả về n/p50/p95/p99/mean/max
+(ms), `None` nếu không có tin nào được giao (vd CycloneDDS 0% ở 17
+endpoint). Đã gắn vào `run_probe()`'s return dict là
+`latency_stats_ms`. Có unit test riêng
+(`ComputeLatencyStatsMsTest`, 2 case: rỗng → None, và gộp đúng 100 mẫu
+1-100ms → p50≈50, p99≈99).
+
+**3. Discovery convergence time + bytes** — đây là phần khó nhất vì
+cơ chế đo "tự nhiên" nhất (`pub.get_subscription_count() > 0`, vòng lặp
+sẵn có trong `fleetqox_rmw_trace_endpoint.py`) đã được XÁC NHẬN không
+đáng tin ở mục "CycloneDDS discovery bug bí ẩn" phía trên (API này có
+thể báo sai dù dữ liệu vẫn được giao đúng) — nếu cứ dùng API đó để đo
+thời gian thì con số ra sẽ chỉ luôn bằng đúng `--discovery-timeout-s`
+(15s mặc định) đối với CycloneDDS/Zenoh/FastDDS, một artifact đo lường
+chứ không phải số thật. Giải pháp: thêm cơ chế **beacon độc lập với
+RMW**, không dựa vào bất kỳ API nội bộ nào:
+- Mỗi endpoint publish tên chính nó lên 1 topic dùng chung
+  (`/fleetqox_trace/_discovery_probe`) mỗi 100ms, đồng thời subscribe
+  topic đó để đếm SỐ LƯỢNG NGUỒN GỬI KHÁC NHAU đã thấy.
+- "Hội tụ" = đã thấy đủ `expected_peer_count` (= tổng số endpoint − 1)
+  nguồn khác nhau — tín hiệu này chỉ phụ thuộc vào việc dữ liệu THẬT có
+  đến được hay không, không tin vào introspection API của riêng RMW
+  nào.
+- CLI arg mới `--expected-peer-count` (mặc định 0 = tắt, giữ nguyên
+  hành vi cũ 100% cho mọi caller/test hiện có). Orchestrator chỉ bật cơ
+  chế này cho RMW chuẩn (Cyclone/Zenoh/FastDDS) — TẮT cho
+  `rmw_fleetqox_cpp` static mode, vì static mode vốn dĩ KHÔNG có bước
+  discovery (bật thêm traffic beacon vào đó sẽ thay đổi hành vi 1
+  pathway đã validate và có số liệu commit rồi, trong khi
+  discovery_convergence_s của nó theo định nghĩa là ~0 sẵn, không cần đo).
+- Kết quả mỗi endpoint ghi `discovery_convergence_s`,
+  `discovery_peers_seen`, `discovery_expected_peers` vào summary JSON;
+  orchestrator gộp lại thành `discovery_convergence_max_s` (lấy MAX
+  chứ không phải mean — đúng định nghĩa "đến khi graph đạt trạng thái
+  ổn định" trong bài báo là tính chất của CẢ fleet, chỉ ổn định khi
+  endpoint chậm nhất cũng đã hội tụ, giống logic
+  `wait_for_ready_then_start()`'s all-endpoints gate).
+
+**Discovery bytes**: đo bằng cách đọc trực tiếp bộ đếm RX+TX byte của
+`ftap0` (tap của `control_station`) qua `ip -s link show` — ĐƠN GIẢN
+HƠN NHIỀU so với bắt pcap rồi phân tích (không cần tcpdump nữa cho
+metric này). Snapshot 1 lần NGAY TRƯỚC khi launch endpoint (mốc 0
+thật), snapshot lần 2 NGAY KHI `wait_for_ready_then_start()` trả về
+(đúng lúc graph đã ổn định theo định nghĩa "ready"). Hiệu số = số byte
+control-plane đã trả trước khi có traffic dữ liệu — CHỦ ĐỘNG tính cả
+nhiễu ARP/ND trong cửa sổ đó (đây là chi phí control-plane thật, không
+lọc bỏ). Method mới: `ReferenceTopologyProbe.tap_byte_counter()`. Gắn
+vào `run_probe()`'s return dict là `discovery_bytes_ftap0`.
+
+**Trạng thái**: toàn bộ code đã viết xong, unit test mới
+(`ComputeLatencyStatsMsTest`) và toàn bộ test suite cũ (13 + 6 + 32 =
+51 test) đều PASS, syntax-check cả 2 file sửa (`py_compile`) sạch.
+CHƯA chạy thử qua Docker/ns-3 thật (chờ tín hiệu "chạy" theo quy ước
+phiên làm việc) — cần verify: (a) beacon topic không tự nhiên nhận lại
+tin của chính mình gây đếm sai (`discovery_peers_seen.discard(self)`
+đã thêm phòng hờ), (b) `ip -s link show` parse đúng format thật trên
+image (đã xác nhận format qua debug trước đó, nhưng chưa test qua code
+path mới `tap_byte_counter()`).
+
+**File thay đổi**: `scripts/fleetqox_rmw_trace_endpoint.py` (beacon
+mechanism + `--expected-peer-count`), `scripts/run_ns3_docker_container_fleet_probe.py`
+(`compute_latency_stats_ms()`, `tap_byte_counter()`, wiring vào
+`launch_endpoints()`/`run_probe()`), `tests/test_ns3_docker_container_fleet_probe.py`
+(test mới), `.gitignore` (`.tcpdump_portable/` — build artifact 14MB từ
+mục đo kích thước gói trước đó, lẽ ra không nên vào git).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và

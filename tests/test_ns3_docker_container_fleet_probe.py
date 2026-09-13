@@ -8,6 +8,7 @@ from scripts.run_ns3_docker_container_fleet_probe import (
     RMW_PORT,
     STATIC_SUBSCRIPTION_TYPE_NAME,
     build_static_subscriptions,
+    compute_latency_stats_ms,
     endpoint_list,
     station_mac,
     topic_for,
@@ -97,6 +98,33 @@ class BuildStaticSubscriptionsTest(unittest.TestCase):
                 "robot_0001": [],
             },
         )
+
+
+class ComputeLatencyStatsMsTest(unittest.TestCase):
+    def test_none_when_nothing_delivered(self):
+        self.assertIsNone(compute_latency_stats_ms({"robot_0000": {"received": []}}))
+        self.assertIsNone(compute_latency_stats_ms({"robot_0000": None}))
+
+    def test_aggregates_across_endpoints_and_converts_to_ms(self):
+        # 1ms, 2ms, ..., 100ms spread across two endpoints -- p50 should
+        # land near the middle and p99 near the top of that range.
+        endpoint_results = {
+            "control_station": {
+                "received": [
+                    {"sent_wall_ns": 0, "recv_wall_ns": i * 1_000_000} for i in range(1, 51)
+                ]
+            },
+            "robot_0000": {
+                "received": [
+                    {"sent_wall_ns": 0, "recv_wall_ns": i * 1_000_000} for i in range(51, 101)
+                ]
+            },
+        }
+        stats = compute_latency_stats_ms(endpoint_results)
+        self.assertEqual(stats["n"], 100)
+        self.assertAlmostEqual(stats["p50_ms"], 50, delta=1)
+        self.assertAlmostEqual(stats["p99_ms"], 99, delta=1)
+        self.assertAlmostEqual(stats["max_ms"], 100, delta=0.001)
 
 
 class ConstantsTest(unittest.TestCase):

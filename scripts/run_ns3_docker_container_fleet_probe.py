@@ -135,6 +135,42 @@ def build_static_subscriptions(
     return {endpoint: sorted(pairs) for endpoint, pairs in by_publisher.items()}
 
 
+def compute_latency_stats_ms(endpoint_results: dict[str, Any]) -> dict[str, Any] | None:
+    """End-to-end latency percentiles (p50/p95/p99) across every delivered
+    message, aggregated over ALL endpoints. Needs no new instrumentation --
+    fleetqox_rmw_trace_endpoint.py's on_message() callback already records
+    both sent_wall_ns (embedded in the payload by the sender, RMW-agnostic
+    since it's just JSON the app itself writes/reads) and recv_wall_ns
+    (stamped locally on receipt) for every entry in "received". This was
+    sitting unused in the result JSON -- see docs/AUDIT_ACCEPTANCE_TRACKING.md
+    "Bổ sung metrics còn thiếu: latency percentile" for why it wasn't
+    reported until now. Returns None if nothing was delivered (avoids
+    dividing by zero / indexing an empty list -- e.g. CycloneDDS's 0%
+    collapse at 17 endpoints)."""
+    samples_ns: list[int] = []
+    for result in endpoint_results.values():
+        if not result:
+            continue
+        for msg in result.get("received", []):
+            samples_ns.append(msg["recv_wall_ns"] - msg["sent_wall_ns"])
+    if not samples_ns:
+        return None
+    samples_ns.sort()
+
+    def _percentile(p: float) -> float:
+        index = min(len(samples_ns) - 1, int(round(p / 100.0 * (len(samples_ns) - 1))))
+        return samples_ns[index] / 1e6
+
+    return {
+        "n": len(samples_ns),
+        "p50_ms": _percentile(50),
+        "p95_ms": _percentile(95),
+        "p99_ms": _percentile(99),
+        "mean_ms": sum(samples_ns) / len(samples_ns) / 1e6,
+        "max_ms": samples_ns[-1] / 1e6,
+    }
+
+
 def docker(*args: str, check: bool = True) -> subprocess.CompletedProcess:
     result = subprocess.run(["docker", *args], capture_output=True, text=True)
     if check and result.returncode != 0:
@@ -462,6 +498,15 @@ class ReferenceTopologyProbe:
             # containers mount the SAME host directory at /work, so a
             # plain shared file under results_dir_container is visible
             # across every container -- no extra IPC mechanism needed.
+            # expected-peer-count only for standard RMWs -- fleetqox's
+            # static mode has no discovery step by design (see
+            # FLEETQOX_RMW_STATIC_MODE above), so forcing the beacon there
+            # would add NEW traffic to an already-validated code path and
+            # change results already committed to
+            # docs/AUDIT_ACCEPTANCE_TRACKING.md for no benefit (its
+            # discovery_convergence_s is definitionally ~0 by construction,
+            # not something that needs measuring).
+            expected_peer_count = 0 if rmw_implementation == "rmw_fleetqox_cpp" else len(self.endpoints) - 1
             inner = (
                 "source /opt/ros/jazzy/setup.bash && "
                 f"{rmw_setup}&& "
@@ -473,6 +518,7 @@ class ReferenceTopologyProbe:
                 f"--drain-s={drain_s:.12g} "
                 f"--discovery-timeout-s={discovery_timeout_s:.12g} "
                 f"--start-wait-timeout-s={start_wait_timeout_s} "
+                f"--expected-peer-count={expected_peer_count} "
                 f"--summary-json=/work/{result_json} "
                 f"--ready-file=/work/{self._ready_files[i]} "
                 f"--start-file=/work/{self._start_file}"
@@ -549,6 +595,30 @@ class ReferenceTopologyProbe:
         result = docker("exec", self.ns3sim_name, "cat", log_path, check=False)
         return result.stdout
 
+    def tap_byte_counter(self, iface: str = "ftap0") -> int:
+        """RX+TX byte counter for one station's tap device inside ns3sim,
+        read straight from `ip -s link show` -- no tcpdump/pcap needed.
+        Used to measure discovery_bytes as a simple before/after delta
+        bracketing wait_for_ready_then_start() (see run_probe()): this is
+        cheaper and more robust than parsing a pcap capture, at the cost of
+        only covering control_station's tap (ftap0 == endpoints[0]), same
+        representative-station scope as the packet-size pcap measurements
+        (docs/AUDIT_ACCEPTANCE_TRACKING.md "đo thật kích thước gói"). Counts
+        whatever crosses that tap during the window, including any pre-app
+        ARP/ND noise -- an honest inclusion, since that traffic is itself
+        part of the real control-plane cost paid before data starts
+        flowing, not an artifact to filter out."""
+        result = docker("exec", self.ns3sim_name, "bash", "-lc", f"ip -s link show {iface}", check=False)
+        rx_bytes = tx_bytes = 0
+        lines = result.stdout.splitlines()
+        for idx, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith("RX:") and idx + 1 < len(lines):
+                rx_bytes = int(lines[idx + 1].split()[0])
+            elif stripped.startswith("TX:") and idx + 1 < len(lines):
+                tx_bytes = int(lines[idx + 1].split()[0])
+        return rx_bytes + tx_bytes
+
     def teardown(self) -> None:
         docker(
             "rm", "-f", self.rigger_name, self.ns3sim_name, *self.endpoint_container_names,
@@ -618,6 +688,7 @@ def run_probe(
     error_text = ""
     endpoint_results: dict[str, Any] = {}
     ns3_log_text = ""
+    discovery_bytes_ftap0: int | None = None
     try:
         probe.start_containers()
         probe.build_ns3_binary()
@@ -636,6 +707,10 @@ def run_probe(
         )
         if rmw_implementation == "rmw_zenoh_cpp":
             probe.start_zenoh_router()
+        # Snapshot BEFORE any endpoint launches -- discovery/control-plane
+        # traffic starts as soon as launch_endpoints() spawns the RMW
+        # processes, so this is the true zero point for discovery_bytes.
+        discovery_bytes_before = probe.tap_byte_counter()
         probe.launch_endpoints(
             trace_container_path=trace_container_path,
             policy=policy,
@@ -650,6 +725,12 @@ def run_probe(
             rmw_implementation=rmw_implementation,
         )
         probe.wait_for_ready_then_start(ready_deadline_s=ready_deadline_s)
+        # Snapshot right as the shared start-gate releases -- by
+        # definition every endpoint has finished its own discovery by this
+        # point (that's what "ready" means here), so this delta is the
+        # control-plane cost paid before any application data flows. Only
+        # covers control_station's tap (ftap0) -- see tap_byte_counter().
+        discovery_bytes_ftap0 = probe.tap_byte_counter() - discovery_bytes_before
         probe.wait_for_completion(
             timeout_s=sim_duration_s + drain_s + start_offset_ms / 1000.0 + 60.0,
             results_dir_container=results_dir_container,
@@ -666,6 +747,12 @@ def run_probe(
     finally:
         probe.teardown()
 
+    discovery_convergence_samples_s = [
+        result["discovery_convergence_s"]
+        for result in endpoint_results.values()
+        if result is not None and result.get("discovery_convergence_s") is not None
+    ]
+
     return {
         "schema_version": "fleetqox.ns3_docker_container_fleet_probe.v1",
         "status": status,
@@ -680,6 +767,15 @@ def run_probe(
             endpoint_results.get(endpoint) is not None for endpoint in endpoints
         ),
         "ns3_log": ns3_log_text,
+        "latency_stats_ms": compute_latency_stats_ms(endpoint_results),
+        "discovery_bytes_ftap0": discovery_bytes_ftap0,
+        # max, not mean: the paper's own definition ("đến khi graph đạt
+        # trạng thái quan sát ổn định") is a whole-fleet property -- the
+        # graph isn't stable until its SLOWEST endpoint converges, same
+        # reasoning as wait_for_ready_then_start()'s all-endpoints gate.
+        "discovery_convergence_max_s": (
+            max(discovery_convergence_samples_s) if discovery_convergence_samples_s else None
+        ),
     }
 
 
