@@ -38,24 +38,52 @@
 // convention (no station singled out as an external, non-radio
 // "DN/Server" role), so Bảng V's three profiles stay apples-to-apples.
 //
-// ADDRESSING: EpcHelper::AssignUeIpv4Address() assigns each UE an address
-// from its own internal "overlay" pool (conventionally 7.0.0.0/8, tied to
-// the PGW's own GTP-U-encapsulation routing logic -- NOT something this
-// program can safely substitute with an arbitrary scheme without also
-// reimplementing that internal PGW matching logic). This program prints
-// the resulting per-endpoint overlay IP (FLEETQOX_NR_MAPPING, mirroring
-// fleetqox_trace_replay_tap.cc's FLEETQOX_TAP_MAPPING) so the Python
-// orchestrator can read it back and configure each real container with a
-// route that sources its traffic AS that overlay IP (`ip route ... src`),
-// while the container's own link-local address to its ghost stays on a
-// separate, fixed, non-EPC-pool subnet -- see the orchestrator script for
-// the exact Linux-side commands this pairs with.
+// ADDRESSING: a UE's own EpcHelper::AssignUeIpv4Address() address CANNOT
+// double as "the address real traffic uses to reach this endpoint" --
+// confirmed via a real small-scale run: a packet addressed to that exact
+// value gets LOCALLY delivered by the UE's own Ipv4L3Protocol (any IP
+// stack does this for its own interface's address), not forwarded on to
+// the ghost, and since no ns-3 application listens there it is silently
+// absorbed. This is exactly the problem a real 5G CPE/router solves with
+// NAT (its own WAN identity vs. the different addresses of devices behind
+// it) -- and ns-3 ships no NAT module (confirmed via `pkg-config
+// --list-all` on this image).
+//
+// FIX (no ns-3 core patch needed): read ns-3.41's own
+// src/lte/model/epc-pgw-application.cc directly -- RecvFromTunDevice()
+// dispatches a downlink packet by an EXACT-MATCH lookup of its
+// destination address in m_ueInfoByAddrMap, a plain
+// std::map<Ipv4Address, Ptr<UeInfo>> populated by the PUBLIC method
+// EpcPgwApplication::SetUeAddress(imsi, address) (called once
+// automatically, from EpcHelper::ActivateEpsBearer(), with the address
+// AssignUeIpv4Address() gave the UE). Nothing stops calling
+// SetUeAddress() a SECOND time for the SAME imsi with a DIFFERENT
+// address: the PGW will then tunnel packets for EITHER address to that
+// UE. So each station gets a manually-chosen SECOND address (from a
+// fixed, non-overlapping sub-range of the very same 7.0.0.0/8 pool,
+// picked here rather than left to the pool's own auto-increment
+// specifically so it can never collide with any UE's own
+// AssignUeIpv4Address()-issued address) registered as an ADDITIONAL
+// valid destination for that UE's tunnel. Since this second address is
+// NOT configured on the UE's own interface, the UE's Ipv4L3Protocol
+// does NOT treat it as local -- it consults the UE's own routing table
+// instead, where an explicit host route (added below) sends it out
+// toward the ghost. This is the value printed as "ue_overlay_ip" in
+// FLEETQOX_NR_MAPPING and is what every real sender must address
+// traffic to -- the UE's own raw EPC-assigned address is now purely an
+// internal radio-layer implementation detail, never used by real
+// traffic at all.
+//
+// The Python orchestrator reads this back and configures each real
+// container with a route that sources its traffic AS that address
+// (`ip route ... src`), while the container's own link-local address to
+// its ghost stays on a separate, fixed, non-EPC-pool subnet -- see the
+// orchestrator script for the exact Linux-side commands this pairs with.
 //
 // Ghost's OWN static routing (AddHostRouteTo) sends traffic for exactly
-// this endpoint's overlay IP out its tap-facing CSMA device, regardless of
+// this endpoint's address out its tap-facing CSMA device, regardless of
 // whether that device's own address happens to share a subnet with the
-// container's traffic -- sidesteps needing any NAT module (confirmed not
-// present in this image's ns-3 build) or exact subnet-matching tricks.
+// container's traffic.
 //
 // Copy this file into an ns-3 workspace and run it against the
 // jazzy-nr image variant (see external/rmw-netem/Dockerfile.nr) with:
@@ -72,6 +100,7 @@
 #include "ns3/mobility-module.h"
 #include "ns3/antenna-module.h"
 #include "ns3/nr-module.h"
+#include "ns3/epc-pgw-application.h"
 
 #include <cmath>
 #include <cstdio>
@@ -311,10 +340,38 @@ main(int argc, char* argv[])
 
   nrHelper->AttachToClosestEnb(ueNetDev, gnbNetDev);
 
-  std::vector<Ipv4Address> ueOverlayIp(totalStations);
+  // AttachToClosestEnb() above internally calls EpcHelper::ActivateEpsBearer()
+  // for the default bearer, which is what actually calls
+  // EpcPgwApplication::SetUeAddress(imsi, ueRadioAddr) the ONE time ns-3
+  // itself does it (registering each UE's OWN raw EPC-assigned address --
+  // see src/lte/helper/no-backhaul-epc-helper.cc's ActivateEpsBearer()).
+  // That address can never be used as this endpoint's real, real-traffic-
+  // facing identity (see the ADDRESSING comment at the top of this file
+  // for why -- confirmed via a real run that a UE locally-consumes, not
+  // forwards, anything addressed to its own interface). SetUeAddress() is
+  // a PUBLIC method with no guard against calling it again for the same
+  // imsi with a DIFFERENT address, so each station additionally gets a
+  // manually-chosen "public" address registered as a SECOND valid
+  // destination for that exact same UE/bearer/tunnel.
+  Ptr<EpcPgwApplication> pgwApp =
+      DynamicCast<EpcPgwApplication>(epcHelper->GetPgwNode()->GetApplication(0));
+  NS_ASSERT_MSG(pgwApp, "PGW node's application 0 was not an EpcPgwApplication");
+
+  std::vector<Ipv4Address> ueRadioAddr(totalStations);
+  std::vector<Ipv4Address> containerPublicIp(totalStations);
   for (uint32_t i = 0; i < totalStations; ++i)
   {
-    ueOverlayIp[i] = ueIpIface.GetAddress(i);
+    ueRadioAddr[i] = ueIpIface.GetAddress(i);
+    // 7.128.0.0/17 -- a fixed sub-range of the SAME 7.0.0.0/8 pool
+    // AssignUeIpv4Address() draws from, but far enough from that pool's
+    // own auto-incrementing base (7.0.0.2, 7.0.0.3, ...) that the two can
+    // never collide for any station count this program is ever run with
+    // (up to 255 stations; the paper's own largest scale is 32).
+    std::ostringstream publicIpStream;
+    publicIpStream << "7.128.0." << (i + 1);
+    containerPublicIp[i] = Ipv4Address(publicIpStream.str().c_str());
+    Ptr<NrUeNetDevice> ueNrDev = DynamicCast<NrUeNetDevice>(ueNetDev.Get(i));
+    pgwApp->SetUeAddress(ueNrDev->GetImsi(), containerPublicIp[i]);
   }
 
   // ---- Ghost <-> UE internal link (point-to-point, one dedicated link
@@ -348,12 +405,20 @@ main(int argc, char* argv[])
     // order ever changes).
     ghostStaticRouting->SetDefaultRoute(linkIfaces.GetAddress(1), ghostLinkIfIndex);
 
-    // UE-side: a directly-connected route to this p2p link already
-    // exists automatically (ns-3, like any IP stack, auto-installs a
-    // route for a device's own subnet on address assignment) -- no
-    // extra UE-side route needed for ghost<->UE traffic specifically;
-    // the UE's default route (set above) only applies to destinations
-    // NOT covered by a more specific route, i.e. every OTHER endpoint.
+    // UE-side: a directly-connected route to this p2p link's OWN subnet
+    // already exists automatically (ns-3, like any IP stack, auto-
+    // installs a route for a device's own subnet on address assignment).
+    // But downlink traffic for THIS station's containerPublicIp arrives
+    // via the NR device (iface 1, from the gNB/EPC) needing an explicit
+    // push back out to the ghost -- it does NOT match iface 1's own
+    // address (that's ueRadioAddr[i], a different value on purpose, see
+    // the ADDRESSING comment at the top of this file) so the default
+    // route (which points OUT iface 1, for uplink) would never send it
+    // back the way it just came without this.
+    Ptr<Ipv4> ueIpv4 = ueNodes.Get(i)->GetObject<Ipv4>();
+    uint32_t ueGhostLinkIfIndex = ueIpv4->GetInterfaceForDevice(link.Get(1));
+    Ptr<Ipv4StaticRouting> ueStaticRouting = ipv4RoutingHelper.GetStaticRouting(ueIpv4);
+    ueStaticRouting->AddHostRouteTo(containerPublicIp[i], ueGhostLinkIfIndex);
   }
 
   // ---- Ghost <-> real Docker container (TapBridge on a CSMA device) ----
@@ -450,18 +515,19 @@ main(int argc, char* argv[])
     Ptr<Ipv4StaticRouting> ghostStaticRouting = ipv4RoutingHelper.GetStaticRouting(ghostIpv4);
     // The one piece of routing state THIS station's ghost needs beyond
     // its default route (added above, pointing at the UE): explicitly
-    // send anything addressed to ITS OWN endpoint's overlay IP back out
-    // the tap-side interface, not toward the UE -- relevant when another
-    // endpoint's downlink traffic for THIS ip arrives via the UE link
-    // and needs to reach the real container, rather than looping back
-    // toward the UE.
-    ghostStaticRouting->AddHostRouteTo(ueOverlayIp[i], ghostRoutedIfIndex);
+    // send anything addressed to ITS OWN endpoint's containerPublicIp
+    // back out the tap-side interface, not toward the UE -- relevant
+    // when another endpoint's downlink traffic for THIS ip arrives via
+    // the UE link and needs to reach the real container, rather than
+    // looping back toward the UE.
+    ghostStaticRouting->AddHostRouteTo(containerPublicIp[i], ghostRoutedIfIndex);
 
     tapBridge.SetAttribute("DeviceName", StringValue(stationTapNames[i]));
     tapBridge.Install(ghostNodes.Get(i), ghostTapDevice);
 
     std::cout << "FLEETQOX_NR_MAPPING " << i << "," << stationEndpointLabels[i] << ","
-              << stationTapNames[i] << "," << ueOverlayIp[i] << "," << ghostLinkLocalIp << "\n";
+              << stationTapNames[i] << "," << containerPublicIp[i] << "," << ghostLinkLocalIp
+              << "\n";
   }
   std::cout.flush();
 
