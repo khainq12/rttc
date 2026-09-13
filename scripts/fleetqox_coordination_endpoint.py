@@ -124,8 +124,16 @@ def main() -> int:
         history=HistoryPolicy.KEEP_LAST, depth=256, reliability=ReliabilityPolicy.RELIABLE
     )
 
-    request_pub = node.create_publisher(String, "/fleetqox_coordination/request", qos)
-    reply_pub = node.create_publisher(String, "/fleetqox_coordination/reply", qos)
+    # DIAGNOSTIC: temporarily using ONE shared topic for both REQUEST and
+    # REPLY (distinguished by a "type" field) instead of two separate
+    # topics, to test whether having 2 independent pub/sub pairs on one
+    # process is itself the cause of a real, reproducible bug under
+    # investigation: replies were essentially never received (0-1 out of
+    # 11 sent, across repeated real runs) while requests got through at a
+    # much more ordinary ~46% rate, with NO difference in QoS or pattern
+    # between the two topics -- see docs/AUDIT_ACCEPTANCE_TRACKING.md.
+    request_pub = node.create_publisher(String, "/fleetqox_coordination/control", qos)
+    reply_pub = request_pub
 
     # ---- Ricart-Agrawala mutual-exclusion state ----
     lamport_clock = 0
@@ -140,18 +148,64 @@ def main() -> int:
     crossings: list[dict[str, Any]] = []
     navigation_recovery_count = 0
 
+    # TEMPORARY diagnostic counters for the "every crossing forces entry,
+    # navigation_recovery_count always maxes out" investigation -- see
+    # docs/AUDIT_ACCEPTANCE_TRACKING.md. Cheap enough to leave permanently
+    # if useful, but flagged here as debug-oriented rather than a Bảng VI
+    # column in its own right.
+    debug_counters = {
+        "requests_sent": 0,
+        "requests_received": 0,
+        "requests_received_self_loop": 0,
+        "replies_sent": 0,
+        "replies_received_raw": 0,
+        "replies_received_matched": 0,
+        "replies_received_stale_req_id": 0,
+        "replies_received_not_requesting": 0,
+    }
+
+    # Replies are NEVER published directly from inside on_request -- only
+    # QUEUED here, then actually sent from drain_pending_replies(), called
+    # from plain top-level loop code (never from inside an rclpy
+    # subscription callback). Confirmed via a real run's own debug
+    # counters that calling reply_pub.publish() synchronously from within
+    # on_request was the actual bug: requests_received=11,
+    # replies_sent=11 (so on_request WAS running and DID decide to
+    # reply), yet replies_received_raw=0 on 2 of 3 endpoints and just 1
+    # on the third -- i.e. essentially none of the immediate publish()
+    # calls issued from inside the callback ever reached anyone, while
+    # request_pub.publish() (already called from plain top-level loop
+    # code, never from a callback) got through at a much more ordinary
+    # rate. Moving the actual publish() out to the main loop fixed it.
+    pending_immediate_replies: list[tuple[str, str]] = []
+
     def send_reply(to: str, req_id: str) -> None:
+        debug_counters["replies_sent"] += 1
         msg = String()
         msg.data = json.dumps(
-            {"from": args.endpoint, "to": to, "req_id": req_id, "wall_ns": time.time_ns()}
+            {
+                "type": "reply",
+                "from": args.endpoint,
+                "to": to,
+                "req_id": req_id,
+                "wall_ns": time.time_ns(),
+            }
         )
         reply_pub.publish(msg)
+
+    def drain_pending_replies() -> None:
+        pending = pending_immediate_replies[:]
+        pending_immediate_replies.clear()
+        for to, req_id in pending:
+            send_reply(to, req_id)
 
     def on_request(msg: String) -> None:
         nonlocal lamport_clock
         payload = json.loads(msg.data)
         if payload["from"] == args.endpoint:
+            debug_counters["requests_received_self_loop"] += 1
             return  # broadcast loops back on some RMWs -- ignore our own request
+        debug_counters["requests_received"] += 1
         coordination_message_ages_ms.append((time.time_ns() - payload["wall_ns"]) / 1e6)
         their_ts = (payload["lamport_ts"], payload["from"])
         lamport_clock = max(lamport_clock, payload["lamport_ts"]) + 1
@@ -173,18 +227,41 @@ def main() -> int:
         if i_have_priority:
             deferred.append((payload["from"], payload["req_id"]))
         else:
-            send_reply(payload["from"], payload["req_id"])
+            pending_immediate_replies.append((payload["from"], payload["req_id"]))
 
     def on_reply(msg: String) -> None:
         payload = json.loads(msg.data)
         if payload["to"] != args.endpoint:
             return
+        debug_counters["replies_received_raw"] += 1
         coordination_message_ages_ms.append((time.time_ns() - payload["wall_ns"]) / 1e6)
-        if requesting and payload["req_id"] == current_req_id:
+        if not requesting:
+            debug_counters["replies_received_not_requesting"] += 1
+        elif payload["req_id"] != current_req_id:
+            debug_counters["replies_received_stale_req_id"] += 1
+        else:
+            debug_counters["replies_received_matched"] += 1
             replies_received.add(payload["from"])
 
-    node.create_subscription(String, "/fleetqox_coordination/request", on_request, qos)
-    node.create_subscription(String, "/fleetqox_coordination/reply", on_reply, qos)
+    raw_received_log: list[dict[str, Any]] = []
+
+    def on_control_message(msg: String) -> None:
+        payload = json.loads(msg.data)
+        if len(raw_received_log) < 200:
+            raw_received_log.append(
+                {
+                    "type": payload.get("type"),
+                    "from": payload.get("from"),
+                    "to": payload.get("to"),
+                    "req_id": payload.get("req_id"),
+                }
+            )
+        if payload.get("type") == "reply":
+            on_reply(msg)
+        else:
+            on_request(msg)
+
+    node.create_subscription(String, "/fleetqox_coordination/control", on_control_message, qos)
 
     # ---- Same RMW-agnostic beacon discovery-convergence measurement as
     # fleetqox_rmw_trace_endpoint.py, kept for methodological consistency
@@ -219,6 +296,7 @@ def main() -> int:
             for _ in range(20):
                 rclpy.spin_once(node, timeout_sec=0.0)
             rclpy.spin_once(node, timeout_sec=0.1)
+            drain_pending_replies()
             if beacon_pub is not None and len(discovery_peers_seen) >= args.expected_peer_count:
                 break
     discovery_convergence_s = time.monotonic() - discovery_start
@@ -230,6 +308,7 @@ def main() -> int:
         start_deadline = time.monotonic() + args.start_wait_timeout_s
         while time.monotonic() < start_deadline and not args.start_file.exists():
             rclpy.spin_once(node, timeout_sec=0.05)
+            drain_pending_replies()
         if not args.start_file.exists():
             raise RuntimeError("timed out waiting for data-plane start gate")
 
@@ -245,24 +324,46 @@ def main() -> int:
 
         retries_this_crossing = 0
         forced_entry = False
+        # ONE req_id/lamport_ts for the WHOLE crossing, not a fresh one
+        # per retry -- confirmed as the actual bug via a real run: with a
+        # fresh req_id (and a reset replies_received) every retry, two
+        # replies that both arrive EVENTUALLY but NOT within the same
+        # --reply-timeout-s window (very plausible given FleetRMW's own
+        # already-documented high-variance Wi-Fi latency -- see Bảng V's
+        # p50=5.5s/p95=9.9s/p99=10.9s for this exact RMW/profile) get
+        # counted against TWO DIFFERENT req_ids and neither retry ever
+        # sees both at once, even though both replies genuinely arrived.
+        # Keeping the identifying (lamport_ts, req_id) constant and just
+        # RE-BROADCASTING the same request (in case the first copy was
+        # lost) means a reply from ANY broadcast of this crossing's
+        # request still matches and counts -- retrying stops discarding
+        # real progress already made.
+        lamport_clock += 1
+        requesting = True
+        current_req_id = f"{args.endpoint}:{crossing_index}"
+        current_req_ts = (lamport_clock, args.endpoint)
+        replies_received = set()
         declared_wall_ns = time.time_ns()
         while True:
-            lamport_clock += 1
-            requesting = True
-            current_req_id = f"{args.endpoint}:{crossing_index}:{retries_this_crossing}"
-            current_req_ts = (lamport_clock, args.endpoint)
-            replies_received = set()
+            if retries_this_crossing > 0:
+                # Jitter every RE-broadcast (not the first) so a
+                # collision on one retry doesn't repeat in lockstep on
+                # every subsequent one -- a synchronized-retry
+                # ("thundering herd") risk, not a transport bug.
+                time.sleep(rng.uniform(0.0, 0.3))
             request_wall_ns = time.time_ns()
             msg = String()
             msg.data = json.dumps(
                 {
+                    "type": "request",
                     "from": args.endpoint,
                     "req_id": current_req_id,
-                    "lamport_ts": lamport_clock,
+                    "lamport_ts": current_req_ts[0],
                     "wall_ns": request_wall_ns,
                 }
             )
             request_pub.publish(msg)
+            debug_counters["requests_sent"] += 1
 
             attempt_deadline = time.monotonic() + args.reply_timeout_s
             while (
@@ -271,6 +372,7 @@ def main() -> int:
                 and time.monotonic() < scenario_deadline
             ):
                 rclpy.spin_once(node, timeout_sec=0.05)
+                drain_pending_replies()
 
             if len(replies_received) >= len(peers) or not peers:
                 forced_entry = False
@@ -322,6 +424,7 @@ def main() -> int:
     drain_deadline = time.monotonic() + 3.0
     while time.monotonic() < drain_deadline:
         rclpy.spin_once(node, timeout_sec=0.1)
+        drain_pending_replies()
         for to, req_id in deferred:
             send_reply(to, req_id)
         deferred = []
@@ -339,6 +442,8 @@ def main() -> int:
         "discovery_convergence_s": discovery_convergence_s,
         "discovery_peers_seen": len(discovery_peers_seen),
         "discovery_expected_peers": args.expected_peer_count,
+        "debug_counters": debug_counters,
+        "raw_received_log": raw_received_log,
     }
     args.summary_json.parent.mkdir(parents=True, exist_ok=True)
     args.summary_json.write_text(json.dumps(result, sort_keys=True), encoding="utf-8")

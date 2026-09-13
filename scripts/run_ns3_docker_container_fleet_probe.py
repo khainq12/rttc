@@ -1125,17 +1125,33 @@ class ReferenceTopologyProbe:
             result_json = f"{results_dir_container}/result_{i}.json"
             log_file = f"{results_dir_container}/endpoint_{i}.log"
             if rmw_implementation == "rmw_fleetqox_cpp":
-                # Coordination traffic is broadcast-shaped (every endpoint
-                # both publishes AND needs to receive every other
-                # endpoint's REQUEST/REPLY), unlike the trace replay's
-                # sparse point-to-point subscription graph -- so static
-                # mode's subscription_aware routing (which only forwards
-                # to explicitly-declared subscribers) isn't the right fit
-                # here; use non-static mode so every endpoint reaches
-                # every other one directly via FLEETQOX_RMW_PEERS.
+                # STATIC_MODE=1 without PEER_POLICY (leaving it at its own
+                # default, "all") -- confirmed via a real run that omitting
+                # STATIC_MODE entirely fails almost completely: without it,
+                # rmw_pubsub.cpp starts a background "graph renewal" thread
+                # that periodically sends heartbeat/advertisement traffic
+                # to converge a real discovery graph (see
+                # ensure_pubsub_graph_renewal_thread()'s own comment) --
+                # the SAME kind of slow, periodic convergence as DDS's own
+                # SPDP, just via a different wire format. Since this
+                # endpoint script passes --skip-discovery-wait (coordination
+                # traffic needs to start on the shared gate, not wait out an
+                # arbitrary timeout), messages sent before that background
+                # graph converges were silently going nowhere -- a real
+                # 2-endpoint smoke test with STATIC_MODE unset got 100%
+                # forced-entry crossings (zero successful mutex acquisitions
+                # in 60s). STATIC_MODE=1 skips starting that thread entirely
+                # and treats FLEETQOX_RMW_PEERS as already fully connected,
+                # matching what makes FleetRMW's "default" mode reliable
+                # everywhere else in this investigation. peer_policy_'s own
+                # default ("all" -- broadcast every frame to every known
+                # peer, no subscription registry needed) is exactly the
+                # broadcast-to-everyone shape this scenario wants, so
+                # subscription_aware mode/a static subscriptions map isn't
+                # needed here the way it is for the trace-replay endpoint.
                 env_prefix = (
                     f"RMW_IMPLEMENTATION=rmw_fleetqox_cpp FLEETQOX_RMW_BIND=0.0.0.0:{RMW_PORT} "
-                    f"FLEETQOX_RMW_PEERS={rmw_peers} "
+                    f"FLEETQOX_RMW_PEERS={rmw_peers} FLEETQOX_RMW_STATIC_MODE=1 "
                 )
                 env_prefix += "".join(
                     f"{key}={value} " for key, value in (extra_rmw_env or {}).items()
