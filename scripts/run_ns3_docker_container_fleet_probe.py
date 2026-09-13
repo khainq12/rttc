@@ -280,6 +280,81 @@ def compute_graph_join_failures(endpoint_results: dict[str, Any]) -> dict[str, A
     }
 
 
+def compute_coordination_metrics(endpoint_results: dict[str, Any]) -> dict[str, Any]:
+    """Bảng VI's 4 columns, computed from fleetqox_coordination_endpoint.py's
+    per-endpoint result JSON (see that file's module docstring for the
+    Ricart-Agrawala zone-mutex protocol this aggregates).
+
+    - coordination_update_age_ms: mean age (recv - declared wall time) of
+      every REQUEST/REPLY message actually received, across all
+      endpoints -- how stale the fleet's shared coordination state is
+      by the time it's acted on.
+    - conflict_resolution_delay_ms: mean, across every crossing that
+      reached a GENUINE consensus (forced_entry == False -- see that
+      field's own comment for why a forced entry, i.e. giving up on
+      collecting every peer's reply, must not be averaged in as if it
+      were an equally valid mutex acquisition), of
+      entered_wall_ns - declared_wall_ns.
+    - navigation_recovery_count: SUM across all endpoints of retry
+      counts (a REQUEST that didn't collect every reply within
+      --reply-timeout-s and had to be re-broadcast) -- see
+      fleetqox_coordination_endpoint.py's module docstring for why this
+      coordination-layer retry is the closest available stand-in for a
+      real navigation-stack recovery in a harness with no actual motion
+      planner.
+    - task_completion_s: MAX across endpoints of task_completion_s --
+      the scenario isn't done until the SLOWEST endpoint finishes its
+      assigned crossings, same "whole-fleet is only as fast as its
+      slowest member" reasoning as discovery_convergence_max_s
+      elsewhere in this file.
+    - forced_entry_rate: fraction of ALL crossings (across all
+      endpoints) that were forced entries -- reported alongside the
+      other 4 so a reader can tell whether conflict_resolution_delay_ms
+      reflects a harness that mostly reached genuine consensus, or one
+      where forced entries were so common the "clean" delay figure
+      covers only a small, possibly unrepresentative minority of
+      crossings.
+
+    Returns None values for whichever field has no eligible samples
+    (e.g. every crossing at every endpoint was forced -- see the 5G
+    profile's N=16/32 collapse) rather than raising or silently
+    defaulting to 0, which would misleadingly read as "instant".
+    """
+    message_ages_ms: list[float] = []
+    resolution_delays_ms: list[float] = []
+    total_crossings = 0
+    forced_crossings = 0
+    total_recovery_count = 0
+    completion_times_s: list[float] = []
+
+    for result in endpoint_results.values():
+        if not result:
+            continue
+        message_ages_ms.extend(result.get("coordination_message_ages_ms", []))
+        total_recovery_count += result.get("navigation_recovery_count", 0)
+        completion_times_s.append(result.get("task_completion_s", 0.0))
+        for crossing in result.get("crossings", []):
+            total_crossings += 1
+            if crossing.get("forced_entry"):
+                forced_crossings += 1
+            else:
+                resolution_delays_ms.append(crossing["conflict_resolution_delay_ms"])
+
+    return {
+        "coordination_update_age_ms": (
+            sum(message_ages_ms) / len(message_ages_ms) if message_ages_ms else None
+        ),
+        "conflict_resolution_delay_ms": (
+            sum(resolution_delays_ms) / len(resolution_delays_ms) if resolution_delays_ms else None
+        ),
+        "navigation_recovery_count": total_recovery_count,
+        "task_completion_s": max(completion_times_s) if completion_times_s else None,
+        "total_crossings": total_crossings,
+        "forced_crossings": forced_crossings,
+        "forced_entry_rate": (forced_crossings / total_crossings) if total_crossings else None,
+    }
+
+
 def parse_docker_mem_usage_mb(mem_usage: str) -> float:
     """Parse docker stats' "{{.MemUsage}}" field, e.g. "45.2MiB / 3.678GiB",
     into the "used" side as decimal MB. Docker reports binary units (Ki/Mi/Gi
@@ -1014,6 +1089,122 @@ class ReferenceTopologyProbe:
             cmd = f"{inner} > /work/{log_file} 2>&1"
             docker("exec", "-d", self.endpoint_container_names[i], "bash", "-lc", cmd)
 
+    def launch_coordination_endpoints(
+        self,
+        *,
+        num_crossings: int,
+        crossing_duration_ms: float,
+        reply_timeout_s: float,
+        seed: int,
+        start_offset_ms: float,
+        discovery_timeout_s: float,
+        start_wait_timeout_s: float,
+        scenario_timeout_s: float,
+        results_dir_container: str,
+        rmw_implementation: str = "rmw_fleetqox_cpp",
+        discovery_mode: str = "default",
+        extra_rmw_env: dict[str, str] | None = None,
+    ) -> None:
+        """Bảng VI ("Chỉ số điều phối và hoàn thành nhiệm vụ") launcher --
+        runs fleetqox_coordination_endpoint.py (the Ricart-Agrawala zone-
+        mutex simulation, see that file's module docstring) instead of
+        fleetqox_rmw_trace_endpoint.py, but reuses the EXACT SAME RMW
+        environment setup (peers list, static-subscription config for
+        FleetRMW, CycloneDDS static-peers XML, Fast DDS discovery-server,
+        Zenoh router session config) as launch_endpoints() -- the network/
+        RMW plumbing is identical, only the application workload differs.
+        """
+        docker("exec", self.rigger_name, "mkdir", "-p", f"/work/{results_dir_container}")
+        self._ready_files = [f"{results_dir_container}/ready_{i}" for i in range(len(self.endpoints))]
+        self._start_file = f"{results_dir_container}/start"
+        for i, endpoint in enumerate(self.endpoints):
+            peers_env = ",".join(other for other in self.endpoints if other != endpoint)
+            rmw_peers = ",".join(
+                f"{self.ips[other]}:{RMW_PORT}" for other in self.endpoints if other != endpoint
+            )
+            result_json = f"{results_dir_container}/result_{i}.json"
+            log_file = f"{results_dir_container}/endpoint_{i}.log"
+            if rmw_implementation == "rmw_fleetqox_cpp":
+                # Coordination traffic is broadcast-shaped (every endpoint
+                # both publishes AND needs to receive every other
+                # endpoint's REQUEST/REPLY), unlike the trace replay's
+                # sparse point-to-point subscription graph -- so static
+                # mode's subscription_aware routing (which only forwards
+                # to explicitly-declared subscribers) isn't the right fit
+                # here; use non-static mode so every endpoint reaches
+                # every other one directly via FLEETQOX_RMW_PEERS.
+                env_prefix = (
+                    f"RMW_IMPLEMENTATION=rmw_fleetqox_cpp FLEETQOX_RMW_BIND=0.0.0.0:{RMW_PORT} "
+                    f"FLEETQOX_RMW_PEERS={rmw_peers} "
+                )
+                env_prefix += "".join(
+                    f"{key}={value} " for key, value in (extra_rmw_env or {}).items()
+                )
+                rmw_setup = f"source /work/{FLEETQOX_RMW_INSTALL}/setup.bash && export {env_prefix}"
+            else:
+                env_prefix = f"RMW_IMPLEMENTATION={rmw_implementation} "
+                if rmw_implementation == "rmw_zenoh_cpp":
+                    if i != 0:
+                        session_config = (
+                            '{ connect: { endpoints: ["' + self.zenoh_router_endpoint() + '"] } }'
+                        )
+                        session_config_path = f"/tmp/zenoh_session_config_coord_{i}.json5"
+                        docker(
+                            "exec", self.endpoint_container_names[i], "bash", "-lc",
+                            f"echo {shlex.quote(session_config)} > {session_config_path}",
+                        )
+                        env_prefix += f"ZENOH_SESSION_CONFIG_URI={session_config_path} "
+                if rmw_implementation == "rmw_cyclonedds_cpp" and discovery_mode == "static_peers":
+                    peer_xml = "".join(
+                        f'<Peer address="{self.ips[other]}"/>'
+                        for other in self.endpoints
+                        if other != endpoint
+                    )
+                    cyclonedds_config = (
+                        '<?xml version="1.0" encoding="UTF-8" ?>'
+                        '<CycloneDDS xmlns="https://cdds.io/config">'
+                        "<Domain><General><AllowMulticast>false</AllowMulticast></General>"
+                        f"<Discovery><Peers>{peer_xml}</Peers>"
+                        "<ParticipantIndex>0</ParticipantIndex></Discovery>"
+                        "</Domain></CycloneDDS>"
+                    )
+                    cyclonedds_config_path = f"/tmp/cyclonedds_static_peers_coord_{i}.xml"
+                    docker(
+                        "exec", self.endpoint_container_names[i], "bash", "-lc",
+                        f"echo {shlex.quote(cyclonedds_config)} > {cyclonedds_config_path}",
+                    )
+                    env_prefix += f"CYCLONEDDS_URI={cyclonedds_config_path} "
+                if rmw_implementation == "rmw_fastrtps_cpp" and discovery_mode == "discovery_server":
+                    env_prefix += f"ROS_DISCOVERY_SERVER={self.fastdds_discovery_server_endpoint()} "
+                env_prefix += "".join(
+                    f"{key}={value} " for key, value in (extra_rmw_env or {}).items()
+                )
+                rmw_setup = f"export {env_prefix}"
+            expected_peer_count = 0 if rmw_implementation == "rmw_fleetqox_cpp" else len(self.endpoints) - 1
+            skip_discovery_wait_flag = " --skip-discovery-wait" if rmw_implementation == "rmw_fleetqox_cpp" else ""
+            inner = (
+                "source /opt/ros/jazzy/setup.bash && "
+                f"{rmw_setup}&& "
+                f"python3 /work/scripts/fleetqox_coordination_endpoint.py "
+                f"--endpoint={shlex.quote(endpoint)} "
+                f"--peers={shlex.quote(peers_env)} "
+                f"--num-crossings={num_crossings} "
+                f"--crossing-duration-ms={crossing_duration_ms:.12g} "
+                f"--reply-timeout-s={reply_timeout_s:.12g} "
+                f"--seed={seed} "
+                f"--start-offset-ms={start_offset_ms:.12g} "
+                f"--discovery-timeout-s={discovery_timeout_s:.12g} "
+                f"--start-wait-timeout-s={start_wait_timeout_s} "
+                f"--scenario-timeout-s={scenario_timeout_s:.12g} "
+                f"--expected-peer-count={expected_peer_count}"
+                f"{skip_discovery_wait_flag} "
+                f"--summary-json=/work/{result_json} "
+                f"--ready-file=/work/{self._ready_files[i]} "
+                f"--start-file=/work/{self._start_file}"
+            )
+            cmd = f"{inner} > /work/{log_file} 2>&1"
+            docker("exec", "-d", self.endpoint_container_names[i], "bash", "-lc", cmd)
+
     def wait_for_ready_then_start(self, ready_deadline_s: float) -> None:
         """Poll (via the rigger, which already has /work mounted) until
         every endpoint's ready-file exists, then touch the shared start
@@ -1323,6 +1514,138 @@ def run_probe(
         "resource_usage": resource_usage,
         "cpu_pct_mean": (sum(cpu_samples) / len(cpu_samples)) if cpu_samples else None,
         "rss_mb_mean": (sum(rss_samples) / len(rss_samples)) if rss_samples else None,
+        "graph_join_failures": compute_graph_join_failures(endpoint_results),
+    }
+
+
+def run_coordination_probe(
+    *,
+    image: str = DEFAULT_IMAGE,
+    output_dir: Path,
+    num_robots: int,
+    seed: int,
+    sim_duration_s: float = 60.0,
+    num_crossings: int = 5,
+    crossing_duration_ms: float = 300.0,
+    reply_timeout_s: float = 5.0,
+    scenario_timeout_s: float = 120.0,
+    start_offset_ms: float = 2000.0,
+    discovery_timeout_s: float = 15.0,
+    ns3_seed: int = 1,
+    ns3_run: int = 1,
+    layout: str = "circle",
+    circle_radius: float = 7.5,
+    path_loss_exponent: float = 2.7,
+    tx_power_dbm: float = 15.0,
+    rx_sensitivity_dbm: float = -82.0,
+    mobility_speed: float = 0.0,
+    num_aps: int = 1,
+    rmw_implementation: str = "rmw_fleetqox_cpp",
+    discovery_mode: str = "default",
+    extra_rmw_env: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Bảng VI ("Chỉ số điều phối và hoàn thành nhiệm vụ") -- see
+    fleetqox_coordination_endpoint.py's module docstring for the
+    Ricart-Agrawala zone-mutex simulation this runs, and
+    compute_coordination_metrics()'s docstring for how the 4 columns are
+    derived from it. Uses the SAME wifi network setup as run_probe()
+    (wire_network()/start_ns3(), the paper's main reference profile,
+    matching Bảng IV's own default) -- pass a different image/wire-up if
+    Bảng VI ever needs to be measured under LAN/5G too, following the
+    same pattern run_lan_probe()/run_nr_probe() already establish.
+
+    No trace CSV here (unlike run_probe()) -- this scenario's workload
+    is fully self-contained inside fleetqox_coordination_endpoint.py,
+    parameterized only by --num-crossings/--crossing-duration-ms/
+    --reply-timeout-s, not by a pre-generated event schedule."""
+    output_dir = output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    run_id = output_dir.name.lstrip(".")
+    endpoints = endpoint_list(num_robots)
+    results_dir_container = f"{output_dir.relative_to(ROOT)}/container_results"
+    (ROOT / results_dir_container).mkdir(parents=True, exist_ok=True)
+
+    probe = ReferenceTopologyProbe(
+        run_id=run_id, image=image, num_robots=num_robots, output_dir=output_dir
+    )
+    ready_deadline_s = max(READY_DEADLINE_S, int(discovery_timeout_s) + 15)
+    start_wait_timeout_s = ready_deadline_s + 30
+    status = "ok"
+    error_text = ""
+    endpoint_results: dict[str, Any] = {}
+    ns3_log_text = ""
+    try:
+        probe.start_containers()
+        probe.build_ns3_binary()
+        probe.wire_network()
+        probe.start_ns3(
+            sim_duration_s=sim_duration_s,
+            num_aps=num_aps,
+            layout=layout,
+            circle_radius=circle_radius,
+            path_loss_exponent=path_loss_exponent,
+            tx_power_dbm=tx_power_dbm,
+            rx_sensitivity_dbm=rx_sensitivity_dbm,
+            mobility_speed=mobility_speed,
+            ns3_seed=ns3_seed,
+            ns3_run=ns3_run,
+        )
+        if rmw_implementation == "rmw_zenoh_cpp":
+            probe.start_zenoh_router()
+        if rmw_implementation == "rmw_fastrtps_cpp" and discovery_mode == "discovery_server":
+            probe.start_fastdds_discovery_server()
+        probe.launch_coordination_endpoints(
+            num_crossings=num_crossings,
+            crossing_duration_ms=crossing_duration_ms,
+            reply_timeout_s=reply_timeout_s,
+            seed=seed,
+            start_offset_ms=start_offset_ms,
+            discovery_timeout_s=discovery_timeout_s,
+            start_wait_timeout_s=start_wait_timeout_s,
+            scenario_timeout_s=scenario_timeout_s,
+            results_dir_container=results_dir_container,
+            rmw_implementation=rmw_implementation,
+            discovery_mode=discovery_mode,
+            extra_rmw_env=extra_rmw_env,
+        )
+        probe.wait_for_ready_then_start(ready_deadline_s=ready_deadline_s)
+        probe.wait_for_completion(
+            timeout_s=start_offset_ms / 1000.0 + scenario_timeout_s + 60.0,
+            results_dir_container=results_dir_container,
+        )
+        endpoint_results = probe.collect_results(results_dir_container)
+        ns3_log_text = probe.ns3_log()
+    except Exception as exc:  # noqa: BLE001 -- report to caller, don't hide the traceback
+        status = "failed"
+        error_text = str(exc)
+        try:
+            ns3_log_text = probe.ns3_log()
+        except Exception:  # noqa: BLE001
+            pass
+    finally:
+        probe.teardown()
+
+    discovery_convergence_samples_s = [
+        result["discovery_convergence_s"]
+        for result in endpoint_results.values()
+        if result is not None and result.get("discovery_convergence_s") is not None
+    ]
+
+    return {
+        "schema_version": "fleetqox.ns3_docker_container_coordination_probe.v1",
+        "status": status,
+        "error": error_text,
+        "num_robots": num_robots,
+        "endpoints": endpoints,
+        "endpoint_results": endpoint_results,
+        "endpoint_results_complete": all(
+            endpoint_results.get(endpoint) is not None for endpoint in endpoints
+        ),
+        "ns3_log": ns3_log_text,
+        "coordination_metrics": compute_coordination_metrics(endpoint_results),
+        "discovery_convergence_max_s": (
+            max(discovery_convergence_samples_s) if discovery_convergence_samples_s else None
+        ),
         "graph_join_failures": compute_graph_join_failures(endpoint_results),
     }
 

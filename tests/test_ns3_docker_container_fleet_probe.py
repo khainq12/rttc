@@ -9,6 +9,7 @@ from scripts.run_ns3_docker_container_fleet_probe import (
     STATIC_SUBSCRIPTION_TYPE_NAME,
     ReferenceTopologyProbe,
     build_static_subscriptions,
+    compute_coordination_metrics,
     compute_graph_join_failures,
     compute_jitter_stale_repair_stats,
     compute_latency_stats_ms,
@@ -266,6 +267,83 @@ class ParseNrMappingTest(unittest.TestCase):
     def test_malformed_line_is_skipped(self):
         log_text = "FLEETQOX_NR_MAPPING 0,control_station,ntap0,7.0.0.2\n"  # missing a field
         self.assertEqual(ReferenceTopologyProbe._parse_nr_mapping(log_text), {})
+
+
+class ComputeCoordinationMetricsTest(unittest.TestCase):
+    """Bảng VI's 4 columns -- see compute_coordination_metrics()'s own
+    docstring for the exact definitions this tests against."""
+
+    def test_averages_message_ages_and_clean_resolution_delays(self):
+        endpoint_results = {
+            "robot_0000": {
+                "coordination_message_ages_ms": [10.0, 20.0],
+                "navigation_recovery_count": 1,
+                "task_completion_s": 12.0,
+                "crossings": [
+                    {"conflict_resolution_delay_ms": 100.0, "forced_entry": False},
+                    {"conflict_resolution_delay_ms": 300.0, "forced_entry": False},
+                ],
+            },
+            "robot_0001": {
+                "coordination_message_ages_ms": [30.0],
+                "navigation_recovery_count": 2,
+                "task_completion_s": 15.0,
+                "crossings": [
+                    {"conflict_resolution_delay_ms": 200.0, "forced_entry": False},
+                ],
+            },
+        }
+        metrics = compute_coordination_metrics(endpoint_results)
+        self.assertAlmostEqual(metrics["coordination_update_age_ms"], 20.0)  # (10+20+30)/3
+        self.assertAlmostEqual(metrics["conflict_resolution_delay_ms"], 200.0)  # (100+300+200)/3
+        self.assertEqual(metrics["navigation_recovery_count"], 3)
+        self.assertAlmostEqual(metrics["task_completion_s"], 15.0)  # max, not mean
+        self.assertEqual(metrics["total_crossings"], 3)
+        self.assertEqual(metrics["forced_crossings"], 0)
+        self.assertAlmostEqual(metrics["forced_entry_rate"], 0.0)
+
+    def test_forced_entries_excluded_from_delay_average_but_counted_separately(self):
+        endpoint_results = {
+            "robot_0000": {
+                "coordination_message_ages_ms": [],
+                "navigation_recovery_count": 5,
+                "task_completion_s": 60.0,
+                "crossings": [
+                    {"conflict_resolution_delay_ms": 9999.0, "forced_entry": True},
+                    {"conflict_resolution_delay_ms": 150.0, "forced_entry": False},
+                ],
+            },
+        }
+        metrics = compute_coordination_metrics(endpoint_results)
+        # Forced entry's delay must NOT pollute the "genuine consensus" average.
+        self.assertAlmostEqual(metrics["conflict_resolution_delay_ms"], 150.0)
+        self.assertEqual(metrics["total_crossings"], 2)
+        self.assertEqual(metrics["forced_crossings"], 1)
+        self.assertAlmostEqual(metrics["forced_entry_rate"], 0.5)
+
+    def test_all_forced_gives_none_delay_not_zero(self):
+        endpoint_results = {
+            "robot_0000": {
+                "coordination_message_ages_ms": [],
+                "navigation_recovery_count": 10,
+                "task_completion_s": 120.0,
+                "crossings": [
+                    {"conflict_resolution_delay_ms": 9999.0, "forced_entry": True},
+                ],
+            },
+        }
+        metrics = compute_coordination_metrics(endpoint_results)
+        self.assertIsNone(metrics["conflict_resolution_delay_ms"])
+        self.assertAlmostEqual(metrics["forced_entry_rate"], 1.0)
+
+    def test_skips_endpoints_with_no_result(self):
+        endpoint_results = {"robot_0000": None, "robot_0001": None}
+        metrics = compute_coordination_metrics(endpoint_results)
+        self.assertIsNone(metrics["coordination_update_age_ms"])
+        self.assertIsNone(metrics["conflict_resolution_delay_ms"])
+        self.assertEqual(metrics["navigation_recovery_count"], 0)
+        self.assertIsNone(metrics["task_completion_s"])
+        self.assertIsNone(metrics["forced_entry_rate"])
 
 
 class ConstantsTest(unittest.TestCase):
