@@ -171,7 +171,7 @@ main(int argc, char* argv[])
   std::vector<std::string> stationEndpointLabels = {"control_station"};
   for (uint32_t i = 0; i < numRobots; ++i)
   {
-    char suffix[16];
+    char suffix[24];
     std::snprintf(suffix, sizeof(suffix), "robot_%04u", i);
     stationEndpointLabels.push_back(suffix);
   }
@@ -387,30 +387,75 @@ main(int argc, char* argv[])
   tapBridge.SetAttribute("Mode", StringValue("UseLocal"));
   for (uint32_t i = 0; i < totalStations; ++i)
   {
-    NetDeviceContainer tapLinkDevices = ghostTapLink.Install(NodeContainer(ghostNodes.Get(i)));
-    // A single-node CSMA "link" (a 1-device bus) purely so the device
-    // exists as an ordinary CsmaNetDevice for TapBridge to attach to --
-    // no second CSMA peer needed inside the simulation since the REAL
-    // far end is the tap/veth pair into the Docker container, not
-    // another ns-3 node.
-    Ptr<NetDevice> ghostTapDevice = tapLinkDevices.Get(0);
+    // TWO CsmaNetDevices on the SAME node, on the SAME shared channel --
+    // NOT one. A real Ethernet NIC never feeds its own transmissions
+    // back into its own receiver (that's what half-duplex CSMA models),
+    // so a single device here would be a dead end: TapBridge injects the
+    // container's frames via SendFrom() (a TRANSMIT onto the channel),
+    // and if that same device were also the one carrying this ghost's
+    // own Ipv4/Arp stack, that stack would NEVER see the frame it just
+    // "transmitted" -- confirmed by a real run: the ghost's ARP never
+    // answered the container's request (`ip neigh` showed FAILED), and
+    // the tap's RX byte counter stayed at exactly 0 for the entire test
+    // regardless of how much the container retried. Splitting into two
+    // peer devices on one channel -- ghostTapDevice (TapBridge, NO IP)
+    // and ghostRoutedDevice (the container's actual gateway IP, runs
+    // ARP/routing) -- makes them genuine peers that DO see each other's
+    // traffic, exactly like a NIC's own port talking to a bridge port
+    // sitting on the same physical segment.
+    // Built via two explicit single-node Install() calls onto the SAME
+    // channel object, NOT NodeContainer(node, node) -- that doubled-up
+    // form reproducibly crashed TapBridge's tap-creator helper with
+    // SIGSEGV (confirmed by 2 separate runs hitting the exact same
+    // crash), most likely because CsmaHelper::Install(NodeContainer) was
+    // never exercised against a container listing the same node twice.
+    // Install(Ptr<Node>, Ptr<Channel>) is the standard, widely-used
+    // pattern for adding an additional device to an already-existing
+    // channel, so this sidesteps that untested code path entirely.
+    NetDeviceContainer firstTapLinkDevice = ghostTapLink.Install(NodeContainer(ghostNodes.Get(i)));
+    Ptr<NetDevice> ghostTapDevice = firstTapLinkDevice.Get(0);
+    Ptr<CsmaChannel> ghostTapChannel = DynamicCast<CsmaChannel>(ghostTapDevice->GetChannel());
+    Ptr<NetDevice> ghostRoutedDevice =
+        ghostTapLink.Install(ghostNodes.Get(i), ghostTapChannel).Get(0);
 
     std::ostringstream tapBase;
     tapBase << "172.16." << i << ".0";
     ghostTapAddressHelper.SetBase(tapBase.str().c_str(), "255.255.255.0");
-    Ipv4InterfaceContainer tapIface = ghostTapAddressHelper.Assign(NetDeviceContainer(ghostTapDevice));
+    Ipv4InterfaceContainer tapIface =
+        ghostTapAddressHelper.Assign(NetDeviceContainer(ghostRoutedDevice));
     const Ipv4Address ghostLinkLocalIp = tapIface.GetAddress(0);
+    // ghostTapDevice ALSO needs a valid Ipv4 interface -- not because
+    // anything of ours actually uses this address (Mode=UseLocal never
+    // applies the tap-creator's discovered IP to anything real; the
+    // container's actual identity is configured entirely on the Linux
+    // side), but because TapBridge::CreateTap() unconditionally calls
+    // ipv4->GetInterfaceForDevice(bridgedDevice) whenever the NODE has
+    // an Ipv4 object at all (it does, for ghostRoutedDevice's sake),
+    // with NO check that THIS SPECIFIC device has an interface. Without
+    // one, GetInterfaceForDevice() returns -1 (0xFFFFFFFF as uint32_t),
+    // which then indexes straight into Ipv4L3Protocol's internal
+    // interface array -- confirmed via ns-3.41's own
+    // src/tap-bridge/model/tap-bridge.cc (the "if (ipv4)" branch around
+    // GetNAddresses(index)/GetAddress(index, 0)) as the exact mechanism
+    // behind a real, reproduced SIGSEGV in the tap-creator helper
+    // process the first time this file split into two devices without
+    // giving the tap-facing one an address of its own. Reuses the same
+    // helper (SetBase() not called again) so this lands on the next free
+    // address in the same /24 -- distinct from ghostRoutedDevice's,
+    // never collides, never actually routed anywhere.
+    ghostTapAddressHelper.Assign(NetDeviceContainer(ghostTapDevice));
 
     Ptr<Ipv4> ghostIpv4 = ghostNodes.Get(i)->GetObject<Ipv4>();
-    uint32_t ghostTapIfIndex = ghostIpv4->GetInterfaceForDevice(ghostTapDevice);
+    uint32_t ghostRoutedIfIndex = ghostIpv4->GetInterfaceForDevice(ghostRoutedDevice);
     Ptr<Ipv4StaticRouting> ghostStaticRouting = ipv4RoutingHelper.GetStaticRouting(ghostIpv4);
     // The one piece of routing state THIS station's ghost needs beyond
     // its default route (added above, pointing at the UE): explicitly
     // send anything addressed to ITS OWN endpoint's overlay IP back out
-    // the tap, not toward the UE -- relevant when another endpoint's
-    // downlink traffic for THIS ip arrives via the UE link and needs to
-    // reach the real container, rather than looping back toward the UE.
-    ghostStaticRouting->AddHostRouteTo(ueOverlayIp[i], ghostTapIfIndex);
+    // the tap-side interface, not toward the UE -- relevant when another
+    // endpoint's downlink traffic for THIS ip arrives via the UE link
+    // and needs to reach the real container, rather than looping back
+    // toward the UE.
+    ghostStaticRouting->AddHostRouteTo(ueOverlayIp[i], ghostRoutedIfIndex);
 
     tapBridge.SetAttribute("DeviceName", StringValue(stationTapNames[i]));
     tapBridge.Install(ghostNodes.Get(i), ghostTapDevice);
