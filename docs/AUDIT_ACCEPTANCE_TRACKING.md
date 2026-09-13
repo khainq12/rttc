@@ -4173,6 +4173,43 @@ giản ngoài pipeline, KHÔNG phải chạy probe thật).
 `run_probe()`), `tests/test_ns3_docker_container_fleet_probe.py` (6
 test mới).
 
+### 13/09/2026 (tiếp) — Tính lại Graph/Join failures từ dữ liệu n=10 đã có (không cần chạy thêm)
+
+`compute_graph_join_failures()` áp dụng ngay lên `container_results/`
+đã lưu từ 40 lần chạy Bảng A (mục trước) — không cần chạy Docker mới:
+
+| RMW | Graph/Join failure rate (n=10) |
+|---|---|
+| **FleetRMW** | N/A (static mode, không chạy beacon, không có khái niệm "join") |
+| **CycloneDDS** | **100%** (10/10 lần, MỌI endpoint đều fail) |
+| **Zenoh** | **100%** (10/10 lần, MỌI endpoint đều fail) |
+| **Fast DDS** | **100%** (10/10 lần, MỌI endpoint đều fail) |
+
+Định nghĩa "fail" ở đây là NGHIÊM: endpoint phải thấy đủ CẢ 16 peer
+trong 15s mới tính "join thành công" — theo breakdown per-endpoint đã
+có ở mục n=1 trước, không endpoint nào (kể cả endpoint launch sớm nhất)
+từng thấy đủ 16/16 trong ngân sách này, nên failure_rate=100% ở CẢ 3
+RMW, CẢ 10 lần là chính xác, không phải lỗi tính toán. Đây là con số
+CỰC KỲ mạnh cho Bảng IV: ở quy mô 17 endpoint, không một RMW multicast-
+discovery chuẩn nào (Cyclone/Zenoh/FastDDS) từng đạt full graph
+convergence trong 15s, ở BẤT KỲ lần chạy nào trong 30 lần đã đo.
+
+**Bảng IV hoàn chỉnh (đủ 5 cột, n=10 nơi áp dụng được)**:
+
+| RMW | Discovery convergence (s) | Discovery bytes | CPU (%) | RSS (MB) | Graph/Join failures |
+|---|---|---|---|---|---|
+| FleetRMW | N/A (không có discovery) | 6,538 ± 181 | *chưa đo — chờ chạy* | *chưa đo — chờ chạy* | N/A |
+| CycloneDDS | ≥15s (censored, 10/10 chạm trần) | 1,126,381 ± 92,486 | *chưa đo* | *chưa đo* | **100%** |
+| Zenoh | ≥15s (censored, 10/10 chạm trần) | 364,535 ± 89,452 | *chưa đo* | *chưa đo* | **100%** |
+| Fast DDS | ≥15s (censored, 10/10 chạm trần) | 1,815,160 ± 455,078 | *chưa đo* | *chưa đo* | **100%** |
+
+Cột CPU/RSS cần chạy lại thật (code đã viết xong ở mục trước, đo mid-
+run qua `docker stats`) — CHƯA có số vì code này được thêm SAU 40 lần
+chạy n=10 đã có, cần 1 lượt chạy mới (40 lần nữa hoặc ít hơn nếu chỉ
+cần n nhỏ hơn để có ước lượng CPU/RSS, vì tài nguyên container thường
+ổn định hơn delivery_pct nhiều — có thể không cần tới n=10 để có số
+đáng tin).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
