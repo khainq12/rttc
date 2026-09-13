@@ -4857,6 +4857,63 @@ thiện hàng "5G" của Bảng V, đối chiếu trực tiếp với Wi-Fi/LAN 
 địa chỉ thứ 2 qua `EpcPgwApplication::SetUeAddress()`, route UE→Ghost
 tường minh, đổi giá trị in ra `FLEETQOX_NR_MAPPING`).
 
+### 13/09/2026 (tiếp) — Bảng V hàng "5G": chạy đủ N=8/16/32 x 4 phương thức x n=3 — phát hiện sập dung lượng theo quy mô rất rõ rệt
+
+Sau khi xác nhận kiến trúc ghost-node hoạt động đúng ở quy mô nhỏ (2
+endpoint), chạy đủ batch N=8/16/32 × {Fast DDS (discovery_server),
+CycloneDDS (static_peers), Zenoh (default), FleetRMW (static/default)}
+× n=3 — cùng phương pháp/tham số (`policy=fifo`, `seconds=3`,
+`start_offset_ms=2000`, `drain_s=10`, `sim_duration_s=30`) đã dùng cho
+2 hàng Wi-Fi/LAN, để so sánh trực tiếp được với nhau. Xác nhận riêng
+bằng thử nghiệm: tăng `sim_duration_s` từ 30 lên 90 ở N=16 cho kết quả
+**giống hệt** (n=51 gói đến, cùng giá trị latency chính xác tới phần
+thập phân) — chứng minh đây KHÔNG phải do thiếu thời gian chờ, mà gói
+tin bị RỚT THẬT ở lớp vô tuyến/MAC, không chỉ bị trễ.
+
+**Kết quả (delivery_pct = % trên tổng packet_rows mỗi lần chạy)**:
+
+| N | Fast DDS | CycloneDDS | Zenoh | FleetRMW |
+|---|---|---|---|---|
+| 8 | 23.6% (p50=4990ms) | **0%** | 34.1% (p50=5896ms) | 39.8% (p50=4437ms) |
+| 16 | **0%** | **0%** | **0%** | 1.9% (p50=9766ms) |
+| 32 | **0%** | **0%** | **0%** | **0%** |
+
+- **N=8**: cả 3/4 phương thức còn hoạt động được (CycloneDDS
+  static_peers vẫn 0% — khớp với phát hiện đã ghi nhận trước đó ở
+  profile LAN/Wi-Fi rằng cơ chế unicast-peers của CycloneDDS có chi phí
+  discovery O(N²), càng dễ sập khi latency nền đã cao sẵn như ở đây).
+- **N=16**: MỌI RMW cần discovery (Fast DDS/CycloneDDS/Zenoh) sập
+  HOÀN TOÀN (`graph_join_failures.failure_rate=1.0` cho cả 17
+  endpoint) — độ trễ một chiều đã ~9-10 giây (xem log FleetRMW cùng
+  quy mô), khiến bất kỳ handshake discovery nào cần round-trip trong
+  15s (`discovery_timeout_s`) đều không kịp hoàn tất. CHỈ FleetRMW
+  (static mode, không cần discovery) còn lọt qua được 1.9%.
+- **N=32**: sập HOÀN TOÀN với CẢ 4 phương thức, kể cả FleetRMW (0%) —
+  1 cell/1 bandwidth-part/numerology-1 dùng chung cho 32+1 UE đã vượt
+  quá dung lượng mà lớp MAC/scheduler mặc định của module `nr` có thể
+  phục vụ trong cửa sổ mô phỏng.
+
+**Ý nghĩa**: đây là phát hiện mạnh, nhất quán với những gì đã thấy ở
+CycloneDDS/Fast DDS khi tăng quy mô trên Wi-Fi — nhưng ở đây biên độ
+sập LỚN HƠN NHIỀU và xảy ra SỚM HƠN NHIỀU (ngay từ N=16 thay vì N=32).
+Nguyên nhân hợp lý nhất: cấu hình PHY dùng trong chương trình
+(`fleetqox_trace_replay_nr.cc`) là 1 gNB / 1 bandwidth part 20MHz /
+numerology 1 — một cấu hình "1 cell nhỏ" khá khiêm tốn so với triển
+khai 5G thật (nhiều BWP, carrier aggregation, scheduler tối ưu hơn
+round-robin mặc định). Đây KHÔNG phải bug — là hệ quả trực tiếp của
+việc chọn tham số PHY đơn giản, chưa tối ưu; nếu muốn kết quả 5G
+"khả quan" hơn ở N=16/32 cần đầu tư thêm việc tinh chỉnh
+bandwidth/numerology/scheduler — chưa làm trong lần chạy này.
+
+**Trạng thái Bảng V**: đủ cả 3 hàng Wi-Fi, LAN, 5G — có thể tổng hợp
+báo cáo đầy đủ. Task #49 (chạy N=8/16/32 x 4 phương thức x n=3) HOÀN
+THÀNH.
+
+**File liên quan**: kết quả thô tại
+`/tmp/.../scratchpad/bang5_nr_8_16_32_n3.jsonl` (36 dòng, không thuộc
+repo — script đo cũng ở scratchpad, không commit, theo đúng quy ước đã
+dùng cho các bảng đo trước).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
