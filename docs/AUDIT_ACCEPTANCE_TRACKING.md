@@ -4718,6 +4718,91 @@ nhỏ (2 endpoint) trước khi chạy batch N=8/16/32 cho Bảng V hàng "5G".
 **Trạng thái**: task viết chương trình mô phỏng 5G — hạ tầng code đã
 xong, CHƯA validate bằng chạy thật.
 
+### 13/09/2026 (tiếp) — Test quy mô nhỏ (2 endpoint) kiến trúc ghost-node: 2 bug thật đã sửa, 1 vấn đề gốc rễ về địa chỉ IP CHƯA giải quyết
+
+Theo yêu cầu "chạy đi, biên dịch thử quy mô nhỏ trước": biên dịch
+`fleetqox_trace_replay_nr.cc` trong image `jazzy-nr` — link thành công,
+chạy độc lập (không qua container) ở quy mô 2 trạm THÀNH CÔNG (tạo tap,
+gán IP overlay `7.0.0.2`/`7.0.0.3` đúng như dự đoán, không crash). Sau
+đó test qua TOÀN BỘ pipeline Docker-per-container thật
+(`run_nr_probe()`) — pipeline chạy hết không crash nhưng
+**`latency_stats_ms: null`** (0% gói tin đến nơi).
+
+**Bug #1 (đã sửa) — ARP chết**: gán địa chỉ IP gateway (172.16.i.1)
+trực tiếp lên CHÍNH thiết bị CSMA mà TapBridge dùng để bridge. Khi
+TapBridge bơm khung tin từ tap vào ns-3 bằng `SendFrom()` (mô phỏng
+"truyền" ra kênh), một NIC thật không bao giờ tự nhận lại khung tin nó
+vừa truyền — nên ngăn xếp Ipv4/ARP của Ghost (nằm trên CHÍNH thiết bị
+đó) không bao giờ thấy được gói ARP của container để trả lời. Xác nhận
+qua `ip neigh` báo `FAILED` và byte RX trên tap luôn = 0. **Sửa**: tách
+thành 2 thiết bị CSMA riêng biệt trên CÙNG 1 channel — 1 cái TapBridge
+gắn vào (không IP), 1 cái khác mang IP thật và xử lý ARP/routing.
+
+**Bug #2 (đã sửa) — SIGSEGV trong tiến trình `tap-creator`**: sau khi
+sửa bug #1, tiến trình con `tap-creator` (helper setuid tạo tap) crash
+với signal 11. Đọc trực tiếp source `ns-3.41`
+(`src/tap-bridge/model/tap-bridge.cc`) xác nhận: `CreateTap()` luôn
+gọi `ipv4->GetInterfaceForDevice(bridgedDevice)` bất cứ khi nào NODE có
+đối tượng Ipv4 (không kiểm tra riêng cho thiết bị được bridge) — trả về
+`-1` (tức `0xFFFFFFFF`) vì thiết bị TapBridge dùng không có Ipv4
+interface, rồi dùng chỉ số đó index thẳng vào mảng nội bộ của
+`Ipv4L3Protocol` → hỏng bộ nhớ → crash. **Sửa**: gán thêm 1 địa chỉ IP
+"giả" (không dùng thật, chỉ để thỏa mãn giả định này) cho thiết bị
+TapBridge dùng. Cũng đổi cách tạo 2 thiết bị từ
+`NodeContainer(node, node)` (gây crash y hệt, khả năng là code path
+chưa từng được test) sang 2 lệnh `Install()` riêng biệt trên cùng 1
+channel — pattern chuẩn, phổ biến của ns-3.
+
+**Xác nhận bằng UDP test trực tiếp**: ARP tới gateway giờ resolve
+thành công (`REACHABLE`). Dùng hook tạm thời vào trace source
+`Drop`/`Tx`/`Rx` của `Ipv4L3Protocol` (qua `Config::ConnectWithoutContext`
+— NS_LOG KHÔNG hoạt động vì image build ở chế độ Release, log bị strip
+lúc biên dịch) xác nhận: **gói tin ĐÃ đi đúng đường
+Ghost0→UE0→[sóng radio 5G mô phỏng]→UE1** (packet size=41 xuất hiện
+khớp ở cả TX của UE0 lẫn RX của UE1) — đây là xác nhận quan trọng rằng
+kiến trúc ghost-node + mô phỏng NR THỰC SỰ truyền được dữ liệu qua lại.
+
+**Vấn đề gốc rễ CHƯA giải quyết — xung đột mô hình địa chỉ IP**: sau
+khi UE1 nhận gói ở lớp radio, nó KHÔNG forward tiếp gói đó xuống Ghost1
+qua liên kết p2p — vì địa chỉ ĐÍCH của gói (`7.0.0.3`) trùng CHÍNH địa
+chỉ IP riêng mà EPC đã gán cho UE1 trên interface NR của nó. Với bất kỳ
+ngăn xếp IP nào, một gói tin gửi đến ĐÚNG địa chỉ của chính interface đó
+sẽ được giao "cục bộ" (local delivery) cho tầng ứng dụng của NODE đó,
+KHÔNG được forward tiếp — mà trên UE1 (node ns-3 thuần), không có ứng
+dụng nào lắng nghe cả nên gói tin bị "nuốt" âm thầm (không có Drop
+trace nào bắn ra, khớp với triệu chứng `rx=0` toàn bộ trước đó).
+
+Đây CHÍNH LÀ vấn đề mà router/CPE 5G thật giải quyết bằng NAT (WAN
+identity của CPE = IP do mạng cấp; LAN đằng sau CPE dùng địa chỉ khác,
+CPE dịch qua lại) — và ns-3 **không có module NAT** (đã xác nhận trước
+đó qua `pkg-config --list-all`). Không có cách nào để "địa chỉ overlay
+UE" vừa là danh tính định tuyến qua EPC, vừa để UE tự động forward tiếp
+xuống Ghost, nếu không có một lớp dịch địa chỉ (NAT) hoặc một ứng dụng
+relay tùy chỉnh chạy trên UE.
+
+**3 hướng đi khả thi tiếp theo** (chưa chọn, cần quyết định của
+người dùng):
+1. Viết một ứng dụng "relay" nhỏ chạy trên mỗi UE (nhận gói ở tầng cục
+   bộ qua raw socket, tự tay chuyển tiếp ra interface Ghost bằng socket
+   ràng buộc thiết bị cụ thể — bỏ qua bảng định tuyến chuẩn). Khối
+   lượng: vừa phải, nhưng cần cẩn thận về checksum/TTL/tránh vòng lặp.
+2. Đóng gói (tunnel) mọi gói tin thật trong 1 lớp UDP phụ, đích tới 1
+   cổng cố định trên UE — UE có 1 ứng dụng lắng nghe cổng đó, giải nén
+   rồi gửi tiếp cho Ghost qua liên kết p2p. Khối lượng: lớn hơn phương
+   án 1, đổi lại rõ ràng/dễ debug hơn.
+3. Rebuild ns-3 ở chế độ Debug (thêm NS_LOG thật) để điều tra xem
+   `NrPointToPointEpcHelper`/EPC có hỗ trợ gán CẢ MỘT SUBNET (không chỉ
+   1 địa chỉ /32) cho một UE hay không — nếu có, container thật có thể
+   dùng 1 subnet riêng sau UE mà không cần NAT/relay gì cả. Rủi ro: có
+   thể EPC helper không hỗ trợ, tốn thời gian điều tra mà không ra kết
+   quả.
+
+**Trạng thái**: 2 bug thật đã tìm và sửa (đã commit/push), xác nhận
+kiến trúc mạng lõi (ghost+CSMA+ARP+radio NR) hoạt động đúng — nhưng
+CHƯA có traffic thật đi trọn vẹn end-to-end. Việc viết nốt lớp giải
+quyết địa chỉ (NAT/relay) là công việc kỹ thuật MỚI, đáng kể, CHƯA bắt
+đầu — đang chờ quyết định hướng đi từ người dùng.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
