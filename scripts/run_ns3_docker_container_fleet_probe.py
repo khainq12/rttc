@@ -457,6 +457,52 @@ class ReferenceTopologyProbe:
         if "WIRE_NETWORK_OK" not in result.stdout:
             raise RuntimeError(f"network wiring failed:\n{result.stdout}\n{result.stderr}")
 
+    def wire_network_lan(self) -> None:
+        """Bảng V's "LAN" network profile -- the paper's own framing is
+        "network control: độ trễ thấp và ít mất gói" (low latency,
+        minimal loss), i.e. an IDEAL switched network, not a wifi/
+        cellular impairment model at all. Reuses ns3sim purely as a
+        bridge host (no ns-3 process ever runs for this profile -- no
+        tap devices, no per-station bridges, no propagation-loss model)
+        -- ONE shared Linux bridge, every endpoint's veth plugged
+        straight into it. This is real kernel-bridged Ethernet between
+        containers on the same host: negligible latency (sub-ms) and
+        zero loss barring genuine congestion, exactly the "control"
+        condition the paper wants LAN to represent."""
+        bridge_host_pid = container_pid(self.ns3sim_name)
+        commands: list[str] = [
+            "set -e",
+            f"nsenter -t {bridge_host_pid} -n -- ip link add name lanbr0 type bridge",
+            f"nsenter -t {bridge_host_pid} -n -- ip link set lanbr0 up",
+        ]
+        for i, endpoint in enumerate(self.endpoints):
+            endpoint_pid = container_pid(self.endpoint_container_names[i])
+            veth_bridge_side = f"vlan{i}br"
+            veth_endpoint_side = f"vlan{i}ep"
+            commands.extend(
+                [
+                    f"ip link add {veth_bridge_side} type veth peer name {veth_endpoint_side}",
+                    f"ip link set {veth_bridge_side} netns {bridge_host_pid}",
+                    f"ip link set {veth_endpoint_side} netns {endpoint_pid}",
+                    f"nsenter -t {bridge_host_pid} -n -- ip link set {veth_bridge_side} up",
+                    f"nsenter -t {bridge_host_pid} -n -- ip link set {veth_bridge_side} master lanbr0",
+                    f"nsenter -t {endpoint_pid} -n -- ip link set {veth_endpoint_side} name eth0",
+                    f"nsenter -t {endpoint_pid} -n -- ip link set eth0 address {station_mac(i)}",
+                    f"nsenter -t {endpoint_pid} -n -- ip addr add {self.ips[endpoint]}/24 dev eth0",
+                    f"nsenter -t {endpoint_pid} -n -- ip link set eth0 up",
+                    f"nsenter -t {endpoint_pid} -n -- ip link set lo up",
+                    # Same multicast-route fix as wire_network() -- needed
+                    # regardless of profile for any non-fleetqox RMW's
+                    # discovery (see that method's comment for the full
+                    # "Network is unreachable" trail).
+                    f"nsenter -t {endpoint_pid} -n -- ip route add 224.0.0.0/4 dev eth0",
+                ]
+            )
+        commands.append("echo WIRE_NETWORK_LAN_OK")
+        result = rigger_run(self.rigger_name, "\n".join(commands))
+        if "WIRE_NETWORK_LAN_OK" not in result.stdout:
+            raise RuntimeError(f"LAN network wiring failed:\n{result.stdout}\n{result.stderr}")
+
     def start_ns3(
         self,
         *,
@@ -1057,6 +1103,140 @@ def run_probe(
         # trạng thái quan sát ổn định") is a whole-fleet property -- the
         # graph isn't stable until its SLOWEST endpoint converges, same
         # reasoning as wait_for_ready_then_start()'s all-endpoints gate.
+        "discovery_convergence_max_s": (
+            max(discovery_convergence_samples_s) if discovery_convergence_samples_s else None
+        ),
+        "resource_usage": resource_usage,
+        "cpu_pct_mean": (sum(cpu_samples) / len(cpu_samples)) if cpu_samples else None,
+        "rss_mb_mean": (sum(rss_samples) / len(rss_samples)) if rss_samples else None,
+        "graph_join_failures": compute_graph_join_failures(endpoint_results),
+    }
+
+
+def run_lan_probe(
+    *,
+    image: str = DEFAULT_IMAGE,
+    output_dir: Path,
+    num_robots: int,
+    policy: str,
+    seconds: int,
+    seed: int,
+    start_offset_ms: float = 2000.0,
+    drain_s: float = 10.0,
+    discovery_timeout_s: float = 15.0,
+    static_mode: bool = True,
+    extra_rmw_env: dict[str, str] | None = None,
+    rmw_implementation: str = "rmw_fleetqox_cpp",
+    discovery_mode: str = "default",
+) -> dict[str, Any]:
+    """Bảng V's "LAN" network profile -- see wire_network_lan()'s
+    docstring for what this represents (an ideal switched network, no
+    wifi/cellular impairment at all). Deliberately a SEPARATE function
+    from run_probe() rather than a mode flag threaded through it: LAN
+    has no ns-3 process, no sim_duration_s/layout/circle_radius/
+    path_loss/tx_power/mobility knobs (none of those concepts apply
+    without a wifi PHY simulation), and no discovery_bytes_ftap0/ns3_log
+    (no tap device exists in this profile) -- forcing all of run_probe()'s
+    wifi-specific parameters to be silently ignored for this profile
+    would be more confusing than a parallel, deliberately smaller
+    function that only exposes what LAN actually has."""
+    output_dir = output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    run_id = output_dir.name.lstrip(".")
+    trace_path = output_dir / f"trace_ref_{num_robots}robot_seed{seed}.csv"
+    events = generate_trace_events(
+        scenario=f"ns3_docker_container_fleet_probe_lan_{num_robots}robot",
+        robots=num_robots,
+        seconds=seconds,
+        seed=seed,
+        capacity_bytes_per_second=max(200_000, num_robots * 6_000),
+        policies=(policy,),
+        include_non_sent=False,
+        merge_control_station=True,
+    )
+    packet_rows = write_simulator_csv(events, trace_path)
+    trace_container_path = f"/work/{trace_path.relative_to(ROOT)}"
+
+    endpoints = endpoint_list(num_robots)
+    effective_static_mode = static_mode and rmw_implementation == "rmw_fleetqox_cpp"
+    static_subscriptions = (
+        build_static_subscriptions(trace_path, policy, endpoints) if effective_static_mode else None
+    )
+    results_dir_container = f"{output_dir.relative_to(ROOT)}/container_results"
+    (ROOT / results_dir_container).mkdir(parents=True, exist_ok=True)
+
+    probe = ReferenceTopologyProbe(
+        run_id=run_id, image=image, num_robots=num_robots, output_dir=output_dir
+    )
+    ready_deadline_s = max(READY_DEADLINE_S, int(discovery_timeout_s) + 15)
+    start_wait_timeout_s = ready_deadline_s + 30
+    status = "ok"
+    error_text = ""
+    endpoint_results: dict[str, Any] = {}
+    resource_usage: dict[str, dict[str, float]] = {}
+    try:
+        probe.start_containers()
+        probe.wire_network_lan()
+        if rmw_implementation == "rmw_zenoh_cpp":
+            probe.start_zenoh_router()
+        if rmw_implementation == "rmw_fastrtps_cpp" and discovery_mode == "discovery_server":
+            probe.start_fastdds_discovery_server()
+        probe.launch_endpoints(
+            trace_container_path=trace_container_path,
+            policy=policy,
+            start_offset_ms=start_offset_ms,
+            drain_s=drain_s,
+            discovery_timeout_s=discovery_timeout_s,
+            static_mode=effective_static_mode,
+            static_subscriptions=static_subscriptions,
+            extra_rmw_env=extra_rmw_env,
+            results_dir_container=results_dir_container,
+            start_wait_timeout_s=start_wait_timeout_s,
+            rmw_implementation=rmw_implementation,
+            discovery_mode=discovery_mode,
+        )
+        probe.wait_for_ready_then_start(ready_deadline_s=ready_deadline_s)
+        # No sim_duration_s to time a mid-run sample against here (no
+        # ns-3 process) -- the real send window is the same
+        # start_offset_ms + seconds/2 as run_probe() uses, timed off the
+        # trace itself rather than any wifi-simulation runtime.
+        time.sleep(start_offset_ms / 1000.0 + max(seconds, 1) / 2.0)
+        resource_usage = probe.sample_resource_usage()
+        probe.wait_for_completion(
+            timeout_s=drain_s + start_offset_ms / 1000.0 + seconds + 60.0,
+            results_dir_container=results_dir_container,
+        )
+        endpoint_results = probe.collect_results(results_dir_container)
+    except Exception as exc:  # noqa: BLE001 -- report to caller, don't hide the traceback
+        status = "failed"
+        error_text = str(exc)
+    finally:
+        probe.teardown()
+
+    discovery_convergence_samples_s = [
+        result["discovery_convergence_s"]
+        for result in endpoint_results.values()
+        if result is not None and result.get("discovery_convergence_s") is not None
+    ]
+    cpu_samples = [v["cpu_pct"] for v in resource_usage.values()]
+    rss_samples = [v["rss_mb"] for v in resource_usage.values()]
+
+    return {
+        "schema_version": "fleetqox.ns3_docker_container_fleet_probe_lan.v1",
+        "network_profile": "LAN",
+        "status": status,
+        "error": error_text,
+        "trace": str(trace_path.relative_to(ROOT)),
+        "packet_rows": packet_rows,
+        "num_robots": num_robots,
+        "endpoints": endpoints,
+        "policy": policy,
+        "endpoint_results": endpoint_results,
+        "endpoint_results_complete": all(
+            endpoint_results.get(endpoint) is not None for endpoint in endpoints
+        ),
+        "latency_stats_ms": compute_latency_stats_ms(endpoint_results),
+        "jitter_stale_repair_stats": compute_jitter_stale_repair_stats(endpoint_results),
         "discovery_convergence_max_s": (
             max(discovery_convergence_samples_s) if discovery_convergence_samples_s else None
         ),

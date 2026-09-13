@@ -4541,6 +4541,63 @@ nhiên) — một hướng điều tra tiềm năng khác cho tương lai.
 `tests/test_ns3_docker_container_fleet_probe.py` (4 test mới,
 `ComputeJitterStaleRepairStatsTest`).
 
+### 13/09/2026 (tiếp) — Bảng V profile LAN: xây kịch bản mạng lý tưởng mới, phát hiện FleetRMW thua CẢ Fast DDS/CycloneDDS trên LAN
+
+Thêm `wire_network_lan()` + `run_lan_probe()`
+(`scripts/run_ns3_docker_container_fleet_probe.py`) — kịch bản mạng
+HOÀN TOÀN MỚI cho profile "LAN": KHÔNG dùng ns-3/wifi simulation nào cả,
+tái sử dụng container `ns3sim` thuần làm bridge host, mỗi endpoint nối
+thẳng veth vào 1 bridge Linux chung duy nhất — đúng tinh thần "network
+control, độ trễ thấp và ít mất gói" mà bài báo mô tả cho LAN, khác hẳn
+mô hình impairment wifi/5G. Xác nhận qua 12 lần chạy thật (4 method ×
+n=3, N=16) — không phải suy đoán.
+
+**BẢNG V — profile LAN (N=16, n=3)**:
+
+| Method | Profile | p50 (ms) | p95 (ms) | p99 (ms) | Jitter (ms) | Delivery ratio | Repair amp. | Stale ratio |
+|---|---|---|---|---|---|---|---|---|
+| Fast DDS | LAN | 376.1 | 1671.6 | 2147.7 | 616.4 | **86.3±0.0%** | N/A | 62.5% |
+| Cyclone DDS | LAN | 377.3 | 1672.7 | 2147.6 | 616.9 | **86.3±0.0%** | N/A | 62.6% |
+| Zenoh | LAN | 372.5 | 1749.1 | 2147.8 | 627.1 | 52.0±35.3% | N/A | 62.5% |
+| **Ours (FleetRMW)** | LAN | **698.7** | 1794.8 | 2203.3 | 605.2 | **65.8±0.1%** | 0.000 | **81.7%** |
+
+**So sánh trực tiếp Wi-Fi vs LAN (cùng N=16, cùng n=3, cùng method)**:
+
+| Method | Delivery Wi-Fi | Delivery LAN | Stale Wi-Fi | Stale LAN |
+|---|---|---|---|---|
+| Fast DDS | 48.4% | **86.3%** ↑ | 100% | **62.5%** ↓ |
+| Cyclone DDS | 0.0% | **86.3%** ↑↑↑ | — | **62.6%** |
+| Zenoh | 48.5% | 52.0% (≈, vẫn dao động mạnh) | 100% | 62.5% |
+| FleetRMW | 27.9% | **65.8%** ↑ | 99.0% | **81.7%** ↓ (nhưng vẫn CAO nhất) |
+
+**Phát hiện quan trọng, bất ngờ**: trên LAN lý tưởng (KHÔNG có nghẽn
+kênh, không mất gói do va chạm) — **FleetRMW (65.8%) THUA CẢ Fast
+DDS/CycloneDDS (86.3%)**, dù ở Wi-Fi FleetRMW từng vượt trội hơn hẳn 2
+RMW này (sập về 0-48%). Đây là bằng chứng TRỰC TIẾP cho phát hiện đã có
+TỪ RẤT SỚM trong investigation này (mục "đo timing thực tế: publish()
+của FleetRMW chậm hơn raw-UDP 6.4 lần"): khi kênh KHÔNG còn là nút thắt
+(LAN lý tưởng), nút thắt CHUYỂN sang chính overhead xử lý nội bộ của
+FleetRMW (mã hoá JSON, transport riêng) — p50 latency của FleetRMW trên
+LAN (698.7ms) cao gấp ~1.85 lần Fast DDS/Cyclone (376ms) dù mạng
+KHÔNG hề chậm hơn. Nói cách khác: **FleetRMW "thắng" ở Wi-Fi vì kênh
+nghẽn che khuất được phần chậm của chính nó, nhưng khi kênh không còn
+là vấn đề, chính processing overhead của FleetRMW lại trở thành nút
+thắt lớn nhất** — đúng hướng tối ưu mà `static_min_v1` (giảm kích thước
+gói) đã nhắm tới nhưng chưa đủ, có thể cần tối ưu CẢ tốc độ xử lý
+(encode/publish) chứ không chỉmicron kích thước gói.
+
+**Zenoh vẫn dao động cực mạnh ngay cả trên LAN lý tưởng** (11.4%-75.2%
+qua 3 lần) — xác nhận đây là đặc tính NỘI TẠI của Zenoh (có thể liên
+quan tới cơ chế phiên/heartbeat riêng), KHÔNG phải do kênh mạng bất ổn
+như giả thuyết ban đầu.
+
+**Trạng thái task #44: HOÀN THÀNH.**
+
+**File thay đổi**: `scripts/run_ns3_docker_container_fleet_probe.py`
+(`wire_network_lan()`, `run_lan_probe()`),
+`/tmp/.../scratchpad/lan_bang5_16robot_n3.py` (script đo, không thuộc
+repo).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
