@@ -4278,6 +4278,62 @@ so sánh ĐÚNG cùng mode (tĩnh vs tĩnh) giữa cả 4 RMW.
 trong `launch_endpoints()`, tham số `discovery_mode` xuyên suốt
 `run_probe()`/CLI).
 
+### 13/09/2026 (tiếp) — Kết quả n=3: Fast DDS ĐƯỢC CỨU đáng kể bởi discovery server, CycloneDDS KHÔNG được cứu bởi static peers — cần đính chính 1 phần kết luận trước đó
+
+Theo yêu cầu người dùng, chạy n=3 (dừng đúng ở n=3 theo yêu cầu, KHÔNG
+chạy tới n=10) cho cả 2 mode mới ở quy mô 17 endpoint:
+
+| Mode | Delivery (n=3, mean±stdev) | Vals | Graph/Join failure |
+|---|---|---|---|
+| CycloneDDS **static_peers** | **0.0 ± 0.0** | [0.0, 0.0, 0.0] | 100% cả 3 lần |
+| CycloneDDS **default** (đối chiếu, n=10 trước đó) | 0.0 ± 0.0 | 10/10 lần đều 0.0 | 100% |
+| Fast DDS **discovery_server** | **50.2 ± 9.1** | [40.0, 57.8, 52.7] | 100% cả 3 lần |
+| Fast DDS **default** (đối chiếu, n=10 trước đó) | 0.0 ± 0.0 | 10/10 lần đều 0.0 | 100% |
+
+**Kết luận — 2 RMW phản ứng HOÀN TOÀN TRÁI NGƯỢC với discovery tĩnh**:
+
+1. **CycloneDDS: KHÔNG được cứu.** Chuyển từ multicast SPDP sang unicast
+   Peers list tĩnh (tắt hoàn toàn multicast) KHÔNG thay đổi gì — vẫn
+   0.0% tuyệt đối ở cả 3 lần, y hệt mode mặc định. Đây là bằng chứng
+   TRỰC TIẾP: nút thắt của CycloneDDS ở quy mô 17 endpoint nằm ở tầng
+   DATA-PLANE (kênh vật lý bị bão hòa khi cố gắng truyền dữ liệu thật),
+   KHÔNG nằm ở cơ chế discovery — loại bỏ discovery overhead hoàn toàn
+   cũng không cứu được. Củng cố thêm giả thuyết cốt lõi của investigation
+   này.
+
+2. **Fast DDS: ĐƯỢC CỨU RÕ RỆT.** Từ 0.0% (mặc định, robust ở n=10)
+   nhảy lên trung bình 50.2% (n=3, dao động 40-58%, khá ổn định) chỉ nhờ
+   đổi sang discovery server tĩnh. **ĐÂY LÀ ĐÍNH CHÍNH QUAN TRỌNG** cho
+   kết luận trước đó ("Fast DDS cũng sập như CycloneDDS, củng cố giả
+   thuyết mọi DDS baseline đều sập ở quy mô lớn") — kết luận đó CHỈ ĐÚNG
+   với discovery mặc định của Fast DDS, KHÔNG PHẢI giới hạn cố hữu của
+   Fast DDS nói chung. Với discovery server tĩnh, Fast DDS hoạt động
+   tốt ngang hoặc hơn cả FleetRMW (24.8%) và gần bằng Zenoh mode mặc
+   định trước static-config (38.5%).
+
+3. **Điểm nghịch lý đáng chú ý**: `graph_join_failure_rate` (tiêu chí
+   NGHIÊM — phải thấy đủ CẢ 16 peer qua beacon) vẫn báo **100%** ở Fast
+   DDS discovery-server dù delivery đã cải thiện RẤT NHIỀU (0%→50%).
+   Nghĩa là: graph không hội tụ đầy đủ theo nghĩa "mọi node thấy mọi
+   node qua kênh beacon dùng chung", nhưng ĐÃ ĐỦ để các cặp giao tiếp
+   THẬT trong trace (chủ yếu control_station↔robot, không phải
+   robot↔robot) hoạt động được. Bài học phương pháp: chỉ số
+   "Graph/Join failures" (đo bằng beacon N-way) và "delivery_pct" (đo
+   bằng traffic thực của trace) là 2 GÓC NHÌN KHÁC NHAU, không suy ra
+   lẫn nhau — 100% join failure không đồng nghĩa với không hoạt động
+   được cho workload cụ thể.
+
+**Lưu ý cỡ mẫu**: n=3, KHÔNG phải n=10 như bảng so sánh default-mode
+trước đó — dừng đúng theo yêu cầu người dùng. CycloneDDS's 0.0%/0.0%
+stdev đã đủ mạnh để tin (giống hệt mức độ chắc chắn của n=10 default
+mode). Fast DDS's 50.2%±9.1% CẦN thêm rep (n=10) mới đủ tin cậy để đưa
+vào bài báo như con số cuối cùng — hiện tại chỉ nên coi là "có bằng
+chứng rõ ràng về cải thiện lớn", chưa phải "con số chính thức".
+
+**File liên quan**: `/tmp/.../scratchpad/static_modes_17endpoint_n10.py`
+(dừng ở n=3 theo yêu cầu, không thuộc repo), kết quả tại
+`results_rmw_socket/.static_modes_17endpoint_n10.json`.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
