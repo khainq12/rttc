@@ -4228,6 +4228,56 @@ FleetRMW/CycloneDDS) — phù hợp với việc 2 middleware này thường cõ
 theo runtime library đầy tính năng hơn (Zenoh's Rust runtime, Fast
 DDS's middleware stack).
 
+### 13/09/2026 (tiếp) — Thêm CycloneDDS static-peers + Fast DDS Discovery Server để so sánh CÙNG MODE với FleetRMW/Zenoh
+
+Người dùng chỉ ra đúng vấn đề: bảng so sánh hiện tại KHÔNG cùng mode —
+FleetRMW chạy static mode (không discovery), Zenoh chạy router + session
+config tĩnh (đã tối ưu), nhưng CycloneDDS và Fast DDS vẫn chạy discovery
+multicast MẶC ĐỊNH, không có biến thể tĩnh nào. Đã thêm code cho cả 2
+(CHƯA chạy — chờ tín hiệu "chạy"):
+
+**CycloneDDS static peers**: CycloneDDS hỗ trợ cấu hình `CYCLONEDDS_URI`
+trỏ tới file XML với `<AllowMulticast>false</AllowMulticast>` +
+`<Discovery><Peers>` liệt kê thẳng địa chỉ unicast của MỌI endpoint —
+tắt hoàn toàn multicast SPDP, buộc dùng danh sách peer tĩnh, cùng triết
+lý với static mode của FleetRMW. Viết file config riêng cho mỗi endpoint
+(nội dung giống nhau, liệt kê tất cả peer trừ chính nó — dù có để lẫn
+chính nó cũng vô hại, CycloneDDS tự bỏ qua).
+
+**Fast DDS Discovery Server**: xác nhận CLI `fastdds discovery` có sẵn
+trong image (`fastdds discovery --help` chạy được). Chạy 1 server
+(`fastdds discovery -i 0 -l <ip_control_station> -p 11811`) BÊN TRONG
+container `control_station` (cùng triết lý với router của Zenoh — không
+cần thêm 1 "trạm wifi" thứ 18 riêng), mọi endpoint (kể cả
+`control_station`) trỏ `ROS_DISCOVERY_SERVER=<ip>:11811` thay vì dùng
+Simple Discovery Protocol mặc định.
+
+**API mới**: tham số `discovery_mode` (`"default"` | `"static_peers"` |
+`"discovery_server"`) thêm vào `run_probe()`/`launch_endpoints()`/CLI
+(`--discovery-mode`). `static_peers` chỉ có tác dụng với
+`rmw_cyclonedds_cpp`, `discovery_server` chỉ có tác dụng với
+`rmw_fastrtps_cpp` — chọn sai kết hợp thì tham số này bị bỏ qua lặng lẽ
+(không phải lỗi, chỉ là không áp dụng được cho RMW đó).
+
+**Trạng thái**: code mới (`ReferenceTopologyProbe.start_fastdds_discovery_server()`,
+`fastdds_discovery_server_endpoint()`, nhánh CycloneDDS-XML trong
+`launch_endpoints()`), toàn bộ 19 test cũ vẫn PASS (không có test mới
+riêng cho phần này vì logic chủ yếu là lệnh docker/shell, khó unit-test
+có ý nghĩa mà không có Docker thật — sẽ verify bằng 1 lượt chạy nhỏ khi
+có tín hiệu "chạy"). Syntax-check sạch. CHƯA chạy qua Docker/ns-3 thật.
+
+**Kế hoạch verify khi được phép chạy**: chạy nhỏ (2-3 endpoint) cho mỗi
+mode mới trước, xác nhận CYCLONEDDS_URI/ROS_DISCOVERY_SERVER hoạt động
+đúng (delivery > 0%, tốt nhất gần bằng mức CycloneDDS/FastDDS default ở
+quy mô nhỏ ~82%), rồi mới chạy full 17-endpoint × nhiều rep để có bảng
+so sánh ĐÚNG cùng mode (tĩnh vs tĩnh) giữa cả 4 RMW.
+
+**File thay đổi**: `scripts/run_ns3_docker_container_fleet_probe.py`
+(`FASTDDS_DISCOVERY_SERVER_PORT`, `start_fastdds_discovery_server()`,
+`fastdds_discovery_server_endpoint()`, nhánh CycloneDDS-static-peers
+trong `launch_endpoints()`, tham số `discovery_mode` xuyên suốt
+`run_probe()`/CLI).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và

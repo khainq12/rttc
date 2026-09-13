@@ -82,6 +82,10 @@ RMW_PORT = 9100
 # read side by side.
 BASE_IP_PREFIX = "10.60.0."
 STATIC_SUBSCRIPTION_TYPE_NAME = "std_msgs/msg/String"
+# Fast DDS's own default discovery-server port (matches server id 0's
+# conventional port in its own CLI examples) -- arbitrary otherwise, just
+# needs to not collide with RMW_PORT/Zenoh's 7447 on the same station.
+FASTDDS_DISCOVERY_SERVER_PORT = 11811
 NS3_ATTACH_WAIT_S = 3
 # Confirmed empirically (see docs/AUDIT_ACCEPTANCE_TRACKING.md "kịch bản
 # mô phỏng theo sơ đồ tham chiếu") that run_ns3_docker_wifi_tap_rmw_probe.py's
@@ -459,6 +463,36 @@ class ReferenceTopologyProbe:
             log = docker("exec", control_station_name, "cat", log_path, check=False)
             raise RuntimeError(f"rmw_zenohd exited early:\n{log.stdout}\n{log.stderr}")
 
+    def fastdds_discovery_server_endpoint(self) -> str:
+        """control_station (endpoint index 0) also hosts the Fast DDS
+        discovery server -- same "run it on control_station instead of a
+        separate 18th station" reasoning as zenoh_router_endpoint()."""
+        return f"{self.ips[self.endpoints[0]]}:{FASTDDS_DISCOVERY_SERVER_PORT}"
+
+    def start_fastdds_discovery_server(self, log_path: str = "/tmp/fastdds_discovery_server.log") -> None:
+        """Fast DDS's static-config alternative to its default multicast
+        Simple Discovery Protocol -- a standalone `fastdds discovery`
+        server process every client points at via ROS_DISCOVERY_SERVER
+        instead of relying on multicast SPDP-equivalent announcements.
+        Confirmed present in this image via `fastdds discovery --help`
+        (part of the fastdds-tools package bundled with ROS 2 Jazzy's
+        Fast DDS). Run inside control_station like start_zenoh_router(),
+        started before any endpoint launches so it's already listening by
+        the time clients connect."""
+        control_station_name = self.endpoint_container_names[0]
+        server_ip = self.ips[self.endpoints[0]]
+        cmd = (
+            "source /opt/ros/jazzy/setup.bash && "
+            f"fastdds discovery -i 0 -l {server_ip} -p {FASTDDS_DISCOVERY_SERVER_PORT} "
+            f"> {log_path} 2>&1"
+        )
+        docker("exec", "-d", control_station_name, "bash", "-lc", cmd)
+        time.sleep(3)
+        check = docker("exec", control_station_name, "bash", "-lc", "pgrep -f 'fastdds discovery'", check=False)
+        if check.returncode != 0:
+            log = docker("exec", control_station_name, "cat", log_path, check=False)
+            raise RuntimeError(f"fastdds discovery server exited early:\n{log.stdout}\n{log.stderr}")
+
     def launch_endpoints(
         self,
         *,
@@ -473,6 +507,7 @@ class ReferenceTopologyProbe:
         results_dir_container: str,
         start_wait_timeout_s: float,
         rmw_implementation: str = "rmw_fleetqox_cpp",
+        discovery_mode: str = "default",
     ) -> None:
         docker("exec", self.rigger_name, "mkdir", "-p", f"/work/{results_dir_container}")
         self._ready_files = [f"{results_dir_container}/ready_{i}" for i in range(len(self.endpoints))]
@@ -537,6 +572,53 @@ class ReferenceTopologyProbe:
                             f"echo {shlex.quote(session_config)} > {session_config_path}",
                         )
                         env_prefix += f"ZENOH_SESSION_CONFIG_URI={session_config_path} "
+                if rmw_implementation == "rmw_cyclonedds_cpp" and discovery_mode == "static_peers":
+                    # Same "sidestep unreliable multicast discovery with a
+                    # static config" approach as rmw_fleetqox_cpp's static
+                    # mode and Zenoh's router+session-config above --
+                    # needed for a FAIR comparison (see
+                    # docs/AUDIT_ACCEPTANCE_TRACKING.md "so sánh cùng mode
+                    # discovery"): the earlier CycloneDDS/FastDDS baselines
+                    # ran with completely default multicast SPDP discovery
+                    # while FleetRMW and Zenoh both already got a static-
+                    # config variant, which isn't apples-to-apples.
+                    # AllowMulticast=false forces SPDP to rely SOLELY on
+                    # the explicit unicast Peers list below -- every
+                    # endpoint lists every OTHER endpoint's IP (including
+                    # itself is harmless, CycloneDDS just ignores a peer
+                    # that resolves to its own address).
+                    peer_xml = "".join(
+                        f'<Peer address="{self.ips[other]}"/>'
+                        for other in self.endpoints
+                        if other != endpoint
+                    )
+                    cyclonedds_config = (
+                        '<?xml version="1.0" encoding="UTF-8" ?>'
+                        '<CycloneDDS xmlns="https://cdds.io/config">'
+                        "<Domain><General><AllowMulticast>false</AllowMulticast></General>"
+                        f"<Discovery><Peers>{peer_xml}</Peers>"
+                        "<ParticipantIndex>auto</ParticipantIndex></Discovery>"
+                        "</Domain></CycloneDDS>"
+                    )
+                    cyclonedds_config_path = f"/tmp/cyclonedds_static_peers_{i}.xml"
+                    docker(
+                        "exec", self.endpoint_container_names[i], "bash", "-lc",
+                        f"echo {shlex.quote(cyclonedds_config)} > {cyclonedds_config_path}",
+                    )
+                    env_prefix += f"CYCLONEDDS_URI={cyclonedds_config_path} "
+                if rmw_implementation == "rmw_fastrtps_cpp" and discovery_mode == "discovery_server":
+                    # Fast DDS's own static-config answer to multicast
+                    # discovery -- a separate "fastdds discovery" server
+                    # process (see start_fastdds_discovery_server()) that
+                    # every client points at explicitly via
+                    # ROS_DISCOVERY_SERVER, instead of Simple Discovery
+                    # Protocol's default multicast announcements. Set for
+                    # EVERY endpoint including control_station itself --
+                    # the server is a separate OS process, not a ROS 2
+                    # node, so control_station's own endpoint process
+                    # still needs this env var to use it rather than
+                    # falling back to default multicast discovery.
+                    env_prefix += f"ROS_DISCOVERY_SERVER={self.fastdds_discovery_server_endpoint()} "
                 env_prefix += "".join(
                     f"{key}={value} " for key, value in (extra_rmw_env or {}).items()
                 )
@@ -737,6 +819,7 @@ def run_probe(
     mobility_speed: float = 0.0,
     num_aps: int = 1,
     rmw_implementation: str = "rmw_fleetqox_cpp",
+    discovery_mode: str = "default",
 ) -> dict[str, Any]:
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -795,6 +878,8 @@ def run_probe(
         )
         if rmw_implementation == "rmw_zenoh_cpp":
             probe.start_zenoh_router()
+        if rmw_implementation == "rmw_fastrtps_cpp" and discovery_mode == "discovery_server":
+            probe.start_fastdds_discovery_server()
         # Snapshot BEFORE any endpoint launches -- discovery/control-plane
         # traffic starts as soon as launch_endpoints() spawns the RMW
         # processes, so this is the true zero point for discovery_bytes.
@@ -811,6 +896,7 @@ def run_probe(
             results_dir_container=results_dir_container,
             start_wait_timeout_s=start_wait_timeout_s,
             rmw_implementation=rmw_implementation,
+            discovery_mode=discovery_mode,
         )
         probe.wait_for_ready_then_start(ready_deadline_s=ready_deadline_s)
         # Snapshot right as the shared start-gate releases -- by
@@ -907,6 +993,22 @@ def main() -> int:
         default="rmw_fleetqox_cpp",
         help="e.g. rmw_fleetqox_cpp (default, uses static_mode), rmw_cyclonedds_cpp, rmw_zenoh_cpp",
     )
+    parser.add_argument(
+        "--discovery-mode",
+        default="default",
+        choices=("default", "static_peers", "discovery_server"),
+        help=(
+            "default: each RMW's own out-of-the-box discovery (multicast "
+            "SPDP for Cyclone/FastDDS, Zenoh's own scouting+router as "
+            "already wired). static_peers: rmw_cyclonedds_cpp only -- "
+            "disables multicast, uses an explicit unicast Peers list "
+            "(CYCLONEDDS_URI), matching FleetRMW/Zenoh's own static-config "
+            "treatment for a fair comparison. discovery_server: "
+            "rmw_fastrtps_cpp only -- runs a `fastdds discovery` server on "
+            "control_station and points every client at it via "
+            "ROS_DISCOVERY_SERVER instead of default multicast discovery."
+        ),
+    )
     parser.add_argument("--summary-json", type=Path, default=None)
     args = parser.parse_args()
 
@@ -927,6 +1029,7 @@ def main() -> int:
         rx_sensitivity_dbm=args.rx_sensitivity_dbm,
         mobility_speed=args.mobility_speed,
         rmw_implementation=args.rmw_implementation,
+        discovery_mode=args.discovery_mode,
     )
     if args.summary_json:
         args.summary_json.parent.mkdir(parents=True, exist_ok=True)
