@@ -4803,6 +4803,60 @@ CHƯA có traffic thật đi trọn vẹn end-to-end. Việc viết nốt lớp 
 quyết địa chỉ (NAT/relay) là công việc kỹ thuật MỚI, đáng kể, CHƯA bắt
 đầu — đang chờ quyết định hướng đi từ người dùng.
 
+### 13/09/2026 (tiếp) — THÀNH CÔNG: traffic thật đi trọn vẹn end-to-end qua kiến trúc ghost-node 5G
+
+Theo hướng được chọn ("Rebuild ns-3 ở Debug + điều tra subnet-per-UE"):
+đọc trực tiếp source `src/lte/model/epc-pgw-application.cc` của
+ns-3.41 (không cần rebuild Debug — đọc source đủ trả lời câu hỏi) và
+xác nhận: `RecvFromTunDevice()` (hàm PGW quyết định gói downlink đi
+tới UE nào) tra cứu đích đến bằng **khớp CHÍNH XÁC** trong
+`m_ueInfoByAddrMap` (một `std::map<Ipv4Address, ...>` thường), được
+điền qua hàm CÔNG KHAI `EpcPgwApplication::SetUeAddress(imsi, addr)` —
+**không hỗ trợ subnet/prefix cho UE** như hướng đã chọn kỳ vọng.
+
+Nhưng phát hiện quan trọng hơn: **không có gì ngăn gọi
+`SetUeAddress()` LẦN THỨ HAI cho cùng 1 imsi với một địa chỉ KHÁC** —
+PGW sẽ tunnel gói cho CẢ HAI địa chỉ về đúng UE đó. Đây chính là lời
+giải cho vấn đề "UE tự nuốt gói vì trùng địa chỉ chính nó" (ghi nhận ở
+mục trước): đăng ký THÊM 1 địa chỉ "công khai" (`7.128.0.<i+1>`, một
+dải cố định nằm trong CÙNG pool `7.0.0.0/8` nhưng KHÔNG BAO GIỜ trùng
+với dải tự động của `AssignUeIpv4Address()`) làm đích hợp lệ thứ 2 cho
+UE đó — vì địa chỉ này KHÔNG được cấu hình trên chính interface của UE,
+ngăn xếp Ipv4 của UE sẽ KHÔNG coi đó là "của mình" nữa, mà tra bảng
+định tuyến — nơi ta thêm 1 route tường minh đẩy nó ra Ghost. Không cần
+patch lõi ns-3, không cần rebuild Debug.
+
+**Kết quả xác nhận bằng chạy thật (2 container, `run_nr_probe()`,
+`num_robots=1`)**:
+```
+"ue_overlay_ip": "7.128.0.1" (control_station), "7.128.0.2" (robot_0000)
+"latency_stats_ms": {"n": 170, "p50_ms": 271.6, "p95_ms": 1371.3, "p99_ms": 1410.8, "mean_ms": 476.8}
+delivery_pct ≈ 170/212 ≈ 80.2%
+```
+Đây là lần ĐẦU TIÊN traffic thật (FleetRMW/ROS2 chạy trong Docker
+container thật) đi trọn vẹn qua đường
+`Docker → TAP → Ghost(CSMA) → (P2P) → UE → gNB → EPC → UE → Ghost →
+TAP → Docker` với 5G-LENA mô phỏng sóng radio ở giữa.
+
+**Tổng kết 3 bug đã tìm và sửa cho profile 5G** (tất cả xác nhận bằng
+chạy thật, không suy đoán):
+1. ARP chết do IP gateway gắn cùng thiết bị mà TapBridge dùng để bridge
+   (SendFrom không tự "nghe lại" chính nó) → tách 2 thiết bị CSMA riêng
+   trên cùng 1 channel.
+2. SIGSEGV trong tiến trình `tap-creator` do thiết bị TapBridge dùng
+   không có Ipv4 interface (đọc source `tap-bridge.cc` xác nhận
+   `GetInterfaceForDevice()` trả về -1 rồi index thẳng vào mảng nội bộ)
+   → gán thêm 1 IP "giả" cho thiết bị đó.
+3. UE tự nuốt gói vì trùng địa chỉ EPC nội bộ của chính nó → đăng ký
+   thêm 1 địa chỉ "công khai" thứ 2 cho cùng UE qua `SetUeAddress()`.
+
+**Bước tiếp theo**: chạy lại ở quy mô lớn hơn (N=8/16/32) để hoàn
+thiện hàng "5G" của Bảng V, đối chiếu trực tiếp với Wi-Fi/LAN đã có.
+
+**File thay đổi**: `external/ns3/fleetqox_trace_replay_nr.cc` (đăng ký
+địa chỉ thứ 2 qua `EpcPgwApplication::SetUeAddress()`, route UE→Ghost
+tường minh, đổi giá trị in ra `FLEETQOX_NR_MAPPING`).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
