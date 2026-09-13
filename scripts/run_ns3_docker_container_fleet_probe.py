@@ -407,6 +407,36 @@ class ReferenceTopologyProbe:
         if result.returncode != 0:
             raise RuntimeError(f"ns-3 binary build failed:\n{result.stdout}\n{result.stderr}")
 
+    def build_ns3_nr_binary(self) -> None:
+        """NR counterpart to build_ns3_binary(), for Bảng V's "5G" profile
+        (external/ns3/fleetqox_trace_replay_nr.cc) -- links against the
+        jazzy-nr image's additional ns3-nr/ns3-antenna pkg-config modules
+        (see external/rmw-netem/Dockerfile.nr) instead of ns3-wifi: the
+        ghost-node architecture never touches a WifiNetDevice at all, only
+        Csma (ghost<->tap), point-to-point (ghost<->UE), and the nr
+        module's own gNB/UE/EPC devices."""
+        build_cmd = (
+            "set -e\n"
+            "g++ -std=c++17 external/ns3/fleetqox_trace_replay_nr.cc "
+            "-o /tmp/fleetqox_nr_bridge "
+            "$(pkg-config --cflags --libs ns3-core ns3-network ns3-internet "
+            "ns3-point-to-point ns3-csma ns3-mobility ns3-antenna "
+            "ns3-tap-bridge ns3-nr)\n"
+            # Same tap-creator baked-path symlink fix as build_ns3_binary()
+            # -- see that method's comment for the full history.
+            "TAPCREATOR_REAL=$(find /usr -iname '*tap-creator*' -type f 2>/dev/null | head -1)\n"
+            "TAPCREATOR_SO=$(find /usr -iname 'libns3*tap-bridge*' 2>/dev/null | head -1)\n"
+            "TAPCREATOR_BAKED=$(strings \"$TAPCREATOR_SO\" 2>/dev/null | "
+            "grep -E '/.*tap-creator$' | head -1)\n"
+            "if [ -n \"$TAPCREATOR_BAKED\" ] && [ ! -e \"$TAPCREATOR_BAKED\" ]; then\n"
+            "  mkdir -p \"$(dirname \"$TAPCREATOR_BAKED\")\" && "
+            "ln -sf \"$TAPCREATOR_REAL\" \"$TAPCREATOR_BAKED\"\n"
+            "fi\n"
+        )
+        result = docker("exec", self.ns3sim_name, "bash", "-lc", build_cmd, check=False)
+        if result.returncode != 0:
+            raise RuntimeError(f"ns-3 NR binary build failed:\n{result.stdout}\n{result.stderr}")
+
     def wire_network(self) -> None:
         """Cross-container equivalent of run_ns3_docker_wifi_tap_rmw_probe.py's
         build_shell_script per-station netns/tap/bridge loop -- same
@@ -503,6 +533,64 @@ class ReferenceTopologyProbe:
         if "WIRE_NETWORK_LAN_OK" not in result.stdout:
             raise RuntimeError(f"LAN network wiring failed:\n{result.stdout}\n{result.stderr}")
 
+    def wire_network_nr_l2(self) -> None:
+        """Bảng V's "5G" network profile, L2-only half of the wiring --
+        see fleetqox_trace_replay_nr.cc's module docstring for the full
+        ghost-node architecture. Same per-endpoint tap+bridge+veth
+        sequence as wire_network() (ns-3's TapBridge, Mode=UseLocal,
+        attaches to a PRE-created persistent tap by name rather than
+        creating an ephemeral one itself -- see wire_network()'s comment
+        and fleetqox_trace_replay_tap.cc's docstring for why), just with
+        an "n" prefix (nbr{i}/ntap{i}) to keep this profile's interface
+        names visually distinct from wire_network()'s wifi-profile
+        br{i}/ftap{i} in case both are ever debugged side by side.
+
+        Deliberately does NOT set each container's real 5G identity here
+        (no station_mac()-style MAC sync is needed either -- unlike
+        WifiNetDevice, CsmaNetDevice supports SendFrom/promiscuous mode
+        natively, so TapBridge's UseLocal mode works with NO MAC
+        synchronization trick at all, matching ns-3 core's own
+        examples/tap-csma-virtual-machine.cc reference pattern). Only
+        brings each container's eth0 up with a LINK-LOCAL address
+        (172.16.<i>.2/24, matching the ghost's own tap-facing CSMA
+        address 172.16.<i>.1/24 assigned by fleetqox_trace_replay_nr.cc's
+        ghostTapAddressHelper) -- enough for the container to reach its
+        own ghost and nothing else yet. The container's actual overlay
+        (EPC-assigned) IP is only known once ns-3 has actually run its
+        UE address-assignment step and printed FLEETQOX_NR_MAPPING (see
+        start_ns3_nr()), which necessarily happens AFTER this method,
+        so finishing the container's routing is a separate method
+        (finish_wire_network_nr()) called after that point."""
+        ns3_pid = container_pid(self.ns3sim_name)
+        commands: list[str] = ["set -e"]
+        for i, endpoint in enumerate(self.endpoints):
+            endpoint_pid = container_pid(self.endpoint_container_names[i])
+            veth_ns3_side = f"v{i}nr3"
+            veth_endpoint_side = f"v{i}nrep"
+            link_local_ip = f"172.16.{i}.2"
+            commands.extend(
+                [
+                    f"nsenter -t {ns3_pid} -n -- ip link add name nbr{i} type bridge",
+                    f"nsenter -t {ns3_pid} -n -- ip link set nbr{i} up",
+                    f"nsenter -t {ns3_pid} -n -- ip tuntap add dev ntap{i} mode tap",
+                    f"nsenter -t {ns3_pid} -n -- ip link set ntap{i} up",
+                    f"nsenter -t {ns3_pid} -n -- ip link set ntap{i} master nbr{i}",
+                    f"ip link add {veth_ns3_side} type veth peer name {veth_endpoint_side}",
+                    f"ip link set {veth_ns3_side} netns {ns3_pid}",
+                    f"ip link set {veth_endpoint_side} netns {endpoint_pid}",
+                    f"nsenter -t {ns3_pid} -n -- ip link set {veth_ns3_side} up",
+                    f"nsenter -t {ns3_pid} -n -- ip link set {veth_ns3_side} master nbr{i}",
+                    f"nsenter -t {endpoint_pid} -n -- ip link set {veth_endpoint_side} name eth0",
+                    f"nsenter -t {endpoint_pid} -n -- ip addr add {link_local_ip}/24 dev eth0",
+                    f"nsenter -t {endpoint_pid} -n -- ip link set eth0 up",
+                    f"nsenter -t {endpoint_pid} -n -- ip link set lo up",
+                ]
+            )
+        commands.append("echo WIRE_NETWORK_NR_L2_OK")
+        result = rigger_run(self.rigger_name, "\n".join(commands))
+        if "WIRE_NETWORK_NR_L2_OK" not in result.stdout:
+            raise RuntimeError(f"NR L2 network wiring failed:\n{result.stdout}\n{result.stderr}")
+
     def start_ns3(
         self,
         *,
@@ -532,6 +620,132 @@ class ReferenceTopologyProbe:
         if check.returncode != 0:
             log = docker("exec", self.ns3sim_name, "cat", log_path, check=False)
             raise RuntimeError(f"ns-3 tap-bridge process exited early:\n{log.stdout}\n{log.stderr}")
+
+    @staticmethod
+    def _parse_nr_mapping(log_text: str) -> dict[str, dict[str, str]]:
+        """Parse fleetqox_trace_replay_nr.cc's
+        "FLEETQOX_NR_MAPPING station_index,endpoint,tap_device,
+        ue_overlay_ip,ghost_link_local_ip" lines (one header + one per
+        endpoint)."""
+        mapping: dict[str, dict[str, str]] = {}
+        for line in log_text.splitlines():
+            if not line.startswith("FLEETQOX_NR_MAPPING "):
+                continue
+            fields = line[len("FLEETQOX_NR_MAPPING "):].split(",")
+            if len(fields) != 5 or fields[0] == "station_index":
+                continue
+            _, endpoint, tap_device, ue_overlay_ip, ghost_link_local_ip = fields
+            mapping[endpoint] = {
+                "tap_device": tap_device,
+                "ue_overlay_ip": ue_overlay_ip,
+                "ghost_link_local_ip": ghost_link_local_ip,
+            }
+        return mapping
+
+    def start_ns3_nr(
+        self,
+        *,
+        sim_duration_s: float,
+        circle_radius: float = 50.0,
+        numerology: int = 1,
+        central_frequency: float = 3.5e9,
+        bandwidth: float = 20e6,
+        gnb_tx_power_dbm: float = 35.0,
+        ue_tx_power_dbm: float = 23.0,
+        ns3_seed: int = 1,
+        ns3_run: int = 1,
+        log_path: str = "/tmp/ns3_nr.log",
+        mapping_wait_s: float = 60.0,
+    ) -> dict[str, dict[str, str]]:
+        """Starts fleetqox_trace_replay_nr.cc's compiled binary and blocks
+        until it has printed every endpoint's FLEETQOX_NR_MAPPING line.
+        Those lines are printed BEFORE Simulator::Run() is ever called
+        (EPC UE-address assignment and every ghost's TapBridge::Install()
+        both happen during setup, in that C++ file's main()), so this
+        returns well before sim_duration_s elapses -- mapping_wait_s=60 is
+        a generous ceiling for the one-time NR channel/spectrum model
+        initialization cost, not a reflection of how long that setup is
+        expected to actually take.
+
+        Returns {endpoint: {"tap_device", "ue_overlay_ip",
+        "ghost_link_local_ip"}}, consumed by finish_wire_network_nr() to
+        configure each real container's routing with its actual
+        EPC-assigned identity -- there is no way to precompute this IP;
+        it's assigned internally by NrPointToPointEpcHelper."""
+        cmd = (
+            f"/tmp/fleetqox_nr_bridge --numRobots={self.num_robots} --tapPrefix=ntap "
+            f"--simDuration={sim_duration_s:.12g} --circleRadius={circle_radius:.12g} "
+            f"--numerology={numerology} --centralFrequency={central_frequency:.12g} "
+            f"--bandwidth={bandwidth:.12g} --gnbTxPowerDbm={gnb_tx_power_dbm:.12g} "
+            f"--ueTxPowerDbm={ue_tx_power_dbm:.12g} "
+            f"--seed={ns3_seed} --run={ns3_run} > {log_path} 2>&1"
+        )
+        docker("exec", "-d", self.ns3sim_name, "bash", "-lc", cmd)
+        deadline = time.monotonic() + mapping_wait_s
+        mapping: dict[str, dict[str, str]] = {}
+        while time.monotonic() < deadline:
+            check = docker(
+                "exec", self.ns3sim_name, "bash", "-lc", "pgrep -f fleetqox_nr_bridge", check=False
+            )
+            if check.returncode != 0:
+                log = docker("exec", self.ns3sim_name, "cat", log_path, check=False)
+                raise RuntimeError(
+                    f"ns-3 NR bridge process exited early:\n{log.stdout}\n{log.stderr}"
+                )
+            log = docker("exec", self.ns3sim_name, "cat", log_path, check=False)
+            mapping = self._parse_nr_mapping(log.stdout)
+            if len(mapping) == len(self.endpoints):
+                return mapping
+            time.sleep(0.5)
+        raise TimeoutError(
+            f"timed out after {mapping_wait_s}s waiting for FLEETQOX_NR_MAPPING "
+            f"(got {len(mapping)}/{len(self.endpoints)} endpoints)"
+        )
+
+    def finish_wire_network_nr(self, mapping: dict[str, dict[str, str]]) -> None:
+        """Second half of the NR profile's container-side IP
+        configuration -- see wire_network_nr_l2()'s docstring for why
+        this can't happen until AFTER ns-3 has assigned + printed each
+        UE's real EPC overlay IP. For endpoint i: adds that overlay IP as
+        a /32 alias on eth0 (so Linux accepts it as a valid explicit
+        route "src"), then an explicit src-routed default route via the
+        ghost's link-local IP -- this forces all of this endpoint's
+        OUTBOUND traffic to carry its true 5G identity as source
+        regardless of eth0's own "natural" (link-local) address, without
+        needing NAT (confirmed unavailable -- no ns-3 NAT module found in
+        this image via `pkg-config --list-all`) or any subnet-matching
+        trick on the ghost's side (the ghost's own AddHostRouteTo,
+        already set up in the C++ file, routes by exact destination IP
+        regardless of subnet).
+
+        Also overwrites self.ips with each endpoint's real overlay IP --
+        every downstream call that reads self.ips (FLEETQOX_RMW_PEERS,
+        zenoh_router_endpoint(), fastdds_discovery_server_endpoint(), the
+        CycloneDDS static-peers XML) then transparently uses each
+        endpoint's true 5G address, no profile-specific branching needed
+        in launch_endpoints()."""
+        commands: list[str] = ["set -e"]
+        for i, endpoint in enumerate(self.endpoints):
+            endpoint_pid = container_pid(self.endpoint_container_names[i])
+            info = mapping[endpoint]
+            overlay_ip = info["ue_overlay_ip"]
+            ghost_ip = info["ghost_link_local_ip"]
+            commands.extend(
+                [
+                    f"nsenter -t {endpoint_pid} -n -- ip addr add {overlay_ip}/32 dev eth0",
+                    f"nsenter -t {endpoint_pid} -n -- ip route replace default via {ghost_ip} "
+                    f"dev eth0 src {overlay_ip}",
+                    # Same multicast-route fix as wire_network()/
+                    # wire_network_lan() -- needed for any non-fleetqox
+                    # RMW's discovery.
+                    f"nsenter -t {endpoint_pid} -n -- ip route add 224.0.0.0/4 dev eth0",
+                ]
+            )
+        commands.append("echo WIRE_NETWORK_NR_IP_OK")
+        result = rigger_run(self.rigger_name, "\n".join(commands))
+        if "WIRE_NETWORK_NR_IP_OK" not in result.stdout:
+            raise RuntimeError(f"NR IP routing setup failed:\n{result.stdout}\n{result.stderr}")
+        self.ips = {endpoint: mapping[endpoint]["ue_overlay_ip"] for endpoint in self.endpoints}
 
     def zenoh_router_endpoint(self) -> str:
         """control_station (endpoint index 0) is where start_zenoh_router()
@@ -1235,6 +1449,182 @@ def run_lan_probe(
         "endpoint_results_complete": all(
             endpoint_results.get(endpoint) is not None for endpoint in endpoints
         ),
+        "latency_stats_ms": compute_latency_stats_ms(endpoint_results),
+        "jitter_stale_repair_stats": compute_jitter_stale_repair_stats(endpoint_results),
+        "discovery_convergence_max_s": (
+            max(discovery_convergence_samples_s) if discovery_convergence_samples_s else None
+        ),
+        "resource_usage": resource_usage,
+        "cpu_pct_mean": (sum(cpu_samples) / len(cpu_samples)) if cpu_samples else None,
+        "rss_mb_mean": (sum(rss_samples) / len(rss_samples)) if rss_samples else None,
+        "graph_join_failures": compute_graph_join_failures(endpoint_results),
+    }
+
+
+DEFAULT_NR_IMAGE = "localhost/fleetrmw/rmw-netem:jazzy-nr"
+
+
+def run_nr_probe(
+    *,
+    image: str = DEFAULT_NR_IMAGE,
+    output_dir: Path,
+    num_robots: int,
+    policy: str,
+    seconds: int,
+    seed: int,
+    sim_duration_s: float = 30.0,
+    start_offset_ms: float = 2000.0,
+    drain_s: float = 10.0,
+    discovery_timeout_s: float = 15.0,
+    static_mode: bool = True,
+    extra_rmw_env: dict[str, str] | None = None,
+    ns3_seed: int = 1,
+    ns3_run: int = 1,
+    circle_radius: float = 50.0,
+    numerology: int = 1,
+    central_frequency: float = 3.5e9,
+    bandwidth: float = 20e6,
+    gnb_tx_power_dbm: float = 35.0,
+    ue_tx_power_dbm: float = 23.0,
+    rmw_implementation: str = "rmw_fleetqox_cpp",
+    discovery_mode: str = "default",
+) -> dict[str, Any]:
+    """Bảng V's "5G" network profile -- see fleetqox_trace_replay_nr.cc's
+    module docstring for the full ghost-node architecture rationale. Uses
+    the SEPARATE jazzy-nr image (DEFAULT_NR_IMAGE), not the base :jazzy
+    image every other profile uses -- only that image has the nr contrib
+    module built in (see external/rmw-netem/Dockerfile.nr).
+
+    Structurally closest to run_probe() (wifi) rather than run_lan_probe():
+    like wifi, this profile has a real ns-3 process, a tap device per
+    endpoint, and an ns3_log -- but the network wiring is split into TWO
+    phases (wire_network_nr_l2() then, only after ns-3 has assigned and
+    printed real UE overlay IPs, finish_wire_network_nr()) instead of
+    wifi's single wire_network() call before start_ns3(), because unlike
+    wifi's scheme (IPs chosen up front by this script itself), each
+    endpoint's real 5G address is assigned INTERNALLY by ns-3's EPC
+    helper and only known once ns-3 actually starts running."""
+    output_dir = output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    run_id = output_dir.name.lstrip(".")
+    trace_path = output_dir / f"trace_ref_{num_robots}robot_seed{seed}.csv"
+    events = generate_trace_events(
+        scenario=f"ns3_docker_container_fleet_probe_nr_{num_robots}robot",
+        robots=num_robots,
+        seconds=seconds,
+        seed=seed,
+        capacity_bytes_per_second=max(200_000, num_robots * 6_000),
+        policies=(policy,),
+        include_non_sent=False,
+        merge_control_station=True,
+    )
+    packet_rows = write_simulator_csv(events, trace_path)
+    trace_container_path = f"/work/{trace_path.relative_to(ROOT)}"
+
+    endpoints = endpoint_list(num_robots)
+    effective_static_mode = static_mode and rmw_implementation == "rmw_fleetqox_cpp"
+    static_subscriptions = (
+        build_static_subscriptions(trace_path, policy, endpoints) if effective_static_mode else None
+    )
+    results_dir_container = f"{output_dir.relative_to(ROOT)}/container_results"
+    (ROOT / results_dir_container).mkdir(parents=True, exist_ok=True)
+
+    probe = ReferenceTopologyProbe(
+        run_id=run_id, image=image, num_robots=num_robots, output_dir=output_dir
+    )
+    ready_deadline_s = max(READY_DEADLINE_S, int(discovery_timeout_s) + 15)
+    start_wait_timeout_s = ready_deadline_s + 30
+    status = "ok"
+    error_text = ""
+    endpoint_results: dict[str, Any] = {}
+    ns3_log_text = ""
+    resource_usage: dict[str, dict[str, float]] = {}
+    nr_mapping: dict[str, dict[str, str]] = {}
+    try:
+        probe.start_containers()
+        probe.build_ns3_nr_binary()
+        probe.wire_network_nr_l2()
+        nr_mapping = probe.start_ns3_nr(
+            sim_duration_s=sim_duration_s,
+            circle_radius=circle_radius,
+            numerology=numerology,
+            central_frequency=central_frequency,
+            bandwidth=bandwidth,
+            gnb_tx_power_dbm=gnb_tx_power_dbm,
+            ue_tx_power_dbm=ue_tx_power_dbm,
+            ns3_seed=ns3_seed,
+            ns3_run=ns3_run,
+        )
+        probe.finish_wire_network_nr(nr_mapping)
+        # From here on, probe.ips holds each endpoint's REAL EPC overlay
+        # IP (finish_wire_network_nr() overwrote it) -- every downstream
+        # call below reads probe.ips exactly like the wifi/LAN profiles
+        # do, no NR-specific branching needed in launch_endpoints().
+        if rmw_implementation == "rmw_zenoh_cpp":
+            probe.start_zenoh_router()
+        if rmw_implementation == "rmw_fastrtps_cpp" and discovery_mode == "discovery_server":
+            probe.start_fastdds_discovery_server()
+        probe.launch_endpoints(
+            trace_container_path=trace_container_path,
+            policy=policy,
+            start_offset_ms=start_offset_ms,
+            drain_s=drain_s,
+            discovery_timeout_s=discovery_timeout_s,
+            static_mode=effective_static_mode,
+            static_subscriptions=static_subscriptions,
+            extra_rmw_env=extra_rmw_env,
+            results_dir_container=results_dir_container,
+            start_wait_timeout_s=start_wait_timeout_s,
+            rmw_implementation=rmw_implementation,
+            discovery_mode=discovery_mode,
+        )
+        probe.wait_for_ready_then_start(ready_deadline_s=ready_deadline_s)
+        # Same mid-send-window timing rationale as run_probe()/
+        # run_lan_probe() -- start_offset_ms + seconds/2 after the shared
+        # start gate, NOT scaled by sim_duration_s (unrelated to how long
+        # the actual trace replay takes).
+        time.sleep(start_offset_ms / 1000.0 + max(seconds, 1) / 2.0)
+        resource_usage = probe.sample_resource_usage()
+        probe.wait_for_completion(
+            timeout_s=sim_duration_s + drain_s + start_offset_ms / 1000.0 + 60.0,
+            results_dir_container=results_dir_container,
+        )
+        endpoint_results = probe.collect_results(results_dir_container)
+        ns3_log_text = probe.ns3_log(log_path="/tmp/ns3_nr.log")
+    except Exception as exc:  # noqa: BLE001 -- report to caller, don't hide the traceback
+        status = "failed"
+        error_text = str(exc)
+        try:
+            ns3_log_text = probe.ns3_log(log_path="/tmp/ns3_nr.log")
+        except Exception:  # noqa: BLE001
+            pass
+    finally:
+        probe.teardown()
+
+    discovery_convergence_samples_s = [
+        result["discovery_convergence_s"]
+        for result in endpoint_results.values()
+        if result is not None and result.get("discovery_convergence_s") is not None
+    ]
+    cpu_samples = [v["cpu_pct"] for v in resource_usage.values()]
+    rss_samples = [v["rss_mb"] for v in resource_usage.values()]
+
+    return {
+        "schema_version": "fleetqox.ns3_docker_container_fleet_probe_nr.v1",
+        "network_profile": "5G",
+        "status": status,
+        "error": error_text,
+        "trace": str(trace_path.relative_to(ROOT)),
+        "packet_rows": packet_rows,
+        "num_robots": num_robots,
+        "endpoints": endpoints,
+        "policy": policy,
+        "endpoint_results": endpoint_results,
+        "endpoint_results_complete": all(
+            endpoint_results.get(endpoint) is not None for endpoint in endpoints
+        ),
+        "ns3_log": ns3_log_text,
+        "nr_mapping": nr_mapping,
         "latency_stats_ms": compute_latency_stats_ms(endpoint_results),
         "jitter_stale_repair_stats": compute_jitter_stale_repair_stats(endpoint_results),
         "discovery_convergence_max_s": (

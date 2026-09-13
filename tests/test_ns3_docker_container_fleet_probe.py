@@ -7,6 +7,7 @@ from scripts.run_ns3_docker_container_fleet_probe import (
     BASE_IP_PREFIX,
     RMW_PORT,
     STATIC_SUBSCRIPTION_TYPE_NAME,
+    ReferenceTopologyProbe,
     build_static_subscriptions,
     compute_graph_join_failures,
     compute_jitter_stale_repair_stats,
@@ -224,6 +225,47 @@ class ParseDockerMemUsageMbTest(unittest.TestCase):
     def test_rejects_unrecognized_format(self):
         with self.assertRaises(ValueError):
             parse_docker_mem_usage_mb("not a mem string")
+
+
+class ParseNrMappingTest(unittest.TestCase):
+    """fleetqox_trace_replay_nr.cc's FLEETQOX_NR_MAPPING lines are the
+    only channel through which the orchestrator learns each endpoint's
+    real EPC-assigned overlay IP (see ReferenceTopologyProbe.start_ns3_nr()/
+    finish_wire_network_nr()) -- worth a direct unit test independent of
+    any actual ns-3 run."""
+
+    def test_parses_mapping_lines_ignoring_header_and_noise(self):
+        log_text = (
+            "some ns-3 setup noise\n"
+            "FLEETQOX_NR_MAPPING station_index,endpoint,tap_device,ue_overlay_ip,"
+            "ghost_link_local_ip\n"
+            "FLEETQOX_NR_MAPPING 0,control_station,ntap0,7.0.0.2,172.16.0.1\n"
+            "FLEETQOX_NR_MAPPING 1,robot_0000,ntap1,7.0.0.3,172.16.1.1\n"
+            "more noise after\n"
+        )
+        mapping = ReferenceTopologyProbe._parse_nr_mapping(log_text)
+        self.assertEqual(
+            mapping,
+            {
+                "control_station": {
+                    "tap_device": "ntap0",
+                    "ue_overlay_ip": "7.0.0.2",
+                    "ghost_link_local_ip": "172.16.0.1",
+                },
+                "robot_0000": {
+                    "tap_device": "ntap1",
+                    "ue_overlay_ip": "7.0.0.3",
+                    "ghost_link_local_ip": "172.16.1.1",
+                },
+            },
+        )
+
+    def test_empty_log_gives_empty_mapping(self):
+        self.assertEqual(ReferenceTopologyProbe._parse_nr_mapping(""), {})
+
+    def test_malformed_line_is_skipped(self):
+        log_text = "FLEETQOX_NR_MAPPING 0,control_station,ntap0,7.0.0.2\n"  # missing a field
+        self.assertEqual(ReferenceTopologyProbe._parse_nr_mapping(log_text), {})
 
 
 class ConstantsTest(unittest.TestCase):
