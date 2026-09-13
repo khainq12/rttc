@@ -4349,6 +4349,67 @@ chứng rõ ràng về cải thiện lớn", chưa phải "con số chính thứ
 (dừng ở n=3 theo yêu cầu, không thuộc repo), kết quả tại
 `results_rmw_socket/.static_modes_17endpoint_n10.json`.
 
+### 13/09/2026 (tiếp) — Bảng IV đủ 3 quy mô (8/16/32 robot); phát hiện + sửa bug CycloneDDS static-peers "cô lập hoàn toàn"; kết luận cuối về static-peers ở mọi quy mô
+
+**Bug tìm được**: khi chạy N=8/32 robot lần đầu để điền đủ 3 quy mô
+Bảng IV, CycloneDDS static-peers cho **0.0% ở CẢ N=8 lẫn N=32** — đáng
+ngờ vì N=8 (9 endpoint) là quy mô nhỏ, CycloneDDS mặc định từng đạt
+82.7% ở quy mô tương đương (7 endpoint) trong investigation trước. Kiểm
+tra log endpoint phát hiện: **mọi endpoint chỉ thấy ĐÚNG beacon của
+chính mình** (`beacon_raw_seen_sample` toàn tên chính nó), `tx=1066
+rx=0` — cô lập hoàn toàn, không phải do quy mô. Nguyên nhân: cấu hình
+`CYCLONEDDS_URI` dùng `<ParticipantIndex>auto</ParticipantIndex>` kết
+hợp Peers không có port — mỗi participant tự chọn "auto" độc lập, không
+đảm bảo TẤT CẢ đều hội tụ về participant-index 0 (port SPDP mặc định mà
+Peers không-port giả định), nên các peer treo tìm nhau ở port sai. **Fix
+đúng: cố định `<ParticipantIndex>0</ParticipantIndex>`** — mọi container
+đều dùng đúng 1 index, khớp giả định port ngầm của Peers. Xác nhận fix
+đúng ở quy mô 2 robot: delivery từ 0%→**82.3%**, khớp CHÍNH XÁC baseline
+CycloneDDS mặc định đã biết.
+
+**Sau khi fix, đo lại đầy đủ 3 quy mô (n=3 mỗi ô)**:
+
+| N robot | Fast DDS | CycloneDDS (đã fix) | Zenoh | FleetRMW (Ours) |
+|---|---|---|---|---|
+| 8 | **100.0 ± 0.0** | **0.0 ± 0.0** | 37.1 ± 31.4 | 41.1 ± 6.9 |
+| 16 | (xem mục "n=10" trước, mặc định=0.0±0.0) | **0.0 ± 0.0** (đo lại 3 lần, đều 0%, `peers_seen=0/16` MỌI endpoint) | (n=10: 38.5±18.3) | (n=10: 24.8±5.5) |
+| 32 | **0.0 ± 0.0** | **0.0 ± 0.0** | **0.0 ± 0.0** | 10.0 ± 1.3 |
+
+**Kết luận cuối (đã CONFIRMED, không còn nghi ngờ do bug)**: CycloneDDS
+static-peers **sập ở MỌI quy mô từ 8 robot trở lên** — kể cả N=8, quy mô
+mà Fast DDS discovery-server đạt 100% và chính FleetRMW đạt 41%. Ranh
+giới "còn hoạt động" nằm đâu đó giữa N=2 (82.3%, xác nhận) và N=8 (0%,
+xác nhận) — CHƯA xác định chính xác (chưa thử N=4, N=6). Cơ chế nghi
+vấn: danh sách Peer unicast tường minh có chi phí O(N²) tổng (mỗi trong
+N node phải tự gửi thông báo riêng tới N-1 node còn lại theo chu kỳ),
+tệ hơn hẳn 1 lần multicast O(N) — nếu đúng, đây là hạn chế CẤU TRÚC của
+cách tiếp cận "static unicast peers" cho CycloneDDS ở quy mô fleet, chứ
+không phải lỗi cấu hình (đã loại trừ) và cũng không hẳn là "channel
+saturation" giống cơ chế discovery-multicast đã biết trước đây — là 1
+cơ chế collapse RIÊNG, đáng để phân biệt trong bài báo.
+
+**Lưu ý cho Bảng IV chính (mục "Bảng IV hoàn chỉnh" phía trên)**: dòng
+CycloneDDS N=16 trong bảng đó (đo trước khi tìm ra bug) đã ĐÚNG về giá
+trị số (0.0%) một cách TÌNH CỜ — nhưng lý do đưa ra khi đó ("chứng minh
+nghẽn ở data-plane, discovery không phải nguyên nhân") KHÔNG ĐÁNG TIN
+vì đo bằng config lỗi. Sau khi đo lại bằng config ĐÚNG, kết luận 0% vẫn
+đứng vững — nhưng cơ chế đúng có thể là "unicast peer list tự nó không
+scale" thay vì "vẫn nghẽn data-plane dù bỏ discovery". Cả 2 cơ chế đều
+dẫn tới cùng kết quả observable, nhưng khác nhau về Ý NGHĨA — với cơ chế
+thật (unicast không scale), câu trả lời "loại bỏ multicast không cứu
+được CycloneDDS" vẫn đúng, chỉ là LÝ DO khác đi.
+
+**CPU/RSS/Discovery bytes ở N=8/N=32 (n=3, cùng bảng)**:
+
+| | Fast DDS N=8 | Cyclone N=8 | Zenoh N=8 | FleetRMW N=8 | Fast DDS N=32 | Cyclone N=32 | Zenoh N=32 | FleetRMW N=32 |
+|---|---|---|---|---|---|---|---|---|
+| Discovery bytes | 1,953,889 | 324,049 | 254,928 | 1,797 | 1,783,367 | 355,467 | 331,669 | 5,637 |
+| CPU % | 7.84 | 13.82 | 6.57 | 10.38 | 2.44 | 12.81 | 2.00 | 8.42 |
+| RSS MB | 44.2 | 38.3 | 48.6 | 38.4 | 42.3 | 37.5 | 38.8 | 37.5 |
+
+**File liên quan**: `/tmp/.../scratchpad/bang4_8_32robot_n3.py`,
+`/tmp/.../scratchpad/cyclone_static_n16_refix.py` (không thuộc repo).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và

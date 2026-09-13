@@ -597,7 +597,22 @@ class ReferenceTopologyProbe:
                         '<CycloneDDS xmlns="https://cdds.io/config">'
                         "<Domain><General><AllowMulticast>false</AllowMulticast></General>"
                         f"<Discovery><Peers>{peer_xml}</Peers>"
-                        "<ParticipantIndex>auto</ParticipantIndex></Discovery>"
+                        # Fixed 0, NOT "auto" -- confirmed via a real run
+                        # that "auto" causes TOTAL cross-participant
+                        # isolation (every endpoint only ever received its
+                        # own beacon loopback, 0 messages from anyone else,
+                        # tx=1066/rx=0 -- not a scale/capacity issue, a
+                        # config bug). A bare "address=<ip>" Peer entry
+                        # (no port) tells CycloneDDS to assume that peer is
+                        # listening at participant-index-0's SPDP port; if
+                        # each container's own participant also resolved
+                        # "auto" to index 0 that assumption should hold, but
+                        # empirically it didn't -- pinning every container
+                        # to the SAME explicit index removes the ambiguity
+                        # "auto" left open. See
+                        # docs/AUDIT_ACCEPTANCE_TRACKING.md "CycloneDDS
+                        # static-peers total isolation bug".
+                        "<ParticipantIndex>0</ParticipantIndex></Discovery>"
                         "</Domain></CycloneDDS>"
                     )
                     cyclonedds_config_path = f"/tmp/cyclonedds_static_peers_{i}.xml"
