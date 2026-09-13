@@ -3690,6 +3690,72 @@ cần coi là chưa xác định.
 `FLEETQOX_WIFI_STATS` ở `fleetqox_trace_replay_tap.cc` — hiện đang
 workaround bằng regex ở tầng script đo lường, không phải sửa gốc.
 
+### 13/09/2026 (tiếp) — Escalation cuối cùng lên n=10: ĐẠT ý nghĩa thống kê, nhưng kèm phát hiện bất đối xứng độ ổn định quan trọng
+
+Theo yêu cầu người dùng ("chạy lại và cho tôi 1 bảng nhất quán"), tiếp
+tục chạy thêm paired run trên CÙNG script/kịch bản (17 endpoint,
+`ns3_run` 1-10, đảo thứ tự chạy mỗi cặp), tăng dần n=3 → n=6 → n=10, để
+xem liệu khoảng tin cậy có hội tụ hay không, dừng dứt điểm ở n=10 (điểm
+dừng đã định trước để tránh "đào tiếp mãi tới khi có ý nghĩa" — một
+dạng p-hacking nếu không có ngưỡng dừng rõ ràng).
+
+**Bảng đầy đủ 10 cặp (delivery_pct, %, 17 endpoint, cùng trace/seed)**:
+
+| run | FleetRMW | Zenoh | Δ (zenoh−fleetqox) |
+|---|---|---|---|
+| 1 | 31.1 | 30.3 | −0.9 |
+| 2 | 17.6 | 67.4 | +49.7 |
+| 3 | 29.0 | 57.8 | +28.7 |
+| 4 | 20.8 | 7.9 | −12.9 |
+| 5 | 26.0 | 33.9 | +7.9 |
+| 6 | 26.7 | 82.2 | +55.5 |
+| 7 | 23.9 | 95.9 | +72.0 |
+| 8 | 23.3 | 45.0 | +21.7 |
+| 9 | 23.8 | 19.7 | −4.0 |
+| 10 | 15.2 | 55.9 | +40.7 |
+
+- FleetRMW: n=10, **mean=23.7%, stdev≈4.9pp** (rất ổn định, dao động
+  trong khoảng hẹp 15.2%-31.1%)
+- Zenoh: n=10, **mean=49.6%, stdev≈27.7pp** (dao động RẤT MẠNH, khoảng
+  7.9%-95.9% — biên độ hơn 12 lần)
+- **Paired delta (zenoh − fleetqox): mean=+25.85pp, stdev=28.40,
+  95% CI = [+5.53, +46.16]** — **LẦN ĐẦU TIÊN khoảng tin cậy KHÔNG còn
+  chứa số 0** kể từ khi bắt đầu đo paired (n=3 và n=6 đều chứa số 0).
+
+**Kết luận cuối cùng (dừng escalation tại đây)**: với n=10, có đủ bằng
+chứng thống kê để nói **Zenoh giao tin trung bình cao hơn FleetRMW ở
+quy mô 17 endpoint** trong kịch bản này — nhưng đây KHÔNG phải "Zenoh
+ổn định/đáng tin cậy hơn". Ngược lại: **FleetRMW ổn định hơn Zenoh
+khoảng 5.7 lần** (stdev 4.9pp vs 27.7pp) — FleetRMW cho kết quả dự đoán
+được (luôn quanh 15-31%), còn Zenoh cực kỳ nhạy với jitter thời gian
+thực của harness (có lúc 7.9%, có lúc 95.9% trong CÙNG cấu hình). Nói
+cách khác: **Zenoh thắng về trung bình nhưng thua xa về độ ổn định** —
+với một hệ thống robot thực tế, độ ổn định/dự đoán được thường quan
+trọng hơn giá trị trung bình một mình nó.
+
+**Dữ liệu mac/phy (trung bình 10 run, xác nhận nhất quán với n=3/n=6)**:
+
+| | mac_tx | mac_rx_drop | phy_tx_begin | phy_rx_drop |
+|---|---|---|---|---|
+| FleetRMW | ~679 | ~13474 | ~2657 | ~2818 |
+| Zenoh | ~19879 | ~587356 | ~82223 | ~38363 |
+| **Tỷ lệ Zenoh/FleetRMW** | **~29x** | **~44x** | **~31x** | **~14x** |
+
+Zenoh liên tục dùng kênh nhiều hơn FleetRMW 29-44 lần ở MỌI run — đây
+là con số ổn định nhất trong toàn bộ investigation (không dao động như
+delivery_pct), củng cố thêm: giá trị trung bình delivery cao hơn của
+Zenoh KHÔNG đến từ "hiệu quả kênh hơn" mà nhiều khả năng đến từ việc
+gửi nhiều gói hơn tuyệt đối (kể cả traffic session/keep-alive), đơn
+giản là gửi nhiều nên lọt qua nhiều hơn về số tuyệt đối dù tỷ lệ
+drop/tổng traffic cũng rất cao.
+
+**Quyết định dừng**: không tiếp tục escalation thêm (n=10 là giới hạn
+đã đặt trước cho investigation này). Câu hỏi gốc của người dùng
+("Zenoh > FleetRMW ở đâu, tại sao") giờ có câu trả lời đầy đủ: có, về
+trung bình, với ý nghĩa thống kê ở n=10 — nhưng đi kèm cái giá là độ
+ổn định kém hơn nhiều so với FleetRMW, và cơ chế là "gửi nhiều hơn"
+chứ không phải "hiệu quả hơn".
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
