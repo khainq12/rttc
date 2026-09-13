@@ -398,8 +398,12 @@ def main() -> int:
         beacon_msg = String()
         beacon_msg.data = args.endpoint
 
+        beacon_raw_seen: list[str] = []
+
         def on_beacon(msg: String) -> None:
-            discovery_peers_seen.add(msg.data)
+            beacon_raw_seen.append(msg.data)
+            if msg.data != args.endpoint:  # a beacon can loop back on some RMWs
+                discovery_peers_seen.add(msg.data)
 
         node.create_subscription(String, beacon_topic, on_beacon, beacon_qos)
 
@@ -412,7 +416,19 @@ def main() -> int:
             if now - last_beacon_sent >= 0.1:
                 beacon_pub.publish(beacon_msg)
                 last_beacon_sent = now
-            discovery_peers_seen.discard(args.endpoint)  # a beacon can loop back on some RMWs
+        # spin_once() services only ONE ready wait-set entity per call, so
+        # drain everything ready each iteration rather than relying on one
+        # call to eventually get to a specific subscription. Confirmed via
+        # a beacon_pub_subscription_count/beacon_raw_seen_count diagnostic
+        # (see the DISCOVERY_TIMEOUT_DEBUG print below) that this alone
+        # does NOT fully explain the discovery-timeout cases seen in
+        # practice -- the deeper cause turned out to be real, timing-
+        # dependent CycloneDDS discovery flakiness between launch-order-
+        # distant peers (see docs/AUDIT_ACCEPTANCE_TRACKING.md "beacon
+        # discovery convergence"), not starvation -- but this is still a
+        # correct fix for the starvation class of bug on its own, so kept.
+        for _ in range(20):
+            rclpy.spin_once(node, timeout_sec=0.0)
         rclpy.spin_once(node, timeout_sec=0.1)
         if beacon_pub is not None:
             if len(discovery_peers_seen) >= args.expected_peer_count:
@@ -422,6 +438,23 @@ def main() -> int:
         ):
             break
     discovery_convergence_s = time.monotonic() - discovery_start
+    if beacon_pub is not None and len(discovery_peers_seen) < args.expected_peer_count:
+        # TEMPORARY diagnostic for the "last-launched endpoint never sees
+        # any beacon" investigation (docs/AUDIT_ACCEPTANCE_TRACKING.md) --
+        # tells apart "writer never matched" from "matched but callback
+        # never fired" without needing a live container to inspect.
+        print(
+            json.dumps(
+                {
+                    "DISCOVERY_TIMEOUT_DEBUG": args.endpoint,
+                    "beacon_pub_subscription_count": beacon_pub.get_subscription_count(),
+                    "beacon_raw_seen_count": len(beacon_raw_seen),
+                    "beacon_raw_seen_sample": beacon_raw_seen[:10],
+                    "topic_names_and_types": node.get_topic_names_and_types(),
+                }
+            ),
+            flush=True,
+        )
 
     if args.ready_file:
         args.ready_file.parent.mkdir(parents=True, exist_ok=True)

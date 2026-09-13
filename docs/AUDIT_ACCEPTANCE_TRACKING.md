@@ -3970,6 +3970,87 @@ mechanism + `--expected-peer-count`), `scripts/run_ns3_docker_container_fleet_pr
 (test mới), `.gitignore` (`.tcpdump_portable/` — build artifact 14MB từ
 mục đo kích thước gói trước đó, lẽ ra không nên vào git).
 
+### 13/09/2026 (tiếp) — Chạy thử thật 4 baseline (FleetRMW/CycloneDDS/Zenoh/FastDDS) ở 17 endpoint với metric mới: xác nhận FastDDS cũng sập ở quy mô lớn, phát hiện discovery convergence bị "chặn trần" ở mọi RMW chuẩn, latency FleetRMW cao bất ngờ
+
+Chạy thật (n=1/RMW, CHƯA paired — xem lưu ý bên dưới) ở quy mô đầy đủ
+17 endpoint, dùng toàn bộ 3 metric mới vừa thêm (Fast DDS, latency
+percentile, discovery convergence/bytes):
+
+| RMW | Delivery | Latency p50/p95/p99 (ms) | Discovery bytes (ftap0) | Discovery convergence |
+|---|---|---|---|---|
+| **FleetRMW** (static) | 24.5% | 7225 / 10459 / 11070 | 6650 | N/A (static mode, không có bước discovery theo thiết kế) |
+| **CycloneDDS** | **0.0%** | — (không tin nào giao) | 1,111,436 | ⚠️ chạm trần 15s (censored) |
+| **Zenoh** (router) | 8.5% | 1590 / 2636 / 2808 | 232,023 | ⚠️ chạm trần 15s (censored) |
+| **Fast DDS** (mới, lần đầu đo) | **0.0%** | — (không tin nào giao) | 2,559,722 | ⚠️ chạm trần 15s (censored) |
+
+**Lưu ý quan trọng về độ tin cậy — n=1, KHÔNG phải kết luận thống kê**:
+đây là 1 lần chạy/RMW, chưa paired/multi-rep như bảng FleetRMW-vs-Zenoh
+đã làm ở mục trước (n=10). Zenoh 8.5% lần này nằm trong đúng khoảng dao
+động RẤT RỘNG đã biết (7.9%-95.9% qua 10 lần chạy) — không mâu thuẫn
+với kết quả trước, chỉ là rơi vào đầu thấp của phân phối. CycloneDDS
+0.0% thì NHẤT QUÁN với phát hiện robust đã có (tái lập lần thứ 3 độc
+lập rồi).
+
+**Fast DDS — phát hiện MỚI, củng cố giả thuyết cốt lõi của toàn bộ
+investigation**: baseline DDS thứ 2 (sau CycloneDDS) CŨNG sập về 0% ở
+17 endpoint, và tốn dung lượng discovery NHIỀU NHẤT trong 4 RMW
+(2.56MB, gấp ~2.3x CycloneDDS, gấp ~11x Zenoh, gấp ~385x FleetRMW) —
+càng củng cố cơ chế đã xác lập: bất kỳ RMW nào dựa vào discovery
+multicast lặp lại (SPDP/SEDP) đều gặp đúng bức tường nghẽn kênh ở quy
+mô 17 trạm, không phải lỗi riêng của CycloneDDS.
+
+**Discovery convergence — TẤT CẢ 3 RMW chuẩn đều CHẠM TRẦN timeout
+15s, đây là số bị CENSORED (giá trị thật là "> 15s" hoặc "không bao
+giờ hội tụ đủ"), KHÔNG PHẢI thời gian hội tụ thật.** Nhìn breakdown
+per-endpoint mới thấy rõ cơ chế: số peer thấy được giảm dần theo THỨ
+TỰ KHỞI ĐỘNG container — vd CycloneDDS: robot launch sớm (`robot_0005`,
+`robot_0006`) thấy được 6-7/16 peer trong 15s, nhưng robot launch
+MUỘN NHẤT (`robot_0014`, `robot_0015`) thấy đúng **0/16** peer. FastDDS
+còn tệ hơn: chỉ 4 robot đầu tiên thấy được vài peer (0-4/16), **12/17
+endpoint còn lại thấy đúng 0/16** — nghĩa là graph KHÔNG BAO GIỜ hội tụ
+đầy đủ trong cửa sổ 15s ở quy mô này, với BẤT KỲ RMW chuẩn nào. Đây là
+bằng chứng ĐỊNH LƯỢNG trực tiếp, độc lập với API `get_subscription_count()`
+(đã biết không đáng tin), cho đúng cơ chế "discovery traffic tự nó đủ
+bão hòa kênh ở quy mô lớn" đã xác lập từ đầu investigation này — giờ
+nhìn thấy được qua lăng kính hoàn toàn khác (đồ thị graph hội tụ theo
+thứ tự khởi động) thay vì chỉ qua delivery_pct.
+
+**Phát hiện phụ, không liên quan tới thay đổi hôm nay nhưng MỚI ĐƯỢC
+NHÌN THẤY nhờ metric mới**: `discovery_convergence_max_s` của FleetRMW
+CŨNG ra ~15.1s ở MỌI endpoint, dù static mode không có bước discovery
+theo thiết kế! Nguyên nhân: khi `--expected-peer-count=0` (beacon tắt),
+code rơi về nhánh CŨ (`pub.get_subscription_count() > 0`) — vốn đã biết
+không đáng tin cho FleetRMW's custom transport (không phải DDS chuẩn,
+API introspection của rclpy không chắc phản ánh đúng), nên vòng lặp này
+LUÔN chạy hết `--discovery-timeout-s` (15s) trước khi qua bước
+ready/start ở CẢ những lần chạy TRƯỚC ĐÂY trong toàn bộ investigation
+(hành vi này đã tồn tại từ đầu, không phải regression của thay đổi hôm
+nay — chỉ là hôm nay mới CÓ SỐ để nhìn thấy nó). Không ảnh hưởng tới
+các so sánh trước đó (delivery_pct đều tính từ CÙNG điểm mốc `start_wall`
+sau gate này), nhưng đáng để tối ưu sau: FleetRMW static mode có thể bỏ
+qua hẳn vòng lặp discovery-wait này (đặt `discovery_timeout_s` ngắn hơn
+nhiều, vd 1-2s, khi biết trước là static mode) để tiết kiệm thời gian
+chạy thật.
+
+**Latency FleetRMW cao bất ngờ (p50=7.2s, p99=11.1s)** — đáng chú ý:
+đây là latency của những tin ĐÃ GIAO THÀNH CÔNG (24.5% delivery), không
+phải latency trung bình của mọi tin gửi. Diễn giải hợp lý: ở quy mô
+nghẽn nặng (chỉ 24.5% lọt qua), các tin SỐNG SÓT có xu hướng là những
+tin phải trải qua nhiều lần retry/repair trước khi thành công — tương
+tự khảo sát "chậm nhưng ổn định" đã có ở mục so sánh Zenoh trước đó,
+giờ có con số latency thật để định lượng. Zenoh latency thấp hơn nhiều
+(p50=1.6s) dù dữ liệu ít hơn — cần thêm rep để xác nhận đây có phải
+pattern thật hay chỉ do n=1.
+
+**Trạng thái**: n=1/RMW, CHƯA statistically confirmed. Cần đo paired
+multi-rep (như cách đã làm cho FleetRMW-vs-Zenoh delivery) nếu muốn
+dùng số liệu này cho bài báo ở mức "kết luận", không chỉ "minh họa sơ
+bộ".
+
+**File liên quan**: `/tmp/.../scratchpad/full_4rmw_17endpoint.py` (script
+đo, không thuộc repo), kết quả lưu tại
+`results_rmw_socket/.full_4rmw_17endpoint.json`.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
