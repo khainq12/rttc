@@ -325,6 +325,53 @@ class ReferenceTopologyProbe:
             log = docker("exec", self.ns3sim_name, "cat", log_path, check=False)
             raise RuntimeError(f"ns-3 tap-bridge process exited early:\n{log.stdout}\n{log.stderr}")
 
+    def zenoh_router_endpoint(self) -> str:
+        """control_station (endpoint index 0) is where start_zenoh_router()
+        runs the router -- its IP:7447 is what every other endpoint's
+        session config points at explicitly (see start_zenoh_router() and
+        the ZENOH_SESSION_CONFIG_URI wiring in launch_endpoints())."""
+        return f"tcp/{self.ips[self.endpoints[0]]}:7447"
+
+    def start_zenoh_router(self, log_path: str = "/tmp/zenohd.log") -> None:
+        """rmw_zenoh_cpp requires a separate rmw_zenohd router process --
+        confirmed via a real run's own warning: "Unable to connect to a
+        Zenoh router. Have you started a router with 'ros2 run
+        rmw_zenoh_cpp rmw_zenohd'?" (see
+        docs/AUDIT_ACCEPTANCE_TRACKING.md "so sánh baseline DDS truyền
+        thống"). Run it INSIDE the control_station container (endpoint
+        index 0) rather than adding an 18th wifi station slot just for
+        this -- Zenoh peers reach it over the same already-wired network
+        the control_station itself uses, no separate tap/veth/bridge
+        needed. Started before any endpoint launches so the router is
+        already listening by the time peers start scouting for it.
+
+        Uses an explicit IPv4 listen config (tcp/0.0.0.0:7447) instead of
+        the default DEFAULT_RMW_ZENOH_ROUTER_CONFIG.json5's `tcp/[::]:7447`
+        -- these netns interfaces are IPv4-only (no IPv6 address was ever
+        configured on them, see wire_network()), so an IPv6-wildcard
+        listen risks not being reachable via the IPv4 addresses every
+        other endpoint actually connects through.
+        """
+        control_station_name = self.endpoint_container_names[0]
+        router_config = (
+            '{ listen: { endpoints: ["tcp/0.0.0.0:7447"] } }'
+        )
+        docker(
+            "exec", control_station_name, "bash", "-lc",
+            f"echo {shlex.quote(router_config)} > /tmp/zenoh_router_config.json5",
+        )
+        cmd = (
+            "source /opt/ros/jazzy/setup.bash && "
+            "export ZENOH_ROUTER_CONFIG_URI=/tmp/zenoh_router_config.json5 && "
+            f"ros2 run rmw_zenoh_cpp rmw_zenohd > {log_path} 2>&1"
+        )
+        docker("exec", "-d", control_station_name, "bash", "-lc", cmd)
+        time.sleep(3)
+        check = docker("exec", control_station_name, "bash", "-lc", "pgrep -f rmw_zenohd", check=False)
+        if check.returncode != 0:
+            log = docker("exec", control_station_name, "cat", log_path, check=False)
+            raise RuntimeError(f"rmw_zenohd exited early:\n{log.stdout}\n{log.stderr}")
+
     def launch_endpoints(
         self,
         *,
@@ -380,6 +427,29 @@ class ReferenceTopologyProbe:
                 # run_ns3_docker_wifi_tap_rmw_probe.py's confirmed working
                 # for ARP, so this should reach every station the same way.
                 env_prefix = f"RMW_IMPLEMENTATION={rmw_implementation} "
+                if rmw_implementation == "rmw_zenoh_cpp":
+                    # Multicast-based scouting for the router did NOT
+                    # converge reliably in this topology (confirmed: even
+                    # small-scale runs failed with the default config) --
+                    # point every non-router endpoint at the router's
+                    # known address explicitly instead, same "sidestep
+                    # unreliable discovery with static config" approach
+                    # already used for rmw_fleetqox_cpp's static mode.
+                    # Skipped for the router's own container (endpoint 0
+                    # == control_station -- see start_zenoh_router()) so
+                    # it doesn't try to connect to itself.
+                    if i != 0:
+                        session_config = (
+                            '{ connect: { endpoints: ["'
+                            + self.zenoh_router_endpoint()
+                            + '"] } }'
+                        )
+                        session_config_path = f"/tmp/zenoh_session_config_{i}.json5"
+                        docker(
+                            "exec", self.endpoint_container_names[i], "bash", "-lc",
+                            f"echo {shlex.quote(session_config)} > {session_config_path}",
+                        )
+                        env_prefix += f"ZENOH_SESSION_CONFIG_URI={session_config_path} "
                 env_prefix += "".join(
                     f"{key}={value} " for key, value in (extra_rmw_env or {}).items()
                 )
@@ -564,6 +634,8 @@ def run_probe(
             ns3_seed=ns3_seed,
             ns3_run=ns3_run,
         )
+        if rmw_implementation == "rmw_zenoh_cpp":
+            probe.start_zenoh_router()
         probe.launch_endpoints(
             trace_container_path=trace_container_path,
             policy=policy,

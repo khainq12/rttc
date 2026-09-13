@@ -3471,6 +3471,94 @@ phải kết luận "FleetRMW tốt hơn DDS truyền thống" — chỉ là "ch
 (tham số `rmw_implementation`, route multicast `224.0.0.0/4` trong
 `wire_network()`).
 
+### 13/09/2026 (tiếp) — Đào sâu tiếp theo yêu cầu: CycloneDDS KHÔNG có bug bí ẩn (chỉ là cùng cơ chế nghẽn kênh đã biết); dựng router cho Zenoh thành công — kết quả BẤT NGỜ, Zenoh vượt cả FleetRMW
+
+**CycloneDDS — đính chính phát hiện trước đó**: dựng lại 2 trạm, cài
+`tcpdump` thật (phải tạo container KHÔNG dùng `--network=none` để có
+mạng internet cài đặt, rồi mới nối vào topology), bắt gói trong lúc
+CycloneDDS cố discovery. Kết quả: **SPDP multicast, ARP, và cả traffic
+unicast SEDP (port 7410-7413) đều truyền qua lại HAI CHIỀU bình
+thường** — hoàn toàn không có dấu hiệu bất thường ở tầng mạng. Kiểm
+tra lại bằng `rclpy` thuần (subscriber tự đếm tin nhận được, KHÔNG
+dùng `pub.get_subscription_count()` như trước): **subscriber nhận đủ
+50/50 tin nhắn** — nghĩa là discovery + truyền dữ liệu THỰC RA hoạt
+động đúng ở quy mô 2 trạm! Kết luận trước đó ("CycloneDDS discovery
+thất bại bí ẩn") là **SAI**, do dùng nhầm API chẩn đoán
+(`get_subscription_count()` phía publisher không phản ánh đúng trạng
+thái match, dù dữ liệu vẫn được giao đúng).
+
+Chạy lại bằng script thật (`fleetqox_rmw_trace_endpoint.py`, đã dùng
+phương pháp đúng — đếm tin nhận được qua callback thật, không qua API
+lỗi) ở nhiều quy mô để tìm ngưỡng sập:
+
+| Quy mô (số endpoint) | Delivery CycloneDDS |
+|---|---|
+| 7 (1 control_station + 6 robot) | **82.7%** |
+| 12 (1 + 11 robot) | **0%** |
+| 17 (1 + 16 robot, đầy đủ) | **0%** |
+
+**Kết luận đúng**: CycloneDDS sập đột ngột đâu đó giữa 7 và 12 endpoint
+— khớp CHÍNH XÁC với cơ chế "traffic discovery/control-plane tự nó đủ
+làm nghẽn kênh wifi ở quy mô lớn" đã xác lập từ SỚM trong investigation
+này (thí nghiệm discovery-only Fast DDS/Cyclone DDS, xem mục "causal
+isolation: discovery-only" phía trên) — KHÔNG phải lỗi kiến trúc
+container mới, mà là hệ quả TẤT YẾU của bất kỳ RMW nào dựa vào discovery
+multicast lặp lại khi 17 trạm cùng cạnh tranh 1 kênh 802.11g.
+
+**Zenoh — dựng router thành công**: log lỗi trước đó đã chỉ rõ nguyên
+nhân (`rmw_zenoh_cpp` cần tiến trình `rmw_zenohd` riêng). Thêm
+`start_zenoh_router()`: chạy `rmw_zenohd` NGAY TRONG container
+`control_station` (không cần thêm 1 "trạm wifi" thứ 18 riêng — peer
+Zenoh chỉ cần TCP tới IP đã biết trước của `control_station`). Phát
+hiện thêm 1 vấn đề cấu hình: router mặc định lắng nghe
+`tcp/[::]:7447` (IPv6 wildcard), nhưng các interface trong netns của
+mình CHỈ có IPv4 (chưa từng cấu hình IPv6) — phải ép router lắng nghe
+tường minh `tcp/0.0.0.0:7447` qua `ZENOH_ROUTER_CONFIG_URI`. Đồng thời,
+multicast scouting mặc định để tự tìm router KHÔNG hội tụ được trong
+topology này (giống hiện tượng gặp phải trước đó) — thay vì gỡ tiếp,
+áp dụng luôn chiến lược "cấu hình tĩnh thay discovery" (giống FleetRMW
+static mode): mỗi endpoint (trừ chính `control_station`) được set
+`ZENOH_SESSION_CONFIG_URI` trỏ thẳng `connect.endpoints` tới địa chỉ
+router đã biết trước — bỏ qua hoàn toàn bước scouting.
+
+**Kết quả Zenoh sau khi sửa (BẤT NGỜ)**:
+
+| Quy mô | Delivery Zenoh |
+|---|---|
+| 7 endpoint | 81.9% |
+| 17 endpoint (đầy đủ) | **60.6%** |
+
+**Zenoh ở quy mô đầy đủ 17 endpoint đạt 60.6% — CAO HƠN CẢ FleetRMW
+static mode (25.1%)!** Diễn giải hợp lý: kiến trúc router của Zenoh
+(mỗi peer chỉ cần 1 kết nối TCP unicast tới router, thiết lập MỘT LẦN
+lúc khởi động) tránh được đúng cơ chế làm CycloneDDS sập — traffic
+discovery liên tục qua multicast broadcast tới TẤT CẢ các trạm. Sau
+khi kết nối TCP tới router đã thiết lập xong, phần lớn traffic tiếp
+theo không cần phát lại discovery multicast nữa, nên ít cạnh tranh kênh
+hơn hẳn so với CycloneDDS.
+
+**Bảng so sánh cuối cùng (S1 baseline, 17 endpoint, cùng trace/seed)**:
+
+| RMW | Quy mô nhỏ (7 endpoint) | Quy mô đầy đủ (17 endpoint) |
+|---|---|---|
+| `rmw_fleetqox_cpp` (static mode) | — (chưa đo riêng ở quy mô nhỏ) | **25.1%** |
+| `rmw_cyclonedds_cpp` | 82.7% | **0%** (sập hoàn toàn khi >~7-11 trạm) |
+| `rmw_zenoh_cpp` (có router, cấu hình tĩnh) | 81.9% | **60.6%** (tốt nhất trong 3) |
+
+**Bài học phương pháp quan trọng**: kết luận "CycloneDDS discovery bug
+bí ẩn" ở phiên trước là kết luận VỘI, dựa trên 1 API chẩn đoán sai —
+bài học là LUÔN xác nhận bằng dữ liệu ứng dụng thật (tin nhắn thực sự
+nhận được) thay vì tin vào 1 con số trạng thái nội bộ của thư viện khi
+có bất thường. Việc quay lại đào sâu (theo đúng yêu cầu người dùng)
+thay vì chấp nhận kết luận vội ban đầu đã dẫn tới phát hiện quan trọng
+hơn nhiều: Zenoh hoạt động tốt hơn cả FleetRMW ở quy mô đầy đủ, một kết
+quả không ngờ tới ban đầu.
+
+**File thay đổi**: `scripts/run_ns3_docker_container_fleet_probe.py`
+(`start_zenoh_router()`, `zenoh_router_endpoint()`, cấu hình
+`ZENOH_SESSION_CONFIG_URI` tĩnh cho mỗi peer, gọi router trước
+`launch_endpoints()` khi `rmw_implementation == "rmw_zenoh_cpp"`).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
