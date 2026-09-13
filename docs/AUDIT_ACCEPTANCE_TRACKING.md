@@ -3576,6 +3576,120 @@ quả không ngờ tới ban đầu.
 `ZENOH_SESSION_CONFIG_URI` tĩnh cho mỗi peer, gọi router trước
 `launch_endpoints()` khi `rmw_implementation == "rmw_zenoh_cpp"`).
 
+### 13/09/2026 (tiếp) — ĐÍNH CHÍNH bằng đo lặp lại (paired, n=3): so sánh Zenoh vs FleetRMW ở 17 endpoint CHƯA CÓ Ý NGHĨA THỐNG KÊ; CycloneDDS 0% ở 17 endpoint được xác nhận LẶP LẠI LẦN 2 (robust)
+
+Theo đúng chuẩn phương pháp đã áp dụng xuyên suốt investigation này (đo
+lặp lại + CI trước khi kết luận, xem mục JSON/compact_v1 và
+`static_min_v1` phía trên), đã chạy lại toàn bộ 6 tổ hợp
+(FleetRMW/CycloneDDS/Zenoh × 7/17 endpoint) một lần nữa, KHÔNG chỉ dựa
+vào 1 lần chạy như bảng ở mục trước. Kết quả rerun (cùng script, cùng
+kịch bản, khác lần chạy):
+
+| Label | Delivery (rerun) | Delivery (lần đo trước) |
+|---|---|---|
+| fleetqox_7 | 49.0% | 35.9% |
+| cyclone_7 | 82.0% | 82.7% |
+| zenoh_7 | **31.8%** | 81.9% |
+| fleetqox_17 | 36.7% | 25.1% |
+| cyclone_17 | **0.0%** | 0% |
+| zenoh_17 | **43.5%** | 60.6% |
+
+**Zenoh đảo chiều hoàn toàn ở quy mô nhỏ** (81.9% → 31.8%, thấp hơn cả
+FleetRMW ở lần rerun này), và giảm mạnh ở quy mô lớn (60.6% → 43.5%).
+FleetRMW đi ngược chiều (tăng cả hai quy mô). Đây là bằng chứng trực
+tiếp cho thấy kết luận "Zenoh vượt FleetRMW" ở mục trước dựa trên
+**1 lần chạy duy nhất mỗi cấu hình** — không đủ để kết luận, đúng như
+hiện tượng "jitter thời gian thực của `RealtimeSimulatorImpl`" đã xác
+lập từ sớm trong investigation này.
+
+**Đo lặp lại có kiểm soát (paired, n=3 mỗi RMW, ghép cặp theo
+`ns3_run`, đảo thứ tự chạy trước/sau mỗi cặp để loại thiên lệch do thứ
+tự)** ở quy mô đầy đủ 17 endpoint, script
+`paired_fleetqox_zenoh_17.py`:
+
+| run | FleetRMW | Zenoh | Δ (zenoh − fleetqox) |
+|---|---|---|---|
+| 1 | 31.1% | 30.3% | −0.9pp |
+| 2 | 17.6% | 67.4% | +49.7pp |
+| 3 | 29.0% | 57.8% | +28.7pp |
+
+- FleetRMW: n=3, mean=25.9%, vals=[31.1, 17.6, 29.0]
+- Zenoh: n=3, mean=51.8%, vals=[30.3, 67.4, 57.8]
+- **Paired delta (zenoh − fleetqox): mean=+25.86pp, stdev=25.42,
+  95% CI = [−37.28, +89.01]**
+
+**Khoảng tin cậy 95% BAO GỒM CẢ SỐ ÂM** — nghĩa là với n=3, dữ liệu
+hiện tại KHÔNG đủ để khẳng định Zenoh tốt hơn FleetRMW ở quy mô 17
+endpoint (run 1 thậm chí cho FleetRMW gần bằng Zenoh). Kết luận trước
+đó ("Zenoh 60.6% > FleetRMW 25.1%, tốt nhất trong 3") phải được ĐÍNH
+CHÍNH thành: **chưa có ý nghĩa thống kê, cần thêm rep hoặc kiểm soát
+thêm biến (RNG seed cố định cho ns-3 ở mức trạm, không chỉ mức global)
+trước khi dùng kết quả này để ra quyết định thiết kế.**
+
+**Dữ liệu wifi_stats (mac/phy, trích bằng regex vì
+`FLEETQOX_WIFI_STATS` có bug dấu phẩy thừa cuối mảng
+`phy_rx_drop_by_reason` làm JSON không hợp lệ — chưa fix ở
+`fleetqox_trace_replay_tap.cc`, mới workaround ở tầng script đo)** cho
+thấy một khác biệt CƠ CHẾ rõ ràng, dù chưa giải thích hết chênh lệch
+delivery:
+
+| | mac_tx_total | mac_rx_total | mac_rx_drop_total | phy_tx_begin_total | phy_rx_drop_total |
+|---|---|---|---|---|---|
+| FleetRMW (trung bình 3 run) | ~730 | ~5425 | ~14949 | ~2695 | ~2796 |
+| Zenoh (trung bình 3 run) | ~19724 | ~29288 | ~582767 | ~81673 | ~38962 |
+
+**Zenoh tạo ra lưu lượng MAC/PHY nhiều hơn FleetRMW khoảng 27-39 lần**
+(mac_tx ~27x, phy_tx_begin ~30x, mac_rx_drop ~39x) — NGƯỢC với diễn
+giải trước đó ("router giúp Zenoh tránh discovery multicast lặp lại
+nên ít traffic hơn"). Thực tế Zenoh dùng kênh nhiều hơn hẳn (có thể do
+session keep-alive/heartbeat liên tục của Zenoh protocol, cộng thêm
+traffic ứng dụng), và bị drop tuyệt đối nhiều hơn hẳn — nhưng vì gửi
+nhiều hơn tuyệt đối nên đôi khi vẫn lọt qua được nhiều tin hơn về số
+tuyệt đối. Đây là dấu hiệu Zenoh KHÔNG "hiệu quả kênh" hơn FleetRMW như
+diễn giải ban đầu — ngược lại tốn kênh hơn nhiều — nhưng cơ chế khiến
+delivery_pct dao động mạnh giữa các run (30.3% → 67.4% → 57.8%) vẫn
+CHƯA được giải thích dứt điểm, cần thêm dữ liệu.
+
+**CycloneDDS 0% ở 17 endpoint: XÁC NHẬN LẶP LẠI LẦN 2, robust.** Cả
+lần đo gốc (mục trước) VÀ lần rerun độc lập ở đây đều cho đúng 0.0%
+tuyệt đối — đây là phát hiện DUY NHẤT trong 3 RMW có thể khẳng định
+chắc chắn ở giai đoạn này, khớp nhất quán với cơ chế "traffic
+discovery/control-plane tự nó đủ bão hòa kênh 802.11g ở quy mô lớn" đã
+xác lập từ sớm trong investigation.
+
+**Trả lời trực tiếp 3 câu hỏi của người dùng (điều tra tại sao Zenoh >
+FleetRMW, tại sao FleetRMW thấp, CycloneDDS 0% có thật không)**:
+
+1. *"Tại sao Zenoh tốt hơn FleetRMW?"* — Với dữ liệu hiện có, CHƯA có
+   câu trả lời đáng tin cậy: hiệu ứng có thể có (mean delta +25.86pp)
+   nhưng KHÔNG có ý nghĩa thống kê (CI bao gồm số âm), và dữ liệu
+   mac/phy cho thấy Zenoh thực ra tốn kênh hơn hẳn, không phải "hiệu
+   quả hơn" như diễn giải ban đầu. Kết luận trước đó bị RÚT LẠI.
+2. *"Tại sao FleetRMW thấp ở quy mô nhỏ?"* — Số đo 7-endpoint CŨNG chỉ
+   có 1 lần chạy mỗi bên (35.9% rồi 49.0% ở 2 lần đo khác nhau) — cùng
+   vấn đề run-to-run variance, nên giả thuyết "gói JSON to hơn → tốn
+   airtime hơn ở quy mô nhỏ" (dựa trên đo pcap 5.9-7.7x kích thước gói
+   đã có bằng chứng độc lập, xem mục trước) vẫn HỢP LÝ về mặt cơ chế,
+   nhưng độ lớn ảnh hưởng THỰC TẾ lên delivery_pct chưa được đo bằng
+   paired/nhiều-rep — cần thêm dữ liệu trước khi khẳng định con số cụ
+   thể.
+3. *"CycloneDDS 0% ở 17 endpoint có thật không?"* — **CÓ, robust**, xác
+   nhận độc lập 2 lần (lần đo gốc + lần rerun), cơ chế đã hiểu rõ
+   (discovery traffic bão hòa kênh).
+
+**Bài học phương pháp (lặp lại đúng bài học JSON/compact_v1 và
+`static_min_v1` phía trên)**: 1 lần chạy — dù chênh lệch trông có vẻ
+rõ ràng đến đâu (60.6% vs 25.1%) — KHÔNG đủ để kết luận trong harness
+này, do jitter thời gian thực đã xác lập từ đầu investigation. Bảng so
+sánh "cuối cùng" ở mục trước phải được đọc với ĐÍNH CHÍNH này: chỉ có
+dòng CycloneDDS 17-endpoint (0%) là đáng tin; dòng FleetRMW-vs-Zenoh
+cần coi là chưa xác định.
+
+**File liên quan**: `/tmp/.../scratchpad/paired_fleetqox_zenoh_17.py`
+(script đo paired, không thuộc repo). Chưa fix bug dấu phẩy thừa trong
+`FLEETQOX_WIFI_STATS` ở `fleetqox_trace_replay_tap.cc` — hiện đang
+workaround bằng regex ở tầng script đo lường, không phải sửa gốc.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
