@@ -3802,6 +3802,86 @@ trước) → tốn nhiều airtime hơn mỗi lần phát → tăng xác suất
 nghĩa thống kê, cần đo lại bằng phương pháp paired n≥10 tương tự mục
 trên nếu muốn kết luận chắc chắn.
 
+### 13/09/2026 (tiếp) — Đo thật kích thước gói CycloneDDS/Zenoh bằng tcpdump, so với FleetRMW
+
+Người dùng hỏi trực tiếp: kích thước gói CycloneDDS/Zenoh so với
+FleetRMW là bao nhiêu (khác với con số "5.9-7.7 lần so với raw-UDP" đã
+biết từ trước — lần này cần so trực tiếp với 2 RMW kia, không phải
+raw-UDP). Dựng 1 kịch bản nhỏ (2 robot + 1 control_station, cùng
+payload/kịch bản `fifo`) trên kiến trúc container mới, bắt gói bằng
+tcpdump thật tại ranh giới TAP (`ftap0` — tap của `control_station`,
+cùng phương pháp đã dùng ở mục "kích thước gói FleetRMW 5.9-7.7 lần").
+
+**Trở ngại kỹ thuật phải giải quyết trước khi đo được**: container
+image chạy với `--network=none` nên không `apt-get install tcpdump`
+trực tiếp được (`docker network connect` xác nhận THẤT BẠI trên
+container ở chế độ `none`: "cannot be connected to multiple networks
+with one of the networks in private (none) mode"). Giải pháp: build
+tcpdump + các shared lib còn thiếu (`libpcap`, `libcap`, ...) MỘT LẦN
+trong 1 container tạm có mạng, lưu vào `/work/.tcpdump_portable/`
+(bind-mount dùng chung mọi container) — sau đó container
+`--network=none` nào cũng exec được qua `LD_LIBRARY_PATH`, không cần
+mạng lúc chạy. Thêm `-Z root` vì tcpdump mặc định hạ quyền xuống user
+hệ thống "tcpdump" (không tồn tại trong container tối giản này, chỉ
+copy binary chứ không cài full gói .deb) — thiếu cờ này tcpdump mở
+file pcap rỗng rồi thoát ngay lập tức với lỗi "Couldn't find user
+'tcpdump'", dễ nhầm là "không có traffic".
+
+**Trở ngại thứ 2 (khó phát hiện hơn)**: lần đo đầu tiên (sau khi đã
+sửa 2 lỗi trên) vẫn chỉ bắt được ~30 dòng toàn nhiễu ARP/IPv6 ND, dù
+endpoint xác nhận đã giao hàng trăm tin thành công (`delivered=349`
+v.v.) — nghĩa là traffic dữ liệu thật CÓ xảy ra nhưng KHÔNG xuất hiện
+trong file pcap. Debug bằng cách theo dõi tiến trình
+`fleetqox_tap_bridge` với `pgrep` mỗi giây suốt cả run: xác nhận tiến
+trình ns-3 THẬT SỰ vẫn sống và xử lý dữ liệu xuyên suốt (traffic thật
+bùng nổ sau khi cổng ready/start được gác xong), nhưng dòng "SIGINT
+sớm cho tcpdump trước khi teardown" trong code đo cũ (`pkill -INT -f
+tcpdump_portable` gọi ngay sau `wait_for_completion()`) là nghi phạm
+chính — bỏ bước này (để `teardown()` tự `docker rm -f`, tương đương
+SIGKILL trực tiếp) thì lần đo tiếp theo bắt được ĐẦY ĐỦ 4390/4390 gói
+kể cả traffic dữ liệu thật. Chưa xác định 100% cơ chế chính xác (nghi
+ngờ liên quan tới cùng loại lỗi "tự khớp chính mình" đã gặp với
+`pgrep -f` ở `wait_for_completion()` trước đây, vì lệnh pkill cũng
+chứa chuỗi "tcpdump_portable" trong chính câu lệnh gọi nó), nhưng đã
+xác nhận thực nghiệm là bỏ bước SIGINT sớm giải quyết được vấn đề.
+
+**Kết quả đo (lọc theo đúng cổng traffic dữ liệu thật của từng RMW,
+tách riêng khỏi overhead discovery)**:
+
+| RMW | Cổng dữ liệu | n gói | Trung bình | Min | Max |
+|---|---|---|---|---|---|
+| `rmw_fleetqox_cpp` (JSON, UDP) | 9100 | 4301 | **589.3 byte** | 102 | 1378 |
+| `rmw_cyclonedds_cpp` (RTPS/CDR, UDP) | 7411 | 642 | **281.2 byte** | 52 | 3700* |
+| `rmw_zenoh_cpp` (binary, qua TCP) | ephemeral | 352 | **259.3 byte** | 3 | 1448 |
+
+*CycloneDDS thỉnh thoảng có gói ~3700 byte (vượt MTU Ethernet 1500) —
+khả năng là gói discovery/participant-announcement bị phân mảnh ở tầng
+IP, không phải kích thước traffic dữ liệu thông thường.
+
+Riêng traffic discovery CỦA CycloneDDS (cổng 7400/7401/7410, SPDP/SEDP)
+đo được trung bình **353.2 byte/gói** trên 84 gói — nghĩa là overhead
+discovery của nó tự nó đã to ngang traffic dữ liệu thật, khớp với cơ
+chế "discovery traffic tự nó đủ bão hòa kênh" đã xác lập từ đầu
+investigation này.
+
+**Kết luận**: gói FleetRMW (JSON) to hơn CycloneDDS khoảng **2.1 lần**,
+to hơn Zenoh khoảng **2.3 lần** — nhỏ hơn NHIỀU so với con số "5.9-7.7
+lần" đã đo trước đây so với raw-UDP. Lý do: raw-UDP là baseline tối
+giản không có wire-format nào cả, còn CycloneDDS (CDR nhị phân) và
+Zenoh (framing nhị phân riêng) cũng có overhead serialization/framing
+của riêng chúng — chỉ là gọn hơn JSON đáng kể, không phải bằng 0. Điều
+này thu hẹp (nhưng không loại bỏ) biên độ cải thiện khả dĩ từ việc tối
+ưu wire-format của FleetRMW (`static_min_v1`): mục tiêu hợp lý là tiệm
+cận ~260-590 byte (mức CycloneDDS/Zenoh), không phải ~96-192 byte
+(mức raw-UDP) — hướng tới mức thấp hơn HẲN so với JSON hiện tại nhưng
+KHÔNG kỳ vọng đạt được toàn bộ mức cải thiện 5.9-7.7x đã ước tính ban
+đầu.
+
+**File liên quan**: `/tmp/.../scratchpad/pcap_size_compare_3rmw.py`
+(script đo, không thuộc repo) — tái sử dụng
+`ReferenceTopologyProbe` từ `scripts/run_ns3_docker_container_fleet_probe.py`
+với 1 bước bổ sung (tcpdump portable + capture trên `ftap0`).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
