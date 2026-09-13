@@ -4051,6 +4051,76 @@ bộ".
 đo, không thuộc repo), kết quả lưu tại
 `results_rmw_socket/.full_4rmw_17endpoint.json`.
 
+### 13/09/2026 (tiếp) — Bảng A đầy đủ: chạy n=10 cho cả 4 baseline (FleetRMW/CycloneDDS/Zenoh/FastDDS), nâng từ "sơ bộ n=1" lên "trung bình n=10"
+
+Theo yêu cầu người dùng, chạy lại đầy đủ 40 lần (4 RMW × n=10, `ns3_run`
+1-10, thứ tự chạy xoay vòng mỗi rep để tránh thiên lệch thứ tự) ở quy
+mô 17 endpoint. Toàn bộ kết quả thô lưu tại
+`results_rmw_socket/.paired_4rmw_17endpoint_n10.json`.
+
+**Bảng A — kết quả trung bình n=10/RMW**:
+
+| RMW | Delivery % (mean±stdev) | Latency p50/p95/p99 (ms) | Discovery bytes (mean) | Discovery convergence |
+|---|---|---|---|---|
+| **FleetRMW** | 24.8 ± 5.5 | 5629 / 10253 / 10982 | 6,538 ± 181 | ⚠️ N/A — artifact, xem ghi chú |
+| **CycloneDDS** | **0.0 ± 0.0** | — (0 tin nào giao trong CẢ 10 lần) | 1,126,381 ± 92,486 | ⚠️ chạm trần 15s (censored) |
+| **Zenoh** | 38.5 ± 18.3 | 2857 / 4417 / 4789 | 364,535 ± 89,452 | ⚠️ chạm trần 15s (censored) |
+| **Fast DDS** | **0.0 ± 0.0** | — (0 tin nào giao trong CẢ 10 lần) | 1,815,160 ± 455,078 | ⚠️ chạm trần 15s (censored) |
+
+**Đọc bảng này thế nào cho đúng**:
+
+1. **CycloneDDS và Fast DDS: 0.0% ở CẢ 10/10 lần chạy, stdev=0** — đây
+   là kết luận chắc chắn nhất có thể có: không phải noise, không cần
+   thêm rep nữa. Cả 2 DDS baseline đều sập HOÀN TOÀN ở quy mô 17
+   endpoint, mọi lần, không ngoại lệ.
+2. **Zenoh dao động rất mạnh (stdev=18.3, gần bằng mean=38.5)** — dải
+   giá trị thực tế trải từ 8.8% đến 64.7% qua 10 lần chạy. Trung bình
+   38.5% là con số ĐÚNG về mặt thống kê (n=10, không phải n=1 nữa), nhưng
+   PHẢI đi kèm cảnh báo độ biến thiên cao — một lần chạy đơn lẻ của
+   Zenoh gần như vô nghĩa nếu đứng một mình (khớp hoàn toàn với phát
+   hiện paired FleetRMW-vs-Zenoh trước đó).
+3. **FleetRMW ổn định** (stdev=5.5 trên mean=24.8, hệ số biến thiên
+   ~22% so với Zenoh ~48%) — khớp với phát hiện "FleetRMW ổn định hơn
+   Zenoh ~5.7 lần" đã có ở mục paired trước, giờ được xác nhận thêm ở
+   bộ dữ liệu MỚI, ĐỘC LẬP này (n=10 khác, không phải cùng 1 tập dữ liệu
+   cũ).
+4. **`discovery_convergence_max_s` của CycloneDDS/Zenoh/Fast DDS đều
+   ~15.1-15.2s ở TẤT CẢ 10 lần — đây LÀ giá trị bị CHẶN TRẦN
+   (`--discovery-timeout-s=15`), KHÔNG PHẢI thời gian hội tụ thật.**
+   Giá trị thật là ">15s" hoặc "không bao giờ hội tụ đủ 16 peer trong
+   ngân sách 15s" — đã xác nhận ở mục n=1 trước đó rằng số peer thấy
+   được giảm dần theo thứ tự khởi động container, phần lớn endpoint
+   launch muộn KHÔNG BAO GIỜ thấy đủ peer trong 15s. Muốn có con số hội
+   tụ THẬT cần tăng `--discovery-timeout-s` lên rất nhiều (60s+) và đo
+   lại — hiện CHƯA làm vì tốn thêm nhiều thời gian chạy thật cho lợi
+   ích chưa rõ (bản thân việc "không hội tụ trong 15s" đã là kết luận
+   đủ mạnh: kênh bị bão hòa bởi chính discovery traffic, không cần biết
+   chính xác mất bao lâu mới hội tụ).
+5. **`discovery_convergence_max_s` của FleetRMW (~15.10s) KHÔNG so
+   sánh được với 3 RMW kia** — đây là artifact từ nhánh code CŨ
+   (`get_subscription_count()`-based, đã biết không đáng tin cho
+   transport riêng của FleetRMW), không phải thời gian discovery thật
+   (static mode không có bước discovery theo thiết kế). Cột này để
+   "N/A" hoặc footnote rõ khi đưa vào bài báo, KHÔNG được xếp cùng hàng
+   so sánh trực tiếp với CycloneDDS/Zenoh/FastDDS.
+6. **Discovery bytes**: thứ tự ổn định qua n=10 — Fast DDS (1.82MB) >
+   CycloneDDS (1.13MB) > Zenoh (365KB) > FleetRMW (6.5KB) — cùng thứ tự
+   như n=1, giờ có thêm bằng chứng n=10 củng cố, không phải trùng hợp
+   ngẫu nhiên của 1 lần chạy.
+7. **Latency FleetRMW cao và ỔN ĐỊNH qua n=10** (p50=5629ms±1480,
+   p99=10982ms±956) — không phải fluke của lần đo n=1 trước (p50=7225ms
+   khi đó nằm trong khoảng dao động bình thường của bộ n=10 này). Zenoh
+   latency thấp hơn (p50=2857ms) nhưng cũng dao động (stdev=955ms).
+
+**Kết luận dùng cho bài báo**: Bảng A ở trên đã đủ điều kiện dùng làm
+số liệu "n=10, mean±stdev" cho Bảng IV/V của `FleetRMW_paper.docx` —
+NGOẠI TRỪ cột discovery convergence (cần ghi rõ là "≥15s, censored"
+thay vì con số cụ thể) và cột discovery convergence của FleetRMW (ghi
+"N/A — static mode" thay vì số).
+
+**File liên quan**: `/tmp/.../scratchpad/paired_4rmw_17endpoint_n10.py`
+(script đo, không thuộc repo, có resume-safety qua file JSON kết quả).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
