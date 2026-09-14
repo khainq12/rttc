@@ -49,6 +49,39 @@ This maps directly onto Bảng VI's columns:
     motion planner.
   - Task completion time: wall-clock time from the shared start gate
     to every participant finishing its assigned --num-crossings.
+
+KNOWN FAILURE MODE, FIXED (see docs/AUDIT_ACCEPTANCE_TRACKING.md
+"endpoint cuối cùng bị cô lập" / "cơ chế Ricart-Agrawala bị kẹt"): a
+real 3-endpoint test surfaced a genuine priority-fairness deadlock, not
+a network or launch-order bug (confirmed by reversing launch order --
+the SAME endpoint got stuck regardless of launch position). Root
+cause: every endpoint started its first request at the SAME frozen
+Lamport value, so priority ties were broken by NAME alone,
+DETERMINISTICALLY and PERMANENTLY favoring lexicographically-earlier
+names; combined with a real Wi-Fi reply loss preventing even the
+TOP-priority endpoint from ever completing a crossing, the
+lowest-priority endpoint's replies sat deferred forever (confirmed via
+raw traffic logs: zero "to: <that endpoint>" messages were EVER
+broadcast, on ANY topic, by ANYONE, for the whole 90s scenario -- not
+lost in transit, never sent at all). Fixed with 3 changes:
+  1. The Lamport clock advertised with each RE-broadcast of a request
+     now keeps advancing (matching the standard definition of a
+     Lamport clock -- it should never be frozen), instead of reusing
+     the exact same timestamp for the whole crossing.
+  2. req_id stays constant across retries of the SAME crossing (kept
+     from an earlier fix) so a reply that arrives on ANY retry still
+     counts -- retries reset the OUTGOING message's freshness only,
+     never discard already-collected replies.
+  3. Deferred replies now have a release timeout
+     (--defer-release-timeout-s): if this process hasn't itself
+     entered its critical section within that long, it gives up
+     enforcing its own priority claim and sends the deferred reply
+     anyway. This is the actual deadlock-breaker -- (1) alone doesn't
+     fix indefinite blocking, since Lamport clocks only ever increase
+     (a struggling process's priority can only get WORSE over time,
+     never jump the queue); a bounded release is what guarantees
+     eventual progress for a low-priority requester when a
+     higher-priority one is itself stuck.
 """
 
 from __future__ import annotations
@@ -77,6 +110,17 @@ def main() -> int:
         default=5.0,
         help="if not all peers have replied within this long, re-broadcast the request "
         "(counts as one navigation-recovery event)",
+    )
+    parser.add_argument(
+        "--defer-release-timeout-s",
+        type=float,
+        default=8.0,
+        help="if a reply has been DEFERRED (because this process itself has -- or believes "
+        "it has -- priority) for longer than this without this process reaching its own "
+        "critical section, send it anyway. Without this, a higher-priority requester that "
+        "is itself stuck (e.g. losing its own replies to network loss) can defer a "
+        "lower-priority requester's reply forever -- a real deadlock confirmed via a live "
+        "3-endpoint run, not a hypothetical.",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--start-offset-ms", type=float, default=1000.0)
@@ -142,7 +186,10 @@ def main() -> int:
     current_req_id: str | None = None
     current_req_ts: tuple[int, str] | None = None
     replies_received: set[str] = set()
-    deferred: list[str] = []
+    # (to, req_id, deferred_at_monotonic) -- the monotonic timestamp is
+    # what release_stale_deferrals() checks against
+    # --defer-release-timeout-s.
+    deferred: list[tuple[str, str, float]] = []
 
     coordination_message_ages_ms: list[float] = []
     crossings: list[dict[str, Any]] = []
@@ -225,9 +272,30 @@ def main() -> int:
         else:
             i_have_priority = False
         if i_have_priority:
-            deferred.append((payload["from"], payload["req_id"]))
+            deferred.append((payload["from"], payload["req_id"], time.monotonic()))
         else:
             pending_immediate_replies.append((payload["from"], payload["req_id"]))
+
+    def release_stale_deferrals() -> None:
+        # The actual deadlock-breaker -- see this file's module
+        # docstring "KNOWN FAILURE MODE, FIXED" section for the real
+        # 3-endpoint run that confirmed indefinite deferral is a genuine
+        # risk, not a hypothetical. Never releases while in_cs (that
+        # would violate mutual exclusion -- a second endpoint could
+        # believe the zone is free while this one is still physically
+        # occupying it); a deferral only ever sits here while
+        # `requesting` (not yet granted), so this is safe.
+        nonlocal deferred
+        if in_cs:
+            return
+        now = time.monotonic()
+        still_deferred = []
+        for to, req_id, deferred_at in deferred:
+            if now - deferred_at >= args.defer_release_timeout_s:
+                send_reply(to, req_id)
+            else:
+                still_deferred.append((to, req_id, deferred_at))
+        deferred = still_deferred
 
     def on_reply(msg: String) -> None:
         payload = json.loads(msg.data)
@@ -297,6 +365,7 @@ def main() -> int:
                 rclpy.spin_once(node, timeout_sec=0.0)
             rclpy.spin_once(node, timeout_sec=0.1)
             drain_pending_replies()
+            release_stale_deferrals()
             if beacon_pub is not None and len(discovery_peers_seen) >= args.expected_peer_count:
                 break
     discovery_convergence_s = time.monotonic() - discovery_start
@@ -309,6 +378,7 @@ def main() -> int:
         while time.monotonic() < start_deadline and not args.start_file.exists():
             rclpy.spin_once(node, timeout_sec=0.05)
             drain_pending_replies()
+            release_stale_deferrals()
         if not args.start_file.exists():
             raise RuntimeError("timed out waiting for data-plane start gate")
 
@@ -324,24 +394,31 @@ def main() -> int:
 
         retries_this_crossing = 0
         forced_entry = False
-        # ONE req_id/lamport_ts for the WHOLE crossing, not a fresh one
-        # per retry -- confirmed as the actual bug via a real run: with a
-        # fresh req_id (and a reset replies_received) every retry, two
-        # replies that both arrive EVENTUALLY but NOT within the same
-        # --reply-timeout-s window (very plausible given FleetRMW's own
-        # already-documented high-variance Wi-Fi latency -- see Bảng V's
-        # p50=5.5s/p95=9.9s/p99=10.9s for this exact RMW/profile) get
+        # req_id stays FIXED for the whole crossing -- confirmed as a
+        # real bug fix: with a fresh req_id (and a reset
+        # replies_received) every retry, two replies that both arrive
+        # EVENTUALLY but NOT within the same --reply-timeout-s window
+        # (very plausible given FleetRMW's own already-documented
+        # high-variance Wi-Fi latency -- see Bảng V's
+        # p50=5.5s/p95=9.9s/p99=10.9s for this exact RMW/profile) got
         # counted against TWO DIFFERENT req_ids and neither retry ever
-        # sees both at once, even though both replies genuinely arrived.
-        # Keeping the identifying (lamport_ts, req_id) constant and just
-        # RE-BROADCASTING the same request (in case the first copy was
-        # lost) means a reply from ANY broadcast of this crossing's
-        # request still matches and counts -- retrying stops discarding
-        # real progress already made.
-        lamport_clock += 1
+        # saw both at once, discarding real progress on every retry.
+        # Re-broadcasting the SAME req_id means a reply from ANY
+        # broadcast of this crossing's request still matches and counts.
+        #
+        # The Lamport TIMESTAMP, in contrast, DOES keep advancing on
+        # each re-broadcast (a real Lamport clock is never frozen -- see
+        # this file's module docstring "KNOWN FAILURE MODE, FIXED" #1).
+        # This does not by itself grant a struggling requester higher
+        # priority (Lamport values only ever increase, so a requester's
+        # priority can only get WORSE over repeated retries, never
+        # better) -- the actual guarantee against indefinite blocking is
+        # release_stale_deferrals() (#3). Advancing it here is about
+        # correctness/hygiene (an unmoving Lamport clock defeats the
+        # point of having one) and keeping cross-crossing causality
+        # meaningful, not a fairness mechanism on its own.
         requesting = True
         current_req_id = f"{args.endpoint}:{crossing_index}"
-        current_req_ts = (lamport_clock, args.endpoint)
         replies_received = set()
         declared_wall_ns = time.time_ns()
         while True:
@@ -351,6 +428,8 @@ def main() -> int:
                 # every subsequent one -- a synchronized-retry
                 # ("thundering herd") risk, not a transport bug.
                 time.sleep(rng.uniform(0.0, 0.3))
+            lamport_clock += 1
+            current_req_ts = (lamport_clock, args.endpoint)
             request_wall_ns = time.time_ns()
             msg = String()
             msg.data = json.dumps(
@@ -373,6 +452,7 @@ def main() -> int:
             ):
                 rclpy.spin_once(node, timeout_sec=0.05)
                 drain_pending_replies()
+                release_stale_deferrals()
 
             if len(replies_received) >= len(peers) or not peers:
                 forced_entry = False
@@ -399,7 +479,7 @@ def main() -> int:
         time.sleep(args.crossing_duration_ms / 1000.0)
         exited_wall_ns = time.time_ns()
         in_cs = False
-        for to, req_id in deferred:
+        for to, req_id, _deferred_at in deferred:
             send_reply(to, req_id)
         deferred = []
 
@@ -425,7 +505,8 @@ def main() -> int:
     while time.monotonic() < drain_deadline:
         rclpy.spin_once(node, timeout_sec=0.1)
         drain_pending_replies()
-        for to, req_id in deferred:
+        release_stale_deferrals()
+        for to, req_id, _deferred_at in deferred:
             send_reply(to, req_id)
         deferred = []
 

@@ -1095,6 +1095,7 @@ class ReferenceTopologyProbe:
         num_crossings: int,
         crossing_duration_ms: float,
         reply_timeout_s: float,
+        defer_release_timeout_s: float = 8.0,
         seed: int,
         start_offset_ms: float,
         discovery_timeout_s: float,
@@ -1104,6 +1105,7 @@ class ReferenceTopologyProbe:
         rmw_implementation: str = "rmw_fleetqox_cpp",
         discovery_mode: str = "default",
         extra_rmw_env: dict[str, str] | None = None,
+        launch_order: list[int] | None = None,
     ) -> None:
         """Bảng VI ("Chỉ số điều phối và hoàn thành nhiệm vụ") launcher --
         runs fleetqox_coordination_endpoint.py (the Ricart-Agrawala zone-
@@ -1113,11 +1115,25 @@ class ReferenceTopologyProbe:
         FleetRMW, CycloneDDS static-peers XML, Fast DDS discovery-server,
         Zenoh router session config) as launch_endpoints() -- the network/
         RMW plumbing is identical, only the application workload differs.
+
+        launch_order: a permutation of range(len(self.endpoints))
+        controlling the ORDER `docker exec -d` calls fire in, for
+        diagnosing whether a stuck endpoint is tied to launch-ORDER
+        (whichever one starts last) vs. that specific endpoint's own
+        name/IP -- see docs/AUDIT_ACCEPTANCE_TRACKING.md "endpoint cuối
+        cùng bị cô lập". Every index/file/container-name association
+        stays keyed by the endpoint's ORIGINAL position in self.endpoints
+        (self.endpoint_container_names[i], result_i.json, ready_i, etc.)
+        regardless of this launch order -- only the wall-clock SEQUENCE
+        of the docker exec calls themselves changes. None (default)
+        launches in the normal 0..N-1 order.
         """
         docker("exec", self.rigger_name, "mkdir", "-p", f"/work/{results_dir_container}")
         self._ready_files = [f"{results_dir_container}/ready_{i}" for i in range(len(self.endpoints))]
         self._start_file = f"{results_dir_container}/start"
-        for i, endpoint in enumerate(self.endpoints):
+        order = launch_order if launch_order is not None else list(range(len(self.endpoints)))
+        for i in order:
+            endpoint = self.endpoints[i]
             peers_env = ",".join(other for other in self.endpoints if other != endpoint)
             rmw_peers = ",".join(
                 f"{self.ips[other]}:{RMW_PORT}" for other in self.endpoints if other != endpoint
@@ -1207,6 +1223,7 @@ class ReferenceTopologyProbe:
                 f"--num-crossings={num_crossings} "
                 f"--crossing-duration-ms={crossing_duration_ms:.12g} "
                 f"--reply-timeout-s={reply_timeout_s:.12g} "
+                f"--defer-release-timeout-s={defer_release_timeout_s:.12g} "
                 f"--seed={seed} "
                 f"--start-offset-ms={start_offset_ms:.12g} "
                 f"--discovery-timeout-s={discovery_timeout_s:.12g} "
@@ -1544,6 +1561,7 @@ def run_coordination_probe(
     num_crossings: int = 5,
     crossing_duration_ms: float = 300.0,
     reply_timeout_s: float = 5.0,
+    defer_release_timeout_s: float = 8.0,
     scenario_timeout_s: float = 120.0,
     start_offset_ms: float = 2000.0,
     discovery_timeout_s: float = 15.0,
@@ -1559,6 +1577,7 @@ def run_coordination_probe(
     rmw_implementation: str = "rmw_fleetqox_cpp",
     discovery_mode: str = "default",
     extra_rmw_env: dict[str, str] | None = None,
+    launch_order: list[int] | None = None,
 ) -> dict[str, Any]:
     """Bảng VI ("Chỉ số điều phối và hoàn thành nhiệm vụ") -- see
     fleetqox_coordination_endpoint.py's module docstring for the
@@ -1614,6 +1633,7 @@ def run_coordination_probe(
             num_crossings=num_crossings,
             crossing_duration_ms=crossing_duration_ms,
             reply_timeout_s=reply_timeout_s,
+            defer_release_timeout_s=defer_release_timeout_s,
             seed=seed,
             start_offset_ms=start_offset_ms,
             discovery_timeout_s=discovery_timeout_s,
@@ -1623,6 +1643,7 @@ def run_coordination_probe(
             rmw_implementation=rmw_implementation,
             discovery_mode=discovery_mode,
             extra_rmw_env=extra_rmw_env,
+            launch_order=launch_order,
         )
         probe.wait_for_ready_then_start(ready_deadline_s=ready_deadline_s)
         probe.wait_for_completion(
