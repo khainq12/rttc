@@ -37,16 +37,18 @@ This maps directly onto Bảng VI's columns:
     it took a real, active contention to resolve (when nobody else is
     contending this reduces to N-1 round-trip times, exactly as it
     should).
-  - Navigation recovery count: this harness has no real navigation
-    stack to recover a path in -- the closest faithful analogue
-    available is a REQUEST retry: if not all N-1 replies arrive within
-    --reply-timeout-s (almost always because a reply was lost on a
-    congested/lossy network, not because anyone misbehaved), the
-    request is re-broadcast with a fresh timestamp. Each such retry is
-    counted here -- report this framing explicitly wherever this
-    column is used, it is a coordination-layer retry standing in for
-    an application-layer recovery, not a measurement of any real
-    motion planner.
+  - Navigation recovery count (field name: coordination_retry_count,
+    renamed 14/09/2026 per review -- "navigation_recovery_count" was
+    misleading, this harness has no real navigation stack to recover a
+    path in): the closest faithful analogue available is a REQUEST
+    retry -- if not all N-1 replies arrive within --reply-timeout-s
+    (almost always because a reply was lost on a congested/lossy
+    network, not because anyone misbehaved), the request is
+    re-broadcast (same req_id, same frozen priority timestamp -- see
+    "2 FURTHER FIXES" below). Each such retry is counted here -- report
+    this framing explicitly wherever this column is used: it is a
+    coordination-layer retry standing in for an application-layer
+    recovery, not a measurement of any real motion planner.
   - Task completion time: wall-clock time from the shared start gate
     to every participant finishing its assigned --num-crossings.
 
@@ -64,24 +66,61 @@ lowest-priority endpoint's replies sat deferred forever (confirmed via
 raw traffic logs: zero "to: <that endpoint>" messages were EVER
 broadcast, on ANY topic, by ANYONE, for the whole 90s scenario -- not
 lost in transit, never sent at all). Fixed with 3 changes:
-  1. The Lamport clock advertised with each RE-broadcast of a request
-     now keeps advancing (matching the standard definition of a
-     Lamport clock -- it should never be frozen), instead of reusing
-     the exact same timestamp for the whole crossing.
-  2. req_id stays constant across retries of the SAME crossing (kept
-     from an earlier fix) so a reply that arrives on ANY retry still
-     counts -- retries reset the OUTGOING message's freshness only,
-     never discard already-collected replies.
-  3. Deferred replies now have a release timeout
-     (--defer-release-timeout-s): if this process hasn't itself
-     entered its critical section within that long, it gives up
-     enforcing its own priority claim and sends the deferred reply
-     anyway. This is the actual deadlock-breaker -- (1) alone doesn't
-     fix indefinite blocking, since Lamport clocks only ever increase
-     (a struggling process's priority can only get WORSE over time,
-     never jump the queue); a bounded release is what guarantees
-     eventual progress for a low-priority requester when a
+  1. The Lamport clock now properly advances BETWEEN crossings (each
+     crossing takes one fresh increment when it starts), instead of
+     every endpoint reusing the exact same initial value forever.
+  2. req_id stays constant across retries of the SAME crossing so a
+     reply that arrives on ANY retry still counts -- retries reset the
+     OUTGOING message's freshness only, never discard already-collected
+     replies.
+  3. Deferred replies have a release timeout (--defer-release-timeout-s):
+     if this process hasn't itself entered its critical section within
+     that long, it gives up enforcing its own priority claim and sends
+     the deferred reply anyway. This is the actual deadlock-breaker --
+     (1) alone doesn't fix indefinite blocking, since Lamport clocks
+     only ever increase (a struggling process's priority can only get
+     WORSE over time, never jump the queue); a bounded release is what
+     guarantees eventual progress for a low-priority requester when a
      higher-priority one is itself stuck.
+
+2 FURTHER FIXES, 14/09/2026 (found via external review of this file
+after the Open5GS profile showed FleetRMW pinned at 100% forced_entry
+even at N=8, unlike its healthy ~60% delivery on the same profile/
+scale in Bảng V's trace-replay workload -- see
+docs/AUDIT_ACCEPTANCE_TRACKING.md):
+  4. The Lamport timestamp attached to a crossing's REQUEST is now
+     frozen for the WHOLE crossing (one increment, taken once before
+     the retry loop, reused on every retry's re-broadcast) instead of
+     advancing on EVERY retry as fix #1 above originally did between
+     13/09 and 14/09/2026. That per-retry advance was itself a real
+     fairness bug: since a LOWER (lamport_ts, name) wins priority ties
+     and Lamport values only ever increase, a requester needing more
+     retries -- almost always because ITS OWN messages are the ones
+     being lost, not because it misbehaved -- got a strictly WORSE
+     priority on every single retry, a vicious cycle where the
+     requester most in need of protection was punished hardest. A
+     retransmission of the same logical request is not a new causal
+     event by Lamport's own definition and should not consume a new
+     clock value; only a crossing's first broadcast does now.
+  5. release_stale_deferrals() (fix #3 above) had a real mutual-
+     exclusion safety gap: releasing a deferred reply tells a
+     lower-priority peer "go ahead" without this process having
+     actually finished OR abandoned its own current request. If that
+     peer then enters its critical section, and THIS process's own
+     in-flight request separately, later collects a full reply set
+     (e.g. via some other endpoint's release elsewhere in the fleet),
+     both could end up physically inside the zone at once --
+     unreplicated double-occupancy that no existing metric would have
+     caught (a crossing only gets flagged forced_entry when giving up
+     at the scenario deadline, not when it succeeds on a set of
+     replies that included a stale, timeout-released one). Fixed:
+     yielding priority to a peer now also invalidates this process's
+     OWN currently-collected reply set (replies_received is cleared),
+     forcing it to earn a full fresh set via the normal retry path
+     before it's allowed to enter -- exactly as if this attempt had
+     just failed outright. Deliberately conservative: costs one extra
+     retry's worth of latency, not a narrower but harder-to-verify
+     correctness argument.
 """
 
 from __future__ import annotations
@@ -193,10 +232,10 @@ def main() -> int:
 
     coordination_message_ages_ms: list[float] = []
     crossings: list[dict[str, Any]] = []
-    navigation_recovery_count = 0
+    coordination_retry_count = 0
 
     # TEMPORARY diagnostic counters for the "every crossing forces entry,
-    # navigation_recovery_count always maxes out" investigation -- see
+    # coordination_retry_count always maxes out" investigation -- see
     # docs/AUDIT_ACCEPTANCE_TRACKING.md. Cheap enough to leave permanently
     # if useful, but flagged here as debug-oriented rather than a Bảng VI
     # column in its own right.
@@ -210,6 +249,7 @@ def main() -> int:
         "replies_received_stale_req_id": 0,
         "replies_received_not_requesting": 0,
         "publish_failures": 0,
+        "own_claim_yielded_on_timeout": 0,
     }
 
     def safe_publish(pub, msg: String) -> None:
@@ -304,18 +344,45 @@ def main() -> int:
         # would violate mutual exclusion -- a second endpoint could
         # believe the zone is free while this one is still physically
         # occupying it); a deferral only ever sits here while
-        # `requesting` (not yet granted), so this is safe.
-        nonlocal deferred
+        # `requesting` (not yet granted), so this is safe FROM THE
+        # RELEASER'S side.
+        #
+        # SAFETY GAP FIXED HERE (flagged in review, confirmed real by
+        # tracing it through): releasing a deferred reply is us telling
+        # a lower-priority peer "go ahead, I'm not holding you back
+        # anymore" WITHOUT having actually finished (or abandoned) our
+        # own current request. If our own in-flight request later
+        # SEPARATELY collects its full reply set (e.g. the peer that was
+        # blocking IT also times out and yields), we could enter our
+        # critical section too -- while the peer we just released may
+        # already be inside ITS OWN, a genuine double-occupancy. The
+        # peer's reply to OUR OWN prior request doesn't protect against
+        # this: replies are sent whenever a peer decides it doesn't have
+        # priority, regardless of whether IT is later granted its own
+        # entry by a different release elsewhere in the fleet. Fix:
+        # yielding priority to someone invalidates whatever reply set
+        # we'd already collected for our OWN current request -- we must
+        # earn a fresh full set (via the normal retry path just below)
+        # before we're allowed to enter, exactly as if this attempt had
+        # just failed outright. This is deliberately conservative (an
+        # extra retry cycle costs latency, not safety) rather than
+        # trying to prove a narrower condition is fine.
+        nonlocal deferred, replies_received
         if in_cs:
             return
         now = time.monotonic()
         still_deferred = []
+        released_any = False
         for to, req_id, deferred_at in deferred:
             if now - deferred_at >= args.defer_release_timeout_s:
                 send_reply(to, req_id)
+                released_any = True
             else:
                 still_deferred.append((to, req_id, deferred_at))
         deferred = still_deferred
+        if released_any and requesting:
+            debug_counters["own_claim_yielded_on_timeout"] += 1
+            replies_received = set()
 
     def on_reply(msg: String) -> None:
         payload = json.loads(msg.data)
@@ -426,21 +493,29 @@ def main() -> int:
         # Re-broadcasting the SAME req_id means a reply from ANY
         # broadcast of this crossing's request still matches and counts.
         #
-        # The Lamport TIMESTAMP, in contrast, DOES keep advancing on
-        # each re-broadcast (a real Lamport clock is never frozen -- see
-        # this file's module docstring "KNOWN FAILURE MODE, FIXED" #1).
-        # This does not by itself grant a struggling requester higher
-        # priority (Lamport values only ever increase, so a requester's
-        # priority can only get WORSE over repeated retries, never
-        # better) -- the actual guarantee against indefinite blocking is
-        # release_stale_deferrals() (#3). Advancing it here is about
-        # correctness/hygiene (an unmoving Lamport clock defeats the
-        # point of having one) and keeping cross-crossing causality
-        # meaningful, not a fairness mechanism on its own.
+        # The Lamport TIMESTAMP is now ALSO frozen for the whole
+        # crossing (one increment, taken once below, reused on every
+        # retry's re-broadcast) -- changed from an earlier version that
+        # bumped it on every retry. That earlier behavior was flagged in
+        # review as a real fairness bug: since LOWER (lamport_ts, name)
+        # wins priority ties, and Lamport values only ever increase, a
+        # requester needing more retries (almost always because ITS OWN
+        # messages are the ones being lost, not because it misbehaved)
+        # got a STRICTLY WORSE priority on every retry -- exactly the
+        # requester most likely to need protection was the one being
+        # punished hardest, a vicious cycle that plausibly explains
+        # forced_entry rates staying pinned near 100% even at small N
+        # (see docs/AUDIT_ACCEPTANCE_TRACKING.md, 14/09/2026 entry). A
+        # retransmission of the SAME logical request is not a new
+        # causal event by Lamport's own definition, so it should not
+        # consume a new clock value -- only the FIRST broadcast of a
+        # crossing does.
         requesting = True
         current_req_id = f"{args.endpoint}:{crossing_index}"
         replies_received = set()
         declared_wall_ns = time.time_ns()
+        lamport_clock += 1
+        current_req_ts = (lamport_clock, args.endpoint)
         while True:
             if retries_this_crossing > 0:
                 # Jitter every RE-broadcast (not the first) so a
@@ -448,8 +523,6 @@ def main() -> int:
                 # every subsequent one -- a synchronized-retry
                 # ("thundering herd") risk, not a transport bug.
                 time.sleep(rng.uniform(0.0, 0.3))
-            lamport_clock += 1
-            current_req_ts = (lamport_clock, args.endpoint)
             request_wall_ns = time.time_ns()
             msg = String()
             msg.data = json.dumps(
@@ -478,7 +551,7 @@ def main() -> int:
                 forced_entry = False
                 break
             retries_this_crossing += 1
-            navigation_recovery_count += 1
+            coordination_retry_count += 1
             if time.monotonic() >= scenario_deadline:
                 # Gave up waiting for full consensus and entering anyway --
                 # under severe enough network collapse (e.g. the 5G profile
@@ -537,7 +610,7 @@ def main() -> int:
         "num_crossings_completed": len(crossings),
         "num_crossings_requested": args.num_crossings,
         "crossings": crossings,
-        "navigation_recovery_count": navigation_recovery_count,
+        "coordination_retry_count": coordination_retry_count,
         "coordination_message_ages_ms": coordination_message_ages_ms,
         "task_completion_s": task_completion_s,
         "discovery_convergence_s": discovery_convergence_s,
@@ -554,7 +627,7 @@ def main() -> int:
                 "status": "ok",
                 "endpoint": args.endpoint,
                 "crossings_completed": len(crossings),
-                "navigation_recovery_count": navigation_recovery_count,
+                "coordination_retry_count": coordination_retry_count,
             }
         )
     )

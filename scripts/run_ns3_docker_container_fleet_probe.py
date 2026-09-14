@@ -295,11 +295,14 @@ def compute_coordination_metrics(endpoint_results: dict[str, Any]) -> dict[str, 
       collecting every peer's reply, must not be averaged in as if it
       were an equally valid mutex acquisition), of
       entered_wall_ns - declared_wall_ns.
-    - navigation_recovery_count: SUM across all endpoints of retry
-      counts (a REQUEST that didn't collect every reply within
-      --reply-timeout-s and had to be re-broadcast) -- see
-      fleetqox_coordination_endpoint.py's module docstring for why this
-      coordination-layer retry is the closest available stand-in for a
+    - coordination_retry_count (renamed 14/09/2026 from
+      navigation_recovery_count -- the old name was misleading, see
+      fleetqox_coordination_endpoint.py's module docstring): SUM across
+      all endpoints of retry counts (a REQUEST that didn't collect
+      every reply within --reply-timeout-s and had to be re-broadcast)
+      -- see fleetqox_coordination_endpoint.py's module docstring for
+      why this coordination-layer retry is the closest available
+      stand-in for a
       real navigation-stack recovery in a harness with no actual motion
       planner.
     - task_completion_s: MAX across endpoints of task_completion_s --
@@ -331,7 +334,7 @@ def compute_coordination_metrics(endpoint_results: dict[str, Any]) -> dict[str, 
         if not result:
             continue
         message_ages_ms.extend(result.get("coordination_message_ages_ms", []))
-        total_recovery_count += result.get("navigation_recovery_count", 0)
+        total_recovery_count += result.get("coordination_retry_count", 0)
         completion_times_s.append(result.get("task_completion_s", 0.0))
         for crossing in result.get("crossings", []):
             total_crossings += 1
@@ -347,7 +350,7 @@ def compute_coordination_metrics(endpoint_results: dict[str, Any]) -> dict[str, 
         "conflict_resolution_delay_ms": (
             sum(resolution_delays_ms) / len(resolution_delays_ms) if resolution_delays_ms else None
         ),
-        "navigation_recovery_count": total_recovery_count,
+        "coordination_retry_count": total_recovery_count,
         "task_completion_s": max(completion_times_s) if completion_times_s else None,
         "total_crossings": total_crossings,
         "forced_crossings": forced_crossings,

@@ -277,7 +277,7 @@ class ComputeCoordinationMetricsTest(unittest.TestCase):
         endpoint_results = {
             "robot_0000": {
                 "coordination_message_ages_ms": [10.0, 20.0],
-                "navigation_recovery_count": 1,
+                "coordination_retry_count": 1,
                 "task_completion_s": 12.0,
                 "crossings": [
                     {"conflict_resolution_delay_ms": 100.0, "forced_entry": False},
@@ -286,7 +286,7 @@ class ComputeCoordinationMetricsTest(unittest.TestCase):
             },
             "robot_0001": {
                 "coordination_message_ages_ms": [30.0],
-                "navigation_recovery_count": 2,
+                "coordination_retry_count": 2,
                 "task_completion_s": 15.0,
                 "crossings": [
                     {"conflict_resolution_delay_ms": 200.0, "forced_entry": False},
@@ -296,7 +296,7 @@ class ComputeCoordinationMetricsTest(unittest.TestCase):
         metrics = compute_coordination_metrics(endpoint_results)
         self.assertAlmostEqual(metrics["coordination_update_age_ms"], 20.0)  # (10+20+30)/3
         self.assertAlmostEqual(metrics["conflict_resolution_delay_ms"], 200.0)  # (100+300+200)/3
-        self.assertEqual(metrics["navigation_recovery_count"], 3)
+        self.assertEqual(metrics["coordination_retry_count"], 3)
         self.assertAlmostEqual(metrics["task_completion_s"], 15.0)  # max, not mean
         self.assertEqual(metrics["total_crossings"], 3)
         self.assertEqual(metrics["forced_crossings"], 0)
@@ -306,7 +306,7 @@ class ComputeCoordinationMetricsTest(unittest.TestCase):
         endpoint_results = {
             "robot_0000": {
                 "coordination_message_ages_ms": [],
-                "navigation_recovery_count": 5,
+                "coordination_retry_count": 5,
                 "task_completion_s": 60.0,
                 "crossings": [
                     {"conflict_resolution_delay_ms": 9999.0, "forced_entry": True},
@@ -325,7 +325,7 @@ class ComputeCoordinationMetricsTest(unittest.TestCase):
         endpoint_results = {
             "robot_0000": {
                 "coordination_message_ages_ms": [],
-                "navigation_recovery_count": 10,
+                "coordination_retry_count": 10,
                 "task_completion_s": 120.0,
                 "crossings": [
                     {"conflict_resolution_delay_ms": 9999.0, "forced_entry": True},
@@ -341,7 +341,7 @@ class ComputeCoordinationMetricsTest(unittest.TestCase):
         metrics = compute_coordination_metrics(endpoint_results)
         self.assertIsNone(metrics["coordination_update_age_ms"])
         self.assertIsNone(metrics["conflict_resolution_delay_ms"])
-        self.assertEqual(metrics["navigation_recovery_count"], 0)
+        self.assertEqual(metrics["coordination_retry_count"], 0)
         self.assertIsNone(metrics["task_completion_s"])
         self.assertIsNone(metrics["forced_entry_rate"])
 
