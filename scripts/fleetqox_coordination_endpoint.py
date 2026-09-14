@@ -177,6 +177,23 @@ def main() -> int:
     parser.add_argument("--start-file", type=Path, default=None)
     parser.add_argument("--expected-peer-count", type=int, default=0)
     parser.add_argument("--skip-discovery-wait", action="store_true")
+    parser.add_argument(
+        "--priority-mode",
+        choices=("lamport", "fleetqox"),
+        default="lamport",
+        help="'lamport' (default, the 'Ours-NoQoX' arm): priority ties are broken purely "
+        "by (lamport_ts, name), exactly as this file always did -- no notion of WHICH "
+        "task a crossing belongs to. 'fleetqox' (the 'Ours-FleetQoX' arm): priority is "
+        "compared on task_criticality FIRST (higher wins outright, regardless of "
+        "lamport_ts), falling back to (lamport_ts, name) only between two requests of "
+        "equal criticality -- i.e. a safety-critical crossing request always wins over a "
+        "routine one, matching FleetQoX's own task-aware priority thesis "
+        "(fleetqox/model.py's TaskContext.task_criticality) applied to THIS protocol's "
+        "own contention, not just to per-message transport scheduling like Bảng V's "
+        "--policy does. Both modes run the identical wire protocol/retry/defer-release "
+        "machinery -- only the priority COMPARISON differs -- so any measured difference "
+        "is attributable to the priority rule itself, not some other confound.",
+    )
     args = parser.parse_args()
 
     import rclpy
@@ -186,6 +203,22 @@ def main() -> int:
 
     peers = [p for p in args.peers.split(",") if p]
     rng = random.Random(f"{args.seed}:{args.endpoint}")
+
+    # Deterministic, seed-independent task-criticality tier assignment: every
+    # 4th participant (by sorted name, so every process derives the SAME
+    # assignment for the SAME fleet without needing to exchange anything) is
+    # "safety" tier (0.9), the rest "routine" (0.3) -- a fixed ~25% split
+    # loosely matching a real fleet where most traffic is routine but some
+    # robots/tasks are always safety-critical. Only used when
+    # --priority-mode=fleetqox; computed unconditionally anyway so it's
+    # always present in the result JSON for inspection either way.
+    _all_names = sorted([args.endpoint, *peers])
+    task_criticality = 0.9 if _all_names.index(args.endpoint) % 4 == 0 else 0.3
+
+    def priority_key(lamport_ts: int, name: str, criticality: float) -> tuple:
+        if args.priority_mode == "fleetqox":
+            return (-criticality, lamport_ts, name)
+        return (lamport_ts, name)
 
     # Same /parameter_events-suppression patch as fleetqox_rmw_trace_endpoint.py
     # -- see that file's comment for why it has to happen before create_node().
@@ -314,7 +347,9 @@ def main() -> int:
             return  # broadcast loops back on some RMWs -- ignore our own request
         debug_counters["requests_received"] += 1
         coordination_message_ages_ms.append((time.time_ns() - payload["wall_ns"]) / 1e6)
-        their_ts = (payload["lamport_ts"], payload["from"])
+        their_key = priority_key(
+            payload["lamport_ts"], payload["from"], payload.get("task_criticality", 0.0)
+        )
         lamport_clock = max(lamport_clock, payload["lamport_ts"]) + 1
         # While ACTUALLY in the zone (in_cs), defer UNCONDITIONALLY --
         # no timestamp comparison here. Mutual exclusion's safety
@@ -327,7 +362,9 @@ def main() -> int:
         # the zone yet (the `requesting` case below).
         if in_cs:
             i_have_priority = True
-        elif requesting and current_req_ts is not None and current_req_ts < their_ts:
+        elif requesting and current_req_ts is not None and (
+            priority_key(current_req_ts[0], current_req_ts[1], task_criticality) < their_key
+        ):
             i_have_priority = True
         else:
             i_have_priority = False
@@ -531,6 +568,7 @@ def main() -> int:
                     "from": args.endpoint,
                     "req_id": current_req_id,
                     "lamport_ts": current_req_ts[0],
+                    "task_criticality": task_criticality,
                     "wall_ns": request_wall_ns,
                 }
             )
@@ -606,6 +644,8 @@ def main() -> int:
     result = {
         "schema_version": "fleetqox.coordination_endpoint.v1",
         "endpoint": args.endpoint,
+        "priority_mode": args.priority_mode,
+        "task_criticality": task_criticality,
         "num_peers": len(peers),
         "num_crossings_completed": len(crossings),
         "num_crossings_requested": args.num_crossings,

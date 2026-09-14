@@ -1109,6 +1109,7 @@ class ReferenceTopologyProbe:
         crossing_duration_ms: float,
         reply_timeout_s: float,
         defer_release_timeout_s: float = 8.0,
+        priority_mode: str = "lamport",
         seed: int,
         start_offset_ms: float,
         discovery_timeout_s: float,
@@ -1237,6 +1238,7 @@ class ReferenceTopologyProbe:
                 f"--crossing-duration-ms={crossing_duration_ms:.12g} "
                 f"--reply-timeout-s={reply_timeout_s:.12g} "
                 f"--defer-release-timeout-s={defer_release_timeout_s:.12g} "
+                f"--priority-mode={priority_mode} "
                 f"--seed={seed} "
                 f"--start-offset-ms={start_offset_ms:.12g} "
                 f"--discovery-timeout-s={discovery_timeout_s:.12g} "
@@ -1575,6 +1577,7 @@ def run_coordination_probe(
     crossing_duration_ms: float = 300.0,
     reply_timeout_s: float = 5.0,
     defer_release_timeout_s: float = 8.0,
+    priority_mode: str = "lamport",
     scenario_timeout_s: float = 120.0,
     start_offset_ms: float = 2000.0,
     discovery_timeout_s: float = 15.0,
@@ -1647,6 +1650,7 @@ def run_coordination_probe(
             crossing_duration_ms=crossing_duration_ms,
             reply_timeout_s=reply_timeout_s,
             defer_release_timeout_s=defer_release_timeout_s,
+            priority_mode=priority_mode,
             seed=seed,
             start_offset_ms=start_offset_ms,
             discovery_timeout_s=discovery_timeout_s,

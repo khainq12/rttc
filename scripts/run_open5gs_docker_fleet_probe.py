@@ -631,6 +631,7 @@ def run_open5gs_coordination_probe(
     crossing_duration_ms: float = 300.0,
     reply_timeout_s: float = 5.0,
     defer_release_timeout_s: float = 8.0,
+    priority_mode: str = "lamport",
     scenario_timeout_s: float = 120.0,
     start_offset_ms: float = 2000.0,
     discovery_timeout_s: float = 15.0,
@@ -668,6 +669,7 @@ def run_open5gs_coordination_probe(
             crossing_duration_ms=crossing_duration_ms,
             reply_timeout_s=reply_timeout_s,
             defer_release_timeout_s=defer_release_timeout_s,
+            priority_mode=priority_mode,
             seed=seed,
             start_offset_ms=start_offset_ms,
             discovery_timeout_s=discovery_timeout_s,
@@ -745,6 +747,11 @@ def main() -> int:
     coord_p.add_argument("--seed", type=int, default=13)
     coord_p.add_argument("--rmw-implementation", default="rmw_fleetqox_cpp")
     coord_p.add_argument("--discovery-mode", default="default")
+    coord_p.add_argument(
+        "--priority-mode", choices=("lamport", "fleetqox"), default="lamport",
+        help="'lamport' = Ours-NoQoX (current behavior). 'fleetqox' = Ours-FleetQoX "
+        "(task_criticality-aware priority) -- see fleetqox_coordination_endpoint.py.",
+    )
     coord_p.add_argument("--summary-json", type=Path, default=None)
 
     args = parser.parse_args()
@@ -798,6 +805,7 @@ def main() -> int:
             image=args.image, output_dir=args.output_dir, num_robots=args.num_robots,
             seed=args.seed, subscribers=subscribers,
             rmw_implementation=args.rmw_implementation, discovery_mode=args.discovery_mode,
+            priority_mode=args.priority_mode,
         )
         if args.summary_json:
             args.summary_json.parent.mkdir(parents=True, exist_ok=True)
