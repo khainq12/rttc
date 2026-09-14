@@ -5176,41 +5176,84 @@ phải do bản chất traffic ROS 2 hay ranh giới vật lý của 5G nói chu
 `reply_timeout_s=5.0`/`defer_release_timeout_s=8.0` tuned từ trước,
 xem bảng đầy đủ ở `docs/BANG_V_VI_KET_QUA.md`)**:
 
+Số liệu dưới đây là bản ĐÃ SỬA (14/09/2026, sau khi vá 2 bug Ricart-
+Agrawala — xem mục ngay dưới) — THAY cho bản đầu tiên chạy cùng ngày
+(đã lỗi thời; bản trước fix nằm trong commit git trước đó và trong
+`bang6_open5gs_8_16_32_n3.jsonl` không có hậu tố `_v2`, không lặp lại
+nguyên văn ở đây để tránh gây nhầm bản nào là số liệu chính thức).
+
 | N | Fast DDS | CycloneDDS | Zenoh | FleetRMW |
 |---|---|---|---|---|
-| 8 | 0% forced | 100% | 34% | **100%** |
-| 16 | 30% forced | 100% | 26% | **100%** |
-| 32 | 99% forced | 100% | 100% | **100%** |
+| 8 | 0% forced | 100% | 65% | **100%** |
+| 16 | 14% forced | 100% | 76% | **100%** |
+| 32 | 100% forced | 100% | 100% | **100%** |
 
-**Phát hiện bất ngờ cần lưu ý khi trích dẫn**: FleetRMW ở Bảng VI
-100% forced_entry NGAY CẢ Ở N=8 — trái ngược hẳn với Bảng V (cùng
-profile, cùng quy mô, FleetRMW giao tin ổn 59.6%). Đã kiểm tra kỹ
-KHÔNG PHẢI bug: `debug_counters.publish_failures=0` ở mọi endpoint
-(gửi OK ở tầng OS), nhưng REPLY message thực sự bị mất trên đường —
-dàn trải đều across nhiều endpoint khác nhau (loại trừ được kiểu lỗi
-"1 endpoint cụ thể bị cô lập" đã từng gặp và sửa trước đó). Giả
-thuyết hợp lý nhất: coordination endpoint dùng peer_policy "broadcast
-tới tất cả" (không giống trace-replay endpoint dùng
-subscription-aware/thấp tải hơn nhiều) — với N=8 UE đồng thời
-broadcast REQUEST/REPLY dồn dập qua đường hầm GTP-U/UPF, tải burst
-này có thể vượt khả năng UPF forward kịp trong khung `reply_timeout_s`
-hiện tại. THEO ĐÚNG nguyên tắc đã thống nhất trước đó khi gặp tình
-huống tương tự ở ns-3 ("không nên cứ tăng timeout mãi — coi các lần
-timeout đó là coordination failure thực sự"), số liệu này được báo
-cáo NGUYÊN TRẠNG, không cố nới timeout để "cứu" kết quả. Đây là một
-hướng điều tra tiềm năng cho tương lai (ví dụ: đo trực tiếp UDP loss
-rate qua UPF dưới tải cao) nếu cần một con số forced_entry thấp hơn
-cho FleetRMW ở profile này.
+**Phát hiện qua review bên ngoài + 2 bug thật đã sửa trong
+`fleetqox_coordination_endpoint.py`** (chi tiết đầy đủ trong docstring
+của chính file đó, mục "2 FURTHER FIXES, 14/09/2026"):
+1. Lamport timestamp trước đây TĂNG mỗi lần retry trong cùng 1
+   crossing — nghĩa là node nào cần retry nhiều (thường vì CHÍNH gói
+   của nó bị rớt, không phải do nó "sai") lại bị GIẢM ưu tiên mỗi lần
+   retry, một vòng xoáy bất lợi. Đã sửa: đóng băng timestamp ưu tiên
+   cho cả crossing, chỉ tăng 1 lần khi bắt đầu.
+2. `release_stale_deferrals()` (cơ chế phá deadlock thêm từ trước) có
+   lỗ hổng an toàn thật: nhường quyền cho peer do hết giờ chờ nhưng
+   KHÔNG tự huỷ yêu cầu của chính mình — nếu yêu cầu đó SAU ĐÓ lại
+   tình cờ đủ N-1 reply (do một release khác ở đâu đó trong fleet),
+   CẢ 2 bên có thể cùng vào zone 1 lúc — vi phạm mutual exclusion mà
+   không metric nào phát hiện được (forced_entry chỉ gắn cờ khi bỏ
+   cuộc ở deadline, không gắn khi "thành công" trên 1 tập reply đã có
+   phần tử hết hạn). Đã sửa: nhường quyền cho ai đó thì tự huỷ luôn
+   tập reply đã gom, bắt buộc gom lại từ đầu.
+
+**Xác nhận fix có tác dụng thật ở quy mô nhỏ**: test riêng N=2 (3
+endpoint, ngoài batch chính) cho `forced_entry_rate` giảm từ 100%
+(trước fix) xuống **28.6%** (5/7 crossing đạt đồng thuận THẬT, không
+forced) — cải thiện rõ rệt, xác nhận cơ chế `own_claim_yielded_on_timeout`
+(bộ đếm mới) hoạt động đúng thiết kế, không crash, `publish_failures=0`.
+
+**NHƯNG ở N=8 trở lên, FleetRMW vẫn 100% forced_entry — ĐÃ điều tra,
+KHÔNG PHẢI fix bị lỗi hay bug mới**: kiểm tra `debug_counters` thật
+của 1 lượt N=8 sau fix cho thấy `own_claim_yielded_on_timeout` vẫn
+kích hoạt đều (15-17 lần/endpoint, đúng thiết kế), `publish_failures=0`
+mọi nơi, nhưng số reply THẬT nhận được (`replies_received_raw`) chỉ
+0-6 trên mỗi endpoint trong khi cần ĐỦ N-1=8 mới đạt đồng thuận (18
+retry cho 1 crossing duy nhất hoàn thành trong 90s). Kết luận: fix vừa
+sửa giải quyết đúng vấn đề CÔNG BẰNG/ƯU TIÊN (ai thắng khi có tranh
+chấp) và AN TOÀN (double-occupancy), nhưng KHÔNG giải quyết được vấn
+đề ĐỘ TIN CẬY GỬI/NHẬN THÔ dưới tải broadcast N-chiều qua đường hầm
+GTP-U/UPF — đây LÀ MỘT VẤN ĐỀ KHÁC, quy mô càng lớn (N=8 cần đủ 8
+reply, N=32 cần đủ 32) thì xác suất đủ ĐỦ tất cả trong 1 cửa sổ
+`reply_timeout_s` càng thấp theo cấp số nhân, bất kể cơ chế ưu tiên có
+công bằng đến đâu. THEO ĐÚNG nguyên tắc đã thống nhất trước đó
+("không nên cứ tăng timeout mãi — coi các lần timeout đó là
+coordination failure thực sự"), số liệu này được báo cáo NGUYÊN TRẠNG.
+Hướng giải quyết thật (nếu cần) sẽ là đổi chiến lược đồng thuận (ví
+dụ: quorum thay vì cần ĐỦ N-1, hoặc giảm fanout broadcast) — đó là
+một thay đổi GIAO THỨC, không phải bug fix, chưa làm trong lần này.
+
+**Ghi chú phương pháp luận nhỏ**: công thức seed của batch script
+(`hash(method_label) % 7`) dùng `hash()` built-in của Python, giá trị
+này bị RANDOMIZE theo từng lần chạy process (PYTHONHASHSEED mặc định
+không cố định) — nghĩa là seed thực tế cho cùng 1 tổ hợp (N, method,
+run) KHÔNG giống hệt nhau giữa 2 lần chạy batch (trước/sau fix), góp
+phần vào biến động số liệu của Fast DDS/Zenoh (không liên quan gì tới
+2 bug vừa sửa) — không phải lỗi nghiêm trọng (seed chỉ ảnh hưởng
+jitter/stagger ngẫu nhiên bên trong 1 endpoint, không ảnh hưởng tính
+đúng đắn), nhưng đáng lưu ý nếu cần so sánh số liệu tuyệt đối giữa 2
+lần chạy trong tương lai.
 
 **Trạng thái**: Bảng V + VI profile "5G SA emulation" HOÀN THÀNH đầy
 đủ N=8/16/32 x 4 phương thức x n=3, không crash, đã cập nhật
-`docs/BANG_V_VI_KET_QUA.md` (thay hàng "5G" cũ, ghi rõ đây là 2 điểm
-dữ liệu KHÁC NHAU, không so sánh trực tiếp).
+`docs/BANG_V_VI_KET_QUA.md` (thay hàng "5G" cũ VÀ bản Bảng VI lỗi thời
+bằng bản đã sửa 2 bug Ricart-Agrawala ở trên).
 
 **File liên quan**: `external/open5gs/` (vendor), `scripts/
-run_open5gs_docker_fleet_probe.py`, kết quả thô tại
-`/tmp/.../scratchpad/bang5_open5gs_8_16_32_n3.jsonl` +
-`bang6_open5gs_8_16_32_n3.jsonl` (36 dòng mỗi file, không thuộc repo).
+run_open5gs_docker_fleet_probe.py`, `scripts/fleetqox_coordination_endpoint.py`,
+kết quả thô tại `/tmp/.../scratchpad/bang5_open5gs_8_16_32_n3.jsonl` +
+`bang6_open5gs_8_16_32_n3_v2.jsonl` (36 dòng mỗi file, không thuộc
+repo; `bang6_open5gs_8_16_32_n3.jsonl` KHÔNG có `_v2` là bản TRƯỚC fix,
+giữ lại để đối chiếu).
 
 ## Quy ước cập nhật file này
 

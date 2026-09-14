@@ -134,28 +134,42 @@ tranh chấp 1 zone/đường đi chung. Hàng "5G" dưới đây là profile **
 SA emulation (Open5GS + UERANSIM)** — xem ghi chú đầu tài liệu; Wi-Fi
 ở Bảng VI (ns-3) chưa được đo lại trên profile này, chỉ có 5G.
 
+Số liệu dưới đây đã qua 1 lần sửa (14/09/2026): phát hiện + vá 2 bug
+thật trong thuật toán Ricart-Agrawala (`fleetqox_coordination_endpoint.py`)
+qua review bên ngoài — (1) timestamp ưu tiên trước đây tăng mỗi lần
+retry, phạt nặng node nào cần retry nhiều nhất (thường là node đang bị
+mất gói, không phải node "sai"); (2) cơ chế nhường quyền khi hết giờ
+chờ (`defer_release_timeout_s`) có lỗ hổng an toàn thật, có thể phá
+mutual exclusion. Đã sửa cả 2, xác nhận fix có tác dụng thật ở quy mô
+nhỏ (N=2 test riêng: forced_entry 100%→28.6%) — chi tiết đầy đủ trong
+`AUDIT_ACCEPTANCE_TRACKING.md` (14/09/2026, "2 FURTHER FIXES").
+Cột "Navigation recovery count" cũng đổi tên nội bộ thành
+`coordination_retry_count` (tên cũ gây hiểu lầm là đo phục hồi
+navigation thật — không phải, đây luôn là số lần retry ở tầng
+coordination).
+
 | Method | N robots | Coordination update age (ms) | Conflict-resolution delay (ms) | Navigation recovery count | Task completion time (s) | Scenario/seed |
 |---|---|---|---|---|---|---|
-| Fast DDS | 8 | 35.3 | 1932.1 | 0.0 | 8.6 | n=3 |
+| Fast DDS | 8 | 37.6 | 1905.2 | 0.0 | 8.6 | n=3 |
 | Cyclone DDS | 8 | — (0 tin đến) | — (0% hội tụ) | 162.0 | 90.3 | n=3 |
-| Zenoh | 8 | 30.7 | 8150.6 | 97.0 | 90.3 | n=3 |
-| **Ours** | 8 | 31.0 | — (0% hội tụ) | 162.0 | 90.3 | n=3 |
-| Fast DDS | 16 | 21.9 | 3472.4 | 195.0 | 65.7 | n=3 |
+| Zenoh | 8 | 13.8 | 10049.9 | 139.7 | 90.3 | n=3 |
+| **Ours** | 8 | 24.2 | — (0% hội tụ) | 162.0 | 90.3 | n=3 |
+| Fast DDS | 16 | 30.1 | 3775.8 | 97.3 | 40.9 | n=3 |
 | Cyclone DDS | 16 | — (0 tin đến) | — (0% hội tụ) | 306.0 | 90.3 | n=3 |
-| Zenoh | 16 | 36.5 | 8282.9 | 176.0 | 90.3 | n=3 |
-| **Ours** | 16 | 53.7 | — (0% hội tụ) | 306.0 | 90.3 | n=3 |
-| Fast DDS | 32 | 105.5 | 36203.8 | 594.0 | 90.7 | n=3 |
+| Zenoh | 16 | 20.7 | 8905.0 | 282.0 | 90.3 | n=3 |
+| **Ours** | 16 | 94.9 | — (0% hội tụ) | 306.0 | 90.3 | n=3 |
+| Fast DDS | 32 | 123.5 | — (0% hội tụ) | 594.0 | 90.9 | n=3 |
 | Cyclone DDS | 32 | — (0 tin đến) | — (0% hội tụ) | 594.0 | 90.3 | n=3 |
-| Zenoh | 32 | 81.1 | — (0% hội tụ) | 594.0 | 90.4 | n=3 |
-| **Ours** | 32 | 86.3 | — (0% hội tụ) | 594.0 | 90.4 | n=3 |
+| Zenoh | 32 | 61.8 | — (0% hội tụ) | 594.0 | 90.4 | n=3 |
+| **Ours** | 32 | 196.3 | — (0% hội tụ) | 594.0 | 90.4 | n=3 |
 
 ### Tỷ lệ forced_entry (% lần "ép vào" zone do hết giờ chờ, không đạt đồng thuận thật)
 
 | N | Fast DDS | Cyclone DDS | Zenoh | FleetRMW |
 |---|---|---|---|---|
-| 8 | **0%** | 100% | 34% | 100% |
-| 16 | 30% | 100% | 26% | 100% |
-| 32 | 99% | 100% | 100% | 100% |
+| 8 | **0%** | 100% | 65% | 100% |
+| 16 | 14% | 100% | 76% | 100% |
+| 32 | 100% | 100% | 100% | 100% |
 
 ### Ghi chú khi đọc bảng
 
@@ -165,23 +179,27 @@ SA emulation (Open5GS + UERANSIM)** — xem ghi chú đầu tài liệu; Wi-Fi
 - **"—" ở Cyclone DDS (Coordination update age)** = 0 tin nhắn nào
   từng đến ở MỌI quy mô — cùng vấn đề discovery O(N²) đã ghi nhận với
   CycloneDDS static_peers ở mọi profile khác (Bảng IV/V, Wi-Fi/LAN cũ).
-- **Fast DDS hội tụ tốt ở N=8/16** (0%/30% forced_entry, conflict-
-  resolution delay thật đo được 1.9-3.5s) nhưng gần như sập ở N=32
-  (99%) — khác hẳn ns-3 5G-LENA cũ (nơi Fast DDS đã sập từ N=16); ở
-  đây core 5G SA thật không có trần dung lượng radio nên Fast DDS
-  sống lâu hơn, chỉ sập khi core+scheduler thật sự quá tải ở N=32.
-- **FleetRMW ở 100% forced_entry MỌI quy mô, kể cả N=8** — khác biệt
-  RÕ RỆT so với Bảng V (nơi FleetRMW giao tin ổn 55-70% ở cùng
-  profile/quy mô) — đã kiểm chứng KHÔNG PHẢI bug: `publish_failures=0`
-  ở mọi endpoint (gửi thành công ở tầng OS), nhưng REPLY message bị
-  rớt trên đường với tỷ lệ rất cao và dàn trải đều across nhiều
-  endpoint (không phải 1 endpoint cụ thể bị cô lập) — kết luận đây là
-  mất gói REQUEST/REPLY thật dưới traffic broadcast-dồn-dập qua đường
-  hầm GTP-U/UPF, đúng loại phát hiện mà `reply_timeout_s`/
-  `defer_release_timeout_s` (tuned từ profile Wi-Fi trước đó) KHÔNG xử
-  lý được — theo đúng nguyên tắc đã thống nhất trước đó ("không nên cứ
-  tăng timeout mãi"), số liệu này được báo cáo NGUYÊN TRẠNG như một
-  phát hiện thật, không cố "sửa" bằng cách nới thêm timeout.
+- **Fast DDS hội tụ tốt ở N=8/16** (0%/14% forced_entry, conflict-
+  resolution delay thật đo được 1.9-3.8s) nhưng sập hẳn ở N=32 (100%)
+  — khác hẳn ns-3 5G-LENA cũ (nơi Fast DDS đã sập từ N=16); ở đây core
+  5G SA thật không có trần dung lượng radio nên Fast DDS sống lâu hơn,
+  chỉ sập khi core+scheduler thật sự quá tải ở N=32.
+- **FleetRMW ở 100% forced_entry MỌI quy mô, kể cả sau khi đã vá 2 bug
+  Ricart-Agrawala ở trên** — ĐÃ điều tra kỹ, KHÔNG PHẢI do 2 bug đó
+  (bằng chứng: cơ chế nhường-quyền-do-timeout mới vẫn kích hoạt đúng
+  thiết kế 15-17 lần/endpoint ở N=8, `publish_failures=0` mọi nơi) và
+  KHÔNG PHẢI 1 endpoint cụ thể bị cô lập (mất gói dàn trải đều). Vấn đề
+  THẬT: ở N=8 cần ĐỦ N-1=8 reply mới đạt đồng thuận trong 1 cửa sổ
+  `reply_timeout_s=5s` — số reply thật nhận được mỗi endpoint chỉ 0-6,
+  không đủ dù đã retry 18 lần trong 90s. Đây là vấn đề ĐỘ TIN CẬY gửi/
+  nhận thô dưới tải broadcast N-chiều qua đường hầm GTP-U/UPF, KHÁC
+  với vấn đề công bằng/ưu tiên mà 2 bug fix ở trên giải quyết — quy mô
+  càng lớn thì xác suất đủ TẤT CẢ N-1 reply trong 1 cửa sổ giảm theo
+  cấp số nhân, bất kể cơ chế ưu tiên công bằng đến đâu. Theo đúng
+  nguyên tắc đã thống nhất ("không nên cứ tăng timeout mãi"), số liệu
+  này được báo cáo NGUYÊN TRẠNG; giải quyết thật (nếu cần) đòi hỏi đổi
+  chiến lược đồng thuận (quorum thay vì cần đủ N-1), một thay đổi GIAO
+  THỨC chưa làm trong lần này.
 - **Navigation recovery count giống hệt Total crossings × N-per-run**
   (Fast DDS N=8: 0.0 vì hội tụ tốt, không cần recovery; CycloneDDS/
   FleetRMW luôn = 594 ở N=32 vì MỌI crossing đều forced/recovery).
