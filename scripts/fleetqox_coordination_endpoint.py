@@ -209,7 +209,27 @@ def main() -> int:
         "replies_received_matched": 0,
         "replies_received_stale_req_id": 0,
         "replies_received_not_requesting": 0,
+        "publish_failures": 0,
     }
+
+    def safe_publish(pub, msg: String) -> None:
+        # A real N=32 run crashed here with an UNHANDLED exception --
+        # errno=105 (No buffer space available) from the OS socket layer,
+        # once every endpoint is broadcasting REQUEST/REPLY traffic to 32
+        # peers each. An unhandled crash here is strictly worse than a
+        # handled one: it means this endpoint writes NO summary JSON at
+        # all (wait_for_completion() then times out waiting for a file
+        # that will never appear), losing 100% of this endpoint's data
+        # instead of just the one message that couldn't be sent. Treat it
+        # like any other lost message -- count it and move on, since a
+        # message that physically couldn't be enqueued for sending is,
+        # for this protocol's purposes, indistinguishable from one lost
+        # in transit (the retry-with-persistent-req_id logic already
+        # handles that case correctly).
+        try:
+            pub.publish(msg)
+        except Exception:  # noqa: BLE001 -- OS/RMW-level send failure, not a logic bug
+            debug_counters["publish_failures"] += 1
 
     # Replies are NEVER published directly from inside on_request -- only
     # QUEUED here, then actually sent from drain_pending_replies(), called
@@ -238,7 +258,7 @@ def main() -> int:
                 "wall_ns": time.time_ns(),
             }
         )
-        reply_pub.publish(msg)
+        safe_publish(reply_pub, msg)
 
     def drain_pending_replies() -> None:
         pending = pending_immediate_replies[:]
@@ -359,7 +379,7 @@ def main() -> int:
             if beacon_pub is not None:
                 now = time.monotonic()
                 if now - last_beacon_sent >= 0.1:
-                    beacon_pub.publish(beacon_msg)
+                    safe_publish(beacon_pub, beacon_msg)
                     last_beacon_sent = now
             for _ in range(20):
                 rclpy.spin_once(node, timeout_sec=0.0)
@@ -441,7 +461,7 @@ def main() -> int:
                     "wall_ns": request_wall_ns,
                 }
             )
-            request_pub.publish(msg)
+            safe_publish(request_pub, msg)
             debug_counters["requests_sent"] += 1
 
             attempt_deadline = time.monotonic() + args.reply_timeout_s
