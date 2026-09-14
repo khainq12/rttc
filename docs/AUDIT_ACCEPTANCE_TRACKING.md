@@ -5255,6 +5255,56 @@ kết quả thô tại `/tmp/.../scratchpad/bang5_open5gs_8_16_32_n3.jsonl` +
 repo; `bang6_open5gs_8_16_32_n3.jsonl` KHÔNG có `_v2` là bản TRƯỚC fix,
 giữ lại để đối chiếu).
 
+### 14/09/2026 (tiếp) — Thêm Ours-NoQoX vs Ours-FleetQoX cho Bảng VI: tính năng hoạt động đúng, nhưng KHÔNG phân biệt được ở N=8/16/32 trên profile này — lý do thật, không phải bug
+
+Theo yêu cầu review: thêm `--priority-mode {lamport,fleetqox}` vào
+`fleetqox_coordination_endpoint.py`. `lamport` ("Ours-NoQoX") giữ
+nguyên hành vi cũ (chỉ so `(lamport_ts, name)`). `fleetqox`
+("Ours-FleetQoX") gán mỗi endpoint 1 tier `task_criticality` cố định
+(~25% "safety"=0.9, còn lại "routine"=0.3, xác định qua vị trí tên đã
+sort nên mọi process tự suy ra GIỐNG NHAU không cần trao đổi gì) và so
+criticality TRƯỚC (cao thắng tuyệt đối), chỉ rơi về `(lamport_ts,
+name)` khi hoà criticality — áp dụng đúng triết lý task-aware priority
+của FleetQoX (`fleetqox/model.py`'s `TaskContext.task_criticality`)
+vào chính giao thức tranh chấp này, khác với `--policy` của Bảng V vốn
+chỉ áp dụng cho lịch phát tin, không áp dụng cho việc "ai thắng khi
+tranh chấp zone". Test quy mô nhỏ (N=3) xác nhận cơ chế hoạt động
+đúng: gán tier đúng, không crash.
+
+Chạy đủ N=8/16/32 x 2 chế độ x n=3 (18 lượt, CHỈ dùng `rmw_fleetqox_cpp`
+vì đây là so sánh 2 biến thể của CHÍNH FleetRMW, không phải so giữa 4
+RMW). **Kết quả: forced_entry_rate = 100% cho CẢ 2 CHẾ ĐỘ ở MỌI quy mô
+N=8/16/32** — không phân biệt được.
+
+**Đã điều tra, ĐÂY LÀ KẾT QUẢ THẬT, không phải tính năng bị lỗi**:
+kiểm tra `replies_received_raw` thô của từng endpoint (N=8, cả 2 chế
+độ) cho thấy số reply thật nhận được dao động 0-17 một cách CỰC KỲ
+NHIỄU, không có mẫu hình "endpoint criticality cao nhận được nhiều
+reply hơn" nào cả (vd: `robot_0007` (criticality 0.9) nhận 17 reply ở
+`ours_noqox` nhưng 0 reply ở `ours_fleetqox` cùng N=8) — vì cơ chế ưu
+tiên (dù theo timestamp hay theo criticality) CHỈ quyết định AI THẮNG
+trong số các bên ĐÃ NHẬN ĐƯỢC đủ reply để tranh chấp; ở quy mô N≥8 trên
+profile này, đa số endpoint không bao giờ nhận đủ N-1 reply để tranh
+chấp TỚI NƠI (vấn đề độ tin cậy broadcast thô đã ghi nhận ở mục ngay
+trên) — nghĩa là cơ chế ưu tiên hầu như KHÔNG BAO GIỜ được thực sự
+kích hoạt ở quy mô này, bất kể nó có "thông minh" hay không. Đây CHÍNH
+LÀ hệ quả trực tiếp, nhất quán với phát hiện đã ghi ở mục trên (vấn đề
+độ tin cậy N-chiều lấn át hoàn toàn vấn đề công bằng/ưu tiên).
+
+**Kết luận**: tính năng Ours-NoQoX vs Ours-FleetQoX đã cài đặt ĐÚNG và
+đã XÁC NHẬN hoạt động (qua test N=3), nhưng N=8/16/32 trên profile "5G
+SA emulation" KHÔNG PHẢI điều kiện phù hợp để đo sự khác biệt của nó —
+cần 1 trong 2 hướng để đo được thật: (a) quy mô nhỏ hơn (N=2-3, nơi đã
+xác nhận có crossing đạt đồng thuận thật) hoặc (b) profile ít mất gói
+hơn (vd Wi-Fi/LAN cũ, từng có 1 phần crossing thành công ở N nhỏ) —
+CHƯA làm trong lần này, để ngỏ làm follow-up nếu cần số liệu thật cho
+so sánh này.
+
+**File liên quan**: `scripts/fleetqox_coordination_endpoint.py`
+(`--priority-mode`), kết quả thô tại
+`/tmp/.../scratchpad/bang6_open5gs_noqox_vs_fleetqox_n3.jsonl` (18
+dòng, không thuộc repo).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
