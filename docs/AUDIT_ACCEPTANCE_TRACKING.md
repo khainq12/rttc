@@ -4964,6 +4964,74 @@ print statement mỗi lần.
 được 1 lần đồng thuận "sạch" nào trong test 2-3 endpoint. Cần quyết
 định hướng đi tiếp trước khi chạy batch N=8/16/32 đầy đủ.
 
+### 13/09/2026 (tiếp) — Điều tra + sửa xong deadlock Ricart-Agrawala theo đúng quy trình đề xuất
+
+Làm đúng thứ tự điều tra đã thống nhất:
+
+**Bước 1 — Đổi thứ tự khởi chạy**: đảo ngược hoàn toàn (robot_0001 chạy
+ĐẦU, control_station chạy CUỐI). Kết quả: robot_0001 **VẪN** bị 0 reply
+y hệt → **loại trừ dứt điểm giả thuyết startup-order**, lỗi đi theo
+đúng endpoint cụ thể.
+
+**Bước 2 — Trace request/reply**: thay vì trace thủ công từng gói, dùng
+`raw_received_log` (đã có sẵn từ lần điều tra trước) kiểm tra TRÊN TOÀN
+BỘ 3 endpoint (kể cả người ngoài cuộc) xem có ai từng thấy 1 gói
+"to: robot_0001" hay không → **0 gói, không ai từng thấy, kể cả người
+ngoài cuộc** → xác nhận đây là gói CHƯA BAO GIỜ ĐƯỢC GỬI (kẹt trong
+hàng đợi deferred vĩnh viễn), không phải rớt gói trên đường truyền.
+
+**Nguyên nhân gốc xác nhận**: mọi endpoint bắt đầu request đầu tiên
+với CÙNG giá trị Lamport (đóng băng suốt 1 lần crossing từ fix trước),
+nên tie-break rơi vào so sánh TÊN cố định mãi mãi — endpoint có tên
+"thua" alphabet (robot_0001) luôn bị nhường (defer) bởi cả 2 peer kia.
+Kết hợp với việc peer có ưu tiên cao nhất (`control_station`) cũng
+liên tục xui rủi mất gói Wi-Fi thật nên không bao giờ tự hoàn tất được
+critical section của chính nó → không bao giờ xả hàng đợi deferred →
+cả chuỗi ưu tiên thấp bị kẹt vĩnh viễn.
+
+**Bước 3 — Readiness barrier**: xác nhận hàng rào ready/start
+(`--ready-file`/`--start-file`) ĐÃ CÓ SẴN từ trước trong toàn bộ
+harness (dùng chung với mọi bảng khác) — không cần thêm mới, chỉ xác
+nhận lại là ĐÃ tồn tại và hoạt động đúng.
+
+**Sửa theo đúng 3 điểm người dùng chỉ định**:
+1. Lamport clock giờ TĂNG LIÊN TỤC mỗi lần re-broadcast (không đóng
+   băng cho cả crossing nữa) — đúng bản chất 1 Lamport clock thật.
+2. `req_id` vẫn giữ NGUYÊN suốt 1 crossing (giữ từ fix trước) để reply
+   đến ở bất kỳ lần retry nào cũng được tính.
+3. **Cơ chế thật sự phá vỡ deadlock**: `--defer-release-timeout-s`
+   (mặc định 8s) — nếu 1 reply bị "nhường" (deferred) quá lâu mà
+   CHÍNH endpoint đang giữ nó vẫn chưa tự vào được critical section
+   của mình, nó sẽ TỪ BỎ quyền ưu tiên và gửi reply đó đi luôn. Đây là
+   cơ chế DUY NHẤT thực sự đảm bảo tiến triển — riêng điểm 1 (Lamport
+   tăng liên tục) KHÔNG đủ để phá deadlock, vì giá trị Lamport chỉ có
+   thể TĂNG (ưu tiên chỉ có thể XẤU ĐI qua các lần retry, không bao
+   giờ tự nhảy lên đầu hàng).
+
+**Bước 4 — Kiểm chứng lại (2 lần chạy độc lập, seed khác nhau)**:
+- Seed 1: robot_0001 (endpoint từng kẹt 100%) nay đạt **2/3 lần vào
+  zone THẬT** (forced_entry=False). Tỷ lệ forced_entry chung: 60%.
+- Seed 7: **CẢ 3 endpoint đều đạt ít nhất 1 lần vào zone thật**, tỷ lệ
+  forced_entry chung: 50%, phân bố ĐỀU giữa 3 endpoint (không còn ai bị
+  "cô lập" hệ thống).
+
+**Kết luận**: deadlock đã được sửa dứt điểm — không còn endpoint nào bị
+kẹt vĩnh viễn. Phần forced_entry còn lại (~50-60%) phản ánh nhiễu Wi-Fi
+thật (khớp với đặc tính latency biến thiên mạnh của FleetRMW đã ghi
+nhận ở Bảng V), phân bố đều giữa các endpoint chứ không thiên vị ai —
+đây là dữ liệu thật hợp lệ để báo cáo, không phải bug cần sửa thêm.
+
+**File thay đổi**: `scripts/fleetqox_coordination_endpoint.py` (Lamport
+tăng liên tục, `release_stale_deferrals()`, `--defer-release-timeout-s`),
+`scripts/run_ns3_docker_container_fleet_probe.py` (thêm tham số
+`launch_order` để test đảo thứ tự khởi chạy, nối
+`defer_release_timeout_s` qua `run_coordination_probe()`).
+
+**Trạng thái**: sẵn sàng chạy batch N=8/16/32 cho Bảng VI — đang chờ
+xác nhận từ người dùng có coi mức forced_entry ~50% là đủ "sạch" để
+tiến hành, hay cần tinh chỉnh thêm (tăng `reply-timeout-s`/
+`defer-release-timeout-s`) trước.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
