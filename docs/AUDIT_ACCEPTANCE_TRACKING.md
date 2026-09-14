@@ -5118,6 +5118,100 @@ liệu thật đã qua sensitivity test xác nhận.
 `/tmp/.../scratchpad/bang6_coord_8_16_32_n3.jsonl` (36 dòng, không
 thuộc repo).
 
+### 14/09/2026 — Thay hàng "5G" bằng thí nghiệm Open5GS + UERANSIM (5G SA emulation thật) — theo yêu cầu người dùng
+
+Người dùng đề nghị dùng Open5GS (core 5G SA thật, mã nguồn mở) +
+UERANSIM (gNB/UE giả lập) thay cho ns-3 5G-LENA, với mục tiêu rõ ràng:
+so sánh hành vi 4 middleware (Fast DDS/CycloneDDS/Zenoh/FleetRMW) khi
+cùng chạy qua MỘT hệ 5G SA thật (NGAP/GTP-U/PFCP thật), KHÔNG mô phỏng
+chi tiết kênh vô tuyến (không SINR/fading/propagation/radio
+contention) — giữ nguyên workload/topology/số robot/seed/metric để so
+sánh công bằng với Wi-Fi/LAN/ns-3-5G đã có.
+
+**Vendor hoá + hạ tầng** (`external/open5gs/`, BSD-2-Clause, từ
+`herlesupreeth/docker_open5gs`): 12 NF core (mongo/nrf/scp/ausf/udr/
+udm/smf/upf/amf/pcf/bsf/nssf) + UERANSIM gNB/UE, remap subnet mặc định
+172.22.0.0/16 → 10.90.0.0/24 (trùng với 13 docker network khác đã
+chạy sẵn trên máy — dự án khác, không liên quan RTC). Viết
+`scripts/run_open5gs_docker_fleet_probe.py`: tách lifecycle "core"
+(build/start/provision subscriber — gọi 1 lần/phiên, vì container
+name cố định = chỉ 1 core/host) khỏi lifecycle "per-run"
+(`Open5gsTopologyProbe`, kế thừa `ReferenceTopologyProbe` để tái dùng
+100% `launch_endpoints`/`launch_coordination_endpoints`/
+`wait_for_completion`/... không đổi gì về methodology/metric).
+
+**3 bug thật phát hiện + sửa qua test quy mô nhỏ (2 rồi 8 endpoint)
+trước khi chạy batch lớn** (đúng quy trình đã thống nhất):
+1. `endpoint_list(N)` trả về N+1 (gồm control_station) nhưng code chỉ
+   cấp N container UE → IndexError giữa chừng.
+2. **Auth thất bại vĩnh viễn** ("SQN out of range", không resync
+   được): `open5gs-dbctl add` lưu key vào `security.opc`, nhưng
+   `ueransim-ue.yaml` khai `opType: 'OP'` — 2 kiểu tính khóa khác
+   nhau cho cùng 1 K. Sửa: chuyển key sang `security.op` sau khi add
+   (xác nhận qua test tay: resync SQN 1 lần rồi thành công — đúng
+   hành vi AKA 3GPP bình thường).
+3. **Cô lập hoàn toàn dù đăng nhập được**: `uesimtun0` chỉ có route
+   `/32` cho chính nó, không có route tới dải UE_IPV4_INTERNET còn
+   lại → gói tin gửi UE khác lạc ra `eth0` (default route của docker
+   network) thay vì qua UPF. Thêm `ip route add <UE_IPV4_INTERNET>
+   dev uesimtun0` là hết — test ping tay xác nhận 100% mất gói → 0%.
+
+**BẢNG V — "5G SA emulation" theo quy mô N=8/16/32, n=3 (đầy đủ, xem
+bảng đối chiếu ở `docs/BANG_V_VI_KET_QUA.md`)**:
+
+| N | Fast DDS | CycloneDDS | Zenoh | FleetRMW |
+|---|---|---|---|---|
+| 8 | 82.2% (p50=284.6ms) | 0% | 45.4% (p50=246.9ms) | 59.6% (p50=637.8ms) |
+| 16 | 85.6% (p50=377.9ms) | 0% | 63.9% (p50=382.6ms) | 70.1% (p50=1467.4ms) |
+| 32 | 84.0% (p50=403.5ms) | 0% | 29.3% (p50=422.9ms) | 55.2% (p50=1791.1ms) |
+
+**Khác biệt LỚN NHẤT so với ns-3 5G-LENA cũ**: KHÔNG có cú sập "tất cả
+về 0%" ở N=16/32 — suy giảm dần đều, mọi run đều `status=ok` (không
+crash) kể cả N=32 (33 container UE + 33 container app + core, tổng
+~80 container đồng thời). Cho thấy cú sập trước đây (ns-3) là do trần
+dung lượng CẤU HÌNH PHY đơn giản (1 gNB/1 BWP/numerology 1), không
+phải do bản chất traffic ROS 2 hay ranh giới vật lý của 5G nói chung.
+
+**BẢNG VI — "5G SA emulation" theo quy mô N=8/16/32, n=3 (dùng
+`reply_timeout_s=5.0`/`defer_release_timeout_s=8.0` tuned từ trước,
+xem bảng đầy đủ ở `docs/BANG_V_VI_KET_QUA.md`)**:
+
+| N | Fast DDS | CycloneDDS | Zenoh | FleetRMW |
+|---|---|---|---|---|
+| 8 | 0% forced | 100% | 34% | **100%** |
+| 16 | 30% forced | 100% | 26% | **100%** |
+| 32 | 99% forced | 100% | 100% | **100%** |
+
+**Phát hiện bất ngờ cần lưu ý khi trích dẫn**: FleetRMW ở Bảng VI
+100% forced_entry NGAY CẢ Ở N=8 — trái ngược hẳn với Bảng V (cùng
+profile, cùng quy mô, FleetRMW giao tin ổn 59.6%). Đã kiểm tra kỹ
+KHÔNG PHẢI bug: `debug_counters.publish_failures=0` ở mọi endpoint
+(gửi OK ở tầng OS), nhưng REPLY message thực sự bị mất trên đường —
+dàn trải đều across nhiều endpoint khác nhau (loại trừ được kiểu lỗi
+"1 endpoint cụ thể bị cô lập" đã từng gặp và sửa trước đó). Giả
+thuyết hợp lý nhất: coordination endpoint dùng peer_policy "broadcast
+tới tất cả" (không giống trace-replay endpoint dùng
+subscription-aware/thấp tải hơn nhiều) — với N=8 UE đồng thời
+broadcast REQUEST/REPLY dồn dập qua đường hầm GTP-U/UPF, tải burst
+này có thể vượt khả năng UPF forward kịp trong khung `reply_timeout_s`
+hiện tại. THEO ĐÚNG nguyên tắc đã thống nhất trước đó khi gặp tình
+huống tương tự ở ns-3 ("không nên cứ tăng timeout mãi — coi các lần
+timeout đó là coordination failure thực sự"), số liệu này được báo
+cáo NGUYÊN TRẠNG, không cố nới timeout để "cứu" kết quả. Đây là một
+hướng điều tra tiềm năng cho tương lai (ví dụ: đo trực tiếp UDP loss
+rate qua UPF dưới tải cao) nếu cần một con số forced_entry thấp hơn
+cho FleetRMW ở profile này.
+
+**Trạng thái**: Bảng V + VI profile "5G SA emulation" HOÀN THÀNH đầy
+đủ N=8/16/32 x 4 phương thức x n=3, không crash, đã cập nhật
+`docs/BANG_V_VI_KET_QUA.md` (thay hàng "5G" cũ, ghi rõ đây là 2 điểm
+dữ liệu KHÁC NHAU, không so sánh trực tiếp).
+
+**File liên quan**: `external/open5gs/` (vendor), `scripts/
+run_open5gs_docker_fleet_probe.py`, kết quả thô tại
+`/tmp/.../scratchpad/bang5_open5gs_8_16_32_n3.jsonl` +
+`bang6_open5gs_8_16_32_n3.jsonl` (36 dòng mỗi file, không thuộc repo).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
