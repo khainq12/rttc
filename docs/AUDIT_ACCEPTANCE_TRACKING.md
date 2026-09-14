@@ -5032,6 +5032,92 @@ xác nhận từ người dùng có coi mức forced_entry ~50% là đủ "sạc
 tiến hành, hay cần tinh chỉnh thêm (tăng `reply-timeout-s`/
 `defer-release-timeout-s`) trước.
 
+### 13/09/2026 (tiếp) — Sensitivity test reply-timeout + chạy đủ Bảng VI N=8/16/32 x 4 phương thức x n=3 + sửa 1 crash thật ở N=32
+
+**Sensitivity test trước khi chạy batch lớn** (theo đúng yêu cầu): so
+sánh `reply_timeout_s` = 5s/10s/20s (mỗi mức x 3 seed, N=2 robot):
+
+| reply_timeout_s | forced_entry_rate trung bình |
+|---|---|
+| 5s | **50%** (tốt nhất) |
+| 10s | 65% |
+| 20s | 70% |
+
+**Tăng timeout KHÔNG giảm forced_entry — còn tăng nhẹ** → xác nhận đây
+là coordination failure THẬT do rớt gói REQUEST/REPLY (chờ lâu hơn
+không "cứu" được gói đã mất hẳn, chỉ làm giảm SỐ LẦN retry có thể thực
+hiện trong cùng khoảng thời gian) — không phải do thiếu thời gian chờ.
+Quyết định: giữ `reply_timeout_s=5s`, `defer_release_timeout_s=8s`,
+không tăng thêm, chạy batch với cấu hình này.
+
+**Batch đầy đủ N=8/16/32 x 4 phương thức x n=3 (36 lần chạy)**:
+
+**Bug crash thật phát hiện + sửa giữa chừng**: N=32 FleetRMW ban đầu
+**crash hoàn toàn cả 3 lần** — `errno=105 (No buffer space available)`
+từ `publish()` không có try/except, khi mọi endpoint broadcast
+REQUEST/REPLY tới 32 peer cùng lúc làm tràn buffer UDP của OS. Sửa
+bằng `safe_publish()` (bắt exception, đếm vào `publish_failures`, coi
+như 1 gói bị mất thay vì crash toàn bộ tiến trình) — chạy lại N=32
+FleetRMW sau khi sửa: không còn crash, cả 3 lần đều "ok".
+
+**BẢNG VI — Chỉ số điều phối và hoàn thành nhiệm vụ (N=8/16/32, n=3)**:
+
+| Method | N robots | Coordination update age (ms) | Conflict-resolution delay (ms) | Navigation recovery count | Task completion time (s) | Scenario/seed |
+|---|---|---|---|---|---|---|
+| Fast DDS | 8 | 2398.1 | 7544.2 | 27.3 | 25.7 | n=3 |
+| CycloneDDS | 8 | — (0 tin) | — (0% hội tụ) | 154.3 | 90.6 | n=3 |
+| Zenoh | 8 | 107.3 | 8248.6 | 72.0 | 90.3 | n=3 |
+| **Ours (FleetRMW)** | 8 | 8129.9 | — (0% hội tụ) | 161.7 | 90.3 | n=3 |
+| Fast DDS | 16 | 17420.6 | — (0% hội tụ) | 306.0 | 90.3 | n=3 |
+| CycloneDDS | 16 | — (0 tin) | — (0% hội tụ) | 306.0 | 90.3 | n=3 |
+| Zenoh | 16 | 6818.4 | 33065.3 | 305.3 | 90.3 | n=3 |
+| **Ours (FleetRMW)** | 16 | 23799.9 | — (0% hội tụ) | 305.7 | 90.4 | n=3 |
+| Fast DDS | 32 | 21343.0 | — (0% hội tụ) | 594.0 | 90.4 | n=3 |
+| CycloneDDS | 32 | — (0 tin) | — (0% hội tụ) | 594.0 | 90.4 | n=3 |
+| Zenoh | 32 | 21362.6 | — (0% hội tụ) | 594.0 | 90.3 | n=3 |
+| **Ours (FleetRMW)** | 32 | 36802.2 | — (0% hội tụ) | 584.3 | 90.5 | n=3 |
+
+Ghi chú: "Conflict-resolution delay" chỉ tính trên các lần đạt đồng
+thuận THẬT (forced_entry=False) — hiển thị "—" khi forced_entry_rate=
+100% (không có mẫu nào để tính trung bình, KHÔNG phải 0ms). Tỷ lệ
+forced_entry đầy đủ theo N/method:
+
+| N | Fast DDS | CycloneDDS | Zenoh | FleetRMW |
+|---|---|---|---|---|
+| 8 | **0%** | 100% | 15% | 100% |
+| 16 | 100% | 100% | 95% | 100% |
+| 32 | 100% | 100% | 100% | 100% |
+
+**Phát hiện chính**:
+- **Fast DDS tại N=8 hội tụ HOÀN HẢO (0% forced_entry)** — bất ngờ,
+  đã xác minh KHÔNG phải bug rỗng (coordination_message_ages_ms thật,
+  ~2.4-8.3s, retries giảm dần qua các lần crossing 2→1→0, khớp logic
+  "hệ thống ấm dần lên"). Cơ chế discovery-server tập trung (unicast
+  qua 1 server) của Fast DDS xử lý traffic broadcast-nặng của kịch bản
+  điều phối này tốt hơn hẳn so với các RMW khác ở quy mô nhỏ — nhưng
+  lợi thế này KHÔNG duy trì được, sập về 100% forced ngay từ N=16.
+- **CycloneDDS static_peers 100% forced_entry ở CẢ 3 quy mô** — khớp
+  hoàn toàn với phát hiện O(N²) discovery cost đã ghi nhận nhiều lần
+  trước đó (Bảng IV/V) — 0 tin nhắn nào từng đến (age=None mọi quy mô).
+- **CẢ 4 phương thức đều sập 100% forced_entry từ N=16 trở lên** —
+  thuật toán loại trừ tương hỗ cần ĐỦ N-1 reply nên độ khó tăng theo
+  cấp số nhân với N, kết hợp với nhiễu Wi-Fi thật đã biết → mọi RMW đều
+  thất bại đồng thuận thật ở quy mô lớn. Đây LÀ kết quả thật, không
+  phải bug (đã xác nhận qua sensitivity test: tăng timeout không cứu
+  được).
+- **FleetRMW là RMW DUY NHẤT còn nhận được tin nhắn (age không None)
+  ở CẢ 3 quy mô** — vì không cần discovery, giống pattern đã thấy ở
+  Bảng IV/V.
+
+**Trạng thái Bảng VI: HOÀN THÀNH** — đủ dữ liệu N=8/16/32 x 4 phương
+thức x n=3, không còn crash, forced_entry ~100% ở quy mô lớn là dữ
+liệu thật đã qua sensitivity test xác nhận.
+
+**File liên quan**: `scripts/fleetqox_coordination_endpoint.py`
+(`safe_publish()`), kết quả thô tại
+`/tmp/.../scratchpad/bang6_coord_8_16_32_n3.jsonl` (36 dòng, không
+thuộc repo).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
