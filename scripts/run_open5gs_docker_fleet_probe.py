@@ -240,19 +240,67 @@ def start_open5gs_gnb(*, ready_timeout_s: float = 30.0) -> None:
 
 
 def provision_open5gs_subscribers(count: int) -> list[dict[str, str]]:
-    """Provisions `count` distinct subscriber identities (index 0..count-1,
-    see _subscriber_for_index()) via open5gs-dbctl. Safe to call again with
-    a larger `count` later in the same session (already-provisioned indices
-    just get a harmless "duplicate key" failure from dbctl, tolerated via
-    check=False -- dbctl has no idempotent "add if missing" mode of its
-    own). Returns the full list of subscriber dicts for indices 0..count-1
-    so callers don't need to re-derive them."""
+    """(Re-)provisions `count` distinct subscriber identities (index
+    0..count-1, see _subscriber_for_index()) via open5gs-dbctl, then
+    patches each record's security context directly via mongosh. Two real
+    bugs found (and fixed here) via this profile's own small-scale smoke
+    test:
+
+      1. open5gs-dbctl's `add {imsi key opc}` stores the given key
+         directly as `security.opc` (opc = null). But
+         external/open5gs/ueransim/ueransim-ue.yaml hardcodes
+         `opType: 'OP'` -- i.e. UERANSIM treats its templated UE1_OP
+         value as a raw, UNciphered Operator key and derives OPC from it
+         internally via Milenage, while dbctl told Open5GS to use that
+         SAME raw string AS ALREADY-CICHERED OPC directly. Two
+         structurally different derivations of the "same" key material
+         -- AKA's MAC check only happens to pass by the second retry in
+         a way that surfaces as a permanent "SQN out of range" failure
+         with no successful resync, confirmed live via a manual
+         single-UE test against dbctl's own default (add succeeded, gNB
+         NG-setup succeeded, but every authentication attempt failed
+         identically). Moving the same key from `security.opc` to
+         `security.op` (matching ueransim-ue.yaml's declared opType)
+         fixed it in that same manual test -- first Authentication
+         Request still triggers one "SQN out of range" (a normal 3GPP
+         AUTS resynchronization round-trip for a subscriber whose SQN
+         state was just reset, not a fault), and the immediate retry
+         then succeeds and proceeds through PDU session establishment.
+
+      2. open5gs-dbctl's `add` is a bare `insertOne` with no uniqueness
+         check on imsi (confirmed by inspecting the live subscribers
+         collection: calling this function twice with an overlapping
+         range -- exactly what core-up followed by a second core-up
+         does -- left TWO documents for the same imsi in mongo).
+         remove-then-add makes this idempotent regardless of how many
+         times/with what overlapping ranges it's called, and as a side
+         effect keeps the per-subscriber SQN state starting from a
+         known-clean point every time this is called -- cheap enough to
+         call again before every probe run reusing pool identities
+         across a batch (Open5gsTopologyProbe.start_containers() does
+         this), not just once at core-up time."""
     mongo_ip = _read_env_var("MONGO_IP")
     subscribers = [_subscriber_for_index(i) for i in range(count)]
     for sub in subscribers:
         docker(
             "exec", DBCTL_CONTAINER, DBCTL_PATH, f"--db_uri=mongodb://{mongo_ip}/open5gs",
+            "remove", sub["imsi"], check=False,
+        )
+        docker(
+            "exec", DBCTL_CONTAINER, DBCTL_PATH, f"--db_uri=mongodb://{mongo_ip}/open5gs",
             "add", sub["imsi"], sub["ki"], sub["opc"], check=False,
+        )
+        # Move the key from security.opc (dbctl's default) to security.op
+        # -- see reason #1 above. sub["opc"] is genuinely an OP value
+        # despite the field name (kept as "opc" only so _subscriber_for_index()'s
+        # dict shape matches dbctl's own `add {imsi key opc}` positional
+        # argument order).
+        docker(
+            "exec", DBCTL_CONTAINER, "mongosh", "--quiet", f"mongodb://{mongo_ip}/open5gs",
+            "--eval",
+            f"db.subscribers.updateOne({{imsi:'{sub['imsi']}'}}, "
+            f"{{$set: {{'security.op': '{sub['opc']}', 'security.opc': null}}}})",
+            check=False,
         )
     return subscribers
 
@@ -296,21 +344,31 @@ class Open5gsTopologyProbe(ReferenceTopologyProbe):
         output_dir: Path,
         subscribers: list[dict[str, str]],
     ) -> None:
-        if len(subscribers) < num_robots:
-            raise ValueError(
-                f"only {len(subscribers)} subscribers provisioned, need {num_robots} -- "
-                "call provision_open5gs_subscribers(count=<N>) with a larger count first"
-            )
         self.run_id = run_id
         self.image = image
         self.num_robots = num_robots
+        # endpoint_list() returns num_robots + 1 entries (control_station
+        # plus num_robots robots, see that function's docstring) -- every
+        # per-endpoint container list here must be sized off
+        # len(self.endpoints), NOT num_robots directly, or the last
+        # endpoint (control_station, index 0, or whichever position a
+        # future refactor put it at) silently has no UE container to pair
+        # with. Confirmed as a real bug via a live 2-robot smoke test
+        # ("list index out of range" in _wait_for_ue_ip's enumerate loop)
+        # before this comment was written.
         self.endpoints = endpoint_list(num_robots)
+        if len(subscribers) < len(self.endpoints):
+            raise ValueError(
+                f"only {len(subscribers)} subscribers provisioned, need "
+                f"{len(self.endpoints)} (num_robots + 1 for control_station) -- "
+                "call provision_open5gs_subscribers(count=<N>) with a larger count first"
+            )
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.subscribers = subscribers[:num_robots]
+        self.subscribers = subscribers[: len(self.endpoints)]
         self.rigger_name = f"{OPEN5GS_CONTAINER_PREFIX}_{run_id}_rigger"
         self.ue_container_names = [
-            f"{OPEN5GS_CONTAINER_PREFIX}_{run_id}_ue{i}" for i in range(num_robots)
+            f"{OPEN5GS_CONTAINER_PREFIX}_{run_id}_ue{i}" for i in range(len(self.endpoints))
         ]
         self.endpoint_container_names = [
             f"{OPEN5GS_CONTAINER_PREFIX}_{run_id}_{endpoint}" for endpoint in self.endpoints
@@ -321,6 +379,15 @@ class Open5gsTopologyProbe(ReferenceTopologyProbe):
         return ["-v", f"{ROOT}:/work", "-w", "/work"]
 
     def start_containers(self) -> None:
+        # Reset (remove+re-add) exactly this run's subscriber identities
+        # right before launching fresh UE containers against them -- see
+        # provision_open5gs_subscribers()'s docstring reason #2: every UE
+        # container here is a brand new nr-ue process (SQN=0 on its side),
+        # and Open5GS's network-side SQN for these same IMSIs only ever
+        # advances, so without this reset every run after the first one
+        # to touch a given subscriber slot fails AKA with "SQN out of
+        # range" (confirmed live during this profile's own smoke test).
+        provision_open5gs_subscribers(len(self.subscribers))
         docker(
             "rm", "-f", self.rigger_name, *self.ue_container_names, *self.endpoint_container_names,
             check=False,
@@ -382,13 +449,30 @@ class Open5gsTopologyProbe(ReferenceTopologyProbe):
         project -- direct introspection instead of log-scraping, since
         unlike the ns-3 NR profile's FLEETQOX_NR_MAPPING there's no
         simulator-internal decision to recover, just a real kernel
-        interface to look at."""
+        interface to look at.
+
+        Also adds an explicit route for the whole UE_IPV4_INTERNET pool
+        via uesimtun0 -- `ip addr add` only creates a host /32 route (no
+        subnet route, same gap finish_wire_network_nr() had to work
+        around for the ns-3 NR profile's overlay IPs), so without this
+        every packet aimed at ANOTHER UE's uesimtun0 address falls
+        through to the container's pre-existing docker-network default
+        route (via eth0, the docker_open5gs_default bridge) instead of
+        the UPF-terminated tunnel -- confirmed live: two fresh UEs could
+        register/establish PDU sessions fine but ping between their
+        uesimtun0 addresses was 100% loss until this route was added,
+        100% delivered after. Only this one subnet is redirected, NOT
+        the container's default route -- NGAP/GTP-U signaling traffic
+        (this container's own eth0 address talking to gNB_IP/AMF_IP on
+        docker_open5gs_default) must keep using eth0 unchanged."""
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             result = docker("exec", ue_name, "ip", "-4", "-o", "addr", "show", "uesimtun0", check=False)
             if result.returncode == 0 and result.stdout.strip():
                 match = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", result.stdout)
                 if match:
+                    ue_internet_pool = _read_env_var("UE_IPV4_INTERNET")
+                    docker("exec", ue_name, "ip", "route", "add", ue_internet_pool, "dev", "uesimtun0", check=False)
                     return match.group(1)
             time.sleep(1.0)
         log = docker("logs", "--tail", "80", ue_name, check=False)
@@ -673,7 +757,11 @@ def main() -> int:
     if args.command == "core-up":
         start_open5gs_core()
         start_open5gs_gnb()
-        subscribers = provision_open5gs_subscribers(args.max_robots)
+        # +1: endpoint_list(max_robots) is max_robots robots PLUS
+        # control_station (see Open5gsTopologyProbe.__init__'s comment) --
+        # provision one extra subscriber so a --num-robots=max_robots probe
+        # has exactly enough UE identities for every endpoint.
+        subscribers = provision_open5gs_subscribers(args.max_robots + 1)
         print(json.dumps({"status": "ok", "subscribers_provisioned": len(subscribers)}))
         return 0
 
@@ -688,7 +776,9 @@ def main() -> int:
         return 0
 
     if args.command == "probe":
-        subscribers = [_subscriber_for_index(i) for i in range(args.num_robots)]
+        # +1 for control_station -- see Open5gsTopologyProbe.__init__'s
+        # comment on why endpoint_list(num_robots) has num_robots+1 entries.
+        subscribers = [_subscriber_for_index(i) for i in range(args.num_robots + 1)]
         summary = run_open5gs_probe(
             image=args.image, output_dir=args.output_dir, num_robots=args.num_robots,
             policy=args.policy, seconds=args.seconds, seed=args.seed, subscribers=subscribers,
@@ -701,7 +791,9 @@ def main() -> int:
         return 0 if summary["status"] == "ok" else 1
 
     if args.command == "coordination-probe":
-        subscribers = [_subscriber_for_index(i) for i in range(args.num_robots)]
+        # +1 for control_station -- see Open5gsTopologyProbe.__init__'s
+        # comment on why endpoint_list(num_robots) has num_robots+1 entries.
+        subscribers = [_subscriber_for_index(i) for i in range(args.num_robots + 1)]
         summary = run_open5gs_coordination_probe(
             image=args.image, output_dir=args.output_dir, num_robots=args.num_robots,
             seed=args.seed, subscribers=subscribers,
