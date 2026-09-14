@@ -302,9 +302,8 @@ def compute_coordination_metrics(endpoint_results: dict[str, Any]) -> dict[str, 
       every reply within --reply-timeout-s and had to be re-broadcast)
       -- see fleetqox_coordination_endpoint.py's module docstring for
       why this coordination-layer retry is the closest available
-      stand-in for a
-      real navigation-stack recovery in a harness with no actual motion
-      planner.
+      stand-in for a real navigation-stack recovery in a harness with
+      no actual motion planner.
     - task_completion_s: MAX across endpoints of task_completion_s --
       the scenario isn't done until the SLOWEST endpoint finishes its
       assigned crossings, same "whole-fleet is only as fast as its
@@ -317,6 +316,14 @@ def compute_coordination_metrics(endpoint_results: dict[str, Any]) -> dict[str, 
       where forced entries were so common the "clean" delay figure
       covers only a small, possibly unrepresentative minority of
       crossings.
+    - publish_failures: SUM across all endpoints of
+      debug_counters.publish_failures (safe_publish()'s counter for an
+      OS/RMW-level send that couldn't even be enqueued, e.g. the real
+      N=32 errno=105 ENOBUFS crash this was added to survive) -- added
+      14/09/2026 per review: this was already tracked per-endpoint but
+      not rolled up here, so a reader comparing runs had to go dig
+      through individual endpoint JSON files to tell "genuinely lossy
+      network" apart from "this run's OS send buffer was exhausted".
 
     Returns None values for whichever field has no eligible samples
     (e.g. every crossing at every endpoint was forced -- see the 5G
@@ -328,6 +335,7 @@ def compute_coordination_metrics(endpoint_results: dict[str, Any]) -> dict[str, 
     total_crossings = 0
     forced_crossings = 0
     total_recovery_count = 0
+    total_publish_failures = 0
     completion_times_s: list[float] = []
 
     for result in endpoint_results.values():
@@ -335,6 +343,7 @@ def compute_coordination_metrics(endpoint_results: dict[str, Any]) -> dict[str, 
             continue
         message_ages_ms.extend(result.get("coordination_message_ages_ms", []))
         total_recovery_count += result.get("coordination_retry_count", 0)
+        total_publish_failures += result.get("debug_counters", {}).get("publish_failures", 0)
         completion_times_s.append(result.get("task_completion_s", 0.0))
         for crossing in result.get("crossings", []):
             total_crossings += 1
@@ -351,6 +360,7 @@ def compute_coordination_metrics(endpoint_results: dict[str, Any]) -> dict[str, 
             sum(resolution_delays_ms) / len(resolution_delays_ms) if resolution_delays_ms else None
         ),
         "coordination_retry_count": total_recovery_count,
+        "publish_failures": total_publish_failures,
         "task_completion_s": max(completion_times_s) if completion_times_s else None,
         "total_crossings": total_crossings,
         "forced_crossings": forced_crossings,
