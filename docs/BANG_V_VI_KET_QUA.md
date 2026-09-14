@@ -1,10 +1,59 @@
-# Bảng V và Bảng VI — Kết quả đo thật
+# Bảng IV, V và Bảng VI — Kết quả đo thật
 
-Tài liệu này gom lại 2 bảng kết quả cuối cùng (dữ liệu đo thật qua
+Tài liệu này gom lại 3 bảng kết quả cuối cùng (dữ liệu đo thật qua
 harness Docker + ns-3, không phải suy đoán) để tiện đối chiếu với bài
 báo. Chi tiết phương pháp, quá trình debug, và các phát hiện phụ trợ
 nằm ở [`docs/AUDIT_ACCEPTANCE_TRACKING.md`](AUDIT_ACCEPTANCE_TRACKING.md)
 (tìm theo ngày `13/09/2026`).
+
+## Bảng IV — Discovery/Graph (N=8/16/32, n=3, 1 phương pháp xuyên suốt)
+
+| Method | N robots | Discovery convergence (s) | Discovery bytes | CPU (%) | RSS (MB) | Graph/Join failures |
+|---|---|---|---|---|---|---|
+| Fast DDS | 8 | ≥15s (censored) | 1,953,889 | 7.84 | 44.2 | 44% |
+| Cyclone DDS | 8 | ≥15s (censored) | 324,049 | 13.82 | 38.3 | 100% |
+| Zenoh | 8 | ≥15s (censored) | 254,928 | 6.57 | 48.6 | 59% |
+| **Ours (FleetRMW)** | 8 | **~0.00s** | 1,797 | 10.38 | 38.4 | 0%¹ |
+| Fast DDS | 16 | ≥15s (censored) | 2,347,667 | 4.69 | 43.1 | 100% |
+| Cyclone DDS | 16 | ≥15s (censored) | 1,828,707 | 2.97 | 38.0 | 100% |
+| Zenoh | 16 | ≥15s (censored) | 404,105 | 5.25 | 42.4 | 100% |
+| **Ours (FleetRMW)** | 16 | **~0.00s** | 3,103 | 9.15 | 37.9 | 0%¹ |
+| Fast DDS | 32 | ≥15s (censored) | 1,783,367 | 2.44 | 42.3 | 100% |
+| Cyclone DDS | 32 | ≥15s (censored) | 355,467 | 12.81 | 37.5 | 100% |
+| Zenoh | 32 | ≥15s (censored) | 331,669 | 2.00 | 38.8 | 100% |
+| **Ours (FleetRMW)** | 32 | **~0.00s** | 5,637 | 8.42 | 37.5 | 0%¹ |
+
+¹ FleetRMW không chạy cơ chế beacon N-way (static mode không có bước
+discovery) — 0% ở đây là bộ đếm NATIVE riêng của transport
+(`unreachable_retry_giveups`, xác nhận 0/170 ở N=16). Đây KHÔNG PHẢI
+cùng phép đo beacon như 3 RMW kia — không nên xếp cùng cột như thể so
+sánh trực tiếp được, dù cùng đơn vị "%".
+
+### Delivery_pct đối chiếu (không phải cột trong Bảng IV, liên quan trực tiếp tới Bảng V)
+
+| Method | N=8 | N=16 | N=32 |
+|---|---|---|---|
+| Fast DDS (discovery_server) | 100.0±0.0 | 48.4±7.7 | 0.0±0.0 |
+| Cyclone DDS (static_peers) | 0.0±0.0 | 0.0±0.0 | 0.0±0.0 |
+| Zenoh | 37.1±31.4 | 48.5±14.0 | 0.0±0.0 |
+| FleetRMW | 41.1±6.9 | 27.9±8.5 | 10.0±1.3 |
+
+### Nhận xét chính (Bảng IV)
+
+- **CycloneDDS static-peers sập ở CẢ 3 quy mô** — giới hạn cấu trúc
+  (O(N²) discovery cost), không phải config bug hay ngưỡng quy mô cụ
+  thể — sập ngay từ N=8.
+- **Fast DDS discovery-server: mô hình chữ U ngược** — 100% ở N=8,
+  ~48% ở N=16, sập hẳn 0% ở N=32 — suy giảm dần theo bão hòa kênh, khác
+  hẳn cú sập tức thời của CycloneDDS.
+- **Zenoh sập hoàn toàn ở N=32** (0.0±0.0) dù ổn ở N=8/16 (37-48%) —
+  ngay cả router tĩnh cũng không cứu được ở quy mô 32.
+- **FleetRMW suy giảm đều đặn theo quy mô** (41%→28%→10%) nhưng KHÔNG
+  BAO GIỜ sập về 0% — khác biệt cấu trúc lớn nhất so với 3 RMW kia (tất
+  cả đều sập đúng 0% ở N=32).
+- **CPU/RSS không tăng đơn điệu theo quy mô** — phản ánh mức tải phụ
+  thuộc việc CÓ đang xử lý dữ liệu thật hay chỉ đang chờ/nghẽn, không
+  phải hàm đơn điệu của N.
 
 ## Bảng V — Đầy đủ 3 profile (Wi-Fi / LAN / 5G), N=16, n=3
 
