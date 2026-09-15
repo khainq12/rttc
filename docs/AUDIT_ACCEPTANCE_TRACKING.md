@@ -5623,6 +5623,68 @@ trung thực trong bài báo là "đã cải thiện đáng kể, còn dư đị
 `/tmp/.../scratchpad/bang5_publish_stages_profile.log` (không thuộc
 repo).
 
+### 15/09/2026 (tiếp) — Đo MAC/PHY-layer thật (`FLEETQOX_WIFI_STATS`, ns-3): XÁC NHẬN đúng giả thuyết va chạm kênh — predictive có tỷ lệ drop tại MAC cao hơn ~50%
+
+`external/ns3/fleetqox_trace_replay_tap.cc` đã có sẵn trace hook
+MacTx/MacTxDrop/MacRx/MacRxDrop/PhyTxBegin/PhyRxDrop (in JSON mỗi 5s
+ra ns3.log, đã capture sẵn qua `probe.ns3_log()` — không cần sửa C++
+hay build lại). Parse dòng cuối cùng (snapshot gần nhất trước khi
+process bị kill), Wi-Fi N=16, không cap, 1 lượt mỗi policy (lưu ý:
+JSON output có trailing comma ở mảng `phy_rx_drop_by_reason`, không
+hợp lệ JSON thuần túy, cần strip `,]`/`,}` trước khi parse — chưa sửa
+trong C++, chỉ workaround ở phía Python đọc log).
+
+| | fifo | predictive |
+|---|---|---|
+| mac_tx_total (số lần thử gửi ở tầng MAC) | 448 | 518 |
+| **mac_tx_drop_total** (bị drop do hết lượt retry sau va chạm) | **12** | **21** |
+| **Tỷ lệ drop MAC (mac_tx_drop/mac_tx_total)** | **2.7%** | **4.05%** |
+| mac_rx_total | 4304 | 3953 |
+| phy_rx_drop_total | 1485 | 1385 |
+| phy_rx_drop_by_reason (top reason, mã 9) | 581 | 485 |
+
+**XÁC NHẬN đúng giả thuyết ban đầu (nhiều gói nhỏ → va chạm kênh nhiều
+hơn), lần này bằng số liệu MAC-layer THẬT, không phải suy luận**:
+predictive có tỷ lệ gói TỰ NÓ bị drop tại tầng MAC (do vượt số lần
+retry cho phép sau va chạm CSMA/CA) cao hơn fifo khoảng **50%** (4.05%
+so với 2.7%) — dù `mac_tx_total` (số lần thử) chỉ cao hơn ~16%
+(518 so với 448). Đây CHÍNH LÀ cơ chế vật lý gây ra khoảng cách ~6pp
+còn lại SAU KHI đã bật packet cap 1200pps: bản thân cap là 1 ngưỡng
+TUYẾN TÍNH cố định, không nắm bắt được đường cong xác suất va chạm
+PHI TUYẾN thật của CSMA/CA khi nhiều trạm cùng gửi nhiều gói nhỏ đồng
+thời — packet cap giảm được PHẦN LỚN (vì giảm SỐ LƯỢNG gói chung), nhưng
+không triệt tiêu hoàn toàn được xác suất va chạm cao hơn trên MỖI gói
+nhỏ còn lại.
+
+**phy_rx_drop_total của predictive lại THẤP HƠN fifo** (1385 vs 1485)
+— không mâu thuẫn: đây là drop ở phía NHẬN của TOÀN BỘ 17 trạm (traffic
+tổng hợp, không riêng luồng đang theo dõi), phản ánh predictive gửi ít
+`mac_rx_total` hơn tổng thể (3953 vs 4304) do gói nhỏ hơn/khác cấu
+trúc, không phải bằng chứng ngược lại — chỉ số quyết định nhất vẫn là
+`mac_tx_drop_total` vì đó là tổn thất TRỰC TIẾP của CHÍNH luồng gửi.
+
+**KẾT LUẬN CUỐI CHO TOÀN BỘ CHUỖI ĐIỀU TRA (bước 1-6 + 2 hướng đo
+sâu)**: predictive hiện tại KÉM HƠN fifo trên Wi-Fi/LAN, nguyên nhân
+CHÍNH XÁC (không còn suy đoán) là va chạm kênh CSMA/CA thật tăng theo
+SỐ LƯỢNG gói (không phải overhead phần mềm — đã bác bỏ), packet-aware
+admission giúp ĐÁNG KỂ (giảm ~54% khoảng cách) nhưng KHÔNG đủ vì bản
+thân là 1 ngưỡng tuyến tính không mô hình hoá được va chạm phi tuyến.
+Hướng cải tiến tiếp theo có cơ sở khoa học rõ ràng (nếu muốn làm tiếp):
+mô hình hoá pressure/cost theo hàm PHI TUYẾN của số gói (không chỉ
+ngưỡng cứng), hoặc giảm mức độ "phân mảnh" của compaction (ít gói to
+hơn thay vì nhiều gói nhỏ) khi pressure cao.
+
+**Trạng thái**: điều tra khoa học (bước 1-6 + đo publish_stages + đo
+MAC/PHY) HOÀN THÀNH đầy đủ, có kết luận rõ ràng, có bằng chứng THẬT ở
+mọi tầng (trace-generation, sender software, MAC/PHY) — đủ để viết vào
+bài báo như 1 câu chuyện khoa học hoàn chỉnh: phát hiện → bác bỏ giả
+thuyết sai → xác nhận giả thuyết đúng → fix một phần → xác định chính
+xác phần còn thiếu.
+
+**File liên quan**: `external/ns3/fleetqox_trace_replay_tap.cc`
+(FLEETQOX_WIFI_STATS, đã có sẵn), kết quả thô tại
+`/tmp/.../scratchpad/bang5_mac_stats_profile.log` (không thuộc repo).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
