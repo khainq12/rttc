@@ -177,7 +177,35 @@ RADIO_LINK_UDP_PORT = 4997
 # stays non-zero first (see this comment's own live-tested cliff).
 RADIO_LINK_LOSS_PCT = 2.0
 DBCTL_PATH = "/open5gs/misc/db/open5gs-dbctl"
-UE_TUN_WAIT_S = 45.0
+UE_TUN_WAIT_S = 60.0
+UE_REGISTRATION_MAX_ATTEMPTS = 3
+# 14/09/2026: the radio-loss profile's first full batch showed 15/36
+# runs (42%) failing OUTRIGHT (not just reduced delivery) with
+# "uesimtun0 never came up". First fix tried: just double the single
+# wait budget 45s -> 120s -- this DID help (a live 3-run retest of
+# previously-failed combos went from 3/3 failing to 1/3), confirming
+# most cases really were "needs another NAS retry cycle, not actually
+# stuck" (a successful registration alone took ~26s under 2% loss, one
+# T3510/T3511 cycle). But it did NOT fully fix it: one retest still
+# failed at the full 120s, with a live log showing a UE that DID
+# register, then hit "Radio link failure detected" -> "Cell selection
+# failure, no suitable or acceptable cell found" and never recovered
+# for the rest of the window -- a genuinely wedged local NAS/RRC state
+# machine, not merely "needed more time."
+#
+# Fix: instead of one long wait, several SHORTER attempts
+# (UE_TUN_WAIT_S each), and if an attempt times out, kill that UE's
+# container (and its paired endpoint container -- see
+# _launch_ue_pair()'s docstring for why both must be recreated
+# together) and relaunch BOTH FRESH before retrying -- a brand new
+# nr-ue process starts its NAS/RRC state machine from scratch, so a
+# wedged state from the previous attempt can't carry over. This is the
+# practical equivalent of power-cycling a real UE that's stuck showing
+# "no service." UE_REGISTRATION_MAX_ATTEMPTS=3 bounds the worst case at
+# 3*60=180s per UE (vs the single-shot 120s this replaces), but only
+# pays that cost for a UE that's actually stuck across MULTIPLE fresh
+# attempts, which should be rare -- most cases resolve on attempt 1 or
+# 2.
 UE_KI = "8baf473f2f8fd09487cccbd7097c6862"
 UE_OPC = "11111111111111111111111111111111"
 UE_AMF = "8000"
@@ -479,56 +507,89 @@ class Open5gsTopologyProbe(ReferenceTopologyProbe):
             "run", "-d", "--name", self.rigger_name, "--network=none",
             *self._mount_args(), self.image, "sleep infinity",
         )
-        gnb_ip = _read_env_var("NR_GNB_IP")
-        mcc = _read_env_var("MCC")
-        mnc = _read_env_var("MNC")
-        for i, ue_name in enumerate(self.ue_container_names):
-            sub = self.subscribers[i]
-            docker(
-                "run", "-d", "-i", "-t", "--name", ue_name, f"--network={CORE_NETWORK_NAME}",
-                "--cap-add=NET_ADMIN", "--privileged",
-                # -i -t (matching the vendor's own nr-ue.yaml
-                # stdin_open:true/tty:true): ueransim-ue_init.sh ends with
-                # `./nr-ue -c ... & exec bash $@` -- that trailing bare
-                # `exec bash` becomes PID 1 after backgrounding nr-ue, and
-                # without an allocated tty its stdin is just a closed pipe,
-                # so it hits EOF and exits immediately, taking the whole
-                # container (and the nr-ue child it just started) down
-                # with it. Confirmed by reading the script; a tty keeps
-                # that bash sitting idle instead of exiting.
-                "-e", "COMPONENT_NAME=ueransim-ue", "-e", f"MCC={mcc}", "-e", f"MNC={mnc}",
-                "-e", f"NR_GNB_IP={gnb_ip}", "-e", f"UE1_IMSI={sub['imsi']}",
-                "-e", f"UE1_KI={sub['ki']}", "-e", f"UE1_OP={sub['opc']}",
-                "-e", f"UE1_AMF={sub['amf']}", "-e", f"UE1_IMEI={sub['imei']}",
-                "-e", f"UE1_IMEISV={sub['imeisv']}",
-                "-v", f"{OPEN5GS_ROOT / 'ueransim'}:/mnt/ueransim",
-                UERANSIM_IMAGE,
-            )
-            # Fresh container every run (unlike the shared gNB, which
-            # applies this once in start_open5gs_gnb()) -- see
-            # apply_radio_link_loss()'s docstring for why this only
-            # touches the radio-link port, not NGAP/GTP-U. A UE's very
-            # first RRC/registration attempt could in principle race
-            # ahead of this exec and slip through unshaped, but nr-ue
-            # already retries on loss/failure (confirmed via this
-            # profile's own AKA-resync behavior), so this doesn't need
-            # to be synchronized any tighter than "applied before the
-            # container has had time to do much."
-            apply_radio_link_loss(ue_name, loss_pct=self.radio_link_loss_pct)
-        for i, endpoint_name in enumerate(self.endpoint_container_names):
-            # --network=container:<ue> joins that UE's netns wholesale
-            # (including its uesimtun0 once the PDU session comes up) --
-            # Docker's native equivalent of what the ns-3 profiles build
-            # by hand via nsenter/veth (see module docstring).
-            docker(
-                "run", "-d", "--name", endpoint_name,
-                f"--network=container:{self.ue_container_names[i]}", "--init",
-                *self._mount_args(), self.image, "sleep infinity",
-            )
+        self._gnb_ip = _read_env_var("NR_GNB_IP")
+        self._mcc = _read_env_var("MCC")
+        self._mnc = _read_env_var("MNC")
+        for i in range(len(self.endpoints)):
+            self._launch_ue_pair(i)
         self.ips = {
-            endpoint: self._wait_for_ue_ip(self.ue_container_names[i])
+            endpoint: self._wait_for_ue_ip_with_retry(i)
             for i, endpoint in enumerate(self.endpoints)
         }
+
+    def _launch_ue_pair(self, i: int) -> None:
+        """Creates UE container i and its paired endpoint (app) container
+        TOGETHER, fresh -- the two are permanently coupled at creation
+        time (`--network=container:<ue>` binds an app container to a
+        UE's netns for its whole lifetime, Docker has no way to
+        re-attach a running container to a different namespace later),
+        so retrying a stuck UE (see _wait_for_ue_ip_with_retry()) means
+        recreating BOTH, never just the UE alone."""
+        sub = self.subscribers[i]
+        ue_name = self.ue_container_names[i]
+        endpoint_name = self.endpoint_container_names[i]
+        docker("rm", "-f", ue_name, endpoint_name, check=False)
+        docker(
+            "run", "-d", "-i", "-t", "--name", ue_name, f"--network={CORE_NETWORK_NAME}",
+            "--cap-add=NET_ADMIN", "--privileged",
+            # -i -t (matching the vendor's own nr-ue.yaml
+            # stdin_open:true/tty:true): ueransim-ue_init.sh ends with
+            # `./nr-ue -c ... & exec bash $@` -- that trailing bare
+            # `exec bash` becomes PID 1 after backgrounding nr-ue, and
+            # without an allocated tty its stdin is just a closed pipe,
+            # so it hits EOF and exits immediately, taking the whole
+            # container (and the nr-ue child it just started) down
+            # with it. Confirmed by reading the script; a tty keeps
+            # that bash sitting idle instead of exiting.
+            "-e", "COMPONENT_NAME=ueransim-ue", "-e", f"MCC={self._mcc}", "-e", f"MNC={self._mnc}",
+            "-e", f"NR_GNB_IP={self._gnb_ip}", "-e", f"UE1_IMSI={sub['imsi']}",
+            "-e", f"UE1_KI={sub['ki']}", "-e", f"UE1_OP={sub['opc']}",
+            "-e", f"UE1_AMF={sub['amf']}", "-e", f"UE1_IMEI={sub['imei']}",
+            "-e", f"UE1_IMEISV={sub['imeisv']}",
+            "-v", f"{OPEN5GS_ROOT / 'ueransim'}:/mnt/ueransim",
+            UERANSIM_IMAGE,
+        )
+        # Fresh container every run/retry (unlike the shared gNB, which
+        # applies this once in start_open5gs_gnb()) -- see
+        # apply_radio_link_loss()'s docstring for why this only touches
+        # the radio-link port, not NGAP/GTP-U. A UE's very first RRC/
+        # registration attempt could in principle race ahead of this
+        # exec and slip through unshaped, but nr-ue already retries on
+        # loss/failure (confirmed via this profile's own AKA-resync
+        # behavior), so this doesn't need to be synchronized any tighter
+        # than "applied before the container has had time to do much."
+        apply_radio_link_loss(ue_name, loss_pct=self.radio_link_loss_pct)
+        # --network=container:<ue> joins that UE's netns wholesale
+        # (including its uesimtun0 once the PDU session comes up) --
+        # Docker's native equivalent of what the ns-3 profiles build by
+        # hand via nsenter/veth (see module docstring).
+        docker(
+            "run", "-d", "--name", endpoint_name, f"--network=container:{ue_name}", "--init",
+            *self._mount_args(), self.image, "sleep infinity",
+        )
+
+    def _wait_for_ue_ip_with_retry(
+        self, i: int, max_attempts: int = UE_REGISTRATION_MAX_ATTEMPTS
+    ) -> str:
+        """Wraps _wait_for_ue_ip() in fresh-container retries -- see
+        UE_TUN_WAIT_S/UE_REGISTRATION_MAX_ATTEMPTS's comment for why a
+        single long wait isn't enough (a genuinely wedged NAS/RRC state
+        doesn't self-recover no matter how long you wait, but a BRAND
+        NEW nr-ue process starts clean)."""
+        ue_name = self.ue_container_names[i]
+        last_error: TimeoutError | None = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return self._wait_for_ue_ip(ue_name)
+            except TimeoutError as exc:
+                last_error = exc
+                if attempt < max_attempts:
+                    self._launch_ue_pair(i)
+        assert last_error is not None
+        raise TimeoutError(
+            f"{ue_name}: still no uesimtun0 after {max_attempts} fresh-container attempts "
+            f"({max_attempts * UE_TUN_WAIT_S:.0f}s total); last attempt's error: {last_error}"
+        )
 
     def _wait_for_ue_ip(self, ue_name: str, timeout_s: float = UE_TUN_WAIT_S) -> str:
         """Polls for uesimtun0 to appear inside `ue_name` (created by
