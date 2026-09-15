@@ -5466,6 +5466,64 @@ admission) luôn với bằng chứng đã có.
 `/tmp/.../scratchpad/bang5_fifo_vs_predictive_wifi_n16_n3.jsonl` (6
 dòng, không thuộc repo).
 
+### 15/09/2026 (tiếp) — Bước 4: predictive thua fifo ở MỌI kịch bản đã test, kể cả LAN — tinh chỉnh giả thuyết
+
+Mở rộng so sánh sang Wi-Fi N=8/32 (bổ sung N=16 đã có) và LAN N=16 (để
+kiểm tra giả thuyết "chỉ do overhead MAC 802.11" — LAN không có
+contention/CSMA-CA nào).
+
+| Kịch bản | fifo (n=3) | predictive | Chênh lệch |
+|---|---|---|---|
+| Wi-Fi N=8 | 44.8% | 35.8% | -9pp |
+| Wi-Fi N=16 | 27.2% | 14.6% | -13pp |
+| Wi-Fi N=32 | 12.4% | 11.6% (n=2) | -1pp (~nhiễu) |
+| LAN N=16 | 65.9% | 61.8% | -4pp |
+
+**Phát hiện quan trọng**: predictive thua ở **MỌI** kịch bản đã test,
+kể cả LAN — bác bỏ giả thuyết ban đầu "chỉ do overhead MAC 802.11".
+Kết luận tinh chỉnh: gửi nhiều tin hơn 48% (đã đo ở mục trên) không chỉ
+tốn airtime Wi-Fi mà còn tốn CHÍNH overhead xử lý phần mềm của
+FleetRMW (encode/mutex/syscall mỗi tin — khớp phát hiện trước đó rằng
+FleetRMW có overhead nội bộ đáng kể ngay cả trên LAN, xem Bảng V mục
+"FleetRMW thua cả Fast DDS/CycloneDDS trên LAN"). Chênh lệch LỚN NHẤT
+ở Wi-Fi N=16 (đúng vùng "vừa đủ nghẽn để airtime + overhead cộng dồn
+rõ nhất" — N=8 chưa đủ nghẽn để lộ rõ, N=32 cả 2 policy đều đã sập gần
+hết nên khó phân biệt).
+
+**Trạng thái**: bước 4 HOÀN THÀNH — predictive hiện tại là NET NEGATIVE
+ở mọi kịch bản đã đo, củng cố thêm lý do ưu tiên bước 5 (packet-aware
+admission).
+
+**File liên quan**: kết quả thô tại
+`/tmp/.../scratchpad/bang5_fifo_vs_predictive_scenarios_n3.jsonl` (18
+dòng, không thuộc repo).
+
+### 15/09/2026 (tiếp) — Bước 5: kích hoạt cơ chế packet-aware admission ĐÃ CÓ SẴN trong code (chưa từng được dùng)
+
+Trước khi viết code mới: kiểm tra thấy cơ chế giới hạn theo SỐ PACKET
+(không chỉ byte) **đã tồn tại sẵn** từ investigation trước
+(`NetworkLink.capacity_packets_per_tick`, `_admit_partition`'s
+`remaining_packets` trong `fleetqox/control_plane.py`, `fifo_policy`
+trong `fleetqox/simulator.py`, tham số `capacity_packets_per_second`
+trong `fleetqox/trace.py`'s `generate_trace_events()` — từ task #14-18
+cũ) — nhưng `scripts/run_ns3_docker_container_fleet_probe.py` (harness
+Bảng V/VI chính) **CHƯA BAO GIỜ truyền tham số này** khi gọi
+`generate_trace_events()`. Nghĩa là: KHÔNG cần code cơ chế mới, chỉ
+cần BẬT tham số đã có sẵn.
+
+Đã thêm `capacity_packets_per_second` vào `run_probe()`/`run_lan_probe()`,
+mặc định `None` (giữ nguyên hành vi cũ, không ảnh hưởng số liệu đã công
+bố). Giá trị dùng để test: `1200` pps — tái sử dụng
+`DEFAULT_CAPACITY_PACKETS_PER_SECOND` đã được ĐO ĐẠC THẬT và xác nhận
+có tác dụng (`scripts/run_omnetpp_docker_wifi_parity.py`, round 8/11:
+delivery +19-22 điểm ở 32 robot) từ investigation packet-rate trước
+đó — dùng làm điểm khởi đầu, KHÔNG hiệu chỉnh lại riêng cho harness
+Bảng V này (workload/topology khác với wifi-parity).
+
+**Trạng thái**: code đã sẵn sàng, đang chạy validation (fifo vs
+predictive CÓ packet cap, so với KHÔNG có cap ở trên) — xem mục tiếp
+theo.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
