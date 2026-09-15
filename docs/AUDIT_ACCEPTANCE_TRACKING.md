@@ -5773,6 +5773,95 @@ kết quả thô tại
 400ms/s) và `.../bang5_fifo_vs_predictive_airtimecap_v2_n3.jsonl` (lần
 150ms/s) (không thuộc repo).
 
+### 15/09/2026 (tiếp) — XÁC ĐỊNH ĐƯỢC NGUỒN GỐC nhiễu nền: `RealtimeSimulatorImpl` (bắt buộc với TapBridge) gắn đồng hồ mô phỏng vào wall-clock thật
+
+Theo yêu cầu tạm dừng airtime-aware admission để điều tra nguồn gốc
+nhiễu trước. Đã root-cause được, có bằng chứng trực tiếp, KHÔNG còn là
+suy đoán.
+
+**Thực nghiệm quyết định**: chạy `fifo`, N=16, cùng seed=13, ns3_seed=42,
+**ns3_run=1 CỐ ĐỊNH** (không đổi, khác với các batch n=3 trước vốn dùng
+ns3_run=1/2/3 — ở đây cố tình giữ NGUYÊN mọi tham số đầu vào để cô lập
+đúng nguồn nhiễu) 3 lần liên tiếp, so sánh cả `delivery_pct` lẫn số liệu
+MAC/PHY thật (`FLEETQOX_WIFI_STATS`) từ `ns3_log`:
+
+| Run | packet_rows (trace, phải giống hệt) | delivery_pct | mac_tx_total | mac_rx_total | phy_tx_begin_total |
+|---|---|---|---|---|---|
+| 1 | 2289 | 21.5% | 215 | 3315 | 828 |
+| 2 | 2289 | 26.3% | 270 | 3821 | 1019 |
+| 3 | 2289 | 19.9% | **385** | 3966 | 1401 |
+
+`packet_rows` giống hệt (xác nhận trace CSV đầu vào — sinh bằng Python
+thuần, không có phần thật nào — hoàn toàn tất định như kỳ vọng). Nhưng
+**số liệu MAC/PHY-layer THẬT (đo bởi chính ns-3, không phải suy ra) lại
+lệch tới ~79%** giữa run 1 và run 3 (`mac_tx_total` 215 → 385) dù mọi
+tham số đầu vào giống hệt nhau. Đây là bằng chứng trực tiếp: nguồn nhiễu
+nằm ở CHÍNH quá trình mô phỏng ns-3 thực thi, không phải ở khâu đo/tính
+`delivery_pct` phía sau.
+
+**Cơ chế chính xác (đọc code, không suy đoán)**:
+
+1. `external/ns3/fleetqox_trace_replay_tap.cc` (dòng 15-17, đã ghi chú
+   sẵn từ trước) BẮT BUỘC dùng `ns3::RealtimeSimulatorImpl` vì
+   `TapBridge` yêu cầu — nghĩa là đồng hồ sự kiện rời rạc của ns-3 được
+   đồng bộ THEO wall-clock thật của host, không chạy nhanh-hết-mức-có-thể
+   như mô phỏng ns-3 thuần túy.
+2. `PrintWifiStats()` (cùng file) tự lên lịch in lại **mỗi 5 giây wall-clock
+   thật** — độc lập với bất kỳ tiến trình Python/Docker nào khác.
+3. `ReferenceTopologyProbe.wait_for_completion()`
+   (`scripts/run_ns3_docker_container_fleet_probe.py:1278`) poll mỗi
+   **1.0 giây thật** (`time.sleep(1.0)`) để kiểm tra file kết quả của
+   từng endpoint đã ghi xong chưa — thời điểm "ALL_DONE" phụ thuộc lịch
+   trình OS/Docker thật (khi nào tiến trình endpoint thật ghi xong file),
+   cộng thêm tối đa ~1s trễ do chu kỳ poll.
+4. Ngay sau đó, `probe.ns3_log()` đọc log ns-3 và lấy dòng
+   `FLEETQOX_WIFI_STATS` **CUỐI CÙNG** đã in được tính tới thời điểm đó —
+   các counter là **atomic CỘNG DỒN, không reset** giữa các lần in.
+
+→ Số dòng `FLEETQOX_WIFI_STATS` đã kịp in ra (ví dụ 2 dòng ở t≈10s hay 3
+dòng ở t≈15s) khi `wait_for_completion()` trả về là một đại lượng NGẪU
+NHIÊN theo lịch trình thật của host — chênh lệch dù chỉ vài giây thật
+(do CPU scheduling, Docker exec overhead, I/O) đủ để lệch hẳn 1 chu kỳ
+5 giây, khiến tổng cộng dồn gần như NHÂN ĐÔI giữa các lần chạy "giống hệt
+nhau". `delivery_pct` (tính từ log thật của từng endpoint, cùng chịu
+ràng buộc thời gian thực tương tự) nhiễu theo cùng cơ chế.
+
+**Đây KHÔNG phải bug theo nghĩa thông thường** — `RealtimeSimulatorImpl`
+là yêu cầu KIẾN TRÚC bắt buộc của `TapBridge` (không có lựa chọn khác
+nếu muốn tiến trình Linux thật/RMW thật đi qua kênh Wi-Fi mô phỏng thật,
+đây chính là điểm mạnh của kiến trúc này so với mô phỏng trace thuần —
+đã ghi rõ trong header file từ trước). Nhưng hệ quả là: **MỌI so sánh
+n=3 qua harness Wi-Fi TapBridge sống này (kể cả các bảng IV/V/VI wifi đã
+công bố, không riêng gì thử nghiệm packet-cap/airtime-cap vừa rồi) đều
+mang sẵn nhiễu nền cỡ 20-80% tương đối ở các chỉ số MAC-layer, và ít
+nhất ~5-9 điểm % tuyệt đối ở `delivery_pct`** — lớn hơn hoặc ngang bằng
+nhiều hiệu ứng nhỏ từng được diễn giải là "có tác dụng thật".
+
+**Hướng khắc phục khả thi (chưa làm, cần quyết định)**:
+- (a) Tăng n đáng kể (ví dụ n=10-20/nhánh) + báo cáo khoảng tin cậy
+  thay vì trung bình 3 điểm — không sửa nguồn nhiễu, chỉ pha loãng nó.
+- (b) Sửa `wait_for_completion()`/`ns3_log()` để LUÔN đợi đủ
+  `sim_duration_s` thật trước khi đọc log (thay vì dừng ngay khi
+  endpoint báo xong) — làm số chu kỳ in `PrintWifiStats()` cố định giữa
+  các lần chạy, giảm nhiễu nhưng làm MỖI lần chạy chậm hơn (tốn thêm tới
+  `sim_duration_s` giây thật/lần, hiện đang tận dụng việc dừng sớm để
+  nhanh).
+- (c) Đổi cơ chế tính điểm: dùng cửa sổ thời gian MÔ PHỎNG cố định
+  (không phải "dòng log cuối cùng bắt được") để so counter cùng một mốc
+  thời gian mô phỏng giữa mọi lần chạy, bất kể khi nào wall-clock thật
+  bắt kịp tới đó.
+
+**Trạng thái**: đã xác định CHÍNH XÁC nguồn nhiễu (không còn nghi ngờ),
+có bằng chứng thực nghiệm trực tiếp (bảng 3 dòng ở trên) — cần người
+dùng chọn hướng khắc phục (a)/(b)/(c) trước khi tiếp tục bất kỳ so sánh
+định lượng nào (kể cả quay lại airtime-aware admission).
+
+**File liên quan**: `external/ns3/fleetqox_trace_replay_tap.cc` (dòng
+15-17, 245-278), `scripts/run_ns3_docker_container_fleet_probe.py:1278`
+(`wait_for_completion`); kết quả thô tại
+`/tmp/.../scratchpad/noise_floor_repeat_same_config.jsonl` (không thuộc
+repo).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
