@@ -5524,6 +5524,51 @@ Bảng V này (workload/topology khác với wifi-parity).
 predictive CÓ packet cap, so với KHÔNG có cap ở trên) — xem mục tiếp
 theo.
 
+### 15/09/2026 (tiếp) — Bước 6: validation packet cap 1200pps — có tác dụng THẬT nhưng CHƯA đủ, còn ~6pp chênh lệch chưa giải thích
+
+Chạy lại Wi-Fi N=16 (kịch bản chênh lệch lớn nhất) với
+`capacity_packets_per_second=1200`, cùng seed/topology với bản không
+cap ở mục trên:
+
+| | Không cap | Có cap 1200pps | Δ do cap |
+|---|---|---|---|
+| fifo | 27.2% | 22.1% | -5.1pp |
+| fleetqox_predictive | 14.6% | 16.3% | +1.7pp |
+| **Chênh lệch predictive vs fifo** | **-12.6pp** | **-5.8pp** | **giảm ~54%** |
+
+**Packet cap có tác dụng thật, đúng hướng dự đoán**: khoảng cách giữa
+2 policy giảm gần một nửa (từ -12.6pp xuống -5.8pp) — xác nhận
+"packet-aware admission" LÀ một phần nguyên nhân thật của vấn đề, đúng
+như dự đoán từ bước 1-4. fifo cũng bị giảm (22.1% so với 27.2%) vì bản
+thân nó CŨNG bị giới hạn theo packet-rate (đúng thiết kế
+`fifo_policy`'s `remaining_packets` check) — cap ảnh hưởng CẢ 2 policy,
+chỉ predictive được lợi TƯƠNG ĐỐI nhiều hơn.
+
+**NHƯNG chưa đủ để đảo ngược** — predictive vẫn kém fifo ~6pp sau khi
+cap. Khớp với phát hiện LAN ở bước 4 (predictive cũng thua fifo trên
+LAN, nơi không có MAC contention nào để cap giải quyết) — phần còn lại
+của khoảng cách nhiều khả năng đến từ overhead xử lý PHẦN MỀM của
+chính FleetRMW mỗi tin nhắn (encode/mutex/syscall — đã có sẵn field
+`fleetqox_transport_metrics.publish_stages` để đo chi tiết hơn nếu
+cần), KHÔNG PHẢI vấn đề mạng — packet cap không giải quyết được phần
+này vì nó chỉ kiểm soát SỐ TIN ĐƯỢC ADMIT vào trace, không giảm chi phí
+XỬ LÝ mỗi tin đã admit.
+
+**Trạng thái**: bước 5-6 trong kế hoạch của người dùng HOÀN THÀNH ở
+mức "đã bật + validate cơ chế có sẵn, có tác dụng đo được nhưng chưa
+đủ". Hướng tiếp theo (CHƯA làm, cần người dùng quyết định): (a) hiệu
+chỉnh lại giá trị packet cap riêng cho harness này (1200 chỉ là giá
+trị mượn từ wifi-parity, chưa đo lại cho workload N=16 cụ thể ở đây)
+— có thể còn dư địa cải thiện; (b) điều tra overhead phần mềm
+FleetRMW qua `publish_stages` để tìm phần còn lại của khoảng cách; (c)
+coi đây là kết luận đủ rõ ("predictive cần TIẾP TỤC cải tiến, không
+phải đã xong") và chuyển sang việc khác trong bảng optimizer.
+
+**File liên quan**: `scripts/run_ns3_docker_container_fleet_probe.py`
+(`capacity_packets_per_second` param), kết quả thô tại
+`/tmp/.../scratchpad/bang5_fifo_vs_predictive_packetcap_n3.jsonl` (6
+dòng, không thuộc repo).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
