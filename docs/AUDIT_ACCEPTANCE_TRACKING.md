@@ -5305,6 +5305,101 @@ so sánh này.
 `/tmp/.../scratchpad/bang6_open5gs_noqox_vs_fleetqox_n3.jsonl` (18
 dòng, không thuộc repo).
 
+### 15/09/2026 — Thêm suy hao radio-link giả định vào profile Open5GS (2%), phát hiện + sửa 1 bug hạ tầng thật (42% lượt chạy fail), chạy lại đầy đủ Bảng V + VI
+
+Theo yêu cầu người dùng: ghi chú "5G SA emulation" tự nhận là KHÔNG mô
+phỏng suy hao kênh vô tuyến — người dùng đề nghị thêm 1 hàm suy hao giả
+định để giải quyết khoảng trống này.
+
+**Cơ chế**: `tc netem loss X%` (kernel Linux, không phải công thức
+path-loss kiểu ns-3) lọc qua `tc filter u32` chỉ nhắm đúng cổng UDP
+4997 — cổng "Radio Link Simulation" DUY NHẤT của UERANSIM giữa gNB và
+UE, mang CẢ tín hiệu điều khiển (RRC/NAS) LẪN dữ liệu người dùng đã
+đóng gói (GTP-U). NGAP (38412/sctp) và GTP-U thật (2152/udp, gNB↔UPF)
+là cổng khác, không bị ảnh hưởng — suy hao chỉ tác động đúng "kênh vô
+tuyến giả lập", không đụng core. Áp cho cả gNB (1 lần, lúc
+`start_open5gs_gnb()`) và mỗi UE (mỗi lần launch).
+
+**Chọn thông số bằng thực nghiệm, không phải công thức**: test tay
+N=2 ở 1%/2%/3%/5% loss — phát hiện 1 "vách đá" thật giữa 2% và 3%: 1%
+và 2% đều giao tin thật (190, 316 message), nhưng **3% và 5% mất
+trắng 100%, MỌI LẦN**. Nhiều khả năng do traffic quản lý tunnel của
+UERANSIM đi chung cổng 4997, không chịu được mất dù chỉ 1 frame điều
+khiển quan trọng — 1 lần mất là kẹt cả phiên GTP-U-relay. Chốt
+**2.0%** — giá trị lớn nhất xác nhận vẫn giao tin thật qua thực
+nghiệm, ghi rõ trong code là GIẢ ĐỊNH, không hiệu chỉnh theo đo đạc
+kênh thật nào (`RADIO_LINK_LOSS_PCT`'s comment).
+
+**Phát hiện + sửa 1 bug hạ tầng thật khi chạy full batch lần đầu**:
+36 lượt Bảng V với 2% loss cho **15/36 (42%) lượt FAIL HOÀN TOÀN**
+(không chỉ giảm delivery — UE không đăng ký 5G được trong 45s, cả lượt
+bị huỷ, mất TOÀN BỘ dữ liệu chứ không phải 1 phần). Điều tra qua 2
+bước:
+1. Tăng timeout đăng ký UE 45s→120s: cải thiện đáng kể (retest 3 lượt
+   fail trước đó: 3/3 fail → 1/3 fail) — xác nhận đa số trường hợp chỉ
+   cần thêm 1 chu kỳ retry NAS thật (1 lần đăng ký thành công đo được
+   mất ~26s dưới 2% loss, do 1 chu kỳ retry T3510/T3511). NHƯNG không
+   giải quyết dứt điểm — 1 lượt retest vẫn fail ở 120s, log thật cho
+   thấy 1 UE đã ĐĂNG KÝ THÀNH CÔNG, sau đó gặp "Radio link failure
+   detected" → "Cell selection failure, no suitable or acceptable cell
+   found" và KHÔNG BAO GIỜ tự phục hồi trong thời gian còn lại — trạng
+   thái NAS/RRC bị kẹt thật, không phải "cần chờ thêm".
+2. Sửa triệt để: thay vì 1 lần chờ dài, chia thành NHIỀU lần chờ ngắn
+   hơn (60s/lần, tối đa 3 lần) — nếu 1 lần thất bại, XOÁ và TẠO LẠI
+   HOÀN TOÀN MỚI container UE (và container app đi kèm, vì
+   `--network=container:` của Docker gắn chết lúc tạo, không thể gắn
+   lại) — 1 process `nr-ue` MỚI khởi động lại từ đầu trạng thái NAS/RRC
+   sạch, trạng thái kẹt của lần trước không thể "lây" sang. Xác nhận
+   qua retest trực tiếp: 0/3 "status: failed" (từ 42% ban đầu).
+
+**Kết quả cuối cùng (sau khi sửa, HOÀN TOÀN không còn lượt fail nào,
+72/72 lượt "status: ok")** — xem bảng đầy đủ ở `docs/BANG_V_VI_KET_QUA.md`:
+- Bảng V: delivery giảm mạnh so với bản không suy hao (Fast DDS
+  82-86%→61%/0%/4.9%; FleetRMW 60-70%→25%/25%/0%) — 2% suy hao radio
+  giả định đủ tạo khác biệt LỚN, gần trực giác thông thường về 5G hơn
+  hẳn bản "core sạch hoàn toàn" trước đó. Không còn xu hướng đơn điệu
+  mượt theo N (nhiễu netem IID độc lập, không có "tích luỹ" như
+  contention thật) — hạn chế đã biết, ghi rõ trong docs.
+- Bảng VI: Fast DDS sập HẲN xuống 100% forced_entry ở N=8/16 (trước
+  0%/14%) — kịch bản broadcast-dồn-dập nhạy với suy hao hơn NHIỀU so
+  với trace-replay. Zenoh là RMW DUY NHẤT còn đạt đồng thuận thật ở cả
+  3 quy mô.
+
+**Trạng thái**: Bảng V + VI profile "5G SA emulation + 2% suy hao"
+HOÀN THÀNH đầy đủ N=8/16/32 x 4 phương thức x n=3, 0 lượt fail, đã cập
+nhật `docs/BANG_V_VI_KET_QUA.md` (thay bản không suy hao trước đó theo
+đúng yêu cầu "thay thế hoàn toàn").
+
+**File liên quan**: `scripts/run_open5gs_docker_fleet_probe.py`
+(`apply_radio_link_loss()`, `RADIO_LINK_LOSS_PCT`, `_launch_ue_pair()`,
+`_wait_for_ue_ip_with_retry()`), kết quả thô tại
+`/tmp/.../scratchpad/bang5_open5gs_radioloss_8_16_32_n3.jsonl` +
+`bang6_open5gs_radioloss_8_16_32_n3.jsonl` (36 dòng mỗi file, không
+thuộc repo).
+
+### Câu hỏi mở, CHƯA xử lý — "policy" của FleetQoX chưa từng được đo thật trong bất kỳ bảng nào đã công bố
+
+Người dùng đặt câu hỏi quan trọng: FleetQoX có 6 policy đã viết sẵn
+(fifo, static_priority, fleetqox_csds, fleetqox_predictive,
+fleetqox_predictive_guarded, fleetqox_predictive_lagrangian,
+`fleetqox/trace.py`) nhưng **TOÀN BỘ Bảng IV/V/VI đã đo từ trước tới
+giờ (ns-3 VÀ Open5GS) đều dùng "fifo" (không thông minh) cho MỌI so
+sánh** — để đảm bảo 4 middleware nhận đúng CÙNG một trace/lịch trình
+gửi tin, so sánh công bằng ở tầng TRANSPORT. Nghĩa là: luận điểm cốt
+lõi của FleetQoX (biết ưu tiên theo nhiệm vụ, tự thích nghi) **CHƯA
+TỪNG được đo/chứng minh trong bất kỳ bảng nào đã công bố** — các bảng
+hiện tại chỉ so "đường ống" (transport), chưa so "bộ não quyết định"
+(scheduling/admission). Cũng liên quan: 1 bảng review riêng (ngoài,
+người dùng gửi) đánh giá 10 điểm cải tiến cho tầng optimizer/scheduler
+của FleetQoX (`fleetqox/scheduler.py`, `fleetqox/control_plane.py`,
+`rmw_pubsub.cpp`) — đã kiểm chứng: **cả 10 điểm đều CHƯA có trong
+code** (kể cả 4 điểm bảng ghi "✅ đã triển khai" — xem chi tiết qua
+Explore agent, không lặp lại ở đây). Đây là 1 khối việc lớn (thêm 1
+cặp so sánh Ours-fifo vs Ours-predictive cho Bảng V, tương tự
+Ours-NoQoX/FleetQoX đã làm cho Bảng VI, CỘNG THÊM khả năng cần sửa cả
+C++ RMW cho 10 điểm cải tiến kia) — CHƯA bắt đầu, cần người dùng xác
+nhận phạm vi/thứ tự ưu tiên trước khi làm.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
