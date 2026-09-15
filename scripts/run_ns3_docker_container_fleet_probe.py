@@ -1415,7 +1415,17 @@ def run_probe(
     rmw_implementation: str = "rmw_fleetqox_cpp",
     discovery_mode: str = "default",
     capacity_packets_per_second: int | None = None,
+    capacity_airtime_ns_per_second: int | None = None,
 ) -> dict[str, Any]:
+    # capacity_airtime_ns_per_second default (None = no cap) preserves
+    # existing behavior; when set, only PredictiveAdmissionController
+    # enforces it (fifo/static_priority ignore it, staying a stable
+    # baseline) -- see fleetqox/control_plane.py's _estimate_airtime_ns and
+    # docs/AUDIT_ACCEPTANCE_TRACKING.md 15/09/2026 "MAC/PHY-layer thật" for
+    # the empirical motivation (predictive's real mac_tx_drop rate ran
+    # ~50% higher than fifo's even with the packet-rate cap already
+    # applied, i.e. contention/airtime cost, not just packet count, was
+    # still under-priced).
     # capacity_packets_per_second default (None = no cap) intentionally
     # preserves every EXISTING published Bảng IV/V/VI Wi-Fi number
     # byte-for-byte -- this harness's own generate_trace_events() call
@@ -1445,6 +1455,7 @@ def run_probe(
         seed=seed,
         capacity_bytes_per_second=max(200_000, num_robots * 6_000),
         capacity_packets_per_second=capacity_packets_per_second,
+        capacity_airtime_ns_per_second=capacity_airtime_ns_per_second,
         policies=(policy,),
         include_non_sent=False,
         merge_control_station=True,
@@ -1740,6 +1751,7 @@ def run_lan_probe(
     rmw_implementation: str = "rmw_fleetqox_cpp",
     discovery_mode: str = "default",
     capacity_packets_per_second: int | None = None,
+    capacity_airtime_ns_per_second: int | None = None,
 ) -> dict[str, Any]:
     """Bảng V's "LAN" network profile -- see wire_network_lan()'s
     docstring for what this represents (an ideal switched network, no
@@ -1757,7 +1769,9 @@ def run_lan_probe(
     unlike Wi-Fi, a switched LAN has no CSMA/CA per-frame airtime tax,
     so there's no equivalent physical justification for one. Exposed
     anyway for symmetry/experimentation, not because this profile is
-    known to need it."""
+    known to need it. Same reasoning applies to
+    capacity_airtime_ns_per_second: LAN has no contention/airtime cost to
+    model, so this is exposed for symmetry only."""
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     run_id = output_dir.name.lstrip(".")
@@ -1769,6 +1783,7 @@ def run_lan_probe(
         seed=seed,
         capacity_bytes_per_second=max(200_000, num_robots * 6_000),
         capacity_packets_per_second=capacity_packets_per_second,
+        capacity_airtime_ns_per_second=capacity_airtime_ns_per_second,
         policies=(policy,),
         include_non_sent=False,
         merge_control_station=True,

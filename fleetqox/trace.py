@@ -78,6 +78,7 @@ def generate_trace_events(
     seed: int,
     capacity_bytes_per_second: int | None,
     capacity_packets_per_second: int | None = None,
+    capacity_airtime_ns_per_second: int | None = None,
     policies: Iterable[str] | None = None,
     include_non_sent: bool = False,
     merge_control_station: bool = False,
@@ -92,6 +93,13 @@ def generate_trace_events(
     to real channel capacity -- this lets admission control shed that load
     proactively instead of over-admitting packets the real MAC layer can't
     actually carry.
+
+    capacity_airtime_ns_per_second is an optional, separate total-airtime
+    (nanoseconds/second) ceiling -- a third, more physically accurate
+    capacity dimension on top of the two above (see NetworkLink in
+    fleetqox/model.py for the full rationale). None = no constraint,
+    matching prior behavior; only PredictiveAdmissionController currently
+    enforces it, fifo/static_priority policies ignore it.
     """
 
     requested = list(
@@ -123,6 +131,11 @@ def generate_trace_events(
         if capacity_packets_per_second is not None
         else None
     )
+    capacity_airtime_ns_per_tick = (
+        capacity_airtime_ns_per_second // ticks_per_second
+        if capacity_airtime_ns_per_second is not None
+        else None
+    )
     flows = build_fleet_workload(robots, seed)
 
     events: list[dict[str, object]] = []
@@ -138,6 +151,7 @@ def generate_trace_events(
                 seed=seed,
                 capacity_per_tick=capacity_per_tick,
                 capacity_packets_per_tick=capacity_packets_per_tick,
+                capacity_airtime_ns_per_tick=capacity_airtime_ns_per_tick,
                 tick_ms=tick_ms,
                 ticks_per_second=ticks_per_second,
                 include_non_sent=include_non_sent,
@@ -197,6 +211,7 @@ def _generate_policy_trace(
     ticks_per_second: int,
     include_non_sent: bool,
     capacity_packets_per_tick: int | None = None,
+    capacity_airtime_ns_per_tick: int | None = None,
 ) -> list[dict[str, object]]:
     rng = random.Random(seed)
     ages = {flow.flow_id: 0.0 for flow in flows}
@@ -207,6 +222,7 @@ def _generate_policy_trace(
         link = NetworkLink(
             capacity_bytes_per_tick=_vary_capacity(capacity_per_tick, tick),
             capacity_packets_per_tick=capacity_packets_per_tick,
+            capacity_airtime_ns_per_tick=capacity_airtime_ns_per_tick,
             loss=0.04 + (0.10 if tick % 83 in range(8) else 0.0),
             jitter_ms=8.0 + (18.0 if tick % 57 in range(6) else 0.0),
             rtt_ms=22.0 + (35.0 if tick % 67 in range(4) else 0.0),

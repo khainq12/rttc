@@ -32,6 +32,28 @@ CallablePolicy = Callable[
 ]
 
 
+# 802.11g DCF fixed per-frame overhead (DIFS + average CSMA/CA backoff +
+# PHY preamble/PLCP + SIFS + ACK), in nanoseconds. This is a textbook
+# ballpark, NOT independently calibrated against this repo's exact ns-3
+# config -- same "assumed starting value, validate empirically" approach
+# already used for RADIO_LINK_LOSS_PCT and the packet-rate cap default (see
+# docs/AUDIT_ACCEPTANCE_TRACKING.md). Only used by PredictiveAdmissionController;
+# fifo_policy/static_priority_policy in fleetqox/simulator.py are intentionally
+# left unaware of airtime so they remain a stable, unchanged baseline.
+_WIFI_FIXED_MAC_OVERHEAD_NS = 160_000
+# Matches the ns-3 replay's confirmed 802.11g PHY data rate
+# (external/ns3/fleetqox_trace_replay_tap.cc, DataMode="ErpOfdmRate54Mbps").
+_WIFI_PHY_BITRATE_BPS = 54_000_000
+
+
+def _estimate_airtime_ns(size_bytes: int) -> int:
+    """Rough per-packet channel-occupancy cost: fixed MAC overhead plus payload
+    transmission time at the configured PHY bitrate."""
+
+    payload_ns = (max(0, size_bytes) * 8 * 1_000_000_000) // _WIFI_PHY_BITRATE_BPS
+    return _WIFI_FIXED_MAC_OVERHEAD_NS + payload_ns
+
+
 _CORE_CLASSES = {
     FlowClass.SAFETY,
     FlowClass.CONTROL,
@@ -368,14 +390,16 @@ class PredictiveAdmissionController(CausalSemanticDeadlineScheduler):
         pressure = self._pressure(entries, link)
         remaining = link.capacity_bytes_per_tick
         remaining_packets = link.capacity_packets_per_tick
+        remaining_airtime_ns = link.capacity_airtime_ns_per_tick
         selected: list[FlowDecision] = []
 
         for partition in self._ordered_partitions(entries):
-            admitted, remaining, remaining_packets = self._admit_partition(
+            admitted, remaining, remaining_packets, remaining_airtime_ns = self._admit_partition(
                 partition,
                 capacity=remaining,
                 pressure=pressure,
                 remaining_packets=remaining_packets,
+                remaining_airtime_ns=remaining_airtime_ns,
             )
             selected.extend(admitted)
 
@@ -462,7 +486,8 @@ class PredictiveAdmissionController(CausalSemanticDeadlineScheduler):
         capacity: int,
         pressure: float,
         remaining_packets: int | None = None,
-    ) -> tuple[list[FlowDecision], int, int | None]:
+        remaining_airtime_ns: int | None = None,
+    ) -> tuple[list[FlowDecision], int, int | None, int | None]:
         decisions: list[FlowDecision] = []
         remaining = capacity
         for entry in entries:
@@ -472,13 +497,23 @@ class PredictiveAdmissionController(CausalSemanticDeadlineScheduler):
                 # once the packet-rate ceiling is hit, no further entry can
                 # be admitted regardless of remaining byte budget.
                 break
+            if remaining_airtime_ns is not None and remaining_airtime_ns <= 0:
+                # Channel-occupancy budget exhausted: even a packet that
+                # still fits under the byte/packet-count ceilings would push
+                # real airtime usage over what the cell can carry this tick.
+                break
             decision = self._decision_for_entry(entry, pressure, remaining)
             if decision and decision.allocated_bytes <= remaining:
+                cost_ns = _estimate_airtime_ns(decision.allocated_bytes)
+                if remaining_airtime_ns is not None and cost_ns > remaining_airtime_ns:
+                    continue
                 decisions.append(decision)
                 remaining -= decision.allocated_bytes
                 if remaining_packets is not None:
                     remaining_packets -= 1
-        return decisions, remaining, remaining_packets
+                if remaining_airtime_ns is not None:
+                    remaining_airtime_ns -= cost_ns
+        return decisions, remaining, remaining_packets, remaining_airtime_ns
 
     def _decision_for_entry(
         self,

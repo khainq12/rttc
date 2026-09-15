@@ -5685,6 +5685,94 @@ xác phần còn thiếu.
 (FLEETQOX_WIFI_STATS, đã có sẵn), kết quả thô tại
 `/tmp/.../scratchpad/bang5_mac_stats_profile.log` (không thuộc repo).
 
+### 15/09/2026 (tiếp) — Cài đặt airtime-aware admission + đo thật: KẾT QUẢ ÂM TÍNH, phát hiện thêm vấn đề nhiễu nền của harness
+
+Theo chỉ đạo ưu tiên contention/airtime-aware admission (thay vì tối ưu
+publish_stages, vì bằng chứng MAC-layer ở trên cho thấy nghẽn chính là
+va chạm kênh Wi-Fi), đã cài đặt:
+
+- `fleetqox/model.py`: thêm field `capacity_airtime_ns_per_tick` vào
+  `NetworkLink` (ngân sách chiếm-kênh, đơn vị ns/tick).
+- `fleetqox/control_plane.py`: hằng số `_WIFI_FIXED_MAC_OVERHEAD_NS=160_000`
+  (160µs, DIFS+backoff trung bình+preamble+SIFS+ACK, giá trị textbook
+  802.11g DCF, CHƯA hiệu chỉnh riêng cho cấu hình ns-3 của repo này) và
+  `_WIFI_PHY_BITRATE_BPS=54_000_000` (khớp `ErpOfdmRate54Mbps` đã dùng
+  trong `fleetqox_trace_replay_tap.cc`); hàm `_estimate_airtime_ns()`
+  tính `overhead + payload_bytes*8/bitrate`; enforce trong
+  `_admit_partition()`/`schedule()` — CHỈ áp dụng cho
+  `PredictiveAdmissionController`, `fifo_policy`/`static_priority_policy`
+  giữ nguyên không đổi (baseline ổn định).
+- `fleetqox/trace.py` và `scripts/run_ns3_docker_container_fleet_probe.py`:
+  thêm tham số `capacity_airtime_ns_per_second` xuyên suốt
+  `generate_trace_events()`/`run_probe()`/`run_lan_probe()`, mặc định
+  `None` (không đổi hành vi/số liệu đã công bố nếu không truyền).
+- `py_compile` sạch, 73/73 test hiện có (`test_ns3_docker_container_fleet_probe.py`
+  + `test_control_plane.py` + `test_trace_export.py`) pass, không có
+  regression.
+
+**Đo A/B thật, Wi-Fi N=16, seed=13, ns3_seed=42, n=3/nhánh, cùng packet
+cap 1200pps làm nền (baseline đã biết: gap ~5.8pp)**:
+
+| Ngưỡng airtime | predictive packet_rows | fifo delivery_pct | predictive delivery_pct | Gap |
+|---|---|---|---|---|
+| Không có (chỉ packet cap) | 3311 | 22.1% | 16.3% | **5.8pp** |
+| 400ms/s (400_000_000 ns/s) | 3311 (KHÔNG ĐỔI) | 25.4% | 15.6% | 9.8pp |
+| 150ms/s (150_000_000 ns/s) | 2543 (giảm ~23%) | 31.2% | 12.3% | **18.9pp** |
+
+Lần đầu (400ms/s) không hề bó buộc thêm gì — `packet_rows` của predictive
+giống hệt lần chỉ có packet cap (3311), vì ở kích thước gói trung bình
+trong workload này, ngân sách 8ms/tick (400ms/s ÷ 50 tick/s) lỏng hơn
+ngưỡng packet cap (24 gói/tick × ~250-340µs/gói ≈ 6-8ms/tick) — hai
+ngưỡng gần trùng nhau nên packet cap luôn chặn trước. Hạ xuống 150ms/s
+(3ms/tick) mới thực sự bó buộc chặt hơn (predictive giảm còn 2543 gói,
+~23% ít hơn) — nhưng kết quả **NGƯỢC VỚI GIẢ THUYẾT**: gap KHÔNG hẹp
+lại mà **DOÃNG RỘNG THÊM** (18.9pp, tệ hơn cả baseline không cap nào
+~12.6pp ở lần đo trước). predictive admit ít gói hơn nhưng tỷ lệ giao
+thành công trên SỐ GÓI ĐÃ ADMIT lại giảm, không tăng.
+
+**Cảnh báo quan trọng hơn cả kết quả âm tính — nhiễu nền của harness
+lớn ngang bằng hiệu ứng đang đo**: `fifo_policy` KHÔNG hề tham chiếu
+đến `capacity_airtime_ns_per_tick` (đã xác nhận qua code), và
+`packet_rows` của fifo giữ nguyên 2289 ở CẢ BA lần đo (bằng chứng trace
+CSV nạp vào ns-3 giống hệt nhau). Vậy mà `delivery_pct` thật của fifo
+dao động 22.1% → 25.4% → 31.2% giữa ba lần chạy với CÙNG một cấu hình/
+trace/seed — biên độ dao động ~9.1pp, XẤP XỈ hoặc LỚN HƠN hiệu ứng
+5.8pp từng dùng để kết luận packet cap "có tác dụng thật". Nguyên nhân
+nhiều khả năng là nhiễu thời gian-thực trong pipeline Docker+ns-3 thật
+(container thật, tap device thật, không phải mô phỏng lặp lại thuần
+túy), không phải do policy hay cap. Kết luận cho tới lúc có n lớn hơn:
+**mọi so sánh n=3 qua harness Docker/ns-3 sống này (kể cả các bảng đã
+công bố trước đó) đều có sai số nền đáng kể, chưa chắc phân biệt được
+với hiệu ứng thật ở quy mô vài điểm phần trăm** — cần tăng n hoặc đổi
+cách đo (ví dụ đo trực tiếp qua `FLEETQOX_WIFI_STATS` nhiều lần thay vì
+`delivery_pct` từ 1 lần chạy) trước khi khẳng định thêm bất kỳ kết luận
+định lượng nhỏ nào từ harness này.
+
+**Đánh giá airtime-aware admission (mã đã merge, giữ lại cho mục đích
+nghiên cứu)**: cơ chế enforce đúng như thiết kế (đã xác nhận qua
+`packet_rows` giảm khi ngưỡng đủ chặt, không ảnh hưởng fifo), nhưng
+NGĂN CHẶN Ở TẦNG TRACE-GENERATION (mô phỏng heuristic trước khi gói vào
+ns-3) không tương đương với airtime THẬT mà ns-3 đo được — ngưỡng
+càng chặt chỉ làm predictive admit ÍT gói hơn theo tiêu chí giả định,
+không đảm bảo các gói CÒN LẠI có tỷ lệ va chạm MAC thật thấp hơn. Cần
+đo lại `mac_tx_drop_total` thật (như đã làm ở bước MAC/PHY phía trên)
+CHO CHÍNH CÁC LẦN CHẠY airtime-cap này để biết cơ chế có thực sự giảm
+va chạm MAC hay không, trước khi kết luận airtime-aware admission ở
+dạng hiện tại là hướng đúng hay sai — CHƯA làm bước này.
+
+**Trạng thái**: mã đã cài đặt đúng thiết kế (packet-only baseline không
+đổi, chỉ predictive bị ràng buộc thêm), nhưng dữ liệu thực nghiệm CHƯA
+ủng hộ giả thuyết ban đầu, và đã lộ ra một vấn đề phương pháp luận lớn
+hơn (nhiễu nền harness) cần giải quyết trước khi tin thêm bất kỳ kết
+quả n=3 nào từ harness Docker/ns-3 sống này.
+
+**File liên quan**: `fleetqox/model.py`, `fleetqox/control_plane.py`,
+`fleetqox/trace.py`, `scripts/run_ns3_docker_container_fleet_probe.py`;
+kết quả thô tại
+`/tmp/.../scratchpad/bang5_fifo_vs_predictive_airtimecap_n3.jsonl` (lần
+400ms/s) và `.../bang5_fifo_vs_predictive_airtimecap_v2_n3.jsonl` (lần
+150ms/s) (không thuộc repo).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và

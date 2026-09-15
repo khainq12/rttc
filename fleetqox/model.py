@@ -129,6 +129,20 @@ class NetworkLink:
     # control) relative to real channel capacity. None means no packet-rate
     # constraint (all existing callers keep their current behavior).
     capacity_packets_per_tick: int | None = None
+    # Optional total-airtime ceiling (nanoseconds) for the tick -- a THIRD,
+    # more physically accurate capacity dimension than bytes or packet
+    # count alone. Neither of those alone models real 802.11 DCF cost
+    # correctly: byte budget ignores the mostly size-independent per-frame
+    # overhead (DIFS/backoff/preamble/SIFS/ACK), while a flat packet-count
+    # ceiling treats every packet as equally expensive regardless of size,
+    # AND (found empirically, see docs/AUDIT_ACCEPTANCE_TRACKING.md
+    # 15/09/2026 "MAC/PHY-layer thật") doesn't capture that MORE, SMALLER
+    # packets collide more often under CSMA/CA than FEWER, larger ones for
+    # the same total bytes -- confirmed live: fleetqox_predictive's real
+    # ns-3 MAC-layer drop rate (mac_tx_drop_total/mac_tx_total) ran ~50%
+    # higher than fifo's despite a fixed packet-rate cap already applied.
+    # None means no airtime constraint (existing callers unaffected).
+    capacity_airtime_ns_per_tick: int | None = None
     loss: float = 0.0
     jitter_ms: float = 0.0
     rtt_ms: float = 20.0
@@ -138,6 +152,8 @@ class NetworkLink:
             raise ValueError("capacity must be non-negative")
         if self.capacity_packets_per_tick is not None and self.capacity_packets_per_tick < 0:
             raise ValueError("capacity_packets_per_tick must be non-negative")
+        if self.capacity_airtime_ns_per_tick is not None and self.capacity_airtime_ns_per_tick < 0:
+            raise ValueError("capacity_airtime_ns_per_tick must be non-negative")
         if not 0 <= self.loss <= 1:
             raise ValueError("loss must be in [0, 1]")
         if self.jitter_ms < 0 or self.rtt_ms < 0:
