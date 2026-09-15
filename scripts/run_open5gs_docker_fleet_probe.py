@@ -142,6 +142,40 @@ CORE_SERVICES = (
 # NF in the signaling/data path depends on them, and skipping them cuts a
 # meaningful chunk off the "how long until the core is usable" wait.
 DBCTL_CONTAINER = "nrf"
+# UERANSIM's own "Radio Link Simulation" UDP port (see
+# external/open5gs/nr-gnb.yaml / nr-ue.yaml's "4997/udp" expose) -- the
+# ONE socket standing in for the actual radio interface between gNB and
+# UE. NGAP (38412/sctp, gNB<->AMF) and GTP-U (2152/udp, gNB<->UPF) are
+# separate ports entirely, so filtering tc netem to just this port
+# degrades ONLY the simulated radio link, leaving core-network signaling/
+# data paths untouched -- keeps "radio channel loss" and "core/scheduler
+# overhead" as separable factors, matching this profile's whole point
+# (see run_open5gs_probe()'s module docstring).
+RADIO_LINK_UDP_PORT = 4997
+# Assumed, NOT calibrated against any real channel measurement --
+# originally picked 5.0 (middle of the commonly-cited 1-10% moderate-
+# urban-5G-BLER range) but found empirically (live 2-robot probes at
+# 1/2/3/5%) that THIS profile has a real fragility cliff between 2% and
+# 3%: 1% and 2% both delivered real, healthy traffic (190 and 316
+# messages respectively, in a 3s/2-robot trace), while 3% and 5% BOTH
+# delivered ZERO messages end to end, every time. Root cause not fully
+# isolated, but the most likely explanation is that UERANSIM's own
+# tunnel/session-management control traffic shares this SAME socket
+# with user-plane data (see RADIO_LINK_UDP_PORT's comment -- there is
+# only one simulated link, carrying everything), and its internal
+# GTP-U-relay state apparently does not tolerate losing one of those
+# control frames -- a single such loss plausibly wedges the whole
+# UE<->gNB tunnel relay for the rest of the run, and at 3%+ loss over
+# many packets in a few seconds, hitting at least one such frame
+# becomes near-certain. Settled on 2.0 as the largest value confirmed
+# to still produce real delivery, deliberately conservative rather than
+# chasing a higher "more realistic" number that this simulator can't
+# actually sustain. Report this as "assumed synthetic radio-channel
+# loss (tc netem, 2%), not derived from a channel model" wherever it's
+# cited -- do not imply it was measured or tuned to match a specific
+# real deployment, and do not raise it without re-confirming delivery
+# stays non-zero first (see this comment's own live-tested cliff).
+RADIO_LINK_LOSS_PCT = 2.0
 DBCTL_PATH = "/open5gs/misc/db/open5gs-dbctl"
 UE_TUN_WAIT_S = 45.0
 UE_KI = "8baf473f2f8fd09487cccbd7097c6862"
@@ -221,9 +255,50 @@ def start_open5gs_core(*, ready_timeout_s: float = 90.0) -> None:
     )
 
 
+def apply_radio_link_loss(
+    container_name: str, *, loss_pct: float = RADIO_LINK_LOSS_PCT, port: int = RADIO_LINK_UDP_PORT
+) -> None:
+    """Applies synthetic packet loss (tc netem) to ONLY the UERANSIM
+    radio-link UDP port (see RADIO_LINK_UDP_PORT's comment) on
+    `container_name`'s eth0 -- the "5G SA emulation" profile's real
+    NGAP/GTP-U core-network paths are untouched. Idempotent: replaces
+    any qdisc this already set up (needed for the shared, long-lived
+    gNB container, which this is called on only once per session but
+    must survive being re-invoked without erroring if a prior session
+    already configured it).
+
+    A `prio` root qdisc + `u32` filter classifies traffic to/from
+    `port` into band 1, which has a `netem loss` leaf attached; every
+    other band passes through unshaped -- the standard Linux pattern
+    for "degrade only this one traffic class," confirmed working via a
+    direct test against the docker_ueransim image before wiring this
+    in (tc qdisc/filter show both reported the expected structure)."""
+    docker("exec", container_name, "tc", "qdisc", "del", "dev", "eth0", "root", check=False)
+    script = (
+        "set -e\n"
+        "tc qdisc add dev eth0 root handle 1: prio bands 4 "
+        "priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1\n"
+        f"tc qdisc add dev eth0 parent 1:1 handle 10: netem loss {loss_pct}%\n"
+        f"tc filter add dev eth0 parent 1:0 protocol ip u32 "
+        f"match ip dport {port} 0xffff flowid 1:1\n"
+        f"tc filter add dev eth0 parent 1:0 protocol ip u32 "
+        f"match ip sport {port} 0xffff flowid 1:1\n"
+        "echo RADIO_LINK_LOSS_APPLIED_OK\n"
+    )
+    result = docker("exec", container_name, "bash", "-lc", script, check=False)
+    if "RADIO_LINK_LOSS_APPLIED_OK" not in result.stdout:
+        raise RuntimeError(
+            f"failed to apply radio-link loss on {container_name}:\n{result.stdout}\n{result.stderr}"
+        )
+
+
 def start_open5gs_gnb(*, ready_timeout_s: float = 30.0) -> None:
     """Brings up the single shared UERANSIM gNB against the running core
-    -- call ONCE per session, AFTER start_open5gs_core()."""
+    -- call ONCE per session, AFTER start_open5gs_core(). Also applies
+    the synthetic radio-link loss (see apply_radio_link_loss()) once
+    the gNB process is confirmed up -- this only needs doing once since
+    the gNB container is shared/long-lived across every probe run in a
+    session, unlike the per-run UE containers."""
     result = _compose(GNB_COMPOSE_FILE, "up", "-d", check=False)
     if result.returncode != 0:
         raise RuntimeError(f"gNB `compose up` failed:\n{result.stdout}\n{result.stderr}")
@@ -231,6 +306,7 @@ def start_open5gs_gnb(*, ready_timeout_s: float = 30.0) -> None:
     while time.monotonic() < deadline:
         check = docker("exec", GNB_CONTAINER_NAME, "pgrep", "-f", "nr-gnb", check=False)
         if check.returncode == 0:
+            apply_radio_link_loss(GNB_CONTAINER_NAME)
             return
         time.sleep(1.0)
     log = docker("logs", "--tail", "80", GNB_CONTAINER_NAME, check=False)
@@ -343,10 +419,12 @@ class Open5gsTopologyProbe(ReferenceTopologyProbe):
         num_robots: int,
         output_dir: Path,
         subscribers: list[dict[str, str]],
+        radio_link_loss_pct: float = RADIO_LINK_LOSS_PCT,
     ) -> None:
         self.run_id = run_id
         self.image = image
         self.num_robots = num_robots
+        self.radio_link_loss_pct = radio_link_loss_pct
         # endpoint_list() returns num_robots + 1 entries (control_station
         # plus num_robots robots, see that function's docstring) -- every
         # per-endpoint container list here must be sized off
@@ -426,6 +504,17 @@ class Open5gsTopologyProbe(ReferenceTopologyProbe):
                 "-v", f"{OPEN5GS_ROOT / 'ueransim'}:/mnt/ueransim",
                 UERANSIM_IMAGE,
             )
+            # Fresh container every run (unlike the shared gNB, which
+            # applies this once in start_open5gs_gnb()) -- see
+            # apply_radio_link_loss()'s docstring for why this only
+            # touches the radio-link port, not NGAP/GTP-U. A UE's very
+            # first RRC/registration attempt could in principle race
+            # ahead of this exec and slip through unshaped, but nr-ue
+            # already retries on loss/failure (confirmed via this
+            # profile's own AKA-resync behavior), so this doesn't need
+            # to be synchronized any tighter than "applied before the
+            # container has had time to do much."
+            apply_radio_link_loss(ue_name, loss_pct=self.radio_link_loss_pct)
         for i, endpoint_name in enumerate(self.endpoint_container_names):
             # --network=container:<ue> joins that UE's netns wholesale
             # (including its uesimtun0 once the PDU session comes up) --
@@ -508,6 +597,7 @@ def run_open5gs_probe(
     extra_rmw_env: dict[str, str] | None = None,
     rmw_implementation: str = "rmw_fleetqox_cpp",
     discovery_mode: str = "default",
+    radio_link_loss_pct: float = RADIO_LINK_LOSS_PCT,
 ) -> dict[str, Any]:
     """Bảng V "5G" row, Open5GS + UERANSIM edition -- see module docstring
     for the labeling requirement and architecture. Caller MUST have already
@@ -543,7 +633,7 @@ def run_open5gs_probe(
 
     probe = Open5gsTopologyProbe(
         run_id=run_id, image=image, num_robots=num_robots, output_dir=output_dir,
-        subscribers=subscribers,
+        subscribers=subscribers, radio_link_loss_pct=radio_link_loss_pct,
     )
     ready_deadline_s = max(READY_DEADLINE_S, int(discovery_timeout_s) + 15)
     start_wait_timeout_s = ready_deadline_s + 30
@@ -638,6 +728,7 @@ def run_open5gs_coordination_probe(
     rmw_implementation: str = "rmw_fleetqox_cpp",
     discovery_mode: str = "default",
     extra_rmw_env: dict[str, str] | None = None,
+    radio_link_loss_pct: float = RADIO_LINK_LOSS_PCT,
 ) -> dict[str, Any]:
     """Bảng VI coordination-metrics row, Open5GS + UERANSIM edition -- see
     module docstring and run_open5gs_probe()'s docstring for the shared
@@ -651,7 +742,7 @@ def run_open5gs_coordination_probe(
 
     probe = Open5gsTopologyProbe(
         run_id=run_id, image=image, num_robots=num_robots, output_dir=output_dir,
-        subscribers=subscribers,
+        subscribers=subscribers, radio_link_loss_pct=radio_link_loss_pct,
     )
     ready_deadline_s = max(READY_DEADLINE_S, int(discovery_timeout_s) + 15)
     start_wait_timeout_s = ready_deadline_s + 30
