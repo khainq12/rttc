@@ -5400,6 +5400,72 @@ Ours-NoQoX/FleetQoX đã làm cho Bảng VI, CỘNG THÊM khả năng cần sử
 C++ RMW cho 10 điểm cải tiến kia) — CHƯA bắt đầu, cần người dùng xác
 nhận phạm vi/thứ tự ưu tiên trước khi làm.
 
+### 15/09/2026 (tiếp) — Ours-fifo vs Ours-predictive, Bảng V Wi-Fi N=16 n=3: PHÁT HIỆN NGƯỢC — predictive HIỆN TẠI làm delivery TỆ HƠN fifo, không tốt hơn
+
+Người dùng chọn làm bước 1 trong kế hoạch nghiên cứu 6 bước (FIFO vs
+Predictive trước, rẻ nhất, cho thông tin quan trọng nhất). Chạy
+`run_probe()` (profile Wi-Fi, N=16, cùng seed=13/ns3_seed=42/run1-3
+như hàng Wi-Fi đã công bố) 2 lần — 1 lần `policy=fifo`, 1 lần
+`policy=fleetqox_predictive` — CHỈ dùng `rmw_fleetqox_cpp` (cô lập
+đúng "bộ não" FleetQoX, không lẫn với so sánh transport).
+
+**Bước 2 (decision trace analysis) làm TRƯỚC, miễn phí (thuần Python,
+không cần Docker)**: sinh trace cho cùng 1 kịch bản (N=16, seed=13)
+với 2 policy, đếm action:
+- `fifo`: 2289 event `send` (full-size), 1116 `defer`, 337 `drop`
+  (stale) — tổng bytes gửi = 500,716.
+- `fleetqox_predictive`: 2989 `send_compacted` + 174 `send_degraded` +
+  236 `send` = 3399 event gửi (NHIỀU HƠN fifo), 324 `drop`, chỉ 19
+  `defer` (gần như không bao giờ "chờ", luôn chủ động nén/hạ cấp thay
+  vì hoãn) — tổng bytes gửi = 186,686 (**ít hơn gần 3 lần** so với
+  fifo). Xác nhận: predictive KHÔNG hành xử giống fifo (loại trừ đúng
+  rủi ro người dùng lo ngại) — nó nén payload để gửi NHIỀU tin nhỏ hơn
+  thay vì gửi ÍT tin to.
+
+**Bước 1+3 (network effect thật, qua ns-3 Wi-Fi)**:
+
+| Policy | delivery_pct (n=3) | p50 (ms) | stale ratio |
+|---|---|---|---|
+| fifo | **27.2%** | 5631.2 | 99.2% |
+| fleetqox_predictive | **14.6%** | 5632.6 | 98.7% |
+
+predictive giao ÍT tin hơn fifo cả về TỶ LỆ lẫn SỐ TUYỆT ĐỐI (trung
+bình 495 tin/run so với 622 tin/run của fifo). Kiểm tra
+`fleetqox_transport_metrics.frames_sent` tổng hợp tất cả endpoint/run:
+predictive gửi **10,197 frame** so với fifo's **6,867 frame** — NHIỀU
+HƠN 48%, dù tổng byte payload ÍT HƠN gần 3 lần (khớp đúng phát hiện ở
+bước 2).
+
+**Giải thích hợp lý nhất, khớp đúng mục #5 trong bảng review optimizer
+riêng (15/09/2026, mục trên)**: `PredictiveAdmissionController` hiện
+chỉ kiểm soát theo NGÂN SÁCH BYTE (`capacity_bytes_per_tick`), không
+kiểm soát theo SỐ PACKET/airtime — nó đổi "ít gói to" lấy "nhiều gói
+nhỏ" để tối đa hoá số luồng phục vụ trong ngân sách byte, nhưng
+802.11 Wi-Fi tốn overhead MAC CỐ ĐỊNH mỗi lần truyền (DIFS/backoff/
+SIFS/ACK) KHÔNG PHỤ THUỘC kích thước gói — gửi nhiều gói nhỏ hơn tốn
+NHIỀU airtime hơn gửi ít gói to, dù tổng byte ít hơn. Đây là bằng
+chứng THỰC NGHIỆM trực tiếp cho đúng lỗ hổng "packet-aware admission"
+đã nêu trong bảng review, không còn là suy đoán.
+
+**Ý nghĩa cho luận điểm bài báo**: câu trả lời trung thực cho "FleetQoX
+hiện có tạo giá trị không" là **CHƯA, ở dạng hiện tại nó làm KÉM HƠN
+baseline fifo trên Wi-Fi** — đây là kết quả NGƯỢC với kỳ vọng nhưng
+CHÍNH XÁC là loại phát hiện phương pháp luận (bước 1-3) của người dùng
+được thiết kế để bắt được, và giờ có 1 baseline THẬT (predictive-hiện-
+tại: 14.6%) để so sánh SAU KHI sửa packet-aware admission (bước 5-6
+trong kế hoạch) — biết chính xác cải thiện đến từ đâu.
+
+**Trạng thái**: bước 1-3 trong kế hoạch 6 bước của người dùng HOÀN
+THÀNH cho profile Wi-Fi N=16. Bước 4 (xác định scenario predictive
+thắng/thua) và bước 5-6 (sửa packet-aware admission rồi đo lại) CHƯA
+làm — cần người dùng xác nhận có muốn mở rộng bước 1-3 sang N=8/32
+và/hoặc profile khác trước, hay đi thẳng vào bước 5 (sửa packet-aware
+admission) luôn với bằng chứng đã có.
+
+**File liên quan**: kết quả thô tại
+`/tmp/.../scratchpad/bang5_fifo_vs_predictive_wifi_n16_n3.jsonl` (6
+dòng, không thuộc repo).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
