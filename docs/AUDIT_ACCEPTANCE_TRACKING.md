@@ -5569,6 +5569,60 @@ phải đã xong") và chuyển sang việc khác trong bảng optimizer.
 `/tmp/.../scratchpad/bang5_fifo_vs_predictive_packetcap_n3.jsonl` (6
 dòng, không thuộc repo).
 
+### 15/09/2026 (tiếp) — Đo `publish_stages` (theo yêu cầu hướng (b)): BÁC BỎ giả thuyết "overhead phần mềm" — predictive thực ra NHANH HƠN ở phía gửi
+
+Đo per-stage timing (`fleetqox_transport_metrics.publish_stages`, đã
+có sẵn instrumentation trong `rmw_pubsub.cpp`, cần bật qua env var
+`FLEETQOX_RMW_PUBLISH_STAGE_PROFILING=1` — mặc định tắt để không ảnh
+hưởng hiệu năng đo thật, lúc đầu quên bật nên mọi count=0, đã sửa) —
+Wi-Fi N=16, không cap, 1 lượt mỗi policy.
+
+| Stage (mean/tin, ns) | fifo | predictive |
+|---|---|---|
+| encode | 10,030 | 8,229 |
+| mutex_hold | 37,287 | 40,871 |
+| transport_decode | 46,653 | 38,726 |
+| **transport_send** | **2,806,014** | **211,486** |
+| **transport_sendto_syscall** | **2,753,648** | **167,582** |
+| **udp_send_mutex_wait** | **1,512,044** | **273,545** |
+| **Tổng thời gian trong transport_send (tất cả tin)** | **6.42 giây** | **0.72 giây** |
+
+**KẾT QUẢ NGƯỢC HẲN GIẢ THUYẾT BAN ĐẦU**: predictive nhanh hơn fifo ở
+GẦN NHƯ MỌI stage, đặc biệt vượt trội ở `transport_send`/
+`sendto_syscall` (nhanh hơn ~13 lần mỗi lần gọi) — dù gửi NHIỀU tin
+hơn (3399 vs 2289), TỔNG thời gian bị block trong `sendto()` của
+predictive vẫn ÍT HƠN fifo gần 9 lần (0.72s so với 6.42s). Giải thích
+hợp lý: gói TO của fifo khiến `sendto()` bị kẹt (block) LÂU HƠN mỗI
+lần khi kernel/tap-device nghẽn (mean 2.8ms/lần, max tới 1.45 GIÂY cho
+1 lần gọi!) — trong khi gói NHỎ của predictive dù nhiều hơn nhưng mỗi
+lần gọi nhanh hơn nhiều (mean 211μs/lần), nên TỔNG thời gian ít hơn.
+
+**Kết luận**: giả thuyết "overhead phần mềm FleetRMW mỗi tin nhắn"
+(đưa ra sau phát hiện LAN ở bước 4) **SAI** — predictive KHÔNG tốn
+thêm thời gian xử lý phía GỬI, ngược lại còn hiệu quả hơn. Khoảng cách
+~6pp còn lại (sau khi bật packet cap) phải đến từ nơi KHÁC, NGOÀI
+phạm vi đo của `publish_stages` (chỉ đo phía sender/publish path):
+nhiều khả năng là tầng kênh Wi-Fi/MAC thật (ns-3) hoặc phía nhận
+(subscriber-side), CHƯA đo được qua harness hiện tại.
+
+**Phát hiện phụ, đáng chú ý độc lập**: `transport_send` của CẢ 2
+policy có max_ns ở mức HÀNG TRĂM MILLI-GIÂY tới 1+ GIÂY cho 1 lần gọi
+`sendto()` — xác nhận kernel/tap-device THẬT SỰ bị nghẽn nặng dưới
+Wi-Fi N=16 (khớp với delivery thấp đã biết), không phải giả định suông.
+
+**Trạng thái**: hướng (b) người dùng chọn đã HOÀN THÀNH — kết quả là 1
+phát hiện PHỦ ĐỊNH có giá trị (loại trừ 1 giả thuyết sai), không phải
+tìm ra "thủ phạm" cuối cùng. Muốn tìm tiếp cần: (a) đo phía subscriber
+(không có instrumentation tương đương hiện tại — cần thêm), hoặc (b)
+xem trực tiếp ns-3 MAC-layer stats (queue drop, retry count) — CHƯA
+làm, cần người dùng quyết định có đi tiếp hướng này không hay dừng ở
+đây (packet cap đã xác nhận có tác dụng thật dù chưa đủ, đủ để báo cáo
+trung thực trong bài báo là "đã cải thiện đáng kể, còn dư địa").
+
+**File liên quan**: kết quả thô tại
+`/tmp/.../scratchpad/bang5_publish_stages_profile.log` (không thuộc
+repo).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
