@@ -1414,7 +1414,26 @@ def run_probe(
     num_aps: int = 1,
     rmw_implementation: str = "rmw_fleetqox_cpp",
     discovery_mode: str = "default",
+    capacity_packets_per_second: int | None = None,
 ) -> dict[str, Any]:
+    # capacity_packets_per_second default (None = no cap) intentionally
+    # preserves every EXISTING published Bảng IV/V/VI Wi-Fi number
+    # byte-for-byte -- this harness's own generate_trace_events() call
+    # never passed this parameter before 15/09/2026, even though the
+    # mechanism itself (NetworkLink.capacity_packets_per_tick,
+    # _admit_partition's remaining_packets handling) has existed since
+    # the wifi-parity investigation (tasks #14-18). Confirmed via a live
+    # Ours-fifo vs Ours-predictive test: without this cap,
+    # fleetqox_predictive trades fewer-but-bigger messages for more-
+    # but-smaller ones (compaction/degradation), which INCREASES total
+    # frame count -- and since real 802.11 airtime is dominated by
+    # size-independent per-frame overhead (DIFS/backoff/preamble/ACK),
+    # that made predictive deliver WORSE than fifo on Wi-Fi (14.6% vs
+    # 27.2% at N=16), the opposite of its intent. Pass an explicit value
+    # (e.g. run_omnetpp_docker_wifi_parity.py's own empirically-tuned
+    # DEFAULT_CAPACITY_PACKETS_PER_SECOND=1200, reused here as a
+    # starting point, NOT independently recalibrated for this harness's
+    # own workload/topology) to let admission control account for it.
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     run_id = output_dir.name.lstrip(".")
@@ -1425,6 +1444,7 @@ def run_probe(
         seconds=seconds,
         seed=seed,
         capacity_bytes_per_second=max(200_000, num_robots * 6_000),
+        capacity_packets_per_second=capacity_packets_per_second,
         policies=(policy,),
         include_non_sent=False,
         merge_control_station=True,
@@ -1719,6 +1739,7 @@ def run_lan_probe(
     extra_rmw_env: dict[str, str] | None = None,
     rmw_implementation: str = "rmw_fleetqox_cpp",
     discovery_mode: str = "default",
+    capacity_packets_per_second: int | None = None,
 ) -> dict[str, Any]:
     """Bảng V's "LAN" network profile -- see wire_network_lan()'s
     docstring for what this represents (an ideal switched network, no
@@ -1730,7 +1751,13 @@ def run_lan_probe(
     (no tap device exists in this profile) -- forcing all of run_probe()'s
     wifi-specific parameters to be silently ignored for this profile
     would be more confusing than a parallel, deliberately smaller
-    function that only exposes what LAN actually has."""
+    function that only exposes what LAN actually has.
+
+    capacity_packets_per_second defaults to None (no cap) here too --
+    unlike Wi-Fi, a switched LAN has no CSMA/CA per-frame airtime tax,
+    so there's no equivalent physical justification for one. Exposed
+    anyway for symmetry/experimentation, not because this profile is
+    known to need it."""
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     run_id = output_dir.name.lstrip(".")
@@ -1741,6 +1768,7 @@ def run_lan_probe(
         seconds=seconds,
         seed=seed,
         capacity_bytes_per_second=max(200_000, num_robots * 6_000),
+        capacity_packets_per_second=capacity_packets_per_second,
         policies=(policy,),
         include_non_sent=False,
         merge_control_station=True,
