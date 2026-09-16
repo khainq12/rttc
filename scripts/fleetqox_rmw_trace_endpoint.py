@@ -37,6 +37,7 @@ wifi-parity CSV format.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 import csv
 import ctypes
 import json
@@ -233,6 +234,56 @@ def build_payload(row: dict[str, str], target_bytes: int) -> str:
         )
     payload["p"] = "x" * (target_bytes - overhead)
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def wait_until_deadline_while_spinning(
+    deadline_monotonic: float,
+    spin_once_fn: Callable[[float], None],
+    *,
+    poll_interval_s: float = 0.01,
+    now_fn: Callable[[], float] = time.monotonic,
+) -> None:
+    """Blocks until now_fn() >= deadline_monotonic, servicing ready rclpy
+    callbacks the whole time instead of going fully silent the way a
+    blind time.sleep() does.
+
+    Root cause this replaces (see docs/AUDIT_ACCEPTANCE_TRACKING.md
+    17/09/2026 "SỬA BENCHMARK HARNESS"): the send loop's own inter-send
+    wait was a plain time.sleep(target_offset_s - now_offset) that called
+    rclpy.spin_once() zero times during the sleep. A message that becomes
+    ready to dispatch (T_RMW_READY, per rmw_pubsub.cpp's own
+    instrumentation) partway through that wait sat undelivered until this
+    process woke up for its OWN next scheduled send -- live A/B measured
+    this adding up to ~370ms to control-class message latency, ~99.7% of
+    the previously-opaque "receiver-side" gap, while FleetRMW's actual
+    receive-side processing (MacRx -> T_RMW_READY) stayed under 0.9ms.
+    Same bug class as the drain-burst fix already applied elsewhere in
+    this file (spin_once() services only ONE ready entity per call), but
+    this is the DIFFERENT gap: no spin_once() call happening AT ALL
+    during the wait, not just one call servicing too little per call.
+
+    Design constraints (all directly testable via the fake now_fn/
+    spin_once_fn WaitUntilDeadlineWhileSpinningTest uses):
+      - never returns before deadline_monotonic (must not shift the
+        publish schedule -- the original time.sleep()'s only real job)
+      - never busy-loops: each spin_once_fn call is bounded to at most
+        poll_interval_s (real rclpy.spin_once(timeout_sec=X) blocks up to
+        X seconds inside rmw_wait()'s own 1ms poll loop, so this spends
+        that time productively instead of sleeping blind)
+      - drains everything already ready in a tight burst each iteration
+        (same pattern as the discovery/drain loops elsewhere in this
+        file -- spin_once() only services one ready entity per call)
+    """
+    while True:
+        remaining = deadline_monotonic - now_fn()
+        if remaining <= 0:
+            return
+        for _ in range(20):
+            spin_once_fn(0.0)
+        remaining = deadline_monotonic - now_fn()
+        if remaining <= 0:
+            return
+        spin_once_fn(min(remaining, poll_interval_s))
 
 
 def main() -> int:
@@ -527,9 +578,17 @@ def main() -> int:
     replay_rows = [] if args.discovery_only else outgoing
     for row in replay_rows:
         target_offset_s = (float(row["timestamp_ms"]) + args.start_offset_ms) / 1000.0
-        now_offset = time.monotonic() - start_wall
-        if target_offset_s > now_offset:
-            time.sleep(target_offset_s - now_offset)
+        # Was a blind time.sleep(target_offset_s - now_offset) -- replaced
+        # 17/09/2026 (see docs/AUDIT_ACCEPTANCE_TRACKING.md "SỬA BENCHMARK
+        # HARNESS"): that slept without ever calling spin_once(), so any
+        # message that became ready to dispatch during the wait sat
+        # undelivered until this process's own next scheduled send. Same
+        # deadline (start_wall + target_offset_s), so the publish schedule
+        # itself is unchanged -- this only adds servicing during the wait.
+        wait_until_deadline_while_spinning(
+            start_wall + target_offset_s,
+            lambda timeout_sec: rclpy.spin_once(node, timeout_sec=timeout_sec),
+        )
         # Same "drain everything ready, not just one entity" fix already
         # applied to the discovery wait loop above (spin_once() services
         # only ONE ready wait-set entity per call) -- a single

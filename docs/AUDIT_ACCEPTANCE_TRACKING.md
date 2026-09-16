@@ -7138,6 +7138,94 @@ lịch gửi của chính nó.
 dưới); script phân tích (không thuộc repo):
 `/tmp/.../scratchpad/step11_rmw_internal_vs_dispatch.py`.
 
+**SỬA BENCHMARK HARNESS: loại bỏ artificial dispatch delay, re-benchmark
+A/B/C (17/09/2026) — KEEP fix, regression Bước 7 xác nhận là benchmark
+artifact, KHÔNG cần sửa FleetQoX.**
+
+**Bước 1 — Audit `fleetqox_rmw_trace_endpoint.py`**: rà toàn bộ các chỗ
+chờ trong send loop/discovery loop/start-gate loop/drain loop. Discovery
+loop, start-gate loop, drain loop **đã đúng** (dùng `spin_once(timeout_sec=X)`
+trong vòng lặp, có service liên tục). Đúng MỘT chỗ sai: send loop's
+`time.sleep(target_offset_s - now_offset)` (khoảng chờ tới lần gửi tiếp
+theo của CHÍNH tiến trình) — **0 lần gọi `spin_once()`** trong suốt
+khoảng sleep này. Đây chính xác là cơ chế đã xác nhận ở bước trước
+(`T_RMW_READY→app` chiếm 98-99.7% receiver-side).
+
+**Bước 2 — Minimal fix**: thêm `wait_until_deadline_while_spinning()`
+trong `fleetqox_rmw_trace_endpoint.py` — thay `time.sleep()` bằng vòng
+lặp: drain burst 20x (`spin_once(0.0)`) + 1 lần `spin_once(timeout_sec=
+min(remaining, poll_interval_s=0.01))` bị chặn (bounded), lặp lại tới
+khi `now() >= deadline`. Deadline giữ NGUYÊN (`start_wall + target_offset_s`)
+— không đổi lịch publish. Chỉ sửa harness, không đụng FleetRMW/
+`fleetqox/control_plane.py`/packet cap/ns-3/workload.
+
+**Bước 3 — RED→GREEN**: `tests/test_fleetqox_rmw_trace_endpoint.py`
+thêm `WaitUntilDeadlineWhileSpinningTest` (4 test, dùng fake clock +
+fake `spin_once_fn`, không cần rclpy thật): message "ready" giữa chừng
+phải được service TRƯỚC deadline (không phải chỉ khi deadline tới);
+không bao giờ return sớm hơn deadline (không đổi lịch publish); không
+spin vô hạn lần (chống busy-loop). RED xác nhận (`ImportError`, hàm
+chưa tồn tại) → implement → GREEN (10/10 pass). Full suite:
+**782 passed, 8 failed — đúng 8 lỗi pre-existing đã biết** (ngtcp2_public
+×7, remote_wait_for_all_acked ×1), không có regression mới.
+
+**Bước 4 — Validate root cause**: N=2, cap=150, seed=13, ns3_seed=42, 3
+rep, giữ instrumentation `T_RMW_READY`. Không cần rebuild docker (chỉ
+sửa Python, mount trực tiếp vào container).
+
+| | trước fix (stale) | sau fix (tất cả) |
+|---|---|---|
+| MacRx→T_RMW_READY | 0.29ms | 0.27ms (không đổi, đúng dự kiến) |
+| **T_RMW_READY→app** | **112.9ms (max 370ms)** | **0.61ms (max 1.6ms)** |
+| control fresh | 0/358 stale trong nhóm này | **852/852 fresh (100%)** |
+| pattern suy giảm đầu run | 204ms→20ms | **biến mất** (0.5-0.8ms phẳng suốt run) |
+
+`packet_rows=393` tất định (không đổi), `delivery_pct=97.46%` tất định,
+`degraded=False` cả 3 rep, `sim_lag_s` 6.1-6.5s (cùng dải cũ),
+`endpoint_cpu_pct_mean` 45-53% (không busy-loop, không saturate).
+**Toàn bộ 6 acceptance criteria đạt → KEEP fix.**
+
+**Bước 5 — Re-benchmark A/B/C sau harness fix** (N=2, seed=13,
+ns3_seed=42, paired, 3 rep, `fleetqox/control_plane.py` KHÔNG đổi —
+Optimization #1 `remaining_tier_capacity_fraction=0.15` giữ nguyên):
+
+| Arm | packet_rows | delivery | **fresh (=delivery)** | control fresh | E2E p50 | E2E p90 | E2E max |
+|---|---|---|---|---|---|---|---|
+| A. fifo | 440 | 96.82% | **96.82%** | 100% | 3.74ms | 9.62ms | 25.3ms |
+| B. predictive không cap | 440 | 96.82% | **96.82%** | 100% | 3.09ms | 7.98ms | 22.9ms |
+| C. packet-aware cap=150 | 393 | **97.46%** | **97.46%** | 100% | **2.63ms** | **6.26ms** | 26.9ms |
+
+Admission offline (trace-generation, không đổi so với Bước 7):
+A=440 (control 284 send), B=440 (control 260 send+24 compacted), C=393
+(control 261 send+23 compacted, non-control 76 send/36 defer/5 compacted/
+28 degraded/38 drop) — **giống hệt Bước 7**, xác nhận packet cap vẫn
+kích hoạt thật, optimizer không đổi hành vi admission. `degraded=False`
+cả 9 run, `sim_lag_s` 6.1-6.5s đồng đều, `ns3sim_cpu_pct<1%`,
+`endpoint_cpu_pct_mean` 51-62%.
+
+**Kết luận decisive**: sau khi sửa harness, **fresh_pct == delivery_pct
+ở CẢ 3 ARM** (không còn message nào delivered-nhưng-stale), control
+fresh = 100% cho cả 3 arm. Packet-aware (C) vẫn giữ raw delivery cao
+hơn (97.46% vs 96.82%, đúng như trước — ít gói hơn → ít tranh chấp) và
+GIỜ CŨNG có E2E p50/p90 THẤP NHẤT trong 3 arm, không còn bất kỳ nhược
+điểm freshness nào. **69.9% control fresh của packet-aware ở Bước 7 là
+benchmark artifact do harness dispatch-gap bug, KHÔNG phải hành vi thật
+của packet-aware/optimizer.**
+
+**RESULT (theo đúng nhánh quyết định user đặt ra)**: Packet-aware phục
+hồi hoàn toàn, không còn regression nào → **KHÔNG tạo FleetQoX
+fix/Optimization #2 mới**. Optimization #2 (exempt safety_control khỏi
+packet cap, đã REVERT trước đó) ĐÚNG LÀ không cần thiết — không phải vì
+fix đó sai về nguyên tắc, mà vì vấn đề nó nhắm tới (control fresh thấp
+dưới packet cap) chưa từng có thật ở tầng optimizer; nó là artifact đo
+lường.
+
+**File liên quan**: `scripts/fleetqox_rmw_trace_endpoint.py`,
+`tests/test_fleetqox_rmw_trace_endpoint.py` (commit riêng, xem hash bên
+dưới); script phân tích (không thuộc repo):
+`/tmp/.../scratchpad/step12_harness_fix_validate.py`,
+`/tmp/.../scratchpad/step13_rebenchmark_after_harness_fix.py`.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
