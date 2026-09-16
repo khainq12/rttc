@@ -1561,6 +1561,7 @@ def run_probe(
     discovery_bytes_ftap0: int | None = None
     resource_usage: dict[str, dict[str, float]] = {}
     wifi_stats: dict[str, Any] | None = None
+    ns3_real_elapsed_s_at_log_read: float | None = None
     try:
         probe.start_containers()
         probe.build_ns3_binary()
@@ -1645,6 +1646,13 @@ def run_probe(
         )
         if remaining_wait_s > 0:
             time.sleep(remaining_wait_s)
+        # Real wall-clock seconds elapsed since ns-3 started, at the moment
+        # the log is read -- directly quantifies how far the simulated
+        # clock has fallen behind real time under RealtimeSimulatorImpl
+        # (compare against wifi_stats["sim_time_s"]; see
+        # docs/AUDIT_ACCEPTANCE_TRACKING.md 15-16/09/2026 for why this gap
+        # can be large and persistent once the channel saturates).
+        ns3_real_elapsed_s_at_log_read = time.monotonic() - ns3_start_wall
         ns3_log_text = probe.ns3_log()
         wifi_stats = parse_wifi_stats(ns3_log_text, stats_target_s)
     except Exception as exc:  # noqa: BLE001 -- report to caller, don't hide the traceback
@@ -1680,6 +1688,7 @@ def run_probe(
         ),
         "ns3_log": ns3_log_text,
         "wifi_stats": wifi_stats,
+        "ns3_real_elapsed_s_at_log_read": ns3_real_elapsed_s_at_log_read,
         "latency_stats_ms": compute_latency_stats_ms(endpoint_results),
         "jitter_stale_repair_stats": compute_jitter_stale_repair_stats(endpoint_results),
         "discovery_bytes_ftap0": discovery_bytes_ftap0,
