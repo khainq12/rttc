@@ -6531,6 +6531,91 @@ N=16 là exploratory).
 `degraded`/`sim_lag_s`/`sim_stats_target_s`/`ns3sim_resource_usage` mới
 trong `run_probe()`'s return dict).
 
+### 16/09/2026 (tiếp) — Bước 4: baseline N=1/2/8/16 dùng benchmark mới + so sánh optimizer trên vùng đáng tin cậy
+
+**Bước 4a — xác định ranh giới degraded** (fifo, seed=13/ns3_seed=42/
+ns3_run=1, benchmark sau commit f0330ec):
+
+| N | degraded | delivery | fresh | stale_ratio | E2E p50 | sim_lag_s | CPU ns3sim |
+|---|---|---|---|---|---|---|---|
+| 1 | **False** | 100.0% | 85.4% | 14.6% | 11ms | 6.07s | 0.77% |
+| 2 | **False** | 96.8% | 74.8% | 22.8% | 15ms | 6.21s | 0.91% |
+| 8 | **True** | 34.3% | 0.7% | 98.0% | 2848ms | 11.73s | **100.64%** |
+| 16 | **True** | 17.2% | 0.17% | 98.9% | 5678ms | 20.88s | **101.49%** |
+
+**Ranh giới rõ ràng, nhảy vọt giữa N=2 và N=8** — không phải chuyển
+tiếp mượt: CPU của chính `ns3sim` nhảy từ <1% lên >100% (bão hòa trọn 1
+lõi, đúng khớp phát hiện Bước 2), fresh delivery sập từ 75-85% xuống
+dưới 1%, sim_lag tăng gấp đôi trở lên. **Kết luận Bước 4a: hệ thống bắt
+đầu degraded ở đâu đó trong khoảng (2, 8] — cần N=4 hoặc N=5/6 nếu muốn
+xác định chính xác hơn (CHƯA làm, không cần thiết cho mục tiêu hiện
+tại).**
+
+**Bước 4b — FIFO vs Predictive vs Packet-aware, paired ns3_run,
+n=3/arm ở vùng ĐÁNG TIN CẬY (N=1, N=2), n=1/arm ở vùng exploratory-only
+(N=8, N=16, KHÔNG dùng làm bằng chứng)**:
+
+**N=1 (trivial — mọi arm đều giao 100%, không có tín hiệu phân biệt
+policy thật)**: fifo fresh TB=83.7%, predictive TB=87.0%, packet_aware
+TB=83.6% — chênh lệch nhỏ, N=1 không đủ tranh chấp để phân biệt policy
+có ý nghĩa.
+
+**N=2 (TÍN HIỆU THẬT, ĐÁNG TIN CẬY — degraded=False cả 9/9 lần, VÀ
+delivery_pct GIỐNG HỆT NHAU tuyệt đối qua cả 3 lần lặp mỗi arm, tức
+KHÔNG có phương sai đo được ở N nhỏ này)**:
+
+| Arm | packet_rows | delivery_pct | fresh_pct (TB 3 lần) |
+|---|---|---|---|
+| fifo | 440 | **96.8%** (x3, y hệt) | 80.8% |
+| predictive | 444 | **86.5%** (x3, y hệt) | 70.3% |
+| packet_aware | 444 | **86.5%** (x3, y hệt) | 70.3% |
+
+**fifo THẮNG predictive 10.3 điểm % delivery, 10.5 điểm % fresh — kết
+quả TẤT ĐỊNH (0 phương sai qua 3 lần lặp), không cần kiểm định thống kê
+để khẳng định đây là khác biệt thật.** `packet_aware` **GIỐNG HỆT**
+`predictive` thường (444 packet_rows cả hai, số liệu y hệt từng chữ số)
+— vì tổng tải ở N=2 (444 gói/3s ≈ 148 gói/s) THẤP HƠN NHIỀU ngưỡng cap
+1200 gói/s, nên packet-aware admission KHÔNG BAO GIỜ kích hoạt ở quy mô
+này — không phải packet-cap "không có tác dụng", mà đơn giản là chưa đủ
+tải để nó có cơ hội hoạt động.
+
+**Vùng exploratory (N=8, N=16, degraded=True cả 2 — KHÔNG dùng làm
+bằng chứng chính, chỉ ghi lại để đối chiếu tính nhất quán)**: cùng thứ
+tự fifo > packet_aware > predictive về delivery ở CẢ hai N (N=8: 37.5%
+> 29.8% > 29.3%; N=16: 16.1% > 10.5% > 10.1%) — KHỚP với kết quả vùng
+đáng tin cậy, không mâu thuẫn, nhưng KHÔNG được dùng làm bằng chứng
+chính vì cả 3 arm đều degraded như nhau ở các N này.
+
+**KẾT LUẬN BƯỚC 4 (chỉ dựa trên vùng đáng tin cậy N=2, không dùng N=8/16
+làm bằng chứng chính)**: `fleetqox_predictive` giao KÉM HƠN `fifo` một
+cách THẬT, TẤT ĐỊNH, không nhiễu, ngay cả ở quy mô nhỏ KHÔNG bị ảnh
+hưởng bởi sim-lag — củng cố dứt điểm (không còn nghi ngờ do nhiễu
+harness) kết luận đã có từ trước trong phiên này: predictive hiện tại
+CHƯA tạo ra giá trị so với fifo trên Wi-Fi. `capacity_packets_per_second`
+("packet-aware") không giúp gì ở N=2 vì chưa đủ tải để kích hoạt — CHƯA
+kết luận được packet-aware có tác dụng hay không ở quy mô lớn hơn, vì
+mọi phép đo ở N≥8 đều rơi vào vùng degraded, không đáng tin cậy theo
+đúng tiêu chí Bước 4b.
+
+**KHÔNG có thay đổi nào vào `fleetqox/control_plane.py` trong bước
+này**, đúng chỉ đạo "Không sửa optimizer trong bước này".
+
+**Trạng thái**: Bước 4 HOÀN THÀNH. Ranh giới degraded xác định (giữa
+N=2 và N=8). So sánh optimizer ở vùng đáng tin cậy cho kết quả rõ ràng,
+tất định, không nhiễu — predictive vẫn kém hơn fifo, đúng như mọi phát
+hiện trước đó, giờ có thêm bằng chứng KHÔNG bị nhiễu sim-lag làm loãng.
+Câu hỏi "packet-aware có tác dụng ở quy mô lớn không" vẫn CHƯA có câu
+trả lời đáng tin cậy — cần benchmark ở N nằm trong vùng khỏe mạnh
+nhưng đủ tải để cap kích hoạt (ví dụ N=4-6 với workload dày hơn, hoặc
+tìm cách mở rộng vùng khỏe mạnh trước — ngoài phạm vi Bước 4).
+
+**File liên quan**: `/tmp/.../scratchpad/step4a_baseline_sweep.py`,
+`/tmp/.../scratchpad/step4a_baseline_sweep.jsonl`,
+`/tmp/.../scratchpad/step4b_optimizer_comparison.py`,
+`/tmp/.../scratchpad/step4b_optimizer_comparison.jsonl` (không thuộc
+repo, 4+24 điểm dữ liệu thô); không có thay đổi code nào trong bước
+này.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
