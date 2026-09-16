@@ -6221,6 +6221,85 @@ retry thật + chạy benchmark Bảng VI riêng nếu cần đo coordination th
 `scripts/` ngoài `event_filter`/`ns3_real_elapsed_s_at_log_read` đã merge
 ở các mục trước.
 
+### 16/09/2026 (tiếp) — Phân rã latency: XÁC NHẬN dứt điểm "FleetRMW chậm hay ns-3 real-time chạy không kịp?" → LÀ SIM-LAG, không phải FleetRMW
+
+Theo đề xuất của user: thay vì xây per-message 5-điểm timestamp (cần
+patch ns-3 parse wire format thật của rmw_fleetqox_cpp để khớp 1 frame
+MAC với 1 event_id — rủi ro/cost cao), dùng phương án rẻ hơn đã được
+user duyệt: so sánh baseline GẦN NHƯ KHÔNG TRANH CHẤP (N=1, N=2 — chỉ
+2-3 station) với N=16 đã đo, bằng instrumentation ĐÃ CÓ SẴN và ĐÃ ĐƯỢC
+TIN CẬY (`publish_stages` cho tầng RMW, `latency_stats_ms` cho E2E,
+`wifi_stats.sim_time_s`/`ns3_real_elapsed_s_at_log_read` cho sim-lag).
+fifo, seed=13, ns3_seed=42, n=3/mức, `FLEETQOX_RMW_PUBLISH_STAGE_PROFILING=1`.
+
+**Kết quả (trung bình 3 lần/mức)**:
+
+| | N=1 (2 station) | N=2 (3 station) | N=16 (17 station) |
+|---|---|---|---|
+| E2E latency p50 | **254.6 ms** | **267.9 ms** | **5746.2 ms** |
+| E2E latency mean | 467.7 ms | 476.3 ms | 5150.8 ms |
+| E2E p95/p99/max (1 lần đại diện) | 1320/1339/1359 ms | 1341/1362/1376 ms | 10290/11004/11324 ms |
+| Tổng tầng RMW (encode+mutex_hold+subscription_lookup+transport_decode+transport_send) | **0.307 ms** | 0.272 ms | **3.824 ms** |
+| `wifi_stats.sim_time_s` đạt được | **15 = ĐÚNG target** | 15 = ĐÚNG target | **10 (kẹt, KHÔNG đạt target 15)** |
+| `degraded_no_snapshot_reached_target` | **False/None (không kẹt)** | False/None (không kẹt) | **True cả 3/3 lần** |
+
+**Trả lời trực tiếp câu hỏi cốt lõi của user**: tầng RMW (encode/mutex/
+transport_send/sendto — CHÍNH LÀ code FleetRMW) chỉ tốn **0.3ms (N=1) →
+3.8ms (N=16)** — tăng ~12x khi tải tăng nhưng VẪN chỉ là mili-giây, hoàn
+toàn không đủ giải thích khoảng cách latency E2E từ 255ms lên 5746ms
+(~22x, và là hiệu số ~5.5 GIÂY). Trong khi đó, đúng ngay tại điểm N=16 —
+nơi `sim_time_s` LẦN ĐẦU TIÊN kẹt lại và không đạt target (khác hẳn N=1/
+N=2 nơi sim luôn bắt kịp target đúng hẹn) — là nơi E2E latency nhảy vọt.
+Tương quan này khớp CHÍNH XÁC theo đúng khung quyết định user đã đề ra:
+
+```
+RMW              0.3 → 3.8 ms   (nhỏ, cả 2 chế độ)
+Linux/Tap + WiFi thật (ước qua N=1/N=2, sim không kẹt)  ~250-280ms (sàn, không đổi theo N)
+sim lag (chỉ xuất hiện khi sim KẸT, đúng lúc N=16)      ~5,500 ms  💥
+```
+
+→ Khớp NHÁNH THỨ NHẤT user đã đề ra ("RMW 5ms, Linux 8ms, Wi-Fi 80ms,
+sim lag 15,000ms 💥 → phải sửa benchmark/realtime architecture trước").
+**KẾT LUẬN: FleetRMW (tầng RMW) KHÔNG chậm. ns-3 real-time simulator
+chạy không kịp (sim-lag) dưới tải N=16 MỚI LÀ nguyên nhân khiến toàn hệ
+thống "trông như" chậm hàng giây.** Đây là câu trả lời dứt điểm, có bằng
+chứng số trực tiếp (không suy luận gián tiếp), cho câu hỏi mà user đặt
+ra làm ưu tiên cao nhất trước khi tối ưu bất kỳ thứ gì.
+
+**Phát hiện phụ đáng chú ý (không phải trọng tâm nhưng cần ghi lại
+trung thực)**: ngay cả ở N=1 (gần như không tranh chấp), "sàn" E2E
+latency đã là ~250ms — XẤP XỈ HOẶC VƯỢT `deadline_ms` mặc định (~100-250ms)
+của `control`/`coordination` — nghĩa là NGAY CẢ nếu sim-lag được giải
+quyết hoàn toàn, một phần đáng kể message vẫn có thể trễ hạn do overhead
+polling/scheduling cố hữu của chính harness (rclpy `spin_once` chu kỳ
+50ms trong vòng chờ discovery/start-gate, tần suất drain 0.1s, hoặc bản
+thân TapBridge/RealtimeSimulatorImpl) — KHÔNG PHẢI do tầng RMW (đã đo
+tách riêng, chỉ 0.3ms) hay do tranh chấp Wi-Fi thật. CHƯA điều tra sâu
+nguồn gốc chính xác của "sàn 250ms" này — ngoài phạm vi câu hỏi ưu tiên
+lần này, ghi lại làm việc CHƯA làm nếu muốn tiếp tục.
+
+**Đánh giá phương pháp**: phương án N=1/N=2-vs-N=16 (không xây per-message
+5-điểm timestamp) đã trả lời được ĐÚNG câu hỏi quyết định mà user đặt ra,
+với chi phí thấp hơn nhiều (9 lượt chạy, dùng lại 100% instrumentation
+đã có, không sửa C++ ns-3, không rủi ro parse sai wire format). Nếu cần
+độ chính xác per-message trong tương lai (ví dụ để định lượng CHÍNH XÁC
+bao nhiêu ms là do Linux/Tap so với ns-3 Wi-Fi thật, tách khỏi sim-lag),
+vẫn cần hướng đã cân nhắc nhưng KHÔNG chọn ở đây (patch ns-3 parse wire
+format + match event_id) — nhưng với kết luận đã đủ dứt điểm, việc đó
+không còn cấp thiết cho câu hỏi ưu tiên hiện tại.
+
+**Trạng thái**: câu hỏi ưu tiên cao nhất ("FleetRMW thật sự chậm hay
+ns-3 real-time chạy không kịp?") đã được trả lời DỨT ĐIỂM bằng số liệu
+trực tiếp: **ns-3 real-time chạy không kịp (sim-lag)**. Theo đúng
+khuyến nghị của chính user: bước tiếp theo hợp lý là **sửa benchmark/
+realtime architecture** (không phải tối ưu FleetQoX/FleetRMW nữa) trước
+khi quay lại bất kỳ câu hỏi tối ưu hoá nào.
+
+**File liên quan**: `/tmp/.../scratchpad/latency_decomposition_n1_vs_n16.py`,
+`/tmp/.../scratchpad/latency_decomposition_n1_vs_n16.jsonl` (không thuộc
+repo, 9 điểm dữ liệu thô); không có thay đổi code nào trong lần đo này
+(chỉ dùng lại instrumentation đã merge trước đó).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
