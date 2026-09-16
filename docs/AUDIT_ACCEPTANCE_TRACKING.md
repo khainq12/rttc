@@ -6022,6 +6022,205 @@ chứng minh được thì chưa giữ", KHÔNG tự ý coi n=3 thuận chiều 
 `/tmp/.../scratchpad/bang_control_class_halved_ab_n3.jsonl` (không thuộc
 repo).
 
+### 16/09/2026 (tiếp) — Sweep control-rate 100/75/50/25%, n=5/mức, paired: RAW delivery tăng có ý nghĩa thống kê, NHƯNG fresh/useful delivery KHÔNG cải thiện — KHÔNG đề xuất production change
+
+Theo đúng phương pháp luận chi tiết đã yêu cầu (đo 4 mức, paired
+seed/ns3_run, n≥5 pilot, thu thập rộng, kiểm tra chuỗi nhân quả, KHÔNG
+chỉ báo mean, kiểm tra tác động lên coordination trước khi kết luận).
+
+**Thiết lập**: fifo N=16, seed=13, ns3_seed=42, `event_filter` (đã merge
+16/09/2026) giữ 100%/75%/50%/25% tần suất `control`-class của MỖI robot
+(giữ nguyên mọi class khác). Paired: mỗi rep dùng CÙNG `ns3_run` cho cả 4
+mức, chạy xen kẽ theo rep (không chạy hết 1 mức rồi mới sang mức khác) để
+tránh nhiễu do trôi tải hệ thống theo thời gian trùng với biến mức. n=5
+pilot (20 lượt chạy thật, Docker+ns-3).
+
+**Bảng tĩnh (offline, tất định — không phụ thuộc lần chạy)**:
+
+| Mức | Tổng gói | control | packets/tick TB | max/tick | distinct src/tick TB | max distinct src/tick |
+|---|---|---|---|---|---|---|
+| 100% | 2289 | 1626 | 15.26 | 23 | 4.89 | 11 |
+| 75% | 1883 | 1220 | 12.55 | 20 | 4.88 | 11 |
+| 50% | 1476 | 813 | 9.84 | 17 | 4.88 | 11 |
+| 25% | 1070 | 407 | 7.13 | 14 | 4.88 | 11 |
+
+**Phát hiện tất định quan trọng ngay từ bảng tĩnh**: giảm control-rate
+làm giảm PACKETS/TICK rõ rệt, nhưng KHÔNG hề giảm SỐ ROBOT ĐỒNG THỜI
+GỬI/TICK (4.88-4.89 ở mọi mức, max luôn 11) — vì mỗi robot vẫn gửi các
+class khác (state/perception/...) mỗi tick bất kể control-rate. Đây bác
+bỏ MỘT bước cụ thể trong chuỗi nhân quả được đề xuất
+("control rate ↓ → simultaneous transmissions ↓") NGAY TỪ ĐẦU, bằng
+chứng tất định, không cần thống kê.
+
+**Kết quả thật (mean ± sd, n=5, Welch t-test 25% vs 100%)**:
+
+| Chỉ số | 100% | 75% | 50% | 25% | diff (25%-100%) | t | df |
+|---|---|---|---|---|---|---|---|
+| delivery_pct (tổng) | 27.1±6.64 | 25.3±3.77 | 33.9±7.29 | 36.5±3.38 | **+9.37pp** | 2.81 | 5.9 |
+| control_class delivery_pct | 30.8±8.64 | 29.3±5.43 | 45.2±12.05 | 57.9±6.79 | **+27.2pp** | 5.53 | 7.6 |
+| coordination_class delivery_pct | 10.8±1.35 | 11.5±1.23 | 12.1±1.43 | 12.8±0.32 | **+2.01pp** | 3.24 | 4.5 |
+| mac_tx_total | 326±75 | 387±103 | 331±79 | 401±291* | +74 | 0.55 | 4.5 |
+| mac_rx_drop_total | 6220±1722 | 6843±1520 | 6264±2133 | 8029±6962* | +1809 | 0.56 | 4.5 |
+| phy_rx_drop_total | 1312±292 | 1447±238 | 1205±203 | 1575±892* | +263 | 0.63 | 4.8 |
+| ns3_real_elapsed_s_at_log_read (sim lag) | 24.97±1.08 | 24.52±0.07 | 24.24±0.53 | 23.76±0.67 | -1.21s | -2.12 | 6.7 |
+| `degraded_no_snapshot_reached_target` | 5/5 | 5/5 | 5/5 | 5/5 | — | — | — |
+
+*Mức 25% có 1 lần chạy ngoại lệ (rep 3): mac_tx_total=917,
+mac_rx_drop_total=20381 — một đợt sập kênh dữ dội xảy ra NGAY CẢ ở mức
+control thấp nhất, khẳng định thêm tính chất hỗn loạn/không tất định gần
+điểm bão hòa đã ghi nhận trước đó (15-16/09/2026), không phải control-rate
+"chữa" được hoàn toàn.
+
+**Chuỗi nhân quả (đúng 5 bước đã yêu cầu kiểm tra)**:
+
+```
+control rate ↓
+  → simultaneous transmissions ↓?      BÁC BỎ  (distinct src/tick không đổi: 4.88-4.89 mọi mức)
+  → packets/tick ↓?                    XÁC NHẬN (15.26→7.13, tất định)
+  → MAC retry/tx/drop ↓?                KHÔNG XÁC NHẬN (t=0.55-0.63, nhiễu >> hiệu ứng, có ngoại lệ sập kênh ở mức 25%)
+  → simulation lag ↓?                   KHÔNG THỰC CHẤT (chỉ -1.21s/24s ~5%, t=-2.12 biên giới nhưng KHÔNG đổi kết luận
+                                         "luôn degraded" -- 20/20 lần đều không đạt target t=15s mô phỏng)
+  → fresh/application delivery ↑?       BÁC BỎ (xem bên dưới -- đây là phát hiện quyết định)
+```
+
+**PHÁT HIỆN QUYẾT ĐỊNH — stale_pct/freshness KHÔNG hề cải thiện dù
+delivery thô tăng có ý nghĩa thống kê**:
+
+| | 100% | 75% | 50% | 25% |
+|---|---|---|---|---|
+| control_class stale_pct | 99.96% | 99.95% | 99.92% | 99.83% |
+| coordination_class stale_pct | 93.4% | 94.0% | 92.0% | 95.3% |
+| control_class **FRESH** delivered (đúng deadline_ms), trung bình/5 rep | ~0.2/rep | ~0.2/rep | ~0.2/rep | ~0.4/rep |
+
+Ở MỌI mức, gần như 100% tin nhắn `control` được giao đều đã QUÁ HẠN
+(`deadline_ms`), và số tin nhắn giao ĐÚNG HẠN thực tế chỉ 0-1 tin/lần
+chạy dù raw `delivered` lên tới 200-700 tin. Nguyên nhân: độ trễ đầu-cuối
+thật ở quy mô N=16 trên harness này đã được biết là ở mức GIÂY (latency
+p50 quan sát trước đó: 3000-8700ms — xem các mục đo `latency_stats_ms`
+trước đây trong tài liệu này), trong khi `deadline_ms` mặc định của
+`control`/`coordination` chỉ ~100-250ms — chênh lệch ~1-2 bậc độ lớn,
+khiến GẦN NHƯ MỌI tin nhắn giao được đều tự động "trễ hạn" bất kể
+control-rate là bao nhiêu. Khớp trực tiếp với phát hiện sim-lag (15-16
+/09/2026): độ trễ thật bị chi phối bởi việc đồng hồ mô phỏng tụt lại
+sau wall-clock (~24s thật cho ~10s mô phỏng) — MỘT hiện tượng KHÔNG đổi
+theo control-rate (xem dòng `ns3_real_elapsed_s_at_log_read` — chỉ giảm
+~1.2s/24s, không đủ để đưa bất kỳ tin nhắn nào về trong hạn).
+
+---
+
+**BÁO CÁO THEO ĐÚNG 9 MỤC ĐÃ YÊU CẦU**
+
+**1. Hypothesis**: Giảm tần suất gói `control`-class sẽ giảm đồng thời-
+truyền/tranh chấp kênh, giảm MAC retry/drop, giảm sim-lag, và tăng
+delivery ứng dụng THẬT SỰ HỮU ÍCH (đúng hạn) — không phá coordination.
+
+**2. Experiment**: Sweep 100/75/50/25% control-rate, fifo N=16 seed=13
+ns3_seed=42, paired ns3_run 1-5, n=5/mức (20 lượt Docker+ns-3 thật),
+event_filter diagnostic-only (KHÔNG sửa `fleetqox/control_plane.py`).
+
+**3. Raw results**: xem 2 bảng số liệu đầy đủ ở trên (mean±sd mọi mức,
+toàn bộ 20 điểm dữ liệu thô lưu tại
+`/tmp/.../scratchpad/control_rate_sweep.jsonl`, không thuộc repo).
+
+**4. Control rate → contention → MAC → delivery**: packets/tick giảm
+tất định và rõ ràng; simultaneous senders/tick KHÔNG đổi (bác bỏ 1 nhánh
+giả thuyết cụ thể); MAC/PHY drop KHÔNG có xu hướng rõ (nhiễu >> hiệu
+ứng, t<0.7); RAW delivery_pct tăng có ý nghĩa thống kê (t=2.8-5.5) cả ở
+mức tổng lẫn per-class.
+
+**5. Coordination impact**: `coordination`-class (proxy trong CHÍNH
+benchmark này, KHÔNG PHẢI benchmark Ricart-Agrawala Bảng VI riêng — benchmark
+đó CHƯA được chạy cho thí nghiệm này) có delivery_pct tăng nhẹ nhưng có ý
+nghĩa (+2.01pp, t=3.24) — KHÔNG bị "phá" bởi việc giảm control, nhưng
+cũng KHÔNG cải thiện đáng kể xét theo giá trị tuyệt đối (vẫn chỉ
+~11-13%) và stale_pct của nó vẫn ~92-95% ở MỌI mức — về mặt hữu dụng,
+coordination-class cũng gần như KHÔNG bao giờ giao đúng hạn, bất kể
+control-rate.
+
+**6. Statistical uncertainty**: đã báo mean+sd+se+Welch t/df cho mọi so
+sánh chính, không chỉ mean. Hiệu ứng RAW delivery là thật (t=2.8-5.5,
+p<0.05 một phía), nhưng KHÔNG tính đa so sánh (multiple comparisons) —
+nên diễn giải là "có tín hiệu đáng chú ý", không phải "chứng minh chặt
+chẽ". Ngoại lệ n=1/5 ở mức 25% (sập kênh dữ dội) cho thấy vẫn còn biến
+động hỗn loạn không kiểm soát được bằng đòn bẩy control-rate.
+
+**7. Hypothesis — CONFIRMED / NOT CONFIRMED / INCONCLUSIVE**:
+**HỖN HỢP, có chủ đích tách bạch**:
+- Nhánh cơ chế "control packet COUNT → raw delivery_pct": **CONFIRMED**
+  (thật, có ý nghĩa thống kê, nhất quán ở cả tổng và per-class).
+- Nhánh cơ chế "→ giảm simultaneous senders": **NOT CONFIRMED** (bác bỏ
+  bằng bằng chứng tất định).
+- Nhánh cơ chế "→ giảm MAC/PHY retry-drop pressure": **NOT CONFIRMED**
+  (nhiễu lấn át hoàn toàn hiệu ứng, t<0.7).
+- Nhánh cơ chế "→ giảm sim-lag": **NOT CONFIRMED một cách thực chất**
+  (có xu hướng nhẹ về mặt thống kê nhưng độ lớn không đủ thay đổi kết
+  luận "luôn lag nặng").
+- Mục tiêu THẬT SỰ quan trọng — "→ tăng fresh/useful delivery mà không
+  phá coordination": **NOT CONFIRMED / BÁC BỎ**. Đây là kết luận quyết
+  định cho toàn bộ thí nghiệm.
+
+**8. Nếu confirmed: production change nên test tiếp** — KHÔNG áp dụng.
+Vì mục tiêu thật sự (mục 7, dòng cuối) KHÔNG được xác nhận, **KHÔNG đề
+xuất bất kỳ thay đổi production nào dựa trên đòn bẩy control-rate/packet-
+count admission** (kể cả packet-cap hay airtime-cap đã thử trước đó —
+đúng như user đã cảnh báo trước, không tự động chọn 2 hướng này).
+Hướng có cơ sở hơn (đã nêu từ kết luận chính thức 11/09/2026, vẫn CHƯA
+làm): tấn công trực tiếp vào NĂNG LỰC KÊNH/TOPOLOGY (đa AP qua backbone
+có dây thật, chuẩn Wi-Fi băng thông rộng hơn, hoặc giảm mật độ station/AP)
+thay vì tiếp tục điều chỉnh admission control ở tầng packet-count — vì
+ngay cả khi packet-count admission "thắng" về raw delivery, nó KHÔNG
+chạm được vào nguyên nhân gốc của độ trễ (sim-lag/saturation vật lý)
+khiến MỌI cải thiện raw-delivery đều vô nghĩa về mặt deadline.
+
+**9. Thay đổi bị reject + lý do**:
+- Giảm control-class rate (mọi mức 75/50/25%) làm production change:
+  **REJECT** — dù raw delivery_pct tăng có ý nghĩa thống kê
+  (+9.4pp đến +27pp tùy chỉ số), fresh/đúng-hạn delivery KHÔNG cải thiện
+  (stale_pct luôn ~92-100%), tức cải thiện đo được là "ảo", không giải
+  quyết đúng mục tiêu ứng dụng thật. Đúng tiêu chí user đặt ra: "chỉ giảm
+  bytes/packets nhưng delivery [hữu ích] không tăng" → reject.
+- packet-cap/airtime-cap (đã thử ở các mục trước): tiếp tục KHÔNG được
+  chọn làm production change — lý do cũ (chưa chứng minh cải thiện thật,
+  airtime-cap còn làm khoảng cách DOÃNG RỘNG hơn) VẪN đúng, giờ càng
+  được củng cố bởi phát hiện freshness ở đây (dù packet-count có giảm,
+  vấn đề cốt lõi là độ trễ tuyệt đối do sim-lag/saturation, không phải
+  packet-count đơn thuần).
+
+**Giới hạn đo lường cần nêu rõ (theo đúng yêu cầu trung thực của
+user)**:
+- KHÔNG có counter phân biệt "MAC retry" với "MAC TX lần đầu" trong
+  instrumentation ns-3 hiện tại (`mac_tx_total` gộp chung mọi lần thử,
+  không tách được nguyên bản vs. retry) — cần thêm counter mới ở
+  `fleetqox_trace_replay_tap.cc` nếu muốn đo chính xác "retry pressure",
+  CHƯA làm trong thí nghiệm này.
+- "coordination success/failure", "navigation recovery", "forced entry",
+  "task completion time" theo đúng nghĩa Bảng VI (Ricart-Agrawala mutex)
+  KHÔNG được đo — benchmark đó (`fleetqox_coordination_endpoint.py`/
+  `run_coordination_probe()`) là một kịch bản HOÀN TOÀN RIÊNG, không
+  dùng trace CSV này, và KHÔNG được chạy trong thí nghiệm này. Số liệu
+  "coordination_class" ở trên chỉ là proxy trong CHÍNH benchmark
+  trace-based đang dùng (mức delivery/staleness của 1 flow_class tên là
+  "coordination" trong workload), không phải benchmark điều phối thật.
+- n=5/mức là PILOT theo đúng chỉ dẫn — KHÔNG mở rộng lên n≥10 vì phát
+  hiện quyết định (freshness ~0% mọi mức) có phương sai RẤT THẤP
+  (sd stale_pct chỉ 0.1-0.24 điểm % cho control_class) — mở rộng n sẽ
+  không đổi kết luận định tính, chỉ tốn thêm tài nguyên Docker/ns-3
+  thật; khuyến nghị KHÔNG mở rộng trừ khi user muốn số liệu chặt hơn
+  cho phần raw-delivery (không phải phần freshness).
+
+**Trạng thái**: thí nghiệm HOÀN THÀNH đầy đủ theo đúng 8 bước phương
+pháp luận yêu cầu. Kết luận rõ ràng, có bằng chứng thống kê VÀ tất định
+ở nhiều tầng — không có production change nào được đề xuất từ thí
+nghiệm này. Hướng tiếp theo có cơ sở nhất (nếu muốn tiếp tục) là quay
+lại đề xuất năng lực-kênh/topology từ 11/09/2026, hoặc thêm counter
+retry thật + chạy benchmark Bảng VI riêng nếu cần đo coordination thật.
+
+**File liên quan**: `/tmp/.../scratchpad/control_rate_sweep.py`,
+`/tmp/.../scratchpad/control_rate_sweep.jsonl` (không thuộc repo, 20
+điểm dữ liệu thô); không có thay đổi nào trong `fleetqox/` hay
+`scripts/` ngoài `event_filter`/`ns3_real_elapsed_s_at_log_read` đã merge
+ở các mục trước.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
