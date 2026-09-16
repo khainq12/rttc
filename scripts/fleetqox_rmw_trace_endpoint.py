@@ -98,6 +98,37 @@ def fleetqox_transport_metrics() -> dict[str, Any]:
     return metrics
 
 
+def fleetqox_receive_timeline() -> list[dict[str, Any]]:
+    """Read rmw_pubsub.cpp's T_RMW_READY timeline (event_id + wall_ns at
+    the moment a decoded frame enters a subscription's frame_queue, i.e.
+    the point rmw_take()/rmw_wait() would see it as available) via the
+    same ctypes-into-librmw_fleetqox_cpp.so mechanism as
+    fleetqox_transport_metrics() -- added for the "tách receiver-side
+    FleetRMW internal vs dispatch" investigation (see
+    docs/AUDIT_ACCEPTANCE_TRACKING.md 17/09/2026). Only populated when the
+    caller set FLEETQOX_RMW_RECEIVE_TIMELINE_PROFILING in this process's
+    environment (default: empty list, same "opt-in, zero cost otherwise"
+    pattern as FLEETQOX_RMW_PUBLISH_STAGE_PROFILING).
+    """
+    if os.environ.get("RMW_IMPLEMENTATION") != "rmw_fleetqox_cpp":
+        return []
+    if not os.environ.get("FLEETQOX_RMW_RECEIVE_TIMELINE_PROFILING"):
+        return []
+    try:
+        library = ctypes.CDLL("librmw_fleetqox_cpp.so")
+    except OSError:
+        return []
+    fn = library.rmw_fleetqox_cpp_receive_timeline_json
+    fn.restype = ctypes.c_char_p
+    raw = fn()
+    if not raw:
+        return []
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return []
+
+
 def fleetqox_publish_stage_metrics(library: "ctypes.CDLL") -> dict[str, Any]:
     """publish_payload()'s stage-resolved micro-profiler (see PublishStage
     in rmw_pubsub.cpp) -- only non-zero when the process was launched with
@@ -561,6 +592,7 @@ def main() -> int:
         "send_timing": send_timing,
         "received": received,
         "fleetqox_transport_metrics": fleetqox_transport_metrics(),
+        "fleetqox_receive_timeline": fleetqox_receive_timeline(),
         "discovery_convergence_s": discovery_convergence_s,
         "discovery_peers_seen": len(discovery_peers_seen),
         "discovery_expected_peers": args.expected_peer_count,

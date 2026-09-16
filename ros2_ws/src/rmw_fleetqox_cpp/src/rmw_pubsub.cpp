@@ -501,6 +501,79 @@ void record_transport_target_count(size_t target_count, size_t peer_addresses_si
   g_transport_peer_addresses_size.store(peer_addresses_size, std::memory_order_relaxed);
 }
 
+// Receiver-side timeline (17/09/2026, see
+// docs/AUDIT_ACCEPTANCE_TRACKING.md "Optimization #2: tách receiver-side
+// FleetRMW internal vs dispatch"): marks T_RMW_READY -- the moment a
+// decoded data frame has cleared sequence/dedup/lifespan/content-filter
+// handling and is pushed into a subscription's frame_queue, i.e. the
+// exact point it becomes visible to rmw_take()/rmw_wait(). Combined with
+// the already-existing app-level recv_wall_ns (captured inside the
+// Python on_message callback), this splits the previously-opaque
+// "receiver-side" interval (MacRx -> app callback, found to explain
+// ~96% of stale control-message latency) into:
+//   FleetRMW_receive_internal = T_RMW_READY - T_MAC_RX
+//   Dispatch_wait             = T_APP - T_RMW_READY
+// Env-gated (same pattern as PublishStage/publish_stage_profiling_enabled()
+// above) so the extra system_clock::now() call + mutex + string build
+// never touch the default hot path -- diagnostic-only, does not change
+// sequence/ACK-NACK/retransmission/spin/admission/scheduling behavior in
+// any way; it only OBSERVES a point that already exists in the control
+// flow.
+bool receive_timeline_profiling_enabled()
+{
+  static const bool enabled =
+    std::getenv("FLEETQOX_RMW_RECEIVE_TIMELINE_PROFILING") != nullptr;
+  return enabled;
+}
+
+std::mutex g_receive_timeline_mutex;
+std::vector<std::pair<std::string, std::int64_t>> g_receive_timeline;
+
+// scripts/fleetqox_rmw_trace_endpoint.py's build_payload() embeds
+// event_id as plaintext JSON `"e":"<digits>"` inside the serialized
+// payload -- decoded_frame->serialized_payload already holds that
+// payload's raw bytes (decode_data_frame() already unwrapped the outer
+// FleetRMW envelope's base64 by this point), so no further decoding is
+// needed here (unlike the ns-3 MacTx/MacRx trace point, which sees the
+// wire-encoded envelope and must base64-decode first).
+bool extract_event_id_for_timeline(
+  const std::vector<std::uint8_t> & serialized_payload, std::string * event_id)
+{
+  static const std::string kMarker = "\"e\":\"";
+  auto it = std::search(
+    serialized_payload.begin(), serialized_payload.end(), kMarker.begin(), kMarker.end());
+  if (it == serialized_payload.end()) {
+    return false;
+  }
+  auto digits_start = it + static_cast<std::ptrdiff_t>(kMarker.size());
+  auto digits_end = digits_start;
+  while (digits_end != serialized_payload.end() && std::isdigit(*digits_end)) {
+    ++digits_end;
+  }
+  if (digits_end == digits_start || digits_end == serialized_payload.end() ||
+    *digits_end != '"')
+  {
+    return false;
+  }
+  event_id->assign(digits_start, digits_end);
+  return true;
+}
+
+void record_receive_timeline_ready(const std::vector<std::uint8_t> & serialized_payload)
+{
+  if (!receive_timeline_profiling_enabled()) {
+    return;
+  }
+  std::string event_id;
+  if (!extract_event_id_for_timeline(serialized_payload, &event_id)) {
+    return;
+  }
+  const std::int64_t wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::system_clock::now().time_since_epoch()).count();
+  std::lock_guard<std::mutex> lock(g_receive_timeline_mutex);
+  g_receive_timeline.emplace_back(std::move(event_id), wall_ns);
+}
+
 // Retires `entry` into `data`'s pool (bounded by kRetiredRetransmitEntryPoolCap)
 // instead of letting it fall out of scope and be destroyed outright. Caller
 // must hold g_bus_mutex.
@@ -14359,6 +14432,10 @@ void deliver_decoded_frame_to_subscriptions_locked(
         ++matched_subscriptions;
         enqueue_frame_respecting_destination_order(
           subscription, encoded_frame, decoded_frame->source_timestamp_ns);
+        // T_RMW_READY: frame is now in this subscription's frame_queue,
+        // i.e. exactly the point rmw_take()/rmw_wait() would see it as
+        // available -- see record_receive_timeline_ready()'s comment.
+        record_receive_timeline_ready(decoded_frame->serialized_payload);
         enforce_subscription_depth_locked(subscription, &event_callbacks);
         if (!subscription->destroying &&
           subscription->on_new_message_callback != nullptr)
@@ -14891,6 +14968,34 @@ std::uint64_t rmw_fleetqox_cpp_publish_stage_max_ns(int stage)
     return 0;
   }
   return g_publish_stage_stats[static_cast<size_t>(stage)].max_ns.load(std::memory_order_relaxed);
+}
+
+// Returns the accumulated receive timeline (see
+// record_receive_timeline_ready()) as a JSON array of
+// {"event_id":"...","rmw_ready_wall_ns":...} objects, e.g. for a caller
+// to join against event_id-keyed data from elsewhere (app-level
+// recv_wall_ns, ns-3's MacRx wall_ns). Empty (`"[]"`) unless
+// FLEETQOX_RMW_RECEIVE_TIMELINE_PROFILING is set. Static (not
+// thread_local): populated from the receive thread, read from whichever
+// thread the ctypes caller uses (typically the main Python thread at the
+// end of a run) -- must stay valid across that cross-thread read, unlike
+// rmw_fleetqox_cpp_socket_fleet_plan_last_paths()'s thread_local (which
+// is always read from the same thread it's written on).
+const char * rmw_fleetqox_cpp_receive_timeline_json()
+{
+  static std::string json;
+  std::lock_guard<std::mutex> lock(g_receive_timeline_mutex);
+  std::string built = "[";
+  for (size_t i = 0; i < g_receive_timeline.size(); ++i) {
+    if (i != 0) {
+      built += ",";
+    }
+    built += "{\"event_id\":\"" + g_receive_timeline[i].first + "\",";
+    built += "\"rmw_ready_wall_ns\":" + std::to_string(g_receive_timeline[i].second) + "}";
+  }
+  built += "]";
+  json = std::move(built);
+  return json.c_str();
 }
 
 std::uint64_t rmw_fleetqox_cpp_transport_target_count_sum()

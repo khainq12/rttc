@@ -7032,6 +7032,112 @@ hash bên dưới); script phân tích (không thuộc repo):
 `/tmp/.../scratchpad/step10_control_blackbox_split.py`,
 `/tmp/.../scratchpad/step10b_receiver_side_correlation.py`.
 
+**Tách receiver-side: FleetRMW internal vs rcl/rclpy dispatch (17/09/2026)
+— trả lời dứt điểm câu hỏi A/B, KHÔNG sửa optimizer/FleetRMW.**
+
+**Audit source trước khi thêm code**: đọc `ros2_ws/src/rmw_fleetqox_cpp/src/rmw_pubsub.cpp`
+đúng đường đi nhận: `receive_loop()` (`::recvfrom` trên thread riêng) →
+`handle_received_datagram()` → `handle_received_payload()` (giải mã
+frame, phân biệt ack_nack/data) → `enqueue_received_frame()` →
+`deliver_decoded_frame_to_subscriptions_locked()` (tại đây:
+`observe_frame()` theo dõi sequence/out-of-order — CHỈ ghi nhận, không
+chặn; `enqueue_frame_respecting_destination_order()` — chỉ giữ thứ tự
+khi QoS `destination_order=BY_SOURCE_TIMESTAMP`, mặc định KHÔNG dùng nên
+đi thẳng `push_back()`, không có wait/block nào; `enforce_subscription_depth_locked()`
+— chỉ evict khi vượt depth). Không tìm thấy bất kỳ wait/sleep/block nào
+trên đường đi này — đúng như cảnh báo của user, "không kết luận trước
+khi có timestamp". Sau đó đọc `rmw_wait.cpp`: `rmw_wait()` là vòng lặp
+**polling `std::this_thread::sleep_for(1ms)`**, KHÔNG event-driven —
+chỉ thực sự kiểm tra khi được GỌI.
+
+**Instrumentation tối thiểu đã thêm (1 mốc, đúng yêu cầu)**: `T_RMW_READY`
+— ngay sau `enqueue_frame_respecting_destination_order()` trong
+`deliver_decoded_frame_to_subscriptions_locked()`, tức đúng thời điểm
+frame vào `frame_queue`, sẵn sàng cho `rmw_take()`. Env-gated
+(`FLEETQOX_RMW_RECEIVE_TIMELINE_PROFILING`, mặc định OFF = không đổi
+hành vi/hiệu năng, cùng pattern với `FLEETQOX_RMW_PUBLISH_STAGE_PROFILING`
+đã có sẵn cho phía gửi). Trích `event_id` trực tiếp từ
+`decoded_frame->serialized_payload` (đã base64-decode sẵn bởi
+`decode_data_frame()`, không cần decode lại). Export qua ctypes
+(`rmw_fleetqox_cpp_receive_timeline_json()`, JSON array), đọc từ Python
+theo đúng pattern `fleetqox_transport_metrics()` đã có.
+
+**Sự cố build (đáng ghi vì tốn thời gian, không phải lỗi code)**:
+1) `librmw_fleetqox_cpp.so` được cache sẵn ở `.tmp_fleetrmw_matched_v2_install/`,
+   KHÔNG tự rebuild khi chạy `run_probe()` (khác ns-3 binary) → lần
+   chạy đầu lỗi `undefined symbol`. 2) Rebuild lần 1 bị `cc1plus` OOM-killed
+   (máy chỉ có ~3.9GB cấp cho Docker Desktop VM) → phải build `-j1`
+   (`MAKEFLAGS=-j1 --parallel-workers 1`), mất ~6m40s thay vì song song.
+   3) Lần build `-j1` đầu tiên "ignoring unknown package" — hoá ra `pwd`
+   của session đã lệch sang `/home/ubuntu/Desktop` (không phải `.../RTC`)
+   nên bind-mount docker trỏ sai thư mục — sửa bằng absolute path, build
+   thành công (2 packages, chỉ warning).
+
+**Instrumentation-overhead check**: N=2, cap=150, seed=13, ns3_seed=42,
+3 rep — `packet_rows=393` tất định, `delivery_pct=97.46%` tất định,
+`fresh_pct` [66.9, 65.9, 68.4]% (cùng dải các lần đo trước),
+`degraded=False` cả 3 rep, `sim_lag_s` 5.9-7.0s (cùng cấp độ baseline
+~5-6.5s). **Dùng được làm bằng chứng chính.**
+
+**FACT — phân rã 852 message control/safety, match rate 100%
+(852/852 cả MacRx lẫn T_RMW_READY)**:
+
+| Đoạn | fresh (n=494) mean | stale (n=358) mean | stale max |
+|---|---|---|---|
+| MacRx → T_RMW_READY (FleetRMW internal) | 0.273ms | 0.289ms | 0.889ms |
+| T_RMW_READY → app callback (dispatch) | 15.53ms | **112.87ms** | **369.8ms** |
+| receiver_side (MacRx → app, tổng) | 15.80ms | 113.16ms | 370.3ms |
+
+**Tỷ lệ đóng góp vào receiver_side**: FleetRMW internal = **1.7%
+(fresh) / 0.3% (stale)**; dispatch = **98.3% (fresh) / 99.7% (stale)**.
+`MacRx→T_RMW_READY` gần như hằng số (0.12-0.89ms, KHÔNG có pattern suy
+giảm theo thời gian — bucket 100ms đầu run vẫn chỉ 0.40ms, cùng mức với
+cuối run 0.25ms). Toàn bộ pattern suy giảm đầu run (204ms→20-50ms tìm
+thấy ở bước trước) nằm **HOÀN TOÀN** trong `T_RMW_READY→app`: bucket
+0-100ms = 244.85ms, giảm dần theo đúng cùng hình dạng đã thấy trước
+(52.62ms ở 300-400ms, xuống 16.55ms ở 400-500ms, sau đó dao động
+17-107ms suốt phần còn lại của run — không đơn điệu tuyệt đối nhưng
+không còn xu hướng giảm rõ, khớp với hành vi "bắt kịp backlog" chứ
+không phải suy giảm liên tục).
+
+**REJECTED (bổ sung, có bằng chứng mechanism-level)**:
+6. FleetRMW internal receive processing (decode/sequence-tracking/
+   ACK-NACK generation/enqueue) là nguyên nhân → **loại dứt điểm**:
+   0.27-0.29ms trung bình, hằng số theo thời gian, không phân biệt
+   fresh/stale.
+
+**ROOT CAUSE — vị trí (FACT, mechanism-level, đủ bằng chứng)**: độ trễ
+nằm ở **rcl/rclpy-side dispatch**, cụ thể là cách harness
+(`scripts/fleetqox_rmw_trace_endpoint.py`) gọi `spin_once()`. Đọc
+`rmw_wait.cpp` xác nhận `rmw_wait()` là vòng polling 1ms — CHỈ thực sự
+kiểm tra khi được gọi, không có cơ chế đánh thức chủ động (event-driven)
+nào khác trên đường đi này. Harness's send-loop chỉ gọi
+`spin_once(timeout_sec=0.0)` (burst 20 lần) NGAY TRƯỚC mỗi lần gửi của
+CHÍNH NÓ; khoảng `time.sleep(target_offset_s - now_offset)` giữa 2 lần
+gửi liên tiếp của tiến trình đó **không gọi `spin_once()` một lần nào**
+— nếu tiến trình đang ngủ chờ đến lượt gửi tiếp theo của chính nó trong
+khi có message đến (đã sẵn sàng ở `T_RMW_READY` gần như tức thì), message
+đó nằm chờ cho đến khi tiến trình tỉnh dậy ở lần gửi kế tiếp của CHÍNH
+NÓ. 10 message tệ nhất đều đích đến `robot_0001` ở các tick đầu run
+(0-80ms) — khớp giả thuyết: khoảng cách giữa các lần gửi CỦA CHÍNH
+robot_0001 ở đầu run đủ dài để tạo ra cửa sổ không polling lớn. Đây
+CÙNG LOẠI lỗi với bug spin_once đã tìm và sửa một phần ở Bước 1 (Bước 1
+chỉ sửa "chỉ drain 1 entity/lần gọi" — chưa sửa khoảng trống KHÔNG gọi
+`spin_once()` nào cả giữa các lần gửi).
+
+**NEXT STEP (một bước, suy ra trực tiếp từ bằng chứng, CHƯA implement)**:
+sửa harness (`fleetqox_rmw_trace_endpoint.py`), KHÔNG sửa
+FleetRMW/`fleetqox/control_plane.py`: thay `time.sleep(target_offset_s
+- now_offset)` bằng vòng lặp ngủ từng đoạn ngắn XEN KẼ gọi `spin_once()`
+định kỳ trong lúc chờ đến lượt gửi tiếp theo, để message đến được dispatch
+gần với thời điểm `T_RMW_READY` thay vì chỉ khi tiến trình tỉnh dậy vì
+lịch gửi của chính nó.
+
+**File liên quan**: `ros2_ws/src/rmw_fleetqox_cpp/src/rmw_pubsub.cpp`,
+`scripts/fleetqox_rmw_trace_endpoint.py` (commit riêng, xem hash bên
+dưới); script phân tích (không thuộc repo):
+`/tmp/.../scratchpad/step11_rmw_internal_vs_dispatch.py`.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
