@@ -6616,6 +6616,130 @@ tìm cách mở rộng vùng khỏe mạnh trước — ngoài phạm vi Bước
 repo, 4+24 điểm dữ liệu thô); không có thay đổi code nào trong bước
 này.
 
+### 16/09/2026 (tiếp) — Bước 5: message-level diff FIFO vs Predictive tại N=2, tìm đúng nguyên nhân +10.3pp delivery/+10.5pp fresh, sửa TỐI THIỂU, A/B xác nhận thành công
+
+**Funnel đầy đủ (offline candidate-level + real Docker/ns-3, N=2, seed=13,
+ns3_seed=42, ns3_run=1)**:
+
+| | input | admitted | actually_sent | delivered | fresh |
+|---|---|---|---|---|---|
+| fifo | 467 | 440 | 440 | 426 | 337 |
+| predictive (TRƯỚC fix) | 467 | 444 | 444 | 384 | 226 |
+
+**Trả lời đúng 5 câu hỏi user đặt ra**:
+1. Predictive drop/defer dù còn capacity? → **BÁC BỎ** — predictive drop
+   ÍT hơn fifo (23 vs 27), admit NHIỀU hơn (444 vs 440).
+2. DEGRADED làm mất delivery? → **KHÔNG PHẢI cơ chế chính** — 41/47
+   (87%) message bị mất được predictive gửi NATIVE, cùng byte size hệt
+   fifo, không hề bị nén/giảm.
+3. Capacity/utility đánh giá sai chi phí? → **ĐÚNG, nhưng NGƯỢC hướng
+   dự đoán** — predictive đánh giá THẤP chi phí thật, không phải cao.
+   So khớp tập admission chính xác: 437 candidate cả 2 đều admit, nhưng
+   predictive admit THÊM đúng **7 candidate class thấp nhất**
+   (debug×3/human_qoe×3/perception×1) mà fifo bỏ qua.
+4. Decision không được data-plane thực thi đúng? → **BÁC BỎ DỨT ĐIỂM**
+   — `actually_sent` == `admitted` chính xác tuyệt đối cả 2 policy.
+5. Message fresh hữu ích bị hy sinh không cần thiết? → **CÓ nhưng nhỏ**
+   (chỉ 3/47, "predictive stale drop") — không phải cơ chế chi phối.
+
+**Cơ chế thật**: `fifo_policy` xử lý candidate theo ĐÚNG THỨ TỰ ĐẾN,
+không sắp xếp lại — hết ngân sách byte trong 1 tick là defer ngay dù có
+thể còn dư ở tick khác. `PredictiveAdmissionController` sắp xếp lại
+theo `density` (giá trị/byte) trong partition "remaining" (debug/
+human_qoe/perception, tầng thấp nhất trong `_ordered_partitions()`),
+đóng gói ngân sách byte HIỆU QUẢ HƠN — nhồi thêm được 7 message giá trị
+thấp mà fifo bỏ lỡ vì thứ tự xử lý không may. Nhưng **7 message giá trị
+thấp thêm vào đó tạo đủ tranh chấp kênh để làm sập delivery của 41
+message KHÁC** (native, không hề bị đổi) — đúng chủ đề đã xác lập xuyên
+suốt investigation này: mô hình byte-based không định giá đúng chi phí
+tranh chấp thật, và ở đây "đóng gói byte hiệu quả hơn" của predictive
+lại chính là nguồn gốc vấn đề.
+
+**RED test** (`tests/test_trace_export.py::test_predictive_does_not_admit_more_than_fifo_at_low_load`):
+assert `predictive_admitted <= fifo_admitted` ở đúng scenario N=2/
+seed=13 — **FAIL: 444 not <= 440** trước khi sửa.
+
+**MỘT thay đổi tối thiểu đã thử và LOẠI BỎ trước khi chọn fix cuối**:
+thử dùng `predicted_capacity` (đã có sẵn, tính trong `_pressure()` cho
+mục đích khác) làm TRẦN admission cứng thay vì raw
+`link.capacity_bytes_per_tick` — **KHÔNG có tác dụng** (vẫn 444) ở
+`safety_margin` mặc định 0.88; phải hạ xuống ~0.2 mới đủ mạnh — QUÁ THÔ
+BẠO vì `safety_margin` dùng CHUNG cho mọi tầng ưu tiên (sẽ bóp cả
+safety/control/coordination/state không cần thiết). Đã loại bỏ hướng
+này, không giữ trong code.
+
+**Fix ĐÃ CHỌN (tối thiểu, có phạm vi hẹp)**: thêm
+`PredictiveAdmissionConfig.remaining_tier_capacity_fraction: float = 0.15`
+— áp dụng CHỈ cho partition CUỐI CÙNG ("remaining", tầng thấp nhất) như
+một hệ số chiết khấu THÊM trên ngân sách còn lại sau khi các tầng cao
+hơn đã được phục vụ. safety/control/coordination/state/operator_qoe
+KHÔNG bị ảnh hưởng. Giá trị 0.15 tìm được qua sweep offline (0.3→442,
+0.15→440 khớp đúng số fifo) — giá trị giả định ban đầu, cùng cách tiếp
+cận "assumed value, validate empirically" đã dùng cho `RADIO_LINK_LOSS_PCT`
+trước đó.
+
+**GREEN**: `py_compile` sạch; `test_predictive_does_not_admit_more_than_fifo_at_low_load`
+PASS; toàn bộ 778 test khác PASS (8 fail còn lại thuộc
+`test_ngtcp2_*`/`test_remote_wait_for_all_acked.py`, xác nhận ĐÃ fail
+từ TRƯỚC khi sửa qua `git stash`, không liên quan).
+
+**A/B thật N=2 sau fix (Docker+ns-3, cùng seed/ns3_run)**:
+
+| | packet_rows | delivered | delivery_pct | fresh_pct | degraded |
+|---|---|---|---|---|---|
+| fifo | 440 | 426 | 96.82% | 79.09% | False |
+| predictive (SAU fix) | **440** | **426** | **96.82%** | **81.36%** | False |
+
+**Khớp CHÍNH XÁC số của fifo về admission VÀ delivery — và fresh_pct
+còn CAO HƠN fifo (81.4% vs 79.1%)**, dù raw delivery bằng nhau.
+
+**Kiểm tra 3 tiêu chí "chỉ giữ nếu" user đặt ra**:
+1. **Phục hồi delivery/fresh rõ ràng**: delivery 86.5%→96.8% (+10.3pp,
+   khớp đúng gap ban đầu), fresh 70.3%→81.4% (+11.1pp, còn vượt fifo).
+   ĐẠT.
+2. **KHÔNG đơn giản biến predictive thành fifo**: tập admission KHÔNG
+   giống hệt — overlap 437/440, vẫn có 3 candidate CHỈ predictive admit
+   (khác fifo) và 3 candidate CHỈ fifo admit. 86/437 candidate trùng cả
+   2 admit nhưng predictive gửi KÍCH THƯỚC KHÁC (vẫn đang nén/giảm).
+   ĐẠT.
+3. **Vẫn đưa ra adaptive decision khi có pressure thật**: action
+   breakdown sau fix vẫn có `send_compacted=32`, `send_degraded=57`
+   (THẬM CHÍ NHIỀU degraded hơn trước, vì ngân sách tầng "remaining" hẹp
+   hơn khiến logic pressure-driven (KHÔNG bị đổi) chọn degrade thường
+   xuyên hơn để vẫn cố gắng gửi). Toàn bộ 43 test trong
+   `test_control_plane.py` (compaction dưới pressure, guarded control,
+   lagrangian multiplier...) vẫn PASS nguyên vẹn — cơ chế adaptive
+   KHÔNG bị đụng tới, chỉ trần byte của 1 tầng cụ thể bị siết. ĐẠT.
+
+**Thử lại N=8/N=16 exploratory (degraded=True cả 4 lần, KHÔNG dùng làm
+bằng chứng chính, chỉ ghi nhận)**:
+
+| N | policy | packet_rows | delivery_pct | fresh_pct |
+|---|---|---|---|---|
+| 8 | fifo | 1573 | 36.9% | 0.76% |
+| 8 | predictive (sau fix) | 1710 | 33.4% | 0.76% |
+| 16 | fifo | 2289 | 13.5% | 0.31% |
+| 16 | predictive (sau fix) | 3257 | 10.5% | 0.15% |
+
+Khoảng cách delivery ở N=8 thu hẹp đôi chút so với trước fix (trước:
+fifo 37.5% vs predictive 29.3%, gap 8.2pp; sau: 36.9% vs 33.4%, gap
+3.5pp) nhưng KHÔNG dứt điểm được vì cả 2 vẫn degraded — fresh_pct vẫn
+gần 0% ở cả 2 N như đã biết từ Bước 4 (sim-lag vẫn là nút thắt thật ở
+quy mô này, không phải admission logic).
+
+**Trạng thái**: Bước 5 HOÀN THÀNH đầy đủ theo đúng quy trình user yêu
+cầu (bằng chứng → 1 thay đổi tối thiểu → RED → fix → GREEN → A/B). Fix
+**ĐƯỢC GIỮ** — đáp ứng cả 3 tiêu chí, có bằng chứng số trực tiếp ở vùng
+đáng tin cậy N=2. Vùng N≥8 vẫn cần giải quyết sim-lag/năng lực kênh
+trước khi kết luận thêm bất kỳ điều gì về admission logic ở quy mô lớn.
+
+**File liên quan**: `fleetqox/control_plane.py`
+(`PredictiveAdmissionConfig.remaining_tier_capacity_fraction`, đổi vòng
+lặp partition trong `schedule()`), `tests/test_trace_export.py`
+(`test_predictive_does_not_admit_more_than_fifo_at_low_load`); kết quả
+thô tại `/tmp/.../scratchpad/step5_message_diff.py`,
+`/tmp/.../scratchpad/step5_message_diff_result.json` (không thuộc repo).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và

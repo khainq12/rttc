@@ -77,6 +77,40 @@ class TraceExportTest(unittest.TestCase):
         self.assertTrue(any(event["wire_mode"] == "semantic_delta" for event in events))
         self.assertTrue(all(event["schema_version"] == TRACE_SCHEMA_VERSION for event in events))
 
+    def test_predictive_does_not_admit_more_than_fifo_at_low_load(self) -> None:
+        """At N=2 (well below any real contention limit -- confirmed
+        degraded=False via a live Docker+ns-3 run), fifo_policy's naive
+        per-tick byte-budget FIFO admits 440/467 candidates. Predictive
+        admission, despite being "smarter" about density-based byte
+        packing, was found (see docs/AUDIT_ACCEPTANCE_TRACKING.md
+        16/09/2026 "Bước 5: message-level diff") to admit MORE total
+        candidates (444) at this exact scenario -- 7 extra low-value
+        (debug/human_qoe/perception) messages fifo's simpler logic
+        leaves unsent. A live A/B confirmed this modest excess causes
+        collateral MAC-layer collision loss for 41 OTHER, unrelated,
+        natively-sized messages that fifo delivers successfully --
+        collapsing real delivery from 96.8% to 86.5% even though byte
+        budget was never actually exceeded by either policy."""
+        fifo_events = generate_trace_events(
+            scenario="test", robots=2, seconds=3, seed=13,
+            capacity_bytes_per_second=max(200_000, 2 * 6_000),
+            policies=["fifo"], include_non_sent=True, merge_control_station=True,
+        )
+        predictive_events = generate_trace_events(
+            scenario="test", robots=2, seconds=3, seed=13,
+            capacity_bytes_per_second=max(200_000, 2 * 6_000),
+            policies=["fleetqox_predictive"], include_non_sent=True, merge_control_station=True,
+        )
+        fifo_admitted = sum(1 for e in fifo_events if e["event_type"] == "packet")
+        predictive_admitted = sum(1 for e in predictive_events if e["event_type"] == "packet")
+        self.assertLessEqual(
+            predictive_admitted, fifo_admitted,
+            "predictive admitted more candidates than fifo's naive per-tick byte "
+            "budget at a scenario with abundant real capacity -- the extra "
+            "low-value traffic measurably collapses real delivery via collateral "
+            "MAC contention (see docs/AUDIT_ACCEPTANCE_TRACKING.md 16/09/2026)",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

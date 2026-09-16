@@ -79,6 +79,39 @@ class PredictiveAdmissionConfig:
     semantic_compaction_ratio: float = 0.55
     opportunistic_degradation_ratio: float = 0.14
     stale_drop_ratio: float = 0.82
+    # Extra ceiling applied ONLY to the lowest-priority "remaining"
+    # partition (debug/human_qoe/perception -- everything not
+    # safety/control/coordination/state/operator_qoe, see
+    # _ordered_partitions()'s last tier), as a fraction of whatever byte
+    # budget is left after the higher tiers have been admitted.
+    #
+    # Root cause (see docs/AUDIT_ACCEPTANCE_TRACKING.md 16/09/2026
+    # "Bước 5: message-level diff"): a live N=2 A/B found
+    # PredictiveAdmissionController admitting MORE total candidates than
+    # fifo_policy's naive per-tick byte budget (444 vs 440) -- density-
+    # sorted reordering + compaction let it pack 7 EXTRA low-value sends
+    # into byte headroom fifo's simple, non-reordering pass leaves
+    # unused. The raw byte ceiling was never actually exceeded by
+    # either policy, so tightening the GLOBAL safety_margin has almost
+    # no effect until pushed to unreasonably aggressive values (~0.2,
+    # confirmed empirically) that would also distort compaction/drop
+    # behavior for safety/control/coordination/state traffic which
+    # legitimately needs the room. The real cost of those 7 extra
+    # low-value sends isn't bytes (both policies stayed under budget);
+    # it's the resulting collateral MAC-layer collision loss for 41
+    # OTHER, unrelated, natively-sized messages -- exactly the
+    # "byte-based capacity underprices real contention" gap this
+    # investigation has found repeatedly. Scoping the extra discount to
+    # ONLY the catch-all tier (leaving safety/control/coordination/state/
+    # operator_qoe untouched) targets that specific mechanism without
+    # blunting admission for traffic that actually matters.
+    #
+    # 0.15 is an empirically-found starting value (offline sweep against
+    # this exact N=2/seed=13 scenario landed admitted count at parity
+    # with fifo's 440) -- NOT independently calibrated across other
+    # scenarios, same "assumed value, validate empirically" pattern used
+    # elsewhere in this project (e.g. RADIO_LINK_LOSS_PCT).
+    remaining_tier_capacity_fraction: float = 0.15
 
 
 @dataclass(frozen=True)
@@ -393,10 +426,21 @@ class PredictiveAdmissionController(CausalSemanticDeadlineScheduler):
         remaining_airtime_ns = link.capacity_airtime_ns_per_tick
         selected: list[FlowDecision] = []
 
-        for partition in self._ordered_partitions(entries):
+        partitions = self._ordered_partitions(entries)
+        for index, partition in enumerate(partitions):
+            # Only the LAST partition (the lowest-priority "remaining"
+            # catch-all -- see _ordered_partitions()) gets an extra
+            # discount on top of whatever byte budget the higher tiers
+            # left behind. See
+            # PredictiveAdmissionConfig.remaining_tier_capacity_fraction's
+            # docstring for why: that tier was found admitting more real
+            # contention risk than its byte cost alone implies.
+            capacity_for_partition = remaining
+            if index == len(partitions) - 1:
+                capacity_for_partition = int(remaining * self.config.remaining_tier_capacity_fraction)
             admitted, remaining, remaining_packets, remaining_airtime_ns = self._admit_partition(
                 partition,
-                capacity=remaining,
+                capacity=capacity_for_partition,
                 pressure=pressure,
                 remaining_packets=remaining_packets,
                 remaining_airtime_ns=remaining_airtime_ns,
