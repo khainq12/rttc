@@ -103,6 +103,20 @@ CONTAINER_PREFIX = "fleetqox_ref"
 # is guaranteed to exist by the time the log is read (see
 # _wifi_stats_target_s()/parse_wifi_stats()).
 WIFI_STATS_PRINT_PERIOD_S = 5.0
+# A run CAN eventually reach stats_target_s (so wifi_stats's own
+# degraded_no_snapshot_reached_target never fires) while still having
+# taken far longer in real wall-clock time than it should have -- e.g. a
+# real N=16 run observed sim_time_s reaching the target exactly while
+# sim_lag_s was 22s (vs ~6s for an uncongested N=1/N=2 baseline, itself
+# mostly container/build startup overhead counted before ns-3 starts
+# advancing simulated time at all -- see
+# docs/AUDIT_ACCEPTANCE_TRACKING.md 15-16/09/2026). So "reached target"
+# alone is NOT sufficient to call a run healthy; sim_lag_s materially
+# above the observed healthy floor must ALSO be checked. 10.0s is an
+# assumed starting threshold (comfortably above the ~6s healthy floor,
+# well below the ~22s unhealthy case actually observed) -- NOT
+# independently calibrated across topologies/N, adjust if evidence warrants.
+MAX_HEALTHY_SIM_LAG_S = 10.0
 
 
 def endpoint_list(num_robots: int) -> list[str]:
@@ -1444,6 +1458,36 @@ class ReferenceTopologyProbe:
             usage[endpoint] = {"cpu_pct": cpu_pct, "rss_mb": rss_mb}
         return usage
 
+    def sample_ns3sim_resource_usage(self) -> dict[str, float] | None:
+        """Same `docker stats --no-stream` mechanism as
+        sample_resource_usage(), but for the ns3sim container itself --
+        that one is NOT covered by sample_resource_usage() (endpoint
+        containers only), yet it's the process actually falling behind
+        real time under load (see docs/AUDIT_ACCEPTANCE_TRACKING.md
+        16/09/2026 "profile CPU thật của ns-3"). Call this AFTER the
+        wifi_stats-target wait in run_probe(), not mid-send like the
+        endpoint sample, so it reflects CPU load during the
+        congestion/lag window specifically, not the early uncongested
+        phase."""
+        result = docker(
+            "stats", self.ns3sim_name, "--no-stream",
+            "--format", "{{.CPUPerc}}\t{{.MemUsage}}",
+            check=False,
+        )
+        line = result.stdout.strip()
+        if not line:
+            return None
+        parts = line.split("\t")
+        if len(parts) != 2:
+            return None
+        try:
+            return {
+                "cpu_pct": float(parts[0].rstrip("%")),
+                "rss_mb": parse_docker_mem_usage_mb(parts[1]),
+            }
+        except ValueError:
+            return None
+
     def teardown(self) -> None:
         docker(
             "rm", "-f", self.rigger_name, self.ns3sim_name, *self.endpoint_container_names,
@@ -1562,6 +1606,7 @@ def run_probe(
     resource_usage: dict[str, dict[str, float]] = {}
     wifi_stats: dict[str, Any] | None = None
     ns3_real_elapsed_s_at_log_read: float | None = None
+    ns3sim_resource_usage: dict[str, float] | None = None
     try:
         probe.start_containers()
         probe.build_ns3_binary()
@@ -1653,6 +1698,11 @@ def run_probe(
         # docs/AUDIT_ACCEPTANCE_TRACKING.md 15-16/09/2026 for why this gap
         # can be large and persistent once the channel saturates).
         ns3_real_elapsed_s_at_log_read = time.monotonic() - ns3_start_wall
+        # Sampled here (after the target-wait), not mid-send like the
+        # endpoint containers' own sample above, so this reflects the
+        # ns3sim container's CPU load during the congestion/lag window
+        # itself -- see sample_ns3sim_resource_usage()'s docstring.
+        ns3sim_resource_usage = probe.sample_ns3sim_resource_usage()
         ns3_log_text = probe.ns3_log()
         wifi_stats = parse_wifi_stats(ns3_log_text, stats_target_s)
     except Exception as exc:  # noqa: BLE001 -- report to caller, don't hide the traceback
@@ -1673,6 +1723,35 @@ def run_probe(
     cpu_samples = [v["cpu_pct"] for v in resource_usage.values()]
     rss_samples = [v["rss_mb"] for v in resource_usage.values()]
 
+    # Step 3 (16/09/2026 "chuẩn hoá benchmark"): a single, always-present
+    # top-level verdict on whether THIS run's timing numbers (E2E latency
+    # above all) can be trusted as normal network behavior, instead of
+    # requiring every caller to know to dig into wifi_stats themselves.
+    # `stats_target_s` is a pure function of already-validated params, so
+    # it's always computable here regardless of whether the run reached
+    # that point (an early failure is degraded too, definitionally).
+    stats_target_s = wifi_stats_target_s(
+        start_offset_ms=start_offset_ms, seconds=seconds, drain_s=drain_s
+    )
+    sim_lag_s = (
+        ns3_real_elapsed_s_at_log_read - wifi_stats["sim_time_s"]
+        if wifi_stats is not None
+        and wifi_stats.get("sim_time_s") is not None
+        and ns3_real_elapsed_s_at_log_read is not None
+        else None
+    )
+    degraded = (
+        status != "ok"
+        or wifi_stats is None
+        or bool(wifi_stats.get("degraded_no_snapshot_reached_target"))
+        # A run can reach stats_target_s "on time" by wifi_stats's own
+        # narrower check yet still have burned far more real time getting
+        # there than a healthy run would -- catch that case too (see
+        # MAX_HEALTHY_SIM_LAG_S's docstring for the concrete example that
+        # motivated this).
+        or (sim_lag_s is not None and sim_lag_s > MAX_HEALTHY_SIM_LAG_S)
+    )
+
     return {
         "schema_version": "fleetqox.ns3_docker_container_fleet_probe.v1",
         "status": status,
@@ -1689,6 +1768,21 @@ def run_probe(
         "ns3_log": ns3_log_text,
         "wifi_stats": wifi_stats,
         "ns3_real_elapsed_s_at_log_read": ns3_real_elapsed_s_at_log_read,
+        "ns3sim_resource_usage": ns3sim_resource_usage,
+        # degraded=True means: do NOT interpret this run's latency/MAC
+        # numbers as representative of normal network behavior -- the
+        # ns-3 realtime clock fell behind and never reached
+        # stats_target_s within the wait budget (see
+        # docs/AUDIT_ACCEPTANCE_TRACKING.md 15-16/09/2026). Check this
+        # BEFORE trusting latency_stats_ms from any run at meaningful N.
+        "degraded": degraded,
+        "sim_stats_target_s": stats_target_s,
+        # Real seconds elapsed beyond what sim_time_s has actually
+        # covered, at the moment the log was read -- None if wifi_stats
+        # itself is unavailable (e.g. a failed run). Comparable across
+        # different target/margin configs, unlike the raw
+        # ns3_real_elapsed_s_at_log_read/sim_time_s pair alone.
+        "sim_lag_s": sim_lag_s,
         "latency_stats_ms": compute_latency_stats_ms(endpoint_results),
         "jitter_stale_repair_stats": compute_jitter_stale_repair_stats(endpoint_results),
         "discovery_bytes_ftap0": discovery_bytes_ftap0,

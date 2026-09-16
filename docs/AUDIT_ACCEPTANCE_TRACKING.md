@@ -6462,6 +6462,75 @@ không commit); kết quả thô tại
 `/tmp/.../scratchpad/ns3_cpu_profile_n16_v4_samples.jsonl` (không thuộc
 repo).
 
+### 16/09/2026 (tiếp) — Bước 3: chuẩn hoá benchmark, tự đánh dấu run degraded + luôn lưu đủ 6 chỉ số
+
+Theo đúng yêu cầu: tự đánh dấu run không hợp lệ khi `sim_time` không đạt
+target, và luôn lưu `sim_time`/`wall_time`/`sim_lag`/`E2E latency`/
+`MAC activity`/`CPU usage`.
+
+**Rà lại những gì đã có sẵn** (từ 15-16/09/2026): `wifi_stats.sim_time_s`
+(wall_time proxy qua `ns3_real_elapsed_s_at_log_read`), `latency_stats_ms`
+(E2E), `wifi_stats.mac_*` (MAC activity) — đã có. **Thiếu 2 thứ quan
+trọng**: (1) không có cờ "degraded" Ở CẤP CAO NHẤT (chỉ có
+`wifi_stats.degraded_no_snapshot_reached_target` chôn sâu, dễ bị bỏ
+qua); (2) `sample_resource_usage()` CHỈ đo CPU của các container
+endpoint, KHÔNG đo CPU của chính container `ns3sim` — tức chỉ số CPU
+cũ hoàn toàn không phản ánh đúng process đang là nút thắt thật (đã xác
+nhận ở Bước 2).
+
+**Đã thêm vào `run_probe()`**:
+- `sample_ns3sim_resource_usage()`: đo CPU/RSS của CHÍNH container
+  `ns3sim`, lấy mẫu SAU giai đoạn chờ-đạt-target (không phải giữa cửa sổ
+  gửi như mẫu endpoint cũ) — để phản ánh đúng tải trong LÚC bị kẹt, thay
+  vì giai đoạn còn khỏe mạnh ban đầu.
+- `sim_lag_s`: `ns3_real_elapsed_s_at_log_read - wifi_stats.sim_time_s`
+  — số giây thời gian thật đã trôi qua nhiều hơn số giây mô phỏng đã đạt
+  được, so sánh được xuyên suốt mọi cấu hình target khác nhau.
+- `degraded` (cấp cao nhất, luôn có mặt): `True` nếu status lỗi, HOẶC
+  wifi_stats thiếu, HOẶC không đạt target theo check cũ, HOẶC
+  **`sim_lag_s` vượt `MAX_HEALTHY_SIM_LAG_S=10.0`** (ngưỡng giả định,
+  chưa hiệu chỉnh riêng — nằm giữa mức khỏe mạnh quan sát được ~6s và
+  mức bất thường quan sát được ~22s).
+- `sim_stats_target_s`: giá trị target dùng để so sánh, luôn có mặt.
+
+**Phát hiện quan trọng khi kiểm chứng (lý do cần thêm ngưỡng
+`sim_lag_s`, không chỉ dừng ở check cũ)**: 1 lần chạy N=16 thật cho
+`wifi_stats.sim_time_s = 15` — ĐÚNG bằng target, nên check cũ
+(`degraded_no_snapshot_reached_target`) sẽ báo `False` (coi là hợp lệ)
+— NHƯNG `sim_lag_s` của lần đó là **22.15 giây** (mất 37 giây thật để
+đạt 15 giây mô phỏng!) và `latency p50 = 4955ms`. Nếu chỉ dùng check cũ,
+lần chạy này sẽ bị hiểu nhầm là "bình thường" dù rõ ràng bị lag nặng —
+đúng CHÍNH XÁC cái bẫy user đã cảnh báo ("không còn lấy một run mà ns-3
+đã kẹt rồi coi latency 5 giây là latency mạng bình thường"). Sau khi
+thêm ngưỡng `sim_lag_s > 10.0`, lần chạy tương tự được đánh dấu
+`degraded=True` đúng như kỳ vọng.
+
+**Xác nhận qua 2 lần chạy thật (N=1 và N=16, cùng seed/ns3_seed)**:
+
+| | N=1 | N=16 |
+|---|---|---|
+| `degraded` | **False** | **True** |
+| `sim_lag_s` | 6.0s | 22.3s |
+| `ns3sim_resource_usage.cpu_pct` | 0.72% | **101.32%** (bão hòa 1 lõi — khớp Bước 2) |
+| latency p50 | 5.3ms | 5425ms |
+
+`py_compile` sạch, 30/30 test `test_ns3_docker_container_fleet_probe.py`
+pass.
+
+**Trạng thái**: Bước 3 HOÀN THÀNH — benchmark giờ tự đánh dấu
+`degraded=True` đáng tin cậy (kể cả trường hợp "đạt target nhưng lag
+nặng" từng bị bỏ sót), và luôn lưu đủ 6 chỉ số user yêu cầu
+(`wifi_stats.sim_time_s`, `ns3_real_elapsed_s_at_log_read`, `sim_lag_s`,
+`latency_stats_ms`, `wifi_stats.mac_*`, `ns3sim_resource_usage`). Sẵn
+sàng sang Bước 4 (chạy lại N=1→2→8→16 với cửa sổ đo rõ ràng, rồi mới
+benchmark lại FIFO/Predictive/Packet-aware — coi kết quả optimizer cũ ở
+N=16 là exploratory).
+
+**File liên quan**: `scripts/run_ns3_docker_container_fleet_probe.py`
+(`sample_ns3sim_resource_usage()`, `MAX_HEALTHY_SIM_LAG_S`, các field
+`degraded`/`sim_lag_s`/`sim_stats_target_s`/`ns3sim_resource_usage` mới
+trong `run_probe()`'s return dict).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
