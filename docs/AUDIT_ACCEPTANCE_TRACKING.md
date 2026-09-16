@@ -6823,6 +6823,105 @@ N=2/N=3.
 `/tmp/.../scratchpad/step6_message_diff_n3.py`,
 `/tmp/.../scratchpad/step7_packet_aware_diff.py` (không thuộc repo).
 
+**Optimization #2 (16/09/2026) — thử sửa packet-cap để bảo vệ
+safety_control, kết quả: REVERT (không đạt tiêu chí nghiệm thu).**
+
+**HYPOTHESIS ban đầu**: `remaining_packets` là một ngân sách packet
+dùng chung, depleting tuần tự qua 4 tầng ưu tiên trong `schedule()`
+(`fleetqox/control_plane.py`). Giả thuyết: nếu số candidate
+`safety_control` trong MỘT tick vượt quá ngân sách gói/tick, phần dư bị
+`_admit_partition()` hoãn (`remaining_packets <= 0: break`) dù được xử
+lý đầu tiên — đây là nguyên nhân của 48/53 message control bị fresh→
+stale phát hiện ở Bước 7.
+
+**Fix đã implement (RED→GREEN, KHÔNG giữ lại)**: thêm
+`PredictiveAdmissionConfig.exempt_safety_control_from_packet_cap`
+(mặc định `True`), khiến tầng `safety_control` (index 0) gọi
+`_admit_partition()` với `remaining_packets=None` (không bị chặn bởi
+trần gói), còn ngân sách gói dùng chung vẫn bị trừ đúng số lượng nó
+thực sự dùng trước khi chuyển cho các tầng sau. RED test mới
+(`test_safety_control_not_deferred_by_shared_packet_cap` trong
+`tests/test_control_plane.py`) xác nhận hành vi cũ SAI (control bị
+hoãn khi 4 candidate control > 3 gói/tick), fix làm test GREEN. Full
+suite: 779 passed (không regression mới, cùng 8 lỗi pre-existing đã
+xác nhận từ trước không liên quan).
+
+**FACT — A/B thật N=2, cap=150, n=3 lần lặp, cùng seed (ns3_seed=42,
+ns3_run=1/2/3), cùng phương pháp Bước 7**:
+
+| Arm | packet_rows | delivery_pct | fresh_pct overall (mean) | control sent/delivered | control fresh_pct (mean) |
+|---|---|---|---|---|---|
+| A. predictive, KHÔNG cap (baseline Bước 5) | 440 | 96.82% | 79.17% (từ Bước 7) / thực đo lại: 78.4% [75.68,80.45,79.09] | 284/284 | **71.48%** [67.25,74.65,72.54] |
+| B. packet_aware cap=150, TRƯỚC fix (Bước 7) | 393 | 97.46% | 69.89% [70.74,67.94,70.99] | 284/284 | **61.85%** [63.03,59.15,63.38] |
+| C. packet_aware cap=150, SAU fix | 393 | 97.46% | 68.79% [66.16,69.72,70.48] | 284/284 | **60.28%** [56.70,61.62,62.68] |
+
+(degraded=False, sim_lag_s≈6.1-6.5s, ns3sim_cpu_pct≈0.74-0.95 ở cả 3
+arm — không có run nào bị loại vì suy giảm.)
+
+**FACT quan trọng nhất**: offline (mức sinh trace, tất định) — số
+candidate control admitted qua packet cap là **284/284 y hệt ở cả
+TRƯỚC và SAU fix**, và action breakdown TRƯỚC fix cũng đã là toàn bộ
+`send`/`send_compacted` (0 `defer`/`drop`) khi chạy lại với trace thật
+N=2/seed=13 — nghĩa là **kịch bản admission-time deferral mà fix nhắm
+tới (giả thuyết ban đầu) không thực sự xảy ra đủ nhiều trong trace thật
+này để giải thích 48/53 message bị mất fresh**. RED test chứng minh cơ
+chế deferral CÓ THẬT (ở input tổng hợp adversarial cụ thể), nhưng
+không phải cơ chế CHIẾM ƯU THẾ gây ra hiện tượng quan sát được trong
+live run.
+
+**RESULT — control fresh_pct paired diff (C − B) theo từng rep**: rep1
+−6.33pp, rep2 +2.45pp, rep3 −0.70pp → trung bình −1.53pp, không có
+hướng rõ ràng, nằm trong nhiễu run-to-run (fresh_pct vốn dao động
+±2-8pp giữa các rep dù packet_rows/delivery tất định tuyệt đối). Overall
+fresh_pct cũng không cải thiện (68.79% sau fix vs 69.89% trước fix, vẫn
+cách xa baseline không-cap 78.4%).
+
+**Đối chiếu 6 tiêu chí nghiệm thu user đặt ra**:
+1. Control fresh "phục hồi rõ ràng" — **KHÔNG ĐẠT** (60.28% sau fix vs
+   61.85% trước fix, cách xa baseline không-cap 71.48%; chênh lệch với
+   pre-fix nằm trong nhiễu, không phải cải thiện).
+2. Overall fresh phục hồi về gần/trên baseline ~79.2% — **KHÔNG ĐẠT**
+   (68.79%, cách baseline ~9.6pp, gần như không đổi so với trước fix).
+3. Packet cap vẫn kích hoạt thật — Đạt (393/440, giữ nguyên).
+4. Traffic ưu tiên thấp vẫn bị siết — Đạt (breakdown offline: 76 send/
+   36 defer/5 send_compacted/28 send_degraded/38 drop cho non-control,
+   không đổi).
+5. Fix không chỉ đơn giản tắt packet-aware — Đạt về mặt thiết kế,
+   nhưng vô nghĩa vì (1)(2) không đạt.
+6. Không regression traffic quan trọng ở tải bình thường (không cap) —
+   Không kiểm tra vì fix đã bị loại trước khi cần kiểm tra thêm.
+
+→ **2/6 tiêu chí đạt, 2 tiêu chí cốt lõi (1 và 2) KHÔNG đạt → REVERT
+theo đúng chỉ định của user ("nếu không đạt: revert, không tiếp tục
+chỉnh tham số mò").**
+
+**HYPOTHESIS cho nguyên nhân thật (CHƯA kiểm chứng, việc tiếp theo nếu
+muốn tiếp tục điều tra)**: vì packet cap có TỔNG SỐ GÓI THẤP HƠN
+(393 vs 440) nhưng fresh THẤP HƠN — ngược trực giác "ít gói hơn = ít
+tranh chấp airtime hơn = đến sớm hơn" — nguyên nhân nhiều khả năng
+KHÔNG nằm ở tầng admission (ai được admit khi nào) mà ở tầng THỜI ĐIỂM/
+NHỊP gửi thực tế trên kênh: cap có thể làm thay đổi phân bố theo tick
+của các gói ĐƯỢC admit (dồn cụm khác đi so với không-cap), hoặc tỷ lệ
+`send_compacted` cho non-control tăng lên làm thay đổi kích thước/thời
+điểm gói trên kênh theo cách gây nhiễu chéo (cross-traffic interference)
+tới đúng lúc control cần gửi — chưa đo trực tiếp, cần message-level
+diff theo THỜI GIAN GỬI THẬT (không chỉ theo admission) để xác nhận.
+Việc này CHƯA làm, vì user yêu cầu dừng lại và báo cáo khi 1 fix không
+đạt tiêu chí, không tiếp tục chỉnh mò.
+
+**Hành động**: revert sạch `fleetqox/control_plane.py` và
+`tests/test_control_plane.py` về đúng trạng thái commit `3be8846`
+(`git checkout -- ...`), xác nhận `git diff` rỗng, 39/39 test
+`test_control_plane.py` pass sau revert. Cấu hình hiện tại KHÔNG đổi so
+với sau Bước 7: predictive + fix Bước 5, không cap, là lựa chọn tốt
+nhất đã kiểm chứng.
+
+**File liên quan (không thuộc repo)**:
+`/tmp/.../scratchpad/step8_safety_control_fix_ab.py` (A/C live run),
+`/tmp/.../scratchpad/step8_recover_control_fate_a.py`,
+`/tmp/.../scratchpad/step8_recover_control_fate_b.py` (khôi phục
+control_fate cho arm A/B từ kết quả đã lưu, không chạy lại Docker/ns-3).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
