@@ -5955,6 +5955,73 @@ bằng trace ns-3: loại 2 giả thuyết, xác định nghẽn PHY thật là 
 nhân chính" và "KẾT LUẬN CHÍNH THỨC, khép lại nhánh điều tra
 16-robot-scale" (cả hai 11/09/2026).
 
+### 16/09/2026 — Đo chính xác traffic nào đẩy mạng qua điểm bão hòa + A/B 1 thay đổi nhỏ (KHÔNG đụng optimizer): kết quả CHƯA ĐỦ BẰNG CHỨNG
+
+Theo đúng chỉ đạo: "đừng sửa optimizer ngay, đo chính xác traffic nào đẩy
+mạng qua điểm bão hòa, tạo một thay đổi nhỏ, A/B test, chỉ giữ nếu số
+liệu chứng minh delivery thực sự tăng."
+
+**Đo (offline, không cần Docker/ns-3, phân tích trực tiếp trace đã sinh
+ra)**: trace fifo N=16 seed=13 có 2289 gói, trong đó **1626 gói (71%) là
+`flow_class="control"`**, payload chỉ 96 byte/gói — tổng cộng chỉ
+~156KB, RẤT nhỏ so với ngân sách byte 600KB/3s (`capacity_bytes_per_second
+=max(200_000, robots*6_000)`). Nhưng về SỐ LƯỢNG: cả 150/150 tick trong
+cửa sổ gửi 3 giây đều có traffic, với **15-23 gói từ 5-11 nguồn (robot)
+khác nhau tranh chấp trong CÙNG 1 tick 20ms** kể cả ở tick "bình thường"
+(không chỉ tick đỉnh). Cộng thêm bằng chứng đã có: giữa sim t=5 (đóng cửa
+sổ gửi) và t=10 (drain thuần, KHÔNG có traffic ứng dụng mới),
+`mac_tx_large` nhảy từ 23→1057 trong khi `mac_tx_small` chỉ 172→353 — một
+đợt bùng nổ MAC-retry của DATA FRAME THẬT, không phải traffic mới. Kết
+luận đo: **`control` là traffic chi phối bằng SỐ LƯỢNG GÓI (không phải
+byte) — đúng góc mù mà user đã chỉ ra: FleetQoX định giá theo byte, Wi-Fi
+định giá theo số lần truyền + mức độ tranh chấp**.
+
+**Thay đổi nhỏ (KHÔNG đụng `fleetqox/control_plane.py`)**: thêm hook
+`event_filter` (diagnostic-only, mặc định `None` = không đổi hành vi cũ)
+vào `run_probe()` — áp dụng NGAY SAU `generate_trace_events()`, TRƯỚC khi
+ghi CSV. Dùng hook này để giảm MỘT NỬA tần suất gửi `control`-class của
+MỖI robot (giữ 1/2 số gói theo thứ tự, mỗi nguồn tính riêng) — 2289→1476
+gói tổng (control: 1626→813), các class khác giữ nguyên 100%.
+
+**A/B test thật, fifo N=16, cùng seed=13/ns3_seed=42, ns3_run ghép cặp
+1/2/3, n=3/nhánh**:
+
+| Nhánh | packet_rows | delivery_pct (3 lần) | mean | stdev |
+|---|---|---|---|---|
+| baseline (không đổi) | 2289 | 28.0 / 35.5 / 32.5 | **32.0%** | 3.76 |
+| control_halved | 1476 | 36.6 / 31.9 / 37.9 | **35.5%** | 3.14 |
+
+Chênh lệch trung bình: **+3.5 điểm %** theo hướng ĐÚNG giả thuyết (giảm
+control-class → delivery tăng). NHƯNG: độ lệch chuẩn mỗi nhánh (~3.1-3.8pp)
+xấp xỉ CHÍNH chênh lệch trung bình quan sát được, và khoảng giá trị 2
+nhánh CHỒNG LẤN đáng kể (baseline max=35.5% ngang bằng control_halved
+mean=35.5%; control_halved min=31.9% nằm trong khoảng baseline). Ở n=3,
+đây KHÔNG đủ để kết luận có ý nghĩa thống kê — sai số chuẩn (SE≈std/√3≈
+1.8-2.2pp) khiến chênh lệch quan sát chỉ tương đương ~1.7 SE, dưới
+ngưỡng thường dùng để coi là "khác biệt thật" (thường cần ≥2 SE).
+
+**Kết luận trung thực theo đúng tiêu chí user đặt ra ("chỉ giữ nếu số
+liệu chứng minh delivery thực sự tăng")**: **CHƯA ĐỦ BẰNG CHỨNG để giữ**
+— hướng đi ĐÚNG về mặt lý thuyết (khớp cơ chế đã đo), có tín hiệu
+THUẬN CHIỀU, nhưng n=3 không tách được tín hiệu khỏi nhiễu nền đã biết
+của chính harness này (đã ghi nhận ở mục trước: dao động ~9pp giữa các
+lần chạy hệt nhau). CHƯA kết luận là thay đổi này có tác dụng thật hay
+không — cần MỘT trong hai hướng trước khi quyết định giữ/bỏ: (a) tăng n
+lên đáng kể (ví dụ n=10+/nhánh) để tách nhiễu, hoặc (b) thử mức cắt giảm
+MẠNH hơn (ví dụ còn 1/4 thay vì 1/2 control-class) để xem hiệu ứng có đủ
+lớn vượt hẳn nhiễu nền hay không, trước khi đầu tư vào n lớn cho đúng
+mức cắt giảm.
+
+**Trạng thái**: đo traffic chi phối XONG (control-class, bằng số lượng
+không phải byte — có bằng chứng vững). Thay đổi nhỏ đã A/B test XONG
+nhưng kết quả CHƯA ĐỦ BẰNG CHỨNG để khẳng định — đúng tinh thần "chưa
+chứng minh được thì chưa giữ", KHÔNG tự ý coi n=3 thuận chiều là đủ.
+
+**File liên quan**: `scripts/run_ns3_docker_container_fleet_probe.py`
+(`event_filter` param mới, diagnostic-only); kết quả thô tại
+`/tmp/.../scratchpad/bang_control_class_halved_ab_n3.jsonl` (không thuộc
+repo).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và

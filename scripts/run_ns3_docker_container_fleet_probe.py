@@ -67,7 +67,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -1478,7 +1478,18 @@ def run_probe(
     discovery_mode: str = "default",
     capacity_packets_per_second: int | None = None,
     capacity_airtime_ns_per_second: int | None = None,
+    event_filter: Callable[[list[dict[str, Any]]], list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
+    # event_filter is a DIAGNOSTIC-ONLY hook (not a paper-facing feature):
+    # lets an experiment reshape the trace-generation OUTPUT (e.g. drop a
+    # fraction of one flow_class's packets) before it's written to the CSV
+    # replayed by the real containers/ns-3, WITHOUT touching
+    # fleetqox/control_plane.py or the shared workload generator that every
+    # other published Bảng IV/V/VI number depends on. Default None leaves
+    # every existing caller's behavior byte-for-byte unchanged. See
+    # docs/AUDIT_ACCEPTANCE_TRACKING.md 16/09/2026 "đo traffic nào đẩy
+    # mạng qua điểm bão hòa" for the investigation this was added for.
+    #
     # capacity_airtime_ns_per_second default (None = no cap) preserves
     # existing behavior; when set, only PredictiveAdmissionController
     # enforces it (fifo/static_priority ignore it, staying a stable
@@ -1522,6 +1533,8 @@ def run_probe(
         include_non_sent=False,
         merge_control_station=True,
     )
+    if event_filter is not None:
+        events = event_filter(events)
     packet_rows = write_simulator_csv(events, trace_path)
     trace_container_path = f"/work/{trace_path.relative_to(ROOT)}"
 
