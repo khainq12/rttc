@@ -6740,6 +6740,89 @@ lặp partition trong `schedule()`), `tests/test_trace_export.py`
 thô tại `/tmp/.../scratchpad/step5_message_diff.py`,
 `/tmp/.../scratchpad/step5_message_diff_result.json` (không thuộc repo).
 
+### 16/09/2026 (tiếp) — Bước 6-7: N=3-6 KHÔNG tất định như N=2 (CPU đã bão hòa); tìm pressure thật bằng packet-cap tại N=2; packet-aware BỊ BÁC BỎ vì phá deadline control-class
+
+**Bước 6 — thử tăng N (3-7) để tạo pressure**: sweep fifo tại N=3..7 cho
+thấy CPU của `ns3sim` đã **bão hòa >100% ngay từ N=3** dù `degraded=False`
+(chưa vượt ngưỡng `sim_lag_s`). Bằng chứng trực tiếp N=3 KHÔNG tất định:
+đúng 1 cấu hình (fifo, N=3, seed=13, ns3_seed=42, ns3_run=1) chạy 2 lần
+riêng biệt cho ra **519 và 523 message giao được** — khác nhau. So sánh
+thống kê 3 lần lặp (ns3_run=1/2/3): fifo=79.89%±0.49, predictive=79.64%
+±0.15, packet_aware=79.74%±0.18 delivery — Welch t=0.85, KHÔNG có ý
+nghĩa thống kê. **Kết luận: tăng N để tạo pressure làm mất luôn tính
+tất định cần cho message-level diff chính xác — N=3+ không dùng được
+theo cách này.**
+
+**Bước 7 — pivot theo đề xuất user: giữ N=2 (đã xác nhận tất định), hạ
+`capacity_packets_per_second` xuống DƯỚI tốc độ tự nhiên của N=2 để cap
+thực sự kích hoạt mà không cần tăng N**. Sweep offline: cap≤250 bắt đầu
+bó buộc (440→431), cap=150 bó buộc rõ (440→393, giảm ~11%). Chọn
+cap=150 làm "packet_aware" mới cho thí nghiệm này.
+
+**A/B thật N=2, cap=150, n=3 lần lặp (ns3_run=1/2/3) — packet_rows/degraded
+TẤT ĐỊNH tuyệt đối, chỉ fresh_pct dao động nhẹ**:
+
+| Arm | packet_rows | delivery_pct | fresh_pct (mean±sd) |
+|---|---|---|---|
+| fifo (không cap) | 440 | 96.82% | 74.24% ± 7.44 |
+| predictive (không cap, ĐÃ có fix Bước 5) | 440 | 96.82% | **79.17% ± 2.50** |
+| packet_aware (predictive + cap=150) | 393 | **97.46%** | **69.89% ± 1.69** |
+
+predictive (không cap) vs packet_aware: diff=9.28pp fresh, **t=5.32 —
+có ý nghĩa thống kê rõ ràng**. packet_aware có raw delivery CAO HƠN
+(ít gói hơn → ít tranh chấp hơn) nhưng **fresh THẤP HƠN** — đúng bài
+học "raw delivery tăng không có nghĩa fresh tăng" đã rút ra nhiều lần
+trong investigation này.
+
+**Message-level diff tìm đúng cơ chế**: trong 53 message "chuyển từ
+fresh → không fresh" khi bật cap, **48/53 (91%) là class `control`**
+(lệnh điều khiển robot, `deadline_ms=45` — CHẶT NHẤT trong toàn bộ hệ
+thống, xử lý ĐẦU TIÊN trong `_ordered_partitions()`'s tầng
+`safety_control`). Tất cả đều VẪN ĐƯỢC GIAO (`received=True`) — không
+hề bị drop — nhưng trễ hạn.
+
+**Nguyên nhân**: `remaining_packets` (ngân sách packet-cap) là **MỘT
+NGÂN SÁCH DÙNG CHUNG CHO MỌI TẦNG ƯU TIÊN trong cùng 1 tick** (3 gói/
+tick ở cap=150pps÷50), KHÔNG có phần dành riêng cho `safety_control`.
+Dù control được xử lý TRƯỚC các tầng khác trong thứ tự partition, nếu
+số candidate control trong 1 tick bận (nhiều robot cùng gửi lệnh gần
+nhau) vượt quá 3 gói/tick, một số bị đẩy sang tick sau — dù được ưu
+tiên tuyệt đối về THỨ TỰ, chúng vẫn cạnh tranh về SỐ LƯỢNG SLOT với
+CHÍNH CÁC CANDIDATE CONTROL KHÁC. Với deadline chỉ 45ms, trễ 1-2 tick
+(20-40ms) là đủ phá hạn.
+
+**KẾT LUẬN — packet-aware admission (cơ chế `capacity_packets_per_second`
+hiện tại) BỊ BÁC BỎ cho N=2, cap=150**: dù cải thiện raw delivery, nó
+LÀM HẠI fresh delivery của chính lớp traffic quan trọng nhất (control,
+an toàn/điều khiển) — ngân sách packet dùng chung không bảo vệ được
+THỜI ĐIỂM admit của traffic ưu tiên cao, chỉ bảo vệ việc nó CUỐI CÙNG
+có được admit hay không. Đúng tiêu chí user đặt ra ("chỉ giữ nếu... không
+chỉ giảm bytes/packets nhưng delivery không tăng, HOẶC delivery tăng
+nhưng...xấu đi") — ở đây fresh (chỉ số quan trọng hơn) xấu đi rõ ràng,
+nên **KHÔNG áp dụng packet-aware admission trong cấu hình này**. Cấu
+hình tốt nhất hiện tại vẫn là **predictive với fix Bước 5, KHÔNG cap**
+(đã thắng/hòa fifo ở cả N=2 lẫn N=3, không có nhược điểm nào phát hiện
+được).
+
+**Hướng khả thi nếu muốn cứu packet-aware (CHƯA làm, cần quyết định)**:
+dành ngân sách packet RIÊNG cho tầng `safety_control` (không dùng
+chung với các tầng thấp hơn) — một thay đổi có phạm vi hẹp hơn, tương
+tự cách `remaining_tier_capacity_fraction` đã làm cho tầng "remaining"
+ở Bước 5, nhưng theo hướng NGƯỢC LẠI (bảo vệ tầng cao nhất thay vì siết
+tầng thấp nhất). Không tự ý làm vì "Không sửa packet cap... trong bước
+này" đã được user chỉ định.
+
+**Trạng thái**: Bước 6-7 HOÀN THÀNH. Phát hiện quan trọng về giới hạn
+phương pháp (N≥3 không tất định) VÀ phát hiện cơ chế chính xác packet-
+cap phá deadline control-class. Cấu hình đang giữ: predictive + fix
+Bước 5, không cap — chưa có bằng chứng nào cho thấy cần thay đổi thêm ở
+N=2/N=3.
+
+**File liên quan**: không có thay đổi code (chỉ đo đạc); kết quả thô tại
+`/tmp/.../scratchpad/step6_find_pressured_n.py`,
+`/tmp/.../scratchpad/step6_message_diff_n3.py`,
+`/tmp/.../scratchpad/step7_packet_aware_diff.py` (không thuộc repo).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
