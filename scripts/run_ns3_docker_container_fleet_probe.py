@@ -97,6 +97,12 @@ NS3_ATTACH_WAIT_S = 3
 # latency is meaningfully higher and more variable across runs.
 READY_DEADLINE_S = 60
 CONTAINER_PREFIX = "fleetqox_ref"
+# Must match fleetqox_trace_replay_tap.cc's PrintWifiStats() reschedule
+# period (Simulator::Schedule(Seconds(5.0), ...)) exactly -- used to size
+# the margin added on top of WIFI_STATS_TARGET_S so a qualifying snapshot
+# is guaranteed to exist by the time the log is read (see
+# _wifi_stats_target_s()/parse_wifi_stats()).
+WIFI_STATS_PRINT_PERIOD_S = 5.0
 
 
 def endpoint_list(num_robots: int) -> list[str]:
@@ -278,6 +284,62 @@ def compute_graph_join_failures(endpoint_results: dict[str, Any]) -> dict[str, A
         "failure_rate": failures / total_with_beacon,
         "per_endpoint": per_endpoint,
     }
+
+
+def wifi_stats_target_s(*, start_offset_ms: float, seconds: int, drain_s: float) -> float:
+    """Simulated-time point by which every endpoint's scheduled send loop
+    AND its drain window are guaranteed complete -- see
+    fleetqox_rmw_trace_endpoint.py's own send loop (sleeps to
+    start_offset_ms + each row's scheduled offset, then drains for
+    drain_s). Used as the snapshot target for parse_wifi_stats() so every
+    run reads a MAC/PHY counter snapshot from the same point in the
+    workload's own timeline, instead of whatever snapshot happened to be
+    the last one printed before the orchestrator noticed completion and
+    killed the process (see docs/AUDIT_ACCEPTANCE_TRACKING.md 15/09/2026
+    "XÁC ĐỊNH ĐƯỢC NGUỒN GỐC nhiễu nền" for the root-cause investigation
+    this fixes)."""
+    return start_offset_ms / 1000.0 + max(seconds, 1) + drain_s
+
+
+def parse_wifi_stats(ns3_log: str, target_sim_time_s: float) -> dict[str, Any] | None:
+    """Pick a single FLEETQOX_WIFI_STATS snapshot by SIMULATED elapsed time
+    (sim_time_s, printed by fleetqox_trace_replay_tap.cc's PrintWifiStats())
+    rather than blindly taking the last line in the log. The counters are
+    cumulative atomics that never reset between the periodic (every 5
+    simulated/real seconds, since this program requires
+    ns3::RealtimeSimulatorImpl) prints, so "last line" silently encodes
+    however many real wall-clock seconds happened to elapse before the
+    orchestrator's completion-polling noticed and killed the process --
+    that count varies run to run from ordinary host scheduling jitter,
+    which is what made mac_tx_total/etc. swing ~79% across otherwise
+    byte-identical reruns (see docs/AUDIT_ACCEPTANCE_TRACKING.md
+    15/09/2026). Selecting the FIRST snapshot at or after a fixed target
+    (derived from the workload's own known schedule via
+    wifi_stats_target_s(), not from real time) makes the selected window
+    consistent across runs, PROVIDED the caller also ensures enough real
+    time has actually elapsed before reading the log (run_probe() does
+    this by sleeping the remainder of wifi_stats_target_s() +
+    WIFI_STATS_PRINT_PERIOD_S past ns-3's start if wait_for_completion()
+    returned early). Falls back to the last available line (with
+    degraded=True) if no line reaches the target -- should not happen
+    when the caller has waited long enough, but better than raising."""
+    lines = [line for line in ns3_log.splitlines() if "FLEETQOX_WIFI_STATS" in line]
+    if not lines:
+        return None
+    parsed: list[dict[str, Any]] = []
+    for line in lines:
+        json_part = line.split("FLEETQOX_WIFI_STATS", 1)[1].strip()
+        json_part = json_part.replace(",]", "]").replace(",}", "}")
+        try:
+            parsed.append(json.loads(json_part))
+        except json.JSONDecodeError:
+            continue
+    if not parsed:
+        return None
+    for snapshot in parsed:
+        if snapshot.get("sim_time_s", 0.0) >= target_sim_time_s:
+            return snapshot
+    return {**parsed[-1], "degraded_no_snapshot_reached_target": True}
 
 
 def compute_coordination_metrics(endpoint_results: dict[str, Any]) -> dict[str, Any]:
@@ -1485,10 +1547,16 @@ def run_probe(
     ns3_log_text = ""
     discovery_bytes_ftap0: int | None = None
     resource_usage: dict[str, dict[str, float]] = {}
+    wifi_stats: dict[str, Any] | None = None
     try:
         probe.start_containers()
         probe.build_ns3_binary()
         probe.wire_network()
+        # Recorded right before launch so the elapsed-time check below is
+        # conservative (a few seconds of container-exec/attach overhead
+        # included) rather than risking an early read -- see
+        # wifi_stats_target_s()/parse_wifi_stats().
+        ns3_start_wall = time.monotonic()
         probe.start_ns3(
             sim_duration_s=sim_duration_s,
             num_aps=num_aps,
@@ -1547,7 +1615,25 @@ def run_probe(
             results_dir_container=results_dir_container,
         )
         endpoint_results = probe.collect_results(results_dir_container)
+        # wait_for_completion() above returns as soon as every endpoint's
+        # result file appears, which can be well before enough SIMULATED
+        # (~= real, since this is RealtimeSimulatorImpl) time has passed
+        # for a FLEETQOX_WIFI_STATS snapshot at/after stats_target_s to
+        # have been printed yet -- top up the wait so parse_wifi_stats()
+        # below always has a qualifying line to pick, instead of silently
+        # falling back to whatever was last printed (see
+        # wifi_stats_target_s()'s docstring for why that varies run to
+        # run).
+        stats_target_s = wifi_stats_target_s(
+            start_offset_ms=start_offset_ms, seconds=seconds, drain_s=drain_s
+        )
+        remaining_wait_s = (
+            stats_target_s + WIFI_STATS_PRINT_PERIOD_S - (time.monotonic() - ns3_start_wall)
+        )
+        if remaining_wait_s > 0:
+            time.sleep(remaining_wait_s)
         ns3_log_text = probe.ns3_log()
+        wifi_stats = parse_wifi_stats(ns3_log_text, stats_target_s)
     except Exception as exc:  # noqa: BLE001 -- report to caller, don't hide the traceback
         status = "failed"
         error_text = str(exc)
@@ -1580,6 +1666,7 @@ def run_probe(
             endpoint_results.get(endpoint) is not None for endpoint in endpoints
         ),
         "ns3_log": ns3_log_text,
+        "wifi_stats": wifi_stats,
         "latency_stats_ms": compute_latency_stats_ms(endpoint_results),
         "jitter_stale_repair_stats": compute_jitter_stale_repair_stats(endpoint_results),
         "discovery_bytes_ftap0": discovery_bytes_ftap0,

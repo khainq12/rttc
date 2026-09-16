@@ -5862,6 +5862,99 @@ dùng chọn hướng khắc phục (a)/(b)/(c) trước khi tiếp tục bất 
 `/tmp/.../scratchpad/noise_floor_repeat_same_config.jsonl` (không thuộc
 repo).
 
+### 15-16/09/2026 (tiếp) — Đã cài fix (c), nhưng phát hiện: đồng hồ mô phỏng ns-3 TỰ TỤT LẠI phía sau wall-clock — VÀ đây CHÍNH LÀ hiện tượng "shared-medium saturation" đã kết luận chính thức từ 11/09/2026
+
+**Đã cài đặt hướng (c)** theo yêu cầu người dùng ("sửa cách xác định
+measurement window/thu thập thống kê"):
+- `external/ns3/fleetqox_trace_replay_tap.cc`: thêm field `sim_time_s`
+  (`Simulator::Now().GetSeconds()`) vào mỗi dòng `FLEETQOX_WIFI_STATS`.
+  KHÔNG cần rebuild image — file này được g++ compile lại từ source mỗi
+  lần `build_ns3_binary()` chạy (bind-mount, không bake sẵn trong image).
+- `scripts/run_ns3_docker_container_fleet_probe.py`: thêm
+  `wifi_stats_target_s()` (mốc thời gian mô phỏng mà lịch trình workload
+  ĐÃ BIẾT trước — `start_offset_ms/1000 + seconds + drain_s` — chắc chắn
+  hoàn tất), `parse_wifi_stats()` (chọn snapshot ĐẦU TIÊN có
+  `sim_time_s >= target`, không phải "dòng cuối"), và trong `run_probe()`
+  đảm bảo đợi đủ real-time tương ứng trước khi đọc log nếu
+  `wait_for_completion()` trả về sớm hơn. Field mới `wifi_stats` được
+  thêm vào dict trả về của `run_probe()`. `py_compile` sạch, 30/30 test
+  `test_ns3_docker_container_fleet_probe.py` pass.
+
+**Kiểm chứng phát hiện fix KHÔNG đủ**: chạy lại đúng bài test 3 lần
+giống hệt nhau (fifo, N=16, ns3_seed=42, ns3_run=1 cố định). Cả 3 lần
+đều báo `degraded_no_snapshot_reached_target: true`, `sim_time_s` dừng
+đúng ở **10** (target là 15) — nghĩa là snapshot ở t=15s CHƯA BAO GIỜ
+được in ra trong cả 3 lần. Debug thêm bằng timing tức thời: một lần chạy
+đã đợi tới **25.7 giây thời gian THẬT** kể từ khi ns-3 khởi động (hơn cả
+target+margin=20s) mà đồng hồ MÔ PHỎNG vẫn kẹt ở t=10 — chứng minh đây
+không phải "chưa đợi đủ lâu" mà là **đồng hồ mô phỏng đã tụt lại phía
+sau wall-clock và không đuổi kịp nữa trong bất kỳ khoảng thời gian thực
+nào đã thử**.
+
+**Bằng chứng đây KHÔNG phải bug mới, mà là hiện tượng đã kết luận chính
+thức trước đó**: giữa 2 snapshot t=5 và t=10 của đúng lần chạy debug,
+`mac_tx_large` (frame >100 byte, dùng để phân biệt data frame thật với
+frame ARP/control nhỏ — cơ chế counter này đã có sẵn từ điều tra
+11/09/2026) nhảy từ 23 → 1057 (**+1034 trong 5 giây mô phỏng**), trong
+khi `mac_tx_small` chỉ tăng nhẹ 172 → 353 (+181) — tức đợt bùng nổ chủ
+yếu là DATA FRAME THẬT bị BUFFER/MAC RETRY liên tục, không phải một đợt
+"ARP storm". Điều này khớp CHÍNH XÁC với kết luận chính thức đã có (mục
+"KẾT LUẬN CHÍNH THỨC, khép lại nhánh điều tra 16-robot-scale", đã được
+ChatGPT Plus review): ở quy mô 16-robot/19-endpoint, 7 can thiệp middleware
+độc lập (fix retry EHOSTUNREACH, giảm graph-renewal traffic, multi-AP,
+cô lập dominant sender, discovery event-driven, data-plane routing theo
+subscription, kéo dài discovery-convergence) đều đã được thử và đều
+KHÔNG cải thiện được delivery đầu-cuối — nguyên nhân chi phối là kênh
+802.11g dùng chung BÃO HÒA THẬT (PHY drop 82% là `BUSY_DECODING_PREAMBLE`+
+`PREAMBLE_DETECT_FAILURE`, dấu hiệu kinh điển của xung đột preamble vật
+lý), không phải một lỗi phần mềm còn sót lại.
+
+Một khi kênh rơi vào chế độ bão hòa/tranh chấp này, số lượng sự kiện MAC
+retry/collision cần xử lý bùng nổ theo cấp số nhân — dưới
+`RealtimeSimulatorImpl` (bắt buộc với TapBridge), nếu tốc độ SINH sự
+kiện mới (retry) vượt tốc độ CPU xử lý được, đồng hồ mô phỏng sẽ tụt lại
+phía sau wall-clock và có thể KHÔNG BAO GIỜ đuổi kịp trong bất kỳ khoảng
+thời gian thực hữu hạn nào — chính xác là điều quan sát được (kẹt ở
+t=10 dù đã đợi 25.7s thật).
+
+**Kết luận cho câu hỏi "điều tra tận gốc"**: gốc rễ của hiện tượng này
+ĐÃ được xác định và kết luận CHÍNH THỨC từ 11/09/2026 (không phải phát
+hiện mới) — đây là bão hòa kênh 802.11g đơn-AP thật ở quy mô N≥16, một
+giới hạn VẬT LÝ của topology/PHY hiện dùng cho workload đã đánh giá,
+không phải bug ARP hay bug middleware. Hệ quả trực tiếp cho hướng
+"sửa measurement window" đang làm: **không thể sửa được bằng cách đợi
+lâu hơn hay chọn mốc thời gian khác** — một khi rơi vào bão hòa, hệ
+thống có thể kẹt vĩnh viễn ở một mốc mô phỏng bất kỳ tuỳ theo diễn biến
+tranh chấp cụ thể của lần chạy đó (đây CHÍNH LÀ nguồn gốc sâu xa của
+nhiễu run-to-run, không chỉ là do "dòng log cuối cùng bắt được ngẫu
+nhiên" như phát hiện ban đầu).
+
+**Hàm ý cho toàn bộ chuỗi so sánh fifo/predictive/packet-cap/airtime-cap
+đã làm trong phiên này**: tất cả đều đo ở N=16 trên topology 1-AP
+802.11g đã biết là VẬN HÀNH TRONG VÙNG BÃO HÒA VẬT LÝ THẬT — không phải
+vùng "gần bão hòa nhưng còn dư địa mượt". Động lực va chạm/backoff gần
+điểm bão hòa vốn dĩ HỖN LOẠN (nhạy với nhiễu loạn nhỏ về thời điểm) —
+nghĩa là một phần nhiễu quan sát được không phải lỗi đo đạc có thể sửa
+triệt để, mà là TÍNH CHẤT VẬT LÝ THẬT của hệ thống đang được đo ở điểm
+vận hành này. Cơ chế `sim_time_s`/`parse_wifi_stats()` vừa cài vẫn có
+giá trị (sửa đúng lỗi "dòng cuối ngẫu nhiên" ở NHỮNG trường hợp không
+rơi vào bão hòa, và tự động báo `degraded_no_snapshot_reached_target`
+khi rơi vào bão hòa thay vì âm thầm trả số liệu sai lệch) — nhưng KHÔNG
+đủ để loại bỏ hết nhiễu ở N=16. Hướng còn lại phù hợp nhất (khớp với
+"bước tiếp theo đã thống nhất với ChatGPT" từ 11/09/2026, vẫn CHƯA làm):
+tăng n đáng kể + báo cáo khoảng tin cậy cho MỌI so sánh ở quy mô/topology
+này, hoặc thử nghiệm ở năng lực kênh cao hơn (đa AP qua backbone có dây
+thật, hoặc chuẩn 802.11 băng thông rộng hơn) để thoát khỏi vùng bão hòa
+trước khi so sánh policy.
+
+**File liên quan**: `external/ns3/fleetqox_trace_replay_tap.cc` (field
+`sim_time_s` mới), `scripts/run_ns3_docker_container_fleet_probe.py`
+(`wifi_stats_target_s`, `parse_wifi_stats`, `wifi_stats` field mới);
+tham chiếu bằng chứng gốc đã có từ trước tại chính file này, mục "Đào
+bằng trace ns-3: loại 2 giả thuyết, xác định nghẽn PHY thật là nguyên
+nhân chính" và "KẾT LUẬN CHÍNH THỨC, khép lại nhánh điều tra
+16-robot-scale" (cả hai 11/09/2026).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và

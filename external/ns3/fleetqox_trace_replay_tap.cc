@@ -253,7 +253,14 @@ PrintWifiStats(uint32_t totalStations, uint32_t numAps)
   // realtime simulator's wall clock, so "every 5s" really is every 5
   // real seconds).
   Simulator::Schedule(Seconds(5.0), &PrintWifiStats, totalStations, numAps);
+  // sim_time_s lets the orchestrator pick a snapshot by SIMULATED elapsed
+  // time instead of blindly taking "whichever line happened to be last
+  // before the process got killed" -- the latter varies run-to-run purely
+  // from real wall-clock scheduling jitter around when the orchestrator
+  // notices completion (see docs/AUDIT_ACCEPTANCE_TRACKING.md 15/09/2026
+  // "XÁC ĐỊNH ĐƯỢC NGUỒN GỐC nhiễu nền").
   std::cout << "FLEETQOX_WIFI_STATS {"
+            << "\"sim_time_s\":" << Simulator::Now().GetSeconds() << ","
             << "\"total_stations\":" << totalStations << ","
             << "\"num_aps\":" << numAps << ","
             << "\"associated_stations\":" << g_associatedStaCount.load() << ","
