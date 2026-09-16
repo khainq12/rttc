@@ -6360,6 +6360,108 @@ sửa, dòng ~502 và ~530 cũ); kết quả thô tại
 `/tmp/.../scratchpad/latency_floor_ab_after_spinfix.jsonl` (không thuộc
 repo).
 
+### 16/09/2026 (tiếp) — Bước 2: profile CPU thật của ns-3 khi sim bắt đầu tụt lại ở N=16 (gdb sampling, KHÔNG đoán trước)
+
+Theo đúng chỉ đạo: "Không đoán cách sửa trước. Profile ns-3 lúc nó bắt
+đầu tụt."
+
+**`perf` KHÔNG dùng được**: host có `perf_event_paranoid=4` (chặn hoàn
+toàn), VÀ container runtime thực tế chạy kernel `6.12.76-linuxkit` (VM
+kernel kiểu Docker Desktop) — không có gói `perf` nào khớp kernel này
+qua apt. Bỏ hướng này thay vì cố ép (tốn thời gian, rủi ro cao).
+
+**Chuyển sang `gdb -p <pid> -batch -ex "bt"` làm sampling profiler
+"nghèo"**: xác nhận `ptrace` được phép trong container (khác `perf`).
+2 trở ngại gặp phải và cách xử lý:
+1. `fleetqox_tap_bridge` compile KHÔNG có `-g` — gdb đoán tên hàm SAI
+   HOÀN TOÀN khi thiếu debug symbol (xác nhận qua test tay: 1 process
+   `sleep` đơn giản mà gdb trả về tên hàm vô nghĩa như
+   `create_token_tree`, `derivation_compare`). Fix: build lại binary CHỈ
+   cho lần profile này với `-g -O1` (monkey-patch trong script chẩn
+   đoán, KHÔNG sửa `build_ns3_binary()` thật trong repo).
+2. Container `ns3sim` chạy với `--network=none` (thiết kế có chủ đích,
+   mạng thật chỉ đến qua TAP sau này) → `apt-get install gdb` không tải
+   được lúc runtime. Fix: `docker commit` một image phụ
+   `jazzy-gdb-diag` (cài `gdb` sẵn khi container CHƯA mất mạng), dùng
+   image đó CHỈ cho chẩn đoán này qua tham số `image=` sẵn có của
+   `run_probe()` — không đụng image production `jazzy`.
+3. (Phát hiện thêm) `pgrep -f fleetqox_tap_bridge` khớp NHẦM vào chính
+   process bash bao ngoài (`bash -lc '...fleetqox_tap_bridge...'`), gdb
+   trace nhầm vào bash đang `wait4()` con nó. Fix: đổi sang
+   `pgrep -x fleetqox_tap_br` (khớp đúng tên process thật, bị cắt còn 15
+   ký tự theo giới hạn `comm` của Linux).
+
+**Kết quả (30 mẫu, 1 mẫu/giây, N=16 fifo seed=13/ns3_seed=42/ns3_run=1)**:
+
+- **t=1-9s (9/9 mẫu)**: TOÀN BỘ đều ở
+  `WallClockSynchronizer::SleepWait → DoSynchronize → ProcessOneEvent`
+  — nghĩa là sim ĐANG RẢNH, chờ đúng lịch, bắt kịp wall-clock hoàn hảo.
+- **t=10s trở đi (21/21 mẫu còn lại)**: KHÔNG BAO GIỜ quay lại trạng
+  thái rảnh nữa trong suốt 20 giây còn lại đo được — khớp CHÍNH XÁC với
+  phát hiện thực nghiệm trước đó (sim luôn kẹt quanh t=10, không đuổi
+  kịp trong bất kỳ khoảng real-time nào đã thử).
+
+**Phân loại 21 mẫu "đang bận" theo nhóm chức năng** (một số mẫu chồng
+lấn 2 nhóm, đếm theo frame chi phối):
+| Nhóm | Số mẫu | Ví dụ hàm |
+|---|---|---|
+| **PHY receive/CCA/preamble-detection state machine** | **6/21 (29%)** | `PhyEntity::Start/EndReceiveField`, `StartPreambleDetectionPeriod`, `WifiPhyStateHelper::SwitchMaybeToCcaBusy` |
+| **InterferenceHelper (SNR/PER/noise, toán học giao thoa PHY)** | **3/21 (14%)** | `CalculatePhyHeaderSnrPer`, `CalculateNoiseInterferenceW`, `CalculateChunkSuccessRate` |
+| Event scheduler bookkeeping (chèn vào hàng đợi sự kiện) | 4/21 (19%) | `MapScheduler::Insert` (red-black tree), `RealtimeSimulatorImpl::Schedule` |
+| malloc/free ngay tại đỉnh stack (cấp phát bộ nhớ cho EventId/Callback) | 3/21 (14%) | `_int_malloc`, `_int_free` bên trong tạo `EventId`/`Callback` |
+| MAC channel-access/backoff/queue | 3/21 (14%) | `ChannelAccessManager::UpdateBackoff`, `WifiMacQueue::DoDequeue`, `ApWifiMac::Receive` |
+| TapBridge I/O (ghi gói ra tap device thật) | 2/21 (10%) | `TapBridge::ReceiveFromBridgedDevice` → `libc_write` |
+
+**KẾT LUẬN Bước 2 (bằng chứng trực tiếp, không suy đoán)**: CPU trong
+giai đoạn kẹt bị chi phối bởi **mô phỏng PHY-layer THẬT** (trạng thái
+CCA/preamble-detection + toán SNR/PER/giao thoa của `InterferenceHelper`
+— tổng 9/21 ≈ 43%), **KHÔNG PHẢI** chủ yếu do TapBridge I/O (chỉ 2/21 ≈
+10%) và **KHÔNG PHẢI** chủ yếu do MAC-retry/backoff bookkeeping riêng lẻ
+(3/21 ≈ 14%, có thật nhưng không chi phối). Một phần đáng kể (event
+scheduler + malloc/free, 7/21 ≈ 33% cộng lại) là overhead PHỤ TRỢ của
+kiến trúc discrete-event (tạo/lên lịch `EventId`/`Callback` cho mỗi sự
+kiện PHY mới) — overhead này TỰ PHÌNH TO khi backlog phình to (mỗi sự
+kiện PHY chồng chéo cần tính giao thoa với MỌI sự kiện khác đang hoạt
+động, và mỗi lần tính lại cần cấp phát + lên lịch sự kiện mới), tạo
+vòng xoáy tự củng cố: càng nhiều trạm tranh chấp → càng nhiều sự kiện
+PHY chồng chéo cần tính giao thoa → càng nhiều cấp phát/lên lịch → càng
+chậm → càng dồn backlog.
+
+**Ý nghĩa quan trọng nhất**: đây là chi phí TÍNH TOÁN THẬT của việc mô
+phỏng chính xác giao thoa PHY 802.11 khi nhiều trạm cùng tranh chấp
+1 kênh — không phải lỗi/thiếu tối ưu ở TapBridge hay ở tầng ứng dụng.
+`RealtimeSimulatorImpl` là đơn luồng theo thiết kế của ns-3; một khi
+tổng chi phí tính PHY/giao thoa mỗi giây mô phỏng vượt quá ngân sách
+CPU thật của 1 lõi trong đúng 1 giây thật, sim KHÔNG THỂ đuổi kịp nữa,
+và backlog chỉ có thể tăng (vì tranh chấp tăng theo chính backlog).
+Điều này CỦNG CỐ THÊM (không mâu thuẫn) kết luận chính thức đã có từ
+11/09/2026: hướng khả thi nhất là giảm SỐ TRẠM tranh chấp mỗi kênh
+mô phỏng (đa AP qua backbone có dây thật) hoặc dùng chuẩn PHY đơn giản
+hoá/băng thông cao hơn — KHÔNG PHẢI tối ưu thêm TapBridge hay middleware.
+
+**Lưu ý trung thực về nhiễu do chính phương pháp đo**: `mac_tx_total`/
+`mac_rx_drop_total` ở CẢ 2 lần chạy có gdb sampling (22595-24190 /
+292130-295910) cao hơn NHIỀU so với baseline không profiling (thường
+vài trăm-vài nghìn) — việc gdb attach/detach lặp lại (dù đã giảm xuống
+1 lần/giây) vẫn làm tăng mức độ nghẽn quan sát được so với chạy tự
+nhiên. Vì vậy: **độ lớn tuyệt đối của các số liệu trong lần chạy có
+profiling KHÔNG đại diện cho baseline** — nhưng bảng phân loại "CPU
+đang làm gì" (dựa trên TÊN HÀM tại mỗi mẫu, không phải số lượng sự kiện)
+vẫn là bằng chứng hợp lệ, vì gdb attach/detach không đổi NHỮNG GÌ ns-3
+đang tính khi nó thực sự chạy, chỉ thêm thời gian đóng băng xen giữa.
+
+**Trạng thái**: Bước 2 HOÀN THÀNH, có bằng chứng hàm-cấp-độ trực tiếp
+(không suy đoán). Sẵn sàng sang Bước 3 (chuẩn hoá benchmark: tự động
+đánh dấu run degraded khi `sim_time` không đạt target, luôn lưu đủ
+sim_time/wall_time/sim_lag/E2E latency/MAC activity/CPU — phần lớn đã
+có sẵn từ 15-16/09/2026, cần rà lại xem còn thiếu gì).
+
+**File liên quan**: không có thay đổi trong repo (toàn bộ thay đổi build
+`-g` và image `jazzy-gdb-diag` chỉ tồn tại trong quá trình chẩn đoán,
+không commit); kết quả thô tại
+`/tmp/.../scratchpad/ns3_cpu_profile_n16_v4_samples.jsonl` (không thuộc
+repo).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
