@@ -6300,6 +6300,66 @@ khi quay lại bất kỳ câu hỏi tối ưu hoá nào.
 repo, 9 điểm dữ liệu thô); không có thay đổi code nào trong lần đo này
 (chỉ dùng lại instrumentation đã merge trước đó).
 
+### 16/09/2026 (tiếp) — Bước 1 (theo lộ trình user đề ra): tìm và sửa "sàn 250ms" ở N=1 — GIỮ thay đổi, giảm ~25 LẦN, đã A/B xác nhận
+
+Theo lộ trình 4 bước user đề ra (KHÔNG đụng FleetRMW/FleetQoX, sửa
+benchmark trước): Bước 1 — tìm chính xác ~250ms latency ở N=1 nằm ở đâu,
+sửa bằng thay đổi nhỏ nhất, A/B trước/sau.
+
+**Nghi phạm xác định qua đọc code (không đoán)**:
+`scripts/fleetqox_rmw_trace_endpoint.py` có MỘT comment đã ghi sẵn từ
+trước (dòng ~438-440, trong vòng chờ discovery) mô tả CHÍNH XÁC lớp bug
+này: *"spin_once() services only ONE ready wait-set entity per call"* —
+và vòng lặp discovery ĐÃ có fix (drain hết entity sẵn sàng bằng vòng
+`for _ in range(20): rclpy.spin_once(timeout_sec=0.0)` trước khi gọi
+`spin_once(timeout_sec=0.1)` một lần). NHƯNG fix này KHÔNG được áp dụng
+cho 2 chỗ khác cùng lớp lỗi:
+- Vòng gửi (dòng 502 cũ): chỉ gọi `spin_once(timeout_sec=0.0)` **một
+  lần** mỗi khi gửi 1 message — nếu nhiều message ĐANG chờ nhận cùng lúc,
+  chỉ 1 cái được xử lý, các cái còn lại phải đợi tới vòng lặp SAU (có thể
+  hàng chục/hàng trăm ms sau theo lịch trace).
+- Vòng drain sau khi gửi xong (dòng 530-532 cũ): chỉ gọi
+  `spin_once(timeout_sec=0.1)` — cùng lỗi, mỗi lần gọi chỉ phục vụ 1
+  entity, drain nhiều message chờ sẵn cần NHIỀU vòng lặp, mỗi vòng có
+  thể tốn tới 100ms.
+
+**Fix (thay đổi nhỏ nhất — CHỈ áp dụng lại đúng pattern đã có sẵn trong
+CHÍNH file này, không đụng `fleetqox/` hay `rmw_fleetqox_cpp`)**: thêm
+`for _ in range(20): rclpy.spin_once(node, timeout_sec=0.0)` trước mỗi
+lần gọi `spin_once` có timeout ở cả 2 vị trí trên, drain hết mọi entity
+sẵn sàng trước khi rơi vào một lần chờ có giới hạn.
+
+**A/B thật (Docker+ns-3), cùng seed=13/ns3_seed=42, N=1 và N=2, n=3/mức,
+paired ns3_run**:
+
+| | N=1 TRƯỚC | N=1 SAU | N=2 TRƯỚC | N=2 SAU |
+|---|---|---|---|---|
+| E2E latency p50 (TB 3 lần) | 254.6 ms | **9.4 ms** | 267.9 ms | **11.1 ms** |
+| Giảm | — | **27.2 lần** | — | **24.1 lần** |
+| Số message giao được / tổng | 182/219 (83%) | **219/219 (100%)** | 347/440 (79%) | **426/440 (97%)** |
+
+Không chỉ latency giảm ~25 lần — số message BỊ MẤT hoàn toàn trước đây
+(37/219 ở N=1, ~93/440 ở N=2 — do đến quá trễ, ngoài cửa sổ drain vì bị
+kẹt trong hàng đợi poll) giờ hầu như biến mất. Đây là bằng chứng RẤT
+mạnh: bug polling này không chỉ làm CHẬM mà còn làm MẤT message giả tạo,
+từng bị hiểu nhầm là do mạng/Wi-Fi.
+
+**KẾT LUẬN Bước 1**: ~250ms "sàn" latency ở N=1 gần như HOÀN TOÀN đến
+từ chính harness (polling `spin_once` một-entity-mỗi-lần), KHÔNG phải từ
+FleetRMW (đã đo riêng, chỉ 0.3ms) hay từ độ trễ mạng/Wi-Fi thật. Sau
+fix, sàn thực tế chỉ còn ~9-11ms — gần với latency mạng/Wi-Fi thật hơn
+NHIỀU. **GIỮ thay đổi** — đúng tiêu chí user đặt ra, có đo đạc chứng
+minh rõ ràng, không mơ hồ.
+
+**Trạng thái**: Bước 1 HOÀN THÀNH, đã merge, đã A/B xác nhận. Sẵn sàng
+sang Bước 2 (profile ns-3 xem CPU tốn vào loại event nào khi sim bắt đầu
+tụt lại ở N=16, KHÔNG đoán trước cách sửa).
+
+**File liên quan**: `scripts/fleetqox_rmw_trace_endpoint.py` (2 vị trí
+sửa, dòng ~502 và ~530 cũ); kết quả thô tại
+`/tmp/.../scratchpad/latency_floor_ab_after_spinfix.jsonl` (không thuộc
+repo).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và

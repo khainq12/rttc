@@ -499,7 +499,19 @@ def main() -> int:
         now_offset = time.monotonic() - start_wall
         if target_offset_s > now_offset:
             time.sleep(target_offset_s - now_offset)
-        rclpy.spin_once(node, timeout_sec=0.0)
+        # Same "drain everything ready, not just one entity" fix already
+        # applied to the discovery wait loop above (spin_once() services
+        # only ONE ready wait-set entity per call) -- a single
+        # spin_once(0.0) here only services one of possibly several
+        # already-queued incoming messages, leaving the rest to wait for
+        # a LATER iteration (whenever this row's own scheduled send time
+        # arrives) or the drain loop below. Candidate fix for the ~250ms
+        # N=1 latency floor found 16/09/2026 (see
+        # docs/AUDIT_ACCEPTANCE_TRACKING.md "phân rã latency") -- FleetRMW's
+        # own publish-path cost was measured directly at ~0.3ms, so this
+        # floor has to be harness-side polling, not RMW.
+        for _ in range(20):
+            rclpy.spin_once(node, timeout_sec=0.0)
         target_bytes = max(1, int(row["bytes"]))
         msg = String()
         msg.data = build_payload(row, target_bytes)
@@ -529,6 +541,14 @@ def main() -> int:
 
     drain_deadline = time.monotonic() + args.drain_s
     while time.monotonic() < drain_deadline:
+        # Same fix as the send loop above: drain every already-ready
+        # entity in a tight non-blocking burst before falling back to a
+        # single bounded wait -- a bare spin_once(timeout_sec=0.1) here
+        # only services ONE ready entity per call, so N incoming messages
+        # that arrived close together previously needed N*(up to 100ms)
+        # of real wall-clock time to all be noticed and processed.
+        for _ in range(20):
+            rclpy.spin_once(node, timeout_sec=0.0)
         rclpy.spin_once(node, timeout_sec=0.1)
 
     result = {
