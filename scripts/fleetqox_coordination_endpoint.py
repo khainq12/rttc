@@ -126,11 +126,81 @@ docs/AUDIT_ACCEPTANCE_TRACKING.md):
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 import json
 import random
 import time
 from pathlib import Path
 from typing import Any
+
+
+def wait_until_deadline_while_spinning(
+    deadline_monotonic: float,
+    spin_once_fn: Callable[[float], None],
+    drain_fn: Callable[[], None],
+    *,
+    poll_interval_s: float = 0.01,
+    now_fn: Callable[[], float] = time.monotonic,
+) -> None:
+    """Blocks until now_fn() >= deadline_monotonic, servicing ready rclpy
+    callbacks (and this coordination protocol's own queued-reply
+    machinery) the whole time instead of going fully silent the way a
+    blind time.sleep() does.
+
+    Adapted from fleetqox_rmw_trace_endpoint.py's helper of the same name
+    (see docs/AUDIT_ACCEPTANCE_TRACKING.md 17/09/2026 "SỬA BENCHMARK
+    HARNESS") for THIS file's own semantics -- NOT a mechanical copy.
+    The trace endpoint only needed spin_once() (its on_message() callback
+    does all its work synchronously with no queued side effects); this
+    protocol's replies are deliberately NOT sent synchronously from
+    on_request() (see send_reply()'s call-site comment on
+    pending_immediate_replies -- publishing directly from inside an rclpy
+    subscription callback was a confirmed real bug here), so a wait that
+    only spins without ALSO calling drain_pending_replies() and
+    release_stale_deferrals() would still starve those two actions during
+    the wait.
+
+    Root cause this replaces: three call sites in main()'s crossing loop
+    (the shared start-offset delay, the per-crossing request stagger, and
+    the per-retry jitter) used a blind time.sleep() while this endpoint
+    is idle -- not currently requesting or holding the critical section.
+    Per this protocol's own rule ("if not currently requesting/in the
+    zone... reply immediately"), an idle endpoint should be promptly
+    replying to peers' incoming REQUESTs during exactly these windows;
+    not spinning meant a peer's REQUEST could sit undelivered to
+    on_request() for the whole sleep, inflating coordination_message_age,
+    causing spurious retries, or contributing to forced_entry -- the same
+    bug CLASS already found and fixed in the Bảng V trace-replay harness,
+    now confirmed present here too via source audit (not yet re-measured
+    live -- see Phase 3 of the same investigation).
+
+    Deliberately NOT applied to the crossing_duration_ms sleep while
+    in_cs=True (holding the zone): on_request() unconditionally defers
+    ANY incoming request while in_cs regardless of when it's actually
+    processed, so correctness does not require prompt servicing there --
+    a judgment call, not a clear-cut bug like the three sites above; left
+    as an explicitly documented residual (see that call site's own
+    comment) rather than fixed unilaterally.
+
+    Design constraints (same as the trace-endpoint version): never
+    returns before deadline_monotonic (does not shift the original
+    stagger/jitter/delay duration -- workload timing semantics
+    unchanged); never busy-loops (each spin_once_fn call bounded to at
+    most poll_interval_s); drains everything already ready in a tight
+    burst each iteration before the bounded blocking spin.
+    """
+    while True:
+        remaining = deadline_monotonic - now_fn()
+        if remaining <= 0:
+            return
+        for _ in range(20):
+            spin_once_fn(0.0)
+        drain_fn()
+        remaining = deadline_monotonic - now_fn()
+        if remaining <= 0:
+            return
+        spin_once_fn(min(remaining, poll_interval_s))
+        drain_fn()
 
 
 def main() -> int:
@@ -506,7 +576,16 @@ def main() -> int:
         if not args.start_file.exists():
             raise RuntimeError("timed out waiting for data-plane start gate")
 
-    time.sleep(args.start_offset_ms / 1000.0)
+    # Was a blind time.sleep(args.start_offset_ms / 1000.0) -- this
+    # endpoint is idle (not requesting, not in_cs) during this shared
+    # startup delay, so per the protocol's own rule it should still be
+    # able to reply promptly to any peer's REQUEST that arrives during
+    # it. See wait_until_deadline_while_spinning()'s docstring.
+    wait_until_deadline_while_spinning(
+        time.monotonic() + args.start_offset_ms / 1000.0,
+        lambda timeout_sec: rclpy.spin_once(node, timeout_sec=timeout_sec),
+        lambda: (drain_pending_replies(), release_stale_deferrals()),
+    )
 
     scenario_start = time.monotonic()
     scenario_deadline = scenario_start + args.scenario_timeout_s
@@ -514,7 +593,18 @@ def main() -> int:
     for crossing_index in range(args.num_crossings):
         if time.monotonic() >= scenario_deadline:
             break
-        time.sleep(rng.uniform(0.0, 0.5))  # stagger requests, not a fully synchronized storm
+        # Was a blind time.sleep(stagger_s) -- same fix as above: this
+        # endpoint isn't requesting/in_cs yet for THIS crossing, so it
+        # should stay responsive to peers' REQUESTs during the stagger.
+        # rng.uniform() is still called exactly once per crossing with
+        # the same distribution -- only the wait mechanism changed, not
+        # the stagger's own randomness/duration.
+        stagger_s = rng.uniform(0.0, 0.5)  # stagger requests, not a fully synchronized storm
+        wait_until_deadline_while_spinning(
+            time.monotonic() + stagger_s,
+            lambda timeout_sec: rclpy.spin_once(node, timeout_sec=timeout_sec),
+            lambda: (drain_pending_replies(), release_stale_deferrals()),
+        )
 
         retries_this_crossing = 0
         forced_entry = False
@@ -558,8 +648,20 @@ def main() -> int:
                 # Jitter every RE-broadcast (not the first) so a
                 # collision on one retry doesn't repeat in lockstep on
                 # every subsequent one -- a synchronized-retry
-                # ("thundering herd") risk, not a transport bug.
-                time.sleep(rng.uniform(0.0, 0.3))
+                # ("thundering herd") risk, not a transport bug. Was a
+                # blind time.sleep(jitter_s) -- same fix as the stagger
+                # above: this endpoint is still `requesting` here but
+                # hasn't been granted priority for anyone else's request
+                # yet, so it must stay responsive to peers' REQUESTs
+                # during the jitter (a peer's own reply_timeout_s could
+                # otherwise fire waiting on a reply this endpoint would
+                # have sent immediately had it been spinning).
+                jitter_s = rng.uniform(0.0, 0.3)
+                wait_until_deadline_while_spinning(
+                    time.monotonic() + jitter_s,
+                    lambda timeout_sec: rclpy.spin_once(node, timeout_sec=timeout_sec),
+                    lambda: (drain_pending_replies(), release_stale_deferrals()),
+                )
             request_wall_ns = time.time_ns()
             msg = String()
             msg.data = json.dumps(
@@ -607,6 +709,22 @@ def main() -> int:
         entered_wall_ns = time.time_ns()
         in_cs = True
         requesting = False
+        # AUDITED, DELIBERATELY NOT switched to
+        # wait_until_deadline_while_spinning() (17/09/2026, see
+        # docs/AUDIT_ACCEPTANCE_TRACKING.md "làm sạch harness Bảng VI"):
+        # on_request() unconditionally defers ANY incoming request while
+        # in_cs=True (mutual-exclusion safety requires this regardless of
+        # WHEN the message is actually processed), so correctness does
+        # not require prompt servicing here the way it clearly does for
+        # the idle stagger/jitter/start-offset waits above -- this is a
+        # judgment call, not an unambiguous instance of the same bug.
+        # Known residual left unfixed: a REQUEST that physically arrives
+        # while this endpoint holds the zone won't be dispatched to
+        # on_request() until spin_once() runs again after this sleep,
+        # so its recorded coordination_message_age (and this deferral's
+        # deferred_at timestamp) may be inflated by up to
+        # crossing_duration_ms. Not addressed in this pass -- flagged for
+        # a separate decision rather than fixed unilaterally.
         time.sleep(args.crossing_duration_ms / 1000.0)
         exited_wall_ns = time.time_ns()
         in_cs = False

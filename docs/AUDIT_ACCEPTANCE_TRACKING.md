@@ -7226,6 +7226,65 @@ dưới); script phân tích (không thuộc repo):
 `/tmp/.../scratchpad/step12_harness_fix_validate.py`,
 `/tmp/.../scratchpad/step13_rebenchmark_after_harness_fix.py`.
 
+**LÀM SẠCH HARNESS BẢNG VI: audit + fix callback starvation trong
+`fleetqox_coordination_endpoint.py` (17/09/2026) — Phase 1-3.**
+
+**Phase 1 — Audit semantics từng `time.sleep()`** (4 chỗ, không đoán):
+
+| Dòng | Ý nghĩa | Phân loại | Lý do |
+|---|---|---|---|
+| `start_offset_ms` (đầu scenario) | chờ chung trước khi bắt đầu crossings | **BUG (cùng loại)** | endpoint idle, không giữ priority/CS — theo đúng luật giao thức phải reply "ngay" nếu không giữ priority |
+| stagger trước request mới | 0-0.5s ngẫu nhiên | **BUG rõ ràng** | idle, endpoint khác có thể đang gửi REQUEST cần reply ngay |
+| jitter trước retry | 0-0.3s ngẫu nhiên | **BUG rõ ràng** | vẫn idle về mặt ưu tiên, cùng lý do |
+| `crossing_duration_ms` (đang giữ CS) | mô phỏng thời gian làm việc trong zone | **KHÔNG SỬA** (judgment call) | `on_request()` đã unconditionally defer khi `in_cs=True` bất kể lúc nào xử lý — correctness không phụ thuộc việc service kịp thời; chỉ ảnh hưởng độ chính xác đo `coordination_update_age`/`deferred_at` cho message đến trong lúc giữ CS — để lại làm giới hạn đã biết, không tự ý mở rộng phạm vi sửa |
+
+Vòng chờ reply chính (`while ... spin_once(0.05) ...`) và drain loop cuối
+cùng đã đúng từ trước — không cần sửa.
+
+**Phase 2 — RED→GREEN**: thêm `wait_until_deadline_while_spinning()`
+RIÊNG cho file này (KHÔNG copy máy móc từ `fleetqox_rmw_trace_endpoint.py`
+— coordination cần thêm `drain_fn` gọi `drain_pending_replies()` +
+`release_stale_deferrals()` mỗi vòng, vì reply được QUEUE chứ không gửi
+đồng bộ từ callback). `tests/test_fleetqox_coordination_endpoint.py`
+mới (4 test, fake clock, không cần rclpy). Xác nhận test có discriminating
+power thật: hành vi cũ (blind sleep, không service) làm test FAIL đúng
+như dự kiến. Full suite: 786 passed, đúng 8 lỗi pre-existing, không
+regression mới.
+
+**Phase 3 — Validate tại N=2 (nhỏ nhất hợp lệ), A/B OLD vs NEW, 3 rep
+mỗi bên, cùng seed**:
+
+| | OLD (buggy) mean | NEW (fixed) mean |
+|---|---|---|
+| `coordination_update_age_ms` | 19.9ms | **5.5ms (giảm ~3.6x)** |
+| `forced_entry_rate` | 0.83 | 0.53 |
+| `total_crossings` hoàn thành/120s | 3.67 | 5.67 |
+| `coordination_retry_count` | ~70 | ~70 (không đổi — đúng dự kiến) |
+
+`coordination_retry_count` gần như không đổi giữa 2 arm — xác nhận fix
+KHÔNG thay đổi luật Ricart-Agrawala/retry policy, chỉ loại callback
+starvation. `coordination_update_age` giảm mạnh, `forced_entry_rate`
+giảm, số crossing hoàn thành tăng — đều là hệ quả TỰ NHIÊN của dispatch
+nhanh hơn, không phải thay đổi hành vi trực tiếp.
+
+**Phát hiện phụ quan trọng cho Phase 6**: `task_completion_s` chạm
+TRẦN `scenario_timeout_s=120s` mặc định ở CẢ 2 ARM, mọi rep — ngay ở
+N=2, scenario KHÔNG BAO GIỜ hoàn thành tự nhiên với config mặc định
+(`num_crossings=5`, `reply_timeout_s=5.0s`). Cần xác định đúng config
+lịch sử Bảng VI (không đoán) trước khi chạy N=8/16/32 ở Phase 6, vì N
+cao hơn chắc chắn còn chậm hơn.
+
+**Gap phát hiện thêm**: `run_coordination_probe()` (khác
+`run_probe()`) CHƯA có các field `degraded`/`sim_lag_s`/
+`ns3sim_resource_usage`/`resource_usage` đã chuẩn hoá ở Bước 3 trước
+đây — cần bổ sung trước khi Phase 5/6 có thể phân loại VALID vs
+COMPUTATIONALLY DEGRADED cho Bảng VI ở N cao.
+
+**File liên quan**: `scripts/fleetqox_coordination_endpoint.py`,
+`tests/test_fleetqox_coordination_endpoint.py` (commit riêng, xem hash
+bên dưới); script phân tích (không thuộc repo):
+`/tmp/.../scratchpad/step14_coordination_harness_ab.py`.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
