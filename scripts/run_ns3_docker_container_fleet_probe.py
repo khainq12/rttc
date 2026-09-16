@@ -1523,7 +1523,17 @@ def run_probe(
     capacity_packets_per_second: int | None = None,
     capacity_airtime_ns_per_second: int | None = None,
     event_filter: Callable[[list[dict[str, Any]]], list[dict[str, Any]]] | None = None,
+    save_ns3_log_path: Path | None = None,
 ) -> dict[str, Any]:
+    # save_ns3_log_path is a DIAGNOSTIC-ONLY hook (default None = no
+    # behavior change): the full ns-3 stdout log is already read into
+    # ns3_log_text below before teardown() destroys the container, but
+    # previously discarded once run_probe() returned. Set this to persist
+    # it to a local file for offline analysis of the new FLEETQOX_MAC_EVENT
+    # per-packet lines (see external/ns3/fleetqox_trace_replay_tap.cc) --
+    # does not change any traffic, topology, or optimizer behavior. See
+    # docs/AUDIT_ACCEPTANCE_TRACKING.md 17/09/2026 "Optimization #2: tách
+    # network black box".
     # event_filter is a DIAGNOSTIC-ONLY hook (not a paper-facing feature):
     # lets an experiment reshape the trace-generation OUTPUT (e.g. drop a
     # fraction of one flow_class's packets) before it's written to the CSV
@@ -1714,6 +1724,10 @@ def run_probe(
             pass
     finally:
         probe.teardown()
+
+    if save_ns3_log_path is not None and ns3_log_text:
+        save_ns3_log_path.parent.mkdir(parents=True, exist_ok=True)
+        save_ns3_log_path.write_text(ns3_log_text, encoding="utf-8")
 
     discovery_convergence_samples_s = [
         result["discovery_convergence_s"]

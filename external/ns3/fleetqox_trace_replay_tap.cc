@@ -70,12 +70,18 @@
 #include "ns3/tap-bridge-module.h"
 #include "ns3/wifi-module.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <iostream>
 #include <map>
+#include <mutex>
+#include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -111,6 +117,213 @@ std::atomic<uint64_t> g_phyRxDropTotal{0};
 std::array<std::atomic<uint64_t>, kMaxRxDropReasons> g_phyRxDropByReason{};
 std::atomic<uint64_t> g_associatedStaCount{0};
 
+// Per-packet MAC-layer timeline for the "black-box" decomposition
+// investigation (16-17/09/2026, see docs/AUDIT_ACCEPTANCE_TRACKING.md
+// "Optimization #2: tách network black box"). Existing counters above are
+// aggregate-only and cannot be joined back to a specific application
+// message. scripts/fleetqox_rmw_trace_endpoint.py's build_payload()
+// embeds `"e":"<event_id>"` as plaintext JSON inside the std_msgs/String
+// CDR-serialized wire data -- present verbatim as ASCII bytes at this
+// trace point regardless of whatever RTPS/CDR/802.11 header framing
+// surrounds it, so a raw byte scan finds it without needing to know the
+// exact layout. Logging BOTH Simulator::Now() (simulated time) and a
+// wall-clock timestamp for the same MacTx/MacRx event is what lets the
+// offline analysis distinguish "packet genuinely had to wait/retry a lot
+// in the simulated Wi-Fi model" (sim-time delta is large) from "the
+// realtime simulator just processed this event late relative to wall
+// clock" (sim-time delta stays small while wall-time delta is large) --
+// see PrintWifiStats' file-header comment above for why per-packet
+// printing was previously avoided (interleaved/corrupted stdout): this
+// buffers lines instead and only flushes in a batch, piggybacking on
+// PrintWifiStats' existing 5s Simulator::Schedule cadence, so writes stay
+// on the same single simulation thread and at the same controlled rate.
+std::mutex g_macEventLogMutex;
+std::vector<std::string> g_macEventLogLines;
+
+// Diagnostic-only (17/09/2026): the first live run with this
+// instrumentation found MacTx/MacRx firing thousands of times (matching
+// the existing g_macTxTotal/g_macRxTotal counters) but a naive plaintext
+// scan for `"e":"` matched ZERO of them. A by-packet-size debug dump
+// (kept below, now gated on a genuine post-decode failure) found why:
+// FleetRMW does NOT put the app's JSON on the wire directly. Every data
+// packet is wrapped in FleetRMW's OWN JSON envelope (magic "FRMW1" +
+// `"kind":"sidecar_packet_frame"`, with `route`/`sample_envelope`
+// metadata), and the app's JSON (with our `"e":"<event_id>"` field) is
+// BASE64-ENCODED inside that envelope's `"serialized_payload":{"data":
+// "<base64>"}` field -- so the literal marker never appears un-decoded.
+// FleetRMW also emits a SEPARATE `"kind":"source_sequence_ack_nack"`
+// control frame per data frame with no such field at all -- explains the
+// ~12-15x mac_tx_total amplification vs the ~400-500 logical app
+// messages seen earlier (ack/nack + retry traffic dominates the wire).
+std::atomic<uint64_t> g_macEventAttempts{0};
+std::atomic<uint64_t> g_macEventExtracted{0};
+// One debug dump per DISTINCT failing packet size, gated on packets that
+// DO contain FleetRMW's own `"data":"..."` field but still fail to
+// decode/find our marker afterward -- a genuine anomaly worth seeing,
+// unlike ack_nack/control frames (expected, no such field, not dumped).
+std::mutex g_macEventDebugSeenSizesMutex;
+std::set<uint32_t> g_macEventDebugSeenSizes;
+constexpr std::size_t kMaxDebugDumpSizes = 20;
+
+std::vector<uint8_t>
+Base64Decode(std::vector<uint8_t>::const_iterator begin, std::vector<uint8_t>::const_iterator end)
+{
+  static const std::array<int8_t, 256> table = []() {
+    std::array<int8_t, 256> t{};
+    t.fill(-1);
+    const char* alphabet =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for (int i = 0; i < 64; ++i)
+    {
+      t[static_cast<uint8_t>(alphabet[i])] = static_cast<int8_t>(i);
+    }
+    return t;
+  }();
+  std::vector<uint8_t> out;
+  out.reserve(static_cast<std::size_t>(std::distance(begin, end)) / 4 * 3 + 3);
+  int val = 0;
+  int bits = -8;
+  for (auto i = begin; i != end; ++i)
+  {
+    if (*i == '=')
+    {
+      break;
+    }
+    int8_t d = table[*i];
+    if (d == -1)
+    {
+      continue;
+    }
+    val = (val << 6) + d;
+    bits += 6;
+    if (bits >= 0)
+    {
+      out.push_back(static_cast<uint8_t>((val >> bits) & 0xFF));
+      bits -= 8;
+    }
+  }
+  return out;
+}
+
+void
+DumpDebugPayload(uint32_t size, const std::vector<uint8_t>& buf)
+{
+  bool shouldDump = false;
+  {
+    std::lock_guard<std::mutex> lock(g_macEventDebugSeenSizesMutex);
+    if (g_macEventDebugSeenSizes.size() < kMaxDebugDumpSizes
+        && g_macEventDebugSeenSizes.insert(size).second)
+    {
+      shouldDump = true;
+    }
+  }
+  if (!shouldDump)
+  {
+    return;
+  }
+  std::ostringstream printable;
+  for (uint8_t byteVal : buf)
+  {
+    printable << (std::isprint(byteVal) ? static_cast<char>(byteVal) : '.');
+  }
+  std::lock_guard<std::mutex> lock(g_macEventLogMutex);
+  std::ostringstream line;
+  line << "{\"size\":" << size << ",\"printable\":\"" << printable.str() << "\"}";
+  g_macEventLogLines.push_back(std::string("FLEETQOX_MAC_DEBUG_PAYLOAD ") + line.str());
+}
+
+bool
+ExtractEventId(Ptr<const Packet> packet, std::string& eventId)
+{
+  uint32_t size = packet->GetSize();
+  if (size == 0 || size > 4096)
+  {
+    return false;
+  }
+  std::vector<uint8_t> buf(size);
+  packet->CopyData(buf.data(), size);
+
+  static const std::string kDataMarker = "\"data\":\"";
+  auto dataIt = std::search(buf.begin(), buf.end(), kDataMarker.begin(), kDataMarker.end());
+  if (dataIt == buf.end())
+  {
+    // Not a sidecar_packet_frame (e.g. source_sequence_ack_nack, or
+    // non-Fleet 802.11/ARP traffic) -- nothing to correlate, not an
+    // anomaly, don't dump.
+    return false;
+  }
+  auto b64Start = dataIt + static_cast<std::ptrdiff_t>(kDataMarker.size());
+  auto b64End = std::find(b64Start, buf.end(), '"');
+  if (b64End == buf.end() || b64End == b64Start)
+  {
+    DumpDebugPayload(size, buf);
+    return false;
+  }
+  std::vector<uint8_t> decoded = Base64Decode(b64Start, b64End);
+
+  static const std::string kMarker = "\"e\":\"";
+  auto it = std::search(decoded.begin(), decoded.end(), kMarker.begin(), kMarker.end());
+  if (it == decoded.end())
+  {
+    DumpDebugPayload(size, buf);
+    return false;
+  }
+  auto digitsStart = it + static_cast<std::ptrdiff_t>(kMarker.size());
+  auto digitsEnd = digitsStart;
+  while (digitsEnd != decoded.end() && std::isdigit(*digitsEnd))
+  {
+    ++digitsEnd;
+  }
+  if (digitsEnd == digitsStart || digitsEnd == decoded.end() || *digitsEnd != '"')
+  {
+    DumpDebugPayload(size, buf);
+    return false;
+  }
+  eventId.assign(digitsStart, digitsEnd);
+  return true;
+}
+
+void
+LogMacEvent(const char* kind, Ptr<const Packet> packet)
+{
+  g_macEventAttempts.fetch_add(1, std::memory_order_relaxed);
+  std::string eventId;
+  if (!ExtractEventId(packet, eventId))
+  {
+    // Not a Fleet trace-replay application packet (ARP, discovery beacon,
+    // 802.11 management frame, etc.) -- nothing to correlate, skip.
+    return;
+  }
+  g_macEventExtracted.fetch_add(1, std::memory_order_relaxed);
+  int64_t wallNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::system_clock::now().time_since_epoch())
+                       .count();
+  std::ostringstream line;
+  line << "FLEETQOX_MAC_EVENT {\"kind\":\"" << kind << "\",\"event_id\":\"" << eventId << "\","
+       << "\"sim_time_s\":" << Simulator::Now().GetSeconds() << ","
+       << "\"wall_ns\":" << wallNs << "}";
+  std::lock_guard<std::mutex> lock(g_macEventLogMutex);
+  g_macEventLogLines.push_back(line.str());
+}
+
+void
+FlushMacEventLog()
+{
+  std::vector<std::string> lines;
+  {
+    std::lock_guard<std::mutex> lock(g_macEventLogMutex);
+    lines.swap(g_macEventLogLines);
+  }
+  for (const auto& line : lines)
+  {
+    std::cout << line << "\n";
+  }
+  if (!lines.empty())
+  {
+    std::cout.flush();
+  }
+}
+
 void
 MacTxTrace(Ptr<const Packet> packet)
 {
@@ -123,6 +336,7 @@ MacTxTrace(Ptr<const Packet> packet)
   {
     g_macTxLarge.fetch_add(1, std::memory_order_relaxed);
   }
+  LogMacEvent("tx", packet);
 }
 
 void
@@ -132,9 +346,10 @@ MacTxDropTrace(Ptr<const Packet> /* packet */)
 }
 
 void
-MacRxTrace(Ptr<const Packet> /* packet */)
+MacRxTrace(Ptr<const Packet> packet)
 {
   g_macRxTotal.fetch_add(1, std::memory_order_relaxed);
+  LogMacEvent("rx", packet);
 }
 
 void
@@ -253,6 +468,9 @@ PrintWifiStats(uint32_t totalStations, uint32_t numAps)
   // realtime simulator's wall clock, so "every 5s" really is every 5
   // real seconds).
   Simulator::Schedule(Seconds(5.0), &PrintWifiStats, totalStations, numAps);
+  // Flush any buffered per-packet MAC timeline lines on the same safe
+  // cadence/thread as this function -- see g_macEventLogLines' comment.
+  FlushMacEventLog();
   // sim_time_s lets the orchestrator pick a snapshot by SIMULATED elapsed
   // time instead of blindly taking "whichever line happened to be last
   // before the process got killed" -- the latter varies run-to-run purely
@@ -272,6 +490,8 @@ PrintWifiStats(uint32_t totalStations, uint32_t numAps)
             << "\"mac_rx_drop_total\":" << g_macRxDropTotal.load() << ","
             << "\"phy_tx_begin_total\":" << g_phyTxBeginTotal.load() << ","
             << "\"phy_rx_drop_total\":" << g_phyRxDropTotal.load() << ","
+            << "\"mac_event_attempts\":" << g_macEventAttempts.load() << ","
+            << "\"mac_event_extracted\":" << g_macEventExtracted.load() << ","
             << "\"phy_rx_drop_by_reason\":[";
   for (std::size_t i = 0; i < kMaxRxDropReasons; ++i)
   {

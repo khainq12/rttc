@@ -6922,6 +6922,116 @@ nhất đã kiểm chứng.
 `/tmp/.../scratchpad/step8_recover_control_fate_b.py` (khôi phục
 control_fate cho arm A/B từ kết quả đã lưu, không chạy lại Docker/ns-3).
 
+**Tách "network black box" bằng per-packet MAC timeline (17/09/2026) —
+xác định chính xác 40-220ms dư ra nằm ở đâu, KHÔNG sửa optimizer.**
+
+**Instrumentation mới (diagnostic-only)**: `external/ns3/fleetqox_trace_replay_tap.cc`
+thêm `MacTx`/`MacRx` per-packet log (`event_id`, `sim_time_s`, `wall_ns`),
+buffer + flush theo batch mỗi 5s (dùng lại cadence an toàn của
+`PrintWifiStats`, tránh lặp lỗi stdout interleave đã ghi chú sẵn trong
+file). `scripts/run_ns3_docker_container_fleet_probe.py` thêm
+`save_ns3_log_path` (mặc định `None`, không đổi hành vi).
+
+**Audit source trước khi thêm code (đúng quy trình "không đoán")**:
+`MacTx`/`MacRx`/`PhyTxBegin`/`PhyRxDrop` đã có trace source nhưng CHỈ
+tăng counter tổng hợp (atomic), không per-packet, không `event_id`,
+không pcap/ascii-trace — xác nhận KHÔNG map được `event_id` xuyên ns-3
+với dữ liệu cũ, cần instrumentation tối thiểu.
+
+**2 vòng lặp debug trước khi extraction hoạt động (đáng lưu vì phản bác
+1 giả định sai)**: vòng 1 dùng scan plaintext `"e":"` — **0/12048 lần
+trích thành công** dù `MacTx` fire hàng nghìn lần. Debug-dump theo từng
+cỡ gói khác nhau (không chỉ N gói đầu) lộ ra: FleetRMW **không** gửi
+JSON app-level trực tiếp trên wire — mỗi data packet được bọc trong JSON
+envelope riêng của FleetRMW (`"FRMW1"` + `"kind":"sidecar_packet_frame"`,
+có `route`/`sample_envelope`), và JSON app-level (`{"e":...}`) bị
+**base64-encode** bên trong `serialized_payload.data`. Ngoài ra mỗi data
+frame có 1 frame `"kind":"source_sequence_ack_nack"` riêng đi kèm —
+giải thích tỷ lệ khuếch đại ~12-15x giữa `mac_tx_total` (~5900) và số
+message logic thật (~400-500) đã thấy ở Bước 7-8. Sửa extraction: tìm
+`"data":"<base64>"`, decode base64, rồi mới scan marker trong bytes đã
+giải mã → **852/852 (100%) match** ở lần chạy tiếp theo.
+
+**Instrumentation-overhead check (bắt buộc trước khi dùng làm bằng
+chứng)**: N=2, cap=150, seed=13, ns3_seed=42, 3 rep — `packet_rows=393`
+tất định cả 3 rep (khớp Bước 7), `delivery_pct=97.46%` tất định,
+`fresh_pct` [66.9, 65.1, 68.4]% nằm trong dải bình thường của Bước 7
+([67.9, 71.0, 70.7]%), `degraded=False` cả 3 rep, `sim_lag_s≈5.0s`
+(thấp hơn chút so với ~6.1-6.5s baseline nhưng cùng cấp độ, không phải
+dấu hiệu suy giảm). → **Run này dùng được làm bằng chứng chính.**
+
+**FACT — phân rã 852 message safety/control (3 rep) qua 5 mốc thời gian
+cùng `event_id`** (T0=app publish start ≈ `sent_wall_ns`, T1=RMW
+publish() hoàn thành, T2=MacTx trên trạm gửi, T3=MacRx trên trạm nhận,
+T5=app callback ≈ `recv_wall_ns`):
+
+| Đoạn | fresh (n=503) mean | stale (n=349) mean | stale max |
+|---|---|---|---|
+| sender_side (T1→T2, RMW-hand-off→Tap/ns-3) | 1.43ms | 1.98ms | 28.1ms |
+| wifi_wall (T2→T3, wall-clock) | 1.30ms | 1.75ms | 10.8ms |
+| wifi_sim (T2→T3, Simulator::Now() delta) | 1.04ms | 1.44ms | 11.7ms |
+| realtime_lag (wifi_wall − wifi_sim) | 0.26ms | 0.31ms | 3.7ms |
+| **receiver_side (T3→T5, MacRx→app callback)** | **14.0ms** | **109.5ms (p50=85.4ms)** | **395ms** |
+| total_latency | 16.9ms | 113.4ms | 403ms |
+
+`receiver_side` chiếm **~96% tổng latency** của message trễ hạn.
+`wifi_wall`/`wifi_sim` gần như bằng nhau và LUÔN nhỏ (<12ms) kể cả với
+message trễ hạn nặng nhất (403ms) — network/ns-3 KHÔNG dư ra bao nhiêu
+cả về wall lẫn simulated time.
+
+**Phân tích theo thời gian trong run (bucket 100ms theo `scheduled_tick_ms`)**:
+`receiver_side_ms` trung bình **204ms** ở tick 0-100ms, giảm dần —
+**144ms** (100-200ms), **86ms** (200-300ms), **41ms** (300-400ms), rồi
+ổn định quanh **20-50ms** từ tick ~400ms trở đi cho hết 3s run (có vài
+đợt tăng nhẹ 60-110ms rải rác, không còn pattern giảm dần). 10 message
+tệ nhất đều là `event_id` một chữ số (2,4,6,7,9...), **lặp lại y hệt ở
+cả 3 rep** (tất định) — đây là hiện tượng suy giảm khởi động (startup
+transient), không phải nhiễu ngẫu nhiên.
+
+**REJECTED HYPOTHESES** (đã loại, có bằng chứng):
+1. Control bị packet-cap defer/drop ở admission → loại (Optimization #2,
+   đã revert — offline trace cho thấy 284/284 admitted cả trước/sau fix).
+2. Wi-Fi/ns-3 contention/backoff thật là nguyên nhân chính → **loại**:
+   `wifi_sim_ms` luôn nhỏ (max 11.7ms) ngay cả ở message trễ 403ms.
+3. Realtime simulator lag (ns-3 xử lý event muộn theo wall-clock) →
+   **loại**: `realtime_lag_ms` luôn nhỏ (max 3.7ms), không tăng theo
+   mức độ trễ của message.
+4. FleetRMW `publish()`/`sendto()` call là bottleneck → loại (khẳng định
+   lại từ trước): `sender_side_ms` luôn nhỏ (mean <2ms).
+5. Mật độ gói admit/tick hoặc mật độ gói/100ms là nguyên nhân trực tiếp
+   → loại (từ phiên trước, message-diff N=2).
+
+**ROOT CAUSE — mức "ở đâu" (FACT, độ tin cậy cao)**: độ trễ nằm hoàn
+toàn ở **receiver-side dispatch** (từ khi gói tới MAC layer trạm nhận
+đến khi callback app chạy), KHÔNG liên quan mạng.
+
+**ROOT CAUSE — mức "tại sao" (UNKNOWN, chưa đủ bằng chứng cơ chế)**:
+quan sát được mẫu suy giảm đơn điệu đầu run + `rmw_pubsub.cpp` có cơ chế
+theo dõi sequence per-stream tường minh (`highest_contiguous_sequence`,
+`ack_nack`, `out_of_order`) gợi ý một cơ chế warm-up/in-order-gating
+per-stream ở tầng FleetRMW hoặc độ trễ dispatch của vòng lặp
+`spin_once()` phía harness — nhưng **CHƯA xác nhận được cơ chế cụ thể**.
+Thiếu: timestamp ngay tại điểm `rmw_pubsub.cpp` quyết định message sẵn
+sàng giao (trước khi tới rclpy waitset) và tại điểm `spin_once()` thực
+sự dispatch — hiện chỉ có 2 đầu mút của khoảng `receiver_side` (MacRx
+wall_ns và app `recv_wall_ns`), chưa có điểm giữa để tách RMW-internal
+vs harness-polling.
+
+**NEXT OPTIMIZATION**: KHÔNG đề xuất sửa optimizer (chưa đủ bằng chứng
+cơ chế cụ thể). Bước điều tra tiếp theo (không phải optimization) nếu
+muốn tiếp tục: thêm 1 timestamp tối thiểu tại đúng điểm `rmw_pubsub.cpp`
+đánh dấu message sẵn sàng giao, để tách `receiver_side_ms` thành
+"FleetRMW internal" vs "spin_once dispatch latency" — từ đó mới biết
+fix (nếu có) nên nằm ở RMW hay ở pattern polling của harness
+(`fleetqox_rmw_trace_endpoint.py`), không phải ở
+`fleetqox/control_plane.py`.
+
+**File liên quan**: `external/ns3/fleetqox_trace_replay_tap.cc`,
+`scripts/run_ns3_docker_container_fleet_probe.py` (commit riêng, xem
+hash bên dưới); script phân tích (không thuộc repo):
+`/tmp/.../scratchpad/step10_control_blackbox_split.py`,
+`/tmp/.../scratchpad/step10b_receiver_side_correlation.py`.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
