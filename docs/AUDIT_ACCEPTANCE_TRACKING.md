@@ -8138,6 +8138,86 @@ phiên này — cần build lại bằng đúng lệnh `apt-get install tcpdump`
 `docker commit` nếu cần capture tiếp, không phải thay đổi thường trực).
 KHÔNG có code production nào bị sửa trong bước này.
 
+## Checkpoint sớm hơn trong receive_loop(): CASE C xác nhận THUẦN kernel-side, loại hẳn CASE D (18/09/2026)
+
+**Mục tiêu**: tách CASE C thuần (kernel không bao giờ giao gói cho
+`recvfrom()`) khỏi CASE D biên giới (gói CÓ tới `recvfrom()` nhưng bị
+bỏ qua TRƯỚC điểm recv-trace hiện tại, tức trong code dispatch của
+chính FleetRMW) — theo đúng "EXACTLY ONE NEXT STEP" của báo cáo Phase
+9 trước đó. Đây là bước đo lường thuần tuý — **không sửa hành vi gì**.
+
+**Instrumentation mới** (commit `d55ecfd`): checkpoint `raw_recvfrom`
+ghi nhận NGAY sau khi `recvfrom()` trả về thành công trong
+`receive_loop()`, TRƯỚC cả khi `handle_received_datagram()` được gọi
+— sớm hơn điểm recv-trace hiện có (điểm đó nằm sau
+`handle_received_payload()`, tức sau decode + sau các bước dispatch
+unrecoverable-loss-notice/ack-nack/graph/service). Vì payload thô
+(trước decode) không phải lúc nào cũng là JSON thuần (AEAD/peer-auth
+encrypted, hoặc fragment không phải index 0), hàm mới
+`extract_loss_funnel_identity_from_raw_bytes()` chỉ trích xuất
+best-effort bằng substring-scan (không dùng `std::regex`, không tái
+dùng `decode_data_frame()`) — trả `false` (bỏ qua, không ghi) khi
+không chắc chắn. Dùng LẠI đúng env gate
+`FLEETQOX_RMW_LOSS_FUNNEL_TRACE_PROFILING` đã có, không thêm flag mới.
+Export qua `rmw_fleetqox_cpp_loss_funnel_raw_recvfrom_trace_json()`,
+Python side thêm key `"raw_recvfrom"` vào `fleetqox_loss_funnel_trace()`.
+
+**Verify sạch trước khi tin kết quả**: `colcon build` sạch (56.8s),
+`nm -D` xác nhận symbol mới tồn tại, syntax check sạch, full test suite
+786/794 pass (đúng 8 fail cũ không liên quan, không có regression mới).
+N=2 smoke test (`step27a_n2_raw_recvfrom_smoketest.py`): số lượng
+`raw_recvfrom_trace` KHỚP CHÍNH XÁC với `recv_trace` ở cả 3 endpoint
+(156=156, 143=143, 141=141) — checkpoint hoạt động đúng như kỳ vọng
+trước khi chạy N=16.
+
+**LAN N=16, n=3, đúng config lịch sử** — với mỗi message
+`SEND_SUCCESS_NOT_RECEIVED` đã biết (từ send/recv trace hiện có), kiểm
+tra target endpoint đó có xuất hiện trong `raw_recvfrom` trace của nó
+không (`step27b_lan16_raw_recvfrom_check.py`):
+
+| rep | total_missing | seen ở raw_recvfrom | not seen | fraction seen |
+|---|---|---|---|---|
+| 1 | 553 | 1 | 552 | 0.18% |
+| 2 | 551 | 0 | 551 | 0.0% |
+| 3 | 545 | 0 | 545 | 0.0% |
+| **tổng** | **1649** | **1** | **1648** | **0.06%** |
+
+**Kết quả gần như tuyệt đối**: 1648/1649 (99.94%) message
+`SEND_SUCCESS_NOT_RECEIVED` KHÔNG BAO GIỜ xuất hiện tại checkpoint sớm
+nhất có thể (ngay sau `recvfrom()` trả về). 1 trường hợp "seen" duy
+nhất trên tổng 1649 là nhiễu/biên (không đủ để đổi kết luận).
+
+**PHASE 9 (cập nhật) — CASE C xác nhận THUẦN, loại CASE D**: ranh giới
+mất gói được thu hẹp thêm một bậc — KHÔNG PHẢI "gói tới `recvfrom()`
+nhưng bị FleetRMW bỏ qua trước recv-trace" (đó là CASE D, đã loại), MÀ
+LÀ "gói được xác nhận tới `eth0` của receiver bằng tcpdump (Phase
+5/6), nhưng `recvfrom()` của chính tiến trình FleetRMW KHÔNG BAO GIỜ
+trả về các byte đó". Ranh giới chính xác giờ nằm HOÀN TOÀN trong
+kernel: giữa {gói đến link-layer, xác nhận bằng tcpdump trên `eth0`}
+và {syscall `recvfrom()` trả dữ liệu về userspace} — trước cả dòng code
+đầu tiên của FleetRMW xử lý gói đó. Đây KHÔNG PHẢI loại drop đã đo ở
+bước trước (`/proc/net/udp`'s `drops` = 0 tuyệt đối, đã REJECTED —
+xem mục "Receiver-side kernel UDP drop hypothesis" phía trên) — tức là
+một cơ chế kernel KHÁC, chưa xác định, không phản ánh qua counter đó
+(có thể ví dụ: IP-layer discard trước UDP demux, ARP/routing table
+race, hoặc một điều kiện đặc thù liên quan tới đúng 1 sender/topic đã
+nêu ở Phase 7).
+
+**KHÔNG kết luận cơ chế, KHÔNG sửa gì** — đúng yêu cầu người dùng
+("không fix gì") và đúng STOP RULE đã thống nhất xuyên suốt investigation
+này. Phân bố đặc thù theo sender/topic (100% từ `control_station` →
+`robot_NNNN/control`, xem Phase 7 ở mục trên) vẫn giữ nguyên, chưa có
+bước nào trong phase này kiểm tra lại phân bố đó trên raw_recvfrom
+(có thể làm ở bước sau nếu được yêu cầu tiếp).
+
+**File liên quan**: code commit `d55ecfd` (instrumentation, đã push).
+Script batch (không thuộc repo):
+`/tmp/.../scratchpad/step27a_n2_raw_recvfrom_smoketest.py`,
+`step27b_lan16_raw_recvfrom_check.py`, raw:
+`step27b_lan16_raw_recvfrom_check.jsonl`. KHÔNG có code production nào
+bị sửa hành vi trong bước này (chỉ thêm 1 điểm ghi nhận quan sát,
+env-gated, default-off).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
