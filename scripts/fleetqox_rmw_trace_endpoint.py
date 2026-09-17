@@ -172,9 +172,21 @@ def fleetqox_loss_funnel_trace() -> dict[str, list[dict[str, Any]]]:
     because an earlier target in the same send call failed? Only
     populated when FLEETQOX_RMW_LOSS_FUNNEL_TRACE_PROFILING is set (same
     opt-in, zero-cost-otherwise pattern as the other profiling env vars
-    here). Returns {"send": [...], "recv": [...]}.
+    here). Returns {"send": [...], "recv": [...], "raw_recvfrom": [...]}.
+
+    "raw_recvfrom" (added 18/09/2026, see
+    docs/AUDIT_ACCEPTANCE_TRACKING.md) is an EARLIER checkpoint than
+    "recv": recorded directly in receive_loop() right after recvfrom()
+    returns, before any dispatch/reassembly/decode -- lets a message
+    already proven (via packet capture) to reach the receiving
+    container's own network interface be checked against whether
+    recvfrom() itself ever saw those bytes. Best-effort only (can't
+    identify AEAD/peer-auth-encrypted or non-fragment-0 fragment
+    payloads, which have no plaintext JSON yet at this point) -- absence
+    here is not proof of loss for those cases, only for plain DATA
+    frames like this benchmark's traffic.
     """
-    empty: dict[str, list[dict[str, Any]]] = {"send": [], "recv": []}
+    empty: dict[str, list[dict[str, Any]]] = {"send": [], "recv": [], "raw_recvfrom": []}
     if os.environ.get("RMW_IMPLEMENTATION") != "rmw_fleetqox_cpp":
         return empty
     if not os.environ.get("FLEETQOX_RMW_LOSS_FUNNEL_TRACE_PROFILING"):
@@ -187,6 +199,7 @@ def fleetqox_loss_funnel_trace() -> dict[str, list[dict[str, Any]]]:
     for key, symbol_name in (
         ("send", "rmw_fleetqox_cpp_loss_funnel_send_trace_json"),
         ("recv", "rmw_fleetqox_cpp_loss_funnel_recv_trace_json"),
+        ("raw_recvfrom", "rmw_fleetqox_cpp_loss_funnel_raw_recvfrom_trace_json"),
     ):
         fn = getattr(library, symbol_name)
         fn.restype = ctypes.c_char_p

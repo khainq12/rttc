@@ -574,6 +574,81 @@ struct LossFunnelRecvEvent
 std::mutex g_loss_funnel_trace_mutex;
 std::vector<LossFunnelSendEvent> g_loss_funnel_send_events;
 std::vector<LossFunnelRecvEvent> g_loss_funnel_recv_events;
+// Earlier checkpoint than g_loss_funnel_recv_events: recorded directly in
+// receive_loop() right after recvfrom() returns, BEFORE
+// handle_received_datagram()/reassembly/handle_received_payload()'s
+// unrecoverable-loss-notice/ack-nack/graph/service checks/decode_data_frame
+// run at all. Added 18/09/2026 to distinguish, for a
+// SEND_SUCCESS_NOT_RECEIVED message already proven (via packet capture)
+// to reach the receiver's network interface: does recvfrom() itself ever
+// see these bytes (if yes here but still absent from
+// g_loss_funnel_recv_events, the loss is somewhere in FleetRMW's own
+// dispatch chain -- Case D-leaning) or does it never reach recvfrom() at
+// all (if absent here too despite the interface capture showing it --
+// Case C, purely kernel-side, a class of drop not reflected in
+// /proc/net/udp's own "drops" column, already measured at 0). Purely
+// observational -- does not change receive_loop()'s control flow, still
+// calls handle_received_datagram() on the exact same encoded_frame
+// regardless of what this records.
+std::vector<LossFunnelRecvEvent> g_loss_funnel_raw_recvfrom_events;
+
+// Cheap substring-based identity extraction directly on just-received raw
+// bytes, mirroring the SAME regex logic already proven against tcpdump
+// capture text (see /tmp scratchpad step26_packet_capture.py's
+// PUBLISHER_ID_RE/SEQ_RE/TOPIC_RE) but without needing std::regex in a
+// hot receive-thread loop or duplicating decode_data_frame()'s stricter
+// validation. Returns false (and leaves outputs untouched) if this
+// doesn't look like a recognizable Fleet DATA frame -- callers must
+// treat that as "not classifiable," not "definitely not DATA" (e.g. a
+// non-fragment-0 fragment continuation has no JSON at all by design).
+bool extract_loss_funnel_identity_from_raw_bytes(
+  const std::string & raw, std::string * out_publisher_id,
+  std::uint64_t * out_source_sequence, std::string * out_topic)
+{
+  const size_t kind_pos = raw.find("\"kind\":\"sidecar_packet_frame\"");
+  if (kind_pos == std::string::npos) {
+    return false;
+  }
+  const size_t pub_key = raw.find("\"publisher_id\":\"");
+  if (pub_key == std::string::npos) {
+    return false;
+  }
+  const size_t pub_start = pub_key + std::strlen("\"publisher_id\":\"");
+  const size_t pub_end = raw.find('"', pub_start);
+  if (pub_end == std::string::npos) {
+    return false;
+  }
+  const size_t seq_key = raw.find("\"source_sequence_number\":");
+  if (seq_key == std::string::npos) {
+    return false;
+  }
+  const size_t seq_start = seq_key + std::strlen("\"source_sequence_number\":");
+  size_t seq_end = seq_start;
+  while (seq_end < raw.size() && std::isdigit(static_cast<unsigned char>(raw[seq_end]))) {
+    ++seq_end;
+  }
+  if (seq_end == seq_start) {
+    return false;
+  }
+  const std::string route_prefix = "\"route\":{\"robot_id\":\"";
+  const size_t route_key = raw.find(route_prefix);
+  if (route_key == std::string::npos) {
+    return false;
+  }
+  size_t topic_key = raw.find("\",\"topic\":\"", route_key);
+  if (topic_key == std::string::npos) {
+    return false;
+  }
+  const size_t topic_start = topic_key + std::strlen("\",\"topic\":\"");
+  const size_t topic_end = raw.find('"', topic_start);
+  if (topic_end == std::string::npos) {
+    return false;
+  }
+  *out_publisher_id = raw.substr(pub_start, pub_end - pub_start);
+  *out_source_sequence = std::strtoull(raw.substr(seq_start, seq_end - seq_start).c_str(), nullptr, 10);
+  *out_topic = raw.substr(topic_start, topic_end - topic_start);
+  return true;
+}
 
 // Smuggles the currently-publishing DATA frame's identity from
 // send_frame_with_qos() (which has the decoded DataFrame) down into
@@ -7715,6 +7790,31 @@ private:
         continue;
       }
       const std::string encoded_frame(buffer.data(), static_cast<size_t>(received));
+      if (loss_funnel_trace_profiling_enabled()) {
+        // Earliest possible checkpoint: recvfrom() just returned these
+        // exact bytes, nothing else has looked at them yet (not even
+        // AEAD/peer-auth unprotect, fragment reassembly, or any of
+        // handle_received_payload()'s type dispatch). See
+        // g_loss_funnel_raw_recvfrom_events' doc comment. Best-effort
+        // only -- an AEAD/peer-auth-encrypted or non-fragment-0 fragment
+        // payload won't match (no plaintext JSON to find yet), which is
+        // an expected, not-diagnosed-as-loss limitation of this specific
+        // checkpoint, not a bug.
+        std::string publisher_id;
+        std::uint64_t source_sequence = 0;
+        std::string topic;
+        if (extract_loss_funnel_identity_from_raw_bytes(
+            encoded_frame, &publisher_id, &source_sequence, &topic))
+        {
+          LossFunnelRecvEvent event;
+          event.source_id = std::move(publisher_id);
+          event.source_sequence = source_sequence;
+          event.topic = std::move(topic);
+          event.wall_ns = monotonic_timestamp_ns();
+          std::lock_guard<std::mutex> trace_lock(g_loss_funnel_trace_mutex);
+          g_loss_funnel_raw_recvfrom_events.push_back(std::move(event));
+        }
+      }
       if (hybrid_transport() && !udp_aead_enabled_) {
         if (!shared_memory_transport_.send(encoded_frame)) {
           handle_received_datagram(encoded_frame, true, &source);
@@ -15284,6 +15384,29 @@ const char * rmw_fleetqox_cpp_loss_funnel_recv_trace_json()
       built += ",";
     }
     const LossFunnelRecvEvent & event = g_loss_funnel_recv_events[i];
+    built += "{\"source_id\":\"" + loss_funnel_json_escape(event.source_id) + "\",";
+    built += "\"source_sequence\":" + std::to_string(event.source_sequence) + ",";
+    built += "\"topic\":\"" + loss_funnel_json_escape(event.topic) + "\",";
+    built += "\"wall_ns\":" + std::to_string(event.wall_ns) + "}";
+  }
+  built += "]";
+  json = std::move(built);
+  return json.c_str();
+}
+
+// Earlier checkpoint than the above -- see g_loss_funnel_raw_recvfrom_events'
+// doc comment (recorded directly in receive_loop() right after recvfrom()
+// returns, before any dispatch/reassembly/decode).
+const char * rmw_fleetqox_cpp_loss_funnel_raw_recvfrom_trace_json()
+{
+  static std::string json;
+  std::lock_guard<std::mutex> lock(g_loss_funnel_trace_mutex);
+  std::string built = "[";
+  for (size_t i = 0; i < g_loss_funnel_raw_recvfrom_events.size(); ++i) {
+    if (i != 0) {
+      built += ",";
+    }
+    const LossFunnelRecvEvent & event = g_loss_funnel_raw_recvfrom_events[i];
     built += "{\"source_id\":\"" + loss_funnel_json_escape(event.source_id) + "\",";
     built += "\"source_sequence\":" + std::to_string(event.source_sequence) + ",";
     built += "\"topic\":\"" + loss_funnel_json_escape(event.topic) + "\",";
