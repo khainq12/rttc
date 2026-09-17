@@ -8218,6 +8218,133 @@ Script batch (không thuộc repo):
 bị sửa hành vi trong bước này (chỉ thêm 1 điểm ghi nhận quan sát,
 env-gated, default-off).
 
+## Kernel drop-reason tracing (bpftrace kfree_skb): loại TOÀN BỘ traceable kernel drop path — MECHANISM vẫn CHƯA xác định (18/09/2026)
+
+**Mục tiêu**: tìm CHÍNH XÁC kernel stage/function/reason làm biến mất
+gói `/control` (downlink control_station→robot) — đã biết LOCATION
+(receiver's own eth0 → kernel → KHÔNG BAO GIỜ tới `recvfrom()`) nhưng
+CHƯA biết MECHANISM.
+
+**Instrumentation**: dùng `bpftrace` (eBPF) gắn vào tracepoint
+`skb:kfree_skb` của HOST kernel (6.8.0-138-generic) — tracepoint này
+bắt MỌI lần kernel free một skb qua đường "drop" (không phải qua
+`consume_skb()` của luồng xử lý thành công), kèm `reason` (enum
+`skb_drop_reason`, đọc trực tiếp từ
+`/sys/kernel/debug/tracing/events/skb/kfree_skb/format` của CHÍNH
+kernel này — ~90 lý do cụ thể) và `location` (hàm kernel gọi free,
+qua `ksym()`). Vì các container endpoint chỉ có network namespace
+riêng (không có SYS_ADMIN đủ cho eBPF), tracer chạy trong 1 container
+CHẨN ĐOÁN RIÊNG (`--pid=host --privileged`, image mới
+`rmw-netem:jazzy-krnldiag` — build từ `jazzy-apt-ns341-backup` (đã có
+mạng) + `apt-get install tcpdump bpftrace linux-tools-generic`, KHÔNG
+đụng image gốc) — vì các hàm kernel là DÙNG CHUNG cho mọi netns trên
+cùng 1 host, kprobe/tracepoint gắn ở đây thấy được TẤT CẢ traffic của
+benchmark dù nó chạy trong netns riêng của từng container.
+
+**Lỗi instrumentation tự phát hiện + sửa TRƯỚC khi tin kết quả**: lần
+chạy N=16×3 ĐẦU TIÊN cho kết quả "0 kfree_skb event" tuyệt đối — nhưng
+file log ra là **0 byte HOÀN TOÀN, kể cả dòng banner** → nghi ngờ ngay
+(nếu tracer chạy đúng, phải có OUTPUT dù match hay không). Root cause:
+`docker rm -f` gửi SIGKILL cho container ngay khi benchmark xong,
+trong khi `bpftrace`'s stdout khi bị redirect ra file mặc định
+block-buffered (libc) — dữ liệu CHƯA ĐỦ ĐẦY buffer thì bị kill mất,
+KHÔNG BAO GIỜ ghi ra đĩa. **Fix**: bọc bằng `stdbuf -oL` (buộc
+line-buffered) — xác nhận bằng test trực tiếp: đọc file NGAY TRONG LÚC
+container còn sống (không đợi kill) thấy dữ liệu xuất hiện tức thời,
+và dữ liệu KHÔNG đổi sau khi kill — chứng minh fix đúng. Toàn bộ N=16×3
+được CHẠY LẠI với fix này trước khi lấy số liệu chính thức.
+
+**Verify attach thành công (không chỉ verify buffer)**: thêm probe
+`BEGIN { printf("STARTED") }` + in TRỰC TIẾP mọi UDP drop's dest port
+(không lọc port 9100) — chạy 1 rep N=16 THẬT trong khi container tracer
+đã attach từ trước, đọc file NGAY TRONG LÚC container còn chạy (không
+đợi bất kỳ kill nào) → `STARTED` xuất hiện (attach OK, script phức tạp
+compile+load qua BPF verifier thành công) nhưng **0 dòng
+`SEEN_UDP_DROP` cho BẤT KỲ port UDP nào** trong suốt benchmark — tức
+kết quả "0" không phải do tracer chưa attach hay chưa chạy, mà là
+GENUINE zero.
+
+**Kiểm tra confound khác trước khi tin raw_recvfrom's 99.94%-missing
+kết luận (Phase trước)**: lo ngại rằng
+`extract_loss_funnel_identity_from_raw_bytes()` (best-effort, bỏ qua
+payload AEAD/encrypted hoặc fragment≠0) có thể bị "mù" riêng với
+topic `/control`, khiến kết luận trước đó ("99.94% missing không bao
+giờ tới `recvfrom()`") thực ra là lỗi EXTRACTION chứ không phải thật
+sự không tới. **Kiểm tra trực tiếp**: với MỌI message ĐÃ BIẾT delivered
+(có trong recv-trace), tỷ lệ nó CŨNG xuất hiện trong raw_recvfrom-trace
+— đo theo TỪNG topic. Kết quả: **100.00% cho MỌI topic, kể cả TẤT CẢ
+16 topic `robot_NNNN/control`** (ví dụ robot_0000: 91/91, robot_0015:
+21/21) — loại hẳn confound này, xác nhận kết luận 99.94%-missing của
+phase trước là ĐÚNG, không phải artifact.
+
+**LAN N=16, n=3, đúng config lịch sử, kfree_skb filter = UDP dest port
+9100** (sau khi sửa buffer bug):
+
+| rep | missing downlink (control_station→robot) | missing uplink | kfree_skb events (port 9100, MỌI reason) | downlink drops | uplink drops |
+|---|---|---|---|---|---|
+| 1 | 529 | 0 | 0 | 0 | 0 |
+| 2 | 522 | 0 | 0 | 0 | 0 |
+| 3 | 566 | 0 | 0 | 0 | 0 |
+| **tổng** | **1617** | **0** | **0** | **0** | **0** |
+
+**KHÔNG một gói nào trong 1617 gói `/control` bị mất có một sự kiện
+`kfree_skb` tương ứng** — dù tracepoint này bắt được TOÀN BỘ ~90 lý do
+drop mà kernel 6.8 định nghĩa (`SOCKET_RCVBUFF`, `PROTO_MEM`,
+`SOCKET_BACKLOG`, `CPU_BACKLOG`, `QDISC_DROP`, `NETFILTER_DROP`,
+`IP_CSUM`, `IP_INHDR`, `IP_NOPROTO`, `UDP_CSUM`, `NO_SOCKET`,
+`IP_RPFILTER`, `XFRM_POLICY`, ... — danh sách đầy đủ đọc trực tiếp từ
+tracepoint format của CHÍNH kernel này, không đoán). Xác nhận LẦN NỮA
+bằng test live (mục trên): 0 sự kiện UDP drop ở BẤT KỲ port nào trong
+suốt 1 benchmark N=16 thật đang chạy.
+
+**Bổ sung (supporting evidence, không đầy đủ)**: cố gắng đo thêm
+`/proc/net/softnet_stat` (backlog drops/time_squeeze) và `ip -s link`
+per-netns cho từng receiver — KHÔNG lấy được delta sạch vì
+`run_lan_probe()` tự teardown container trong khối `finally` ngay khi
+trả về (không có hook để snapshot NGAY TRƯỚC teardown mà không sửa
+harness). Không coi đây là gap nghiêm trọng: `kfree_skb`'s
+`CPU_BACKLOG`/`QDISC_DROP`/`SOCKET_BACKLOG` reason đã bao phủ đúng các
+sự kiện mà `softnet_stat`'s "dropped" column cũng đếm — đã đo = 0.
+
+**PROOF GATE (theo đúng tiêu chí user đề ra) — KHÔNG ĐẠT**: tiêu chí 2
+("1 kernel stage/reason cụ thể giải thích được phần lớn missing
+packets") THẤT BẠI hoàn toàn — 0/1617 (0.0%) được giải thích bởi bất kỳ
+kernel drop reason nào. Đây KHÔNG chỉ là "chưa tìm thấy" — mà là loại
+TRỪ TOÀN BỘ nhóm giả thuyết "kernel free gói qua 1 đường code đã được
+instrument" (gần như toàn bộ các đường drop hiện đại của kernel 6.8 đi
+qua `kfree_skb_reason()`).
+
+**Ranh giới localization hiện tại** (không đổi so với phase trước, chỉ
+CHẶT hơn): gói ĐÃ đến `eth0` (tcpdump, phase trước) → kernel's
+`netif_receive_skb` (xác nhận generic tracepoint bắt được y hệt pattern
+cho traffic port 9100 thật) → **KHÔNG một sự kiện `kfree_skb` nào** →
+KHÔNG BAO GIỜ tới `recvfrom()` (raw_recvfrom checkpoint, phase trước).
+Điểm "biến mất" nằm đâu đó trong khoảng này nhưng KHÔNG đi qua bất kỳ
+call site nào mà kernel tự instrument để báo "tôi vừa drop 1 gói".
+
+**GIẢ THUYẾT CHƯA KIỂM TRA (đề xuất cho bước tiếp theo DUY NHẤT, KHÔNG
+tự ý làm trong phase này)**: benchmark/measurement-window boundary —
+liệu các gói "missing" có phải là gói ĐẾN TRỄ (tcpdump timestamp gần
+sát cuối cửa sổ đo 3 giây) mà harness đã NGỪNG lắng nghe / container đã
+bị teardown trước khi kernel kịp giao cho `recvfrom()`, chứ KHÔNG PHẢI
+mất mát mạng thật? Đây là phân tích lại dữ liệu tcpdump ĐÃ CÓ SẴN từ
+phase trước (`step26c_lan16_hop_localization.jsonl`) trước tiên, không
+cần chạy benchmark mới ngay.
+
+**KHÔNG kết luận cơ chế, KHÔNG sửa gì** — đúng STOP RULE và yêu cầu
+người dùng. Phân bố downlink-only (1617/1617 = 100% downlink, 0%
+uplink) tái xác nhận đúng như 2 phase trước.
+
+**File liên quan** (không thuộc repo): image chẩn đoán MỚI
+`localhost/fleetrmw/rmw-netem:jazzy-krnldiag` (tcpdump+bpftrace+
+linux-tools, build từ ảnh có mạng, KHÔNG đụng ảnh gốc). Script:
+`/tmp/.../scratchpad/step29_kernel_drop_trace.py` (chạy 2 lần — lần
+đầu bị bug buffer, lần 2 sau khi sửa `stdbuf -oL` mới là số liệu chính
+thức ở trên), `step30_softnet_and_iflink_check.py` (không lấy được
+delta sạch, ghi nhận limitation). KHÔNG có code production/FleetRMW/
+Docker LAN topology nào bị sửa trong phase này — chỉ container chẩn
+đoán tạm thời (đã cleanup).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
