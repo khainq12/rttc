@@ -7285,6 +7285,85 @@ COMPUTATIONALLY DEGRADED cho Bảng VI ở N cao.
 bên dưới); script phân tích (không thuộc repo):
 `/tmp/.../scratchpad/step14_coordination_harness_ab.py`.
 
+**BẢNG V CLEAN RERUN (17/09/2026) — Wi-Fi N=16 UNUSABLE (ns-3 realtime
+degraded), LAN N=16 INVALIDATE kết luận lịch sử cho CẢ 4 RMW.**
+
+**Wi-Fi N=16 (4 RMW × n=3, `policy=fifo seconds=3 start_offset_ms=2000
+drain_s=10 sim_duration_s=30 ns3_seed=42 ns3_run=1-3 seed=13`)**:
+
+| RMW | packet_rows | delivery_pct | sim_lag_s | ns3sim_cpu_pct | degraded |
+|---|---|---|---|---|---|
+| Fast DDS | 2289 | 12.8-19.4% | 39-40s | ~0.01% | **true** |
+| CycloneDDS | 2289 | 0% (0 tin) | 40s | ~101-103% | **true** |
+| Zenoh | 2289 | 0% (0 tin) | 42s | ~0.01% | **true** |
+| FleetRMW | 2289 | 15.2-16.0% | 21-22s | ~101% | **true** |
+
+**12/12 run `degraded=true`** — `sim_lag_s` 21-42 GIÂY, độc lập với RMW
+nào hay harness fix nào. **Phân loại: WIFI N=16 = UNUSABLE DUE TO NS-3
+REALTIME COMPUTATIONAL DEGRADATION.** Không dùng số liệu này để so sánh
+RMW theo bất kỳ chiều nào ("Fleet tốt hơn Fast", "Zenoh/Cyclone kém"
+đều KHÔNG được phép suy ra từ đây).
+
+**Audit CPU sampling anomaly (Fast/Zenoh ~0.01% dù sim_lag~40s)**: đọc
+trực tiếp `sample_ns3sim_resource_usage()` — không có bug parsing/
+container-name (target đúng `self.ns3sim_name`, `docker stats --no-stream`
+chuẩn). **A**: metric đo đúng CPU thật của container trong cửa sổ ~1s
+riêng của `docker stats --no-stream` (cơ chế 2-lần-đọc nội tại của
+Docker). **B**: điểm lấy mẫu (ngay sau `wait_for_completion()`) KHÔNG
+đồng bộ với cùng một pha "bận" của ns-3 giữa các RMW — thời điểm
+`wait_for_completion()` trả về phụ thuộc hành vi discovery/send/drain
+riêng của từng RMW, nên với Fast DDS/Zenoh mẫu 1-giây đó có thể rơi vào
+đúng lúc ns-3 tạm nghỉ giữa các đợt xử lý dồn (bursty), trong khi
+CycloneDDS/FleetRMW rơi vào lúc đang xử lý dồn. **C**: không có bug
+code. → Đây là hạn chế ĐỘ PHÂN GIẢI của phép đo 1-điểm-thời-gian, không
+phải lỗi cần sửa — `sim_lag_s`/`degraded` (đo tích luỹ, không phải
+snapshot) vẫn là bằng chứng chính đáng tin cho việc N=16 bị degraded,
+không bị ảnh hưởng bởi hạn chế này.
+
+**Audit LAN code path (trước khi chạy)**: đọc trực tiếp
+`wire_network_lan()`/`run_lan_probe()` — xác nhận **KHÔNG BAO GIỜ gọi
+`build_ns3_binary()`/`start_ns3()`**, dùng thuần Linux kernel bridge
+(`lanbr0` + veth), không tap device, không propagation model. **LAN
+hoàn toàn độc lập với `RealtimeSimulatorImpl`/`TapBridge`** — không bị
+chung cơ chế degraded như Wi-Fi.
+
+**LAN N=16 CLEAN RERUN (4 RMW × n=3, cùng seed=13, không có ns3_seed vì
+không dùng ns-3)**:
+
+| RMW | delivery lịch sử → mới | stale lịch sử → mới | p50 lịch sử → mới |
+|---|---|---|---|
+| Fast DDS | 86.3±0.0% → 86.6-89.6% | 62.5% → **0.0%** | 376.1ms → **0.72-0.74ms** |
+| CycloneDDS | 86.3±0.0% → 79.3-84.0% | 62.6% → **0.0%** | 377.3ms → **0.68-0.70ms** |
+| Zenoh | 52.0±35.3% → 25.2-31.6% (1/3 rep = 0 tin, khớp variance lịch sử) | 62.5% → **0.0%** | 372.5ms → **0.95-0.96ms** |
+| **FleetRMW** | 65.8±0.1% → 54.5-55.5% | **81.7% → 0.0%** | **698.7ms → 1.19-1.24ms** |
+
+**Stale ratio = 0.0% cho CẢ 4 RMW** (từ 62-82% trước đó). p50 giảm
+300-1000 lần cho mọi RMW. **KẾT LUẬN LỊCH SỬ "FleetRMW thua Fast
+DDS/CycloneDDS trên LAN do processing overhead nội bộ" (p50=698.7ms,
+stale=81.7%) — INVALIDATED BỞI HARNESS BUG**, không phải hành vi thật
+của FleetRMW. Xác nhận đúng nghi ngờ: bug dispatch-gap RMW-agnostic
+(nằm trong `fleetqox_rmw_trace_endpoint.py`'s send loop, dùng chung cho
+CẢ 4 RMW) đã làm méo số liệu của TẤT CẢ 4 RMW, không riêng FleetRMW.
+
+**Phần kết luận CÓ THỂ vẫn đúng ở mức yếu hơn**: FleetRMW's p50
+(1.19-1.24ms) vẫn cao hơn Fast DDS/CycloneDDS (~0.68-0.74ms) khoảng
+1.6-1.8x (so với tỷ lệ 1.85x trước đó) — hướng "FleetRMW có processing
+overhead nội bộ cao hơn" có thể vẫn đúng về ĐỊNH TÍNH, nhưng độ lớn
+tuyệt đối (698ms, stale 81.7%) hoàn toàn sai và không nên trích dẫn.
+Zenoh rep=2 cho 0/17 endpoint nhận tin (không phải crash, xác nhận qua
+`container_results` còn nguyên 17 file) — khớp variance cao đã biết của
+Zenoh (stdev lịch sử 35.3%), không phải bug mới.
+
+**Sự cố hạ tầng (không phải bug)**: Docker daemon bị crash giữa phiên
+(khả năng do các đợt OOM khi rebuild `rmw_fleetqox_cpp` trước đó), user
+đã restart Docker Desktop — làm mất các container Open5GS đã chạy 2+
+ngày trước đó (hệ quả tự nhiên của việc restart Docker Desktop, không
+phải hành động chủ động của agent).
+
+**File liên quan**: script phân tích (không thuộc repo):
+`/tmp/.../scratchpad/step15_bang5_wifi_n16_clean.py`,
+`/tmp/.../scratchpad/step16_bang5_lan_n16_clean.py`.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
