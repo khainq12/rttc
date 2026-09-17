@@ -7439,6 +7439,74 @@ traffic, không đổi scheduler, không tune FleetQoX để "cứu" N cao hơn.
 **File liên quan**: `/tmp/.../scratchpad/step18_wifi_validity_boundary.py`,
 `/tmp/.../scratchpad/step18b_wifi_fleetrmw_n8.py` (không thuộc repo).
 
+## 5G root-cause: UE-to-UE connectivity (17/09/2026) — Phase 1-4
+
+**Audit hạ tầng trước khi đoán**: đọc `_wait_for_ue_ip()` — route
+`ip route add $UE_IPV4_INTERNET dev uesimtun0` đã được code base
+thêm sẵn (comment giải thích đúng lý do: không có route này thì
+UE-to-UE 100% loss). Nghi ngờ ban đầu "`check=False` nuốt lỗi âm thầm"
+— **BÁC BỎ bằng evidence**: chạy lại lệnh route-add tường minh, tất cả
+trả `rc=2 "File exists"` — route ĐÃ tồn tại đúng, không phải nguyên
+nhân.
+
+**Phase 2 — minimal connectivity probe TRƯỚC RMW**: dựng 2-4 UE thật,
+ping cả 2 chiều, ghi source/dest/rc. Kết quả ban đầu: pattern BẤT ĐỐI
+XỨNG, không nhất quán giữa các lần chạy (vd UE1↔UE3 hoạt động hoàn hảo
+cả 2 chiều, mọi cặp khác 0/5).
+
+**Phase 3 — loại trừ từng giả thuyết bằng evidence, không đoán hàng loạt**:
+1. Stale PFCP session (do `docker rm -f` không NAS-deregister sạch) —
+   restart RIÊNG `smf`+`upf` → vấn đề VẪN CÒN (IP pool reset về dải mới
+   nhưng pattern bất đối xứng vẫn y hệt) → **BÁC BỎ giả thuyết hẹp**
+   (chỉ smf+upf không đủ).
+2. Race condition khi đăng ký đồng thời — thử đăng ký TUẦN TỰ (stagger
+   3s/UE) → vấn đề KHÔNG cải thiện, thậm chí pattern khác đi →
+   **BÁC BỎ**.
+3. `rp_filter`/conntrack/iptables kernel-level — kiểm tra trực tiếp:
+   `rp_filter=0` mọi interface, `conntrack_count=2` (không cạn),
+   `FORWARD` chain ACCEPT không rule chặn, `MASQUERADE` đúng như
+   docstring mô tả (`! -o ogstun`) → **BÁC BỎ**, không phải kernel-level.
+4. **tcpdump trực tiếp trên `ogstun` của UPF trong lúc ping fail**: thấy
+   ICMP echo request đến (2 lần, có duplicate) nhưng **KHÔNG BAO GIỜ
+   thấy ICMP echo reply** — gói vào GTP-U forwarding path nhưng không
+   bao giờ đến đích qua logic userspace UPF. Kèm ICMP redirect từ kernel
+   (nghi ngờ là nhiễu, không phải nguyên nhân chính vì GTP-U forward là
+   logic userspace của Open5GS UPF, không qua kernel routing).
+5. **Test với 2 UE hoàn toàn mới (sau restart smf+upf)**: THÀNH CÔNG
+   100% (3/3) — cho thấy vấn đề liên quan tới SỐ LƯỢNG UE/mức độ churn
+   tích luỹ, không phải per-pair routing bug cố định.
+
+**ROOT CAUSE xác nhận (Phase 4, RED→FIX→GREEN)**: state tích luỹ trong
+TOÀN BỘ fleet NF Open5GS (không chỉ smf+upf riêng lẻ) sau nhiều vòng UE
+churn (hàng chục UE tạo/hủy qua nhiều lần test chẩn đoán trong phiên
+này, chỉ `docker rm -f`, không NAS/PFCP release đàng hoàng). **FIX**:
+restart TOÀN BỘ `CORE_SERVICES` (mongo/nrf/scp/ausf/udr/udm/smf/upf/amf/
+pcf/bsf/nssf) + gNB — restart RIÊNG smf+upf KHÔNG đủ (đã test, thất
+bại), phải restart CẢ FLEET NF. **GREEN xác nhận**: sau full restart,
+4 UE mới → **12/12 cặp, 5/5 mỗi chiều**, lặp lại kiểm tra 3 lần liên
+tiếp đều 5/5 — ổn định, tái lập được.
+
+**Code hoá fix** (không chỉ lệnh tay 1 lần) trong
+`scripts/run_open5gs_docker_fleet_probe.py`:
+- `restart_open5gs_core()`: restart toàn bộ NF+gNB, chờ `amf` sẵn sàng
+  lại, có docstring đầy đủ root cause.
+- `verify_ue_to_ue_connectivity()`: dựng 2 UE throwaway, ping 2 chiều,
+  teardown, raise rõ ràng nếu fail — dùng làm pre-flight check TRƯỚC
+  batch thật, tránh lặp lại lỗi "chạy cả batch rồi mới phát hiện 0%
+  delivery" như Phase 5 lần trước. Đã test qua chính function này:
+  **CONNECTIVITY CHECK PASSED**.
+
+**Không phải FleetQoX/RMW failure** — xác nhận lại: pattern lỗi độc lập
+với RMW nào (FastDDS/CycloneDDS/FleetRMW đều fail giống hệt khi core
+degraded, Zenoh chỉ "may mắn" vì đi qua 1 router cố định thay vì cần
+UE-to-UE discovery/static-peer trực tiếp).
+
+**File liên quan**: `scripts/run_open5gs_docker_fleet_probe.py`
+(`restart_open5gs_core()`, `verify_ue_to_ue_connectivity()` — commit
+riêng, xem hash bên dưới); script chẩn đoán (không thuộc repo):
+`/tmp/.../scratchpad/step19_5g_connectivity_diag.py` qua
+`step19e_5g_connectivity_diag.py`.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
