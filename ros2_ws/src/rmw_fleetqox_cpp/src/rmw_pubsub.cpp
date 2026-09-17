@@ -759,6 +759,16 @@ std::int64_t g_last_take_timestamp_ns{0};
 thread_local rmw_message_info_t * g_typed_take_message_info{nullptr};
 std::atomic<std::uint64_t> g_duplicate_data_frames_deduped{0};
 std::atomic<std::uint64_t> g_out_of_order_data_frames_observed{0};
+// Loss-funnel instrumentation (Optimization #2 candidate investigation,
+// see docs/AUDIT_ACCEPTANCE_TRACKING.md): a decoded DATA frame that
+// matched zero local subscriptions (topic/domain/type/partition
+// mismatch, or simply no local subscriber for this topic on this
+// process) never reaches enqueue_frame_respecting_destination_order --
+// previously uncounted, so "received but nobody wanted it" was
+// indistinguishable from "received and delivered." Purely observational
+// atomic counters -- no behavior/timing/admission/retry change.
+std::atomic<std::uint64_t> g_data_frames_matched_zero_subscriptions{0};
+std::atomic<std::uint64_t> g_frames_enqueued_to_subscriptions{0};
 std::atomic<std::uint64_t> g_idle_repair_ack_nack_sent{0};
 std::atomic<std::uint64_t> g_reliable_timeout_retransmissions{0};
 std::atomic<std::uint64_t> g_fragment_observed_timeout_retransmissions_suppressed{0};
@@ -2847,6 +2857,39 @@ public:
   std::uint64_t data_frames_received() const
   {
     return data_frames_received_.load(std::memory_order_relaxed);
+  }
+
+  // Loss-funnel instrumentation (Optimization #2 candidate investigation,
+  // see docs/AUDIT_ACCEPTANCE_TRACKING.md). Purely observational atomic
+  // counters -- no behavior/timing/admission/retry/queue change.
+  std::uint64_t frames_received_unrecognized() const
+  {
+    return frames_received_unrecognized_.load(std::memory_order_relaxed);
+  }
+
+  // send_datagram_to_targets() sends to `targets` sequentially in one
+  // call and returns immediately on the first unretryable per-target
+  // failure -- every target ordered after the failing one in that same
+  // call is never attempted. These counters make that abort/skip
+  // behavior directly measurable instead of inferred.
+  std::uint64_t send_datagram_partial_abort_calls() const
+  {
+    return send_datagram_partial_abort_calls_.load(std::memory_order_relaxed);
+  }
+
+  std::uint64_t send_datagram_full_success_calls() const
+  {
+    return send_datagram_full_success_calls_.load(std::memory_order_relaxed);
+  }
+
+  std::uint64_t send_datagram_targets_attempted() const
+  {
+    return send_datagram_targets_attempted_.load(std::memory_order_relaxed);
+  }
+
+  std::uint64_t send_datagram_targets_skipped() const
+  {
+    return send_datagram_targets_skipped_.load(std::memory_order_relaxed);
   }
 
   bool udp_aead_enabled() const
@@ -6887,8 +6930,10 @@ private:
     if (profiling) {
       record_publish_stage(PublishStage::kUdpSendMutexWait, monotonic_timestamp_ns() - mutex_wait_t0);
     }
+    size_t targets_attempted_this_call = 0;
     for (const sockaddr_in & target : targets) {
       pace_udp_send_locked();
+      ++targets_attempted_this_call;
       const auto sent = ::sendto(
         fd_,
         payload.data(),
@@ -6971,9 +7016,24 @@ private:
             std::to_string(send_errno) + " (" + std::strerror(send_errno) + ")";
           RMW_SET_ERROR_MSG(diag.c_str());
         }
+        // Loss-funnel instrumentation: this call is aborting on target
+        // `targets_attempted_this_call - 1` (0-indexed) of `targets` --
+        // every target ordered AFTER it in this same vector is never
+        // attempted (the loop `return`s here instead of continuing to
+        // the next target). See send_datagram_partial_abort_calls()'s
+        // doc comment. Purely observational -- does not change which
+        // targets get attempted, only counts it.
+        send_datagram_partial_abort_calls_.fetch_add(1, std::memory_order_relaxed);
+        send_datagram_targets_attempted_.fetch_add(
+          targets_attempted_this_call, std::memory_order_relaxed);
+        send_datagram_targets_skipped_.fetch_add(
+          targets.size() - targets_attempted_this_call, std::memory_order_relaxed);
         return RMW_RET_ERROR;
       }
     }
+    send_datagram_full_success_calls_.fetch_add(1, std::memory_order_relaxed);
+    send_datagram_targets_attempted_.fetch_add(
+      targets_attempted_this_call, std::memory_order_relaxed);
     return RMW_RET_OK;
   }
 
@@ -8413,6 +8473,12 @@ private:
       return;
     }
     if (!rmw_fleetqox_cpp::decode_data_frame(encoded_frame)) {
+      // Loss-funnel instrumentation: a received, decrypted (if AEAD/
+      // peer-auth enabled) payload that isn't any recognized frame type
+      // (not unrecoverable-loss-notice/ack-nack/graph/service/data) --
+      // previously silently discarded with no counter distinguishing it
+      // from "never arrived at all."
+      frames_received_unrecognized_.fetch_add(1, std::memory_order_relaxed);
       return;
     }
     data_frames_received_.fetch_add(1, std::memory_order_relaxed);
@@ -8429,6 +8495,11 @@ private:
   std::atomic<std::uint64_t> frames_sent_{0};
   std::atomic<std::uint64_t> frames_received_{0};
   std::atomic<std::uint64_t> data_frames_received_{0};
+  std::atomic<std::uint64_t> frames_received_unrecognized_{0};
+  std::atomic<std::uint64_t> send_datagram_partial_abort_calls_{0};
+  std::atomic<std::uint64_t> send_datagram_full_success_calls_{0};
+  std::atomic<std::uint64_t> send_datagram_targets_attempted_{0};
+  std::atomic<std::uint64_t> send_datagram_targets_skipped_{0};
   bool udp_aead_enabled_{false};
   bool udp_aead_required_{false};
   bool udp_aead_tamper_outbound_once_{false};
@@ -14430,6 +14501,7 @@ void deliver_decoded_frame_to_subscriptions_locked(
           continue;
         }
         ++matched_subscriptions;
+        g_frames_enqueued_to_subscriptions.fetch_add(1, std::memory_order_relaxed);
         enqueue_frame_respecting_destination_order(
           subscription, encoded_frame, decoded_frame->source_timestamp_ns);
         // T_RMW_READY: frame is now in this subscription's frame_queue,
@@ -14498,6 +14570,16 @@ void enqueue_received_frame(const std::string & encoded_frame)
         member.first, member.second, receive_ns, callbacks, event_callbacks,
         ack_nack_payloads, matched_subscriptions);
     }
+  }
+
+  // Loss-funnel instrumentation: a decoded DATA frame that reached
+  // delivery but matched zero local subscriptions (topic/domain/type/
+  // partition mismatch, or genuinely no local subscriber for this
+  // topic) -- previously indistinguishable from "delivered." Only
+  // counted here, after delivery was actually attempted (not on the
+  // coherent-set early-return above, which just means still buffering).
+  if (matched_subscriptions == 0) {
+    g_data_frames_matched_zero_subscriptions.fetch_add(1, std::memory_order_relaxed);
   }
 
   for (const auto & payload : ack_nack_payloads) {
@@ -15040,6 +15122,43 @@ std::uint64_t rmw_fleetqox_cpp_socket_frames_received()
 std::uint64_t rmw_fleetqox_cpp_socket_data_frames_received()
 {
   return socket_transport().data_frames_received();
+}
+
+// Loss-funnel instrumentation (Optimization #2 candidate investigation,
+// see docs/AUDIT_ACCEPTANCE_TRACKING.md). Purely observational counters.
+std::uint64_t rmw_fleetqox_cpp_socket_frames_received_unrecognized()
+{
+  return socket_transport().frames_received_unrecognized();
+}
+
+std::uint64_t rmw_fleetqox_cpp_socket_send_datagram_partial_abort_calls()
+{
+  return socket_transport().send_datagram_partial_abort_calls();
+}
+
+std::uint64_t rmw_fleetqox_cpp_socket_send_datagram_full_success_calls()
+{
+  return socket_transport().send_datagram_full_success_calls();
+}
+
+std::uint64_t rmw_fleetqox_cpp_socket_send_datagram_targets_attempted()
+{
+  return socket_transport().send_datagram_targets_attempted();
+}
+
+std::uint64_t rmw_fleetqox_cpp_socket_send_datagram_targets_skipped()
+{
+  return socket_transport().send_datagram_targets_skipped();
+}
+
+std::uint64_t rmw_fleetqox_cpp_data_frames_matched_zero_subscriptions()
+{
+  return g_data_frames_matched_zero_subscriptions.load(std::memory_order_relaxed);
+}
+
+std::uint64_t rmw_fleetqox_cpp_frames_enqueued_to_subscriptions()
+{
+  return g_frames_enqueued_to_subscriptions.load(std::memory_order_relaxed);
 }
 
 bool rmw_fleetqox_cpp_udp_aead_enabled()

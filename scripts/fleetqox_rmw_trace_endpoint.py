@@ -89,10 +89,38 @@ def fleetqox_transport_metrics() -> dict[str, Any]:
         "graph_full_resyncs_sent",
         "subscription_aware_frames",
         "subscription_aware_fallback_broadcasts",
+        # Loss-funnel instrumentation (Optimization #2 candidate
+        # investigation, see docs/AUDIT_ACCEPTANCE_TRACKING.md): localize
+        # WHERE FleetRMW messages disappear between publish and app
+        # delivery. frames_received_unrecognized = received a payload
+        # that matched no known frame type (fell through decode_data_frame
+        # silently before this instrumentation). send_datagram_*
+        # = measures send_datagram_to_targets()'s per-call fan-out: it
+        # aborts the whole call on the first unretryable per-target send
+        # failure, so every peer ordered after the failing one in that
+        # call's target list is never attempted -- partial_abort_calls
+        # counts how often this happens, targets_skipped counts how many
+        # peer-sends were never even attempted as a result.
+        "frames_received_unrecognized",
+        "send_datagram_partial_abort_calls",
+        "send_datagram_full_success_calls",
+        "send_datagram_targets_attempted",
+        "send_datagram_targets_skipped",
+    )
+    # Global (not per-socket) loss-funnel counters -- different ctypes
+    # export naming (no "_socket_" infix), see rmw_pubsub.cpp's
+    # g_data_frames_matched_zero_subscriptions/g_frames_enqueued_to_subscriptions.
+    global_names = (
+        "data_frames_matched_zero_subscriptions",
+        "frames_enqueued_to_subscriptions",
     )
     metrics: dict[str, Any] = {"available": True}
     for name in names:
         symbol = getattr(library, f"rmw_fleetqox_cpp_socket_{name}")
+        symbol.restype = ctypes.c_uint64
+        metrics[name] = int(symbol())
+    for name in global_names:
+        symbol = getattr(library, f"rmw_fleetqox_cpp_{name}")
         symbol.restype = ctypes.c_uint64
         metrics[name] = int(symbol())
     metrics["publish_stages"] = fleetqox_publish_stage_metrics(library)
