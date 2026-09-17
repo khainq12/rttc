@@ -7364,6 +7364,43 @@ phải hành động chủ động của agent).
 `/tmp/.../scratchpad/step15_bang5_wifi_n16_clean.py`,
 `/tmp/.../scratchpad/step16_bang5_lan_n16_clean.py`.
 
+**5G N=16 clean rerun (Phase B) — BLOCKED bởi lỗi hạ tầng KHÔNG liên
+quan harness fix, chưa có kết luận.**
+
+Xác nhận qua code trước khi chạy: `Open5gsTopologyProbe` kế thừa
+`launch_endpoints()` KHÔNG override từ `ReferenceTopologyProbe` — dùng
+đúng `fleetqox_rmw_trace_endpoint.py` đã sửa, cùng cơ chế với Wi-Fi/LAN.
+
+Dựng lại core Open5GS+UERANSIM từ đầu (image đã có sẵn, không cần
+build lại) sau khi Docker Desktop restart làm mất deployment 2 ngày
+trước đó. Chạy N=16, 4 RMW × n=3, `radio_link_loss_pct=2.0` (khớp
+config lịch sử cuối cùng).
+
+**Kết quả**: FastDDS, CycloneDDS, FleetRMW đều **0 tin nhận được**
+(`rx=0`, `discovery_peers_seen=0`) ở CẢ 3 rep mỗi RMW — dù `tx=86` (gói
+tin có gửi ra), `status=ok` (không báo lỗi), `packet_rows=2289` (trace
+sinh đúng). CHỈ Zenoh (đi qua 1 router trung tâm cố định) vẫn giao tin
+bình thường (55.7-80.6% delivery, 0% stale). **Đây là lỗi kết nối
+UE-to-UE thật** ở lần dựng core MỚI này — không phải do harness fix
+(3 RMW cần discovery/static-peer trực tiếp UE↔UE đều fail giống hệt
+nhau, bất kể cơ chế discovery của từng RMW khác nhau — multicast cho
+FastDDS/CycloneDDS, static IP list cho FleetRMW — gợi ý vấn đề nằm ở
+tầng ROUTING UE-to-UE của core mới dựng, không phải config riêng của
+từng RMW). Đọc code (`run_open5gs_docker_fleet_probe.py`'s "UE-to-UE
+routing note") xác nhận về mặt THIẾT KẾ, UE-to-UE không cần NAT
+workaround — nên đây nhiều khả năng là vấn đề TRẠNG THÁI (stale
+routing/ARP/UE-IP-allocation) riêng của lần dựng lại core này, chưa rõ
+nguyên nhân chính xác.
+
+**Phân loại**: 5G N=16 = **CHƯA CÓ KẾT LUẬN** (not VALID, not INVALIDATED
+— bị chặn bởi lỗi hạ tầng cần điều tra riêng, tách biệt khỏi câu hỏi
+harness dispatch-gap). Không dùng số liệu 5G lần chạy này cho bất kỳ so
+sánh nào. Việc điều tra nguyên nhân UE-to-UE routing để lại làm việc
+riêng, không thuộc phạm vi "làm sạch harness dispatch-gap" đang làm.
+
+**File liên quan**: `/tmp/.../scratchpad/step17_bang5_5g_n16_clean.py`
+(không thuộc repo).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
