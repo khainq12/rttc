@@ -8031,6 +8031,113 @@ ingress-trước-socket.
 trong bước này (sampler hoàn toàn bên ngoài FleetRMW, chỉ đọc
 `/proc/net/udp`+`/proc/net/snmp` qua `docker exec`).
 
+## Packet-level hop localization: LOCATION PROVEN, mechanism NOT yet proven (18/09/2026)
+
+**Mục tiêu**: xác định CHÍNH XÁC hop nào làm biến mất gói
+`SEND_SUCCESS_NOT_RECEIVED` (sendto SUCCESS nhưng receiver không bao
+giờ thấy), bằng packet capture thật, không suy đoán.
+
+**Phase 1 — topology** (đọc `wire_network_lan()`): mỗi endpoint có 1
+cặp veth `vlan{i}br` (phía bridge, trong netns của `ns3sim`) ↔
+`vlan{i}ep` (đổi tên `eth0`, trong netns riêng của endpoint). Bridge
+`lanbr0` sống trong netns của `ns3sim`, MỌI `vlan{i}br` là port của
+bridge này — bắt gói trên `lanbr0` = 1 điểm quan sát DUY NHẤT thấy
+TOÀN BỘ traffic bridge cho MỌI cặp gửi/nhận.
+
+**Instrumentation**: container LAN chạy `--network=none` (xác nhận
+qua lỗi DNS thật khi thử `apt-get install` giữa lúc chạy) — không thể
+cài tcpdump on-demand giữa benchmark. **Fix**: cài tcpdump 1 LẦN vào 1
+container tạm THƯỜNG (có mạng), `docker commit` thành image mới
+`rmw-netem:jazzy-tcpdump` — KHÔNG đụng image gốc, không phải thay đổi
+sản phẩm, chỉ thêm 1 tool chẩn đoán. Capture bằng `tcpdump -A` (text
+ASCII, không cần thư viện parse pcap) tại 3 điểm: sender's `eth0`
+(P1), `lanbr0` (P2), receiver's `eth0` (P3) — cộng P0 (send trace đã
+có) và P4 (recv trace đã có).
+
+**Giải mã DATA frame từ payload thô**: xác nhận qua đọc
+`encode_data_frame_append()` — wire format là JSON THUẦN TUÝ (KHÔNG
+base64-wrap ngoại trừ `serialized_payload.data`), prefix
+`"FRMW1\n"`, field `sample_envelope.publisher_id`/
+`.source_sequence_number` VÀ `route.topic` đọc trực tiếp bằng regex,
+không cần sửa production wire format.
+
+**Phase 4 — N=2 sanity check (bắt buộc trước N=16)**: lần đầu chỉ đạt
+**75.6%** correlation cho message ĐÃ BIẾT delivered — điều tra: DATA
+frame topic "perception" bị FRAGMENT (`FLEETQOX_REPAIR_FRAGMENT_V1|...`
+prefix TRƯỚC `FRMW1\n`), snaplen=512 cắt JSON TRƯỚC khi tới giá trị
+`source_sequence_number`. **Fix**: tăng snaplen lên 2048 — rerun cho
+**100.0%** correlation ở CẢ 3 điểm quan sát (sender/bridge/receiver)
+cho mọi message đã biết delivered. Instrumentation ĐẠT chuẩn Phase 4
+trước khi chạy N=16.
+
+**Phase 5/6 — LAN N=16, FleetRMW-only, n=3, đúng config lịch sử,
+phân loại C0-C5**:
+
+| rep | intended | C0 (sender iface) | C1 (bridge) | C2 (receiver iface) | **C3+ (app/recv-trace)** | C_OK |
+|---|---|---|---|---|---|---|
+| 1 | 2766 | 0 | 0 | 0 | **652 (23.6%)** | 2114 (76.4%) |
+| 2 | 2766 | 0 | 0 | 0 | **610 (22.1%)** | 2156 (77.9%) |
+| 3 | 2766 | 0 | 0 | 0 | **614 (22.2%)** | 2152 (77.8%) |
+
+**C0=C1=C2=0 TUYỆT ĐỐI ở CẢ 3 rep** — gói tin LUÔN LUÔN thấy được ở
+sender interface, LUÔN LUÔN qua bridge, LUÔN LUÔN đến đúng receiver
+interface. **100% tổn thất quan sát được rơi vào C3+**: gói ĐÃ đến
+interface của receiver (xác nhận bằng tcpdump ngay trên `eth0` của
+CHÍNH container đó) nhưng KHÔNG BAO GIỜ xuất hiện trong recv-trace của
+FleetRMW (điểm ghi nhận ngay sau `data_frames_received_.fetch_add()`
+trong `handle_received_payload()`).
+
+**PHASE 9 — CAUSAL LOCALIZATION: CASE C xác nhận** ("receiver
+interface sees packet → Fleet recvfrom does not — LOCATION: receiver
+kernel UDP delivery/socket scheduling path"), loại hẳn CASE A/B (sender
+kernel, bridge/veth) vì C0=C1=C2=0 tuyệt đối. Ranh giới CHÍNH XÁC:
+{link-layer arrival tại `eth0`, xác nhận bằng tcpdump} → {FleetRMW's
+own `handle_received_payload()`, KHÔNG BAO GIỜ gọi tới cho các gói
+này}. **Chưa phân biệt được** CASE C thuần (kernel không bao giờ giao
+gói cho `recvfrom()`, dù `/proc/net/udp`'s `drops`=0 đã đo trước đó —
+có thể là 1 dạng drop KHÁC không phản ánh qua counter đó, vd IP-layer
+discard trước UDP demux) và CASE D biên giới (gói CÓ tới `recvfrom()`
+nhưng bị bỏ qua TRƯỚC điểm trace hiện tại) — cần 1 checkpoint sớm hơn
+(ngay sau `recvfrom()` trả về, TRƯỚC `handle_received_datagram()`) để
+tách bạch hoàn toàn.
+
+**PHÁT HIỆN QUAN TRỌNG NHẤT — Phase 7 phân bố theo sender/receiver/topic
+(rep 1, các rep khác cùng mẫu hình)**:
+
+- **100% tổn thất đến từ ĐÚNG 1 sender: `control_station`** (652/1626
+  = 40.1% các lần gửi của riêng nó) — **TẤT CẢ 16 robot, khi đóng vai
+  sender, có 0 tổn thất tuyệt đối** (uplink robot→control_station trên
+  5 topic khác nhau: `state`/`perception`/`coordination`/`debug`/
+  `human_qoe` — 100% sạch).
+- **100% tổn thất đến từ ĐÚNG 1 pattern topic: `robot_NNNN/control`**
+  (lệnh điều khiển control_station gửi XUỐNG từng robot) — tỷ lệ mất
+  ~37-43% ĐỀU trên CẢ 16 robot (vd robot_0000: 59/143=41.3%,
+  robot_0015: 12/32=37.5%) — **các topic uplink của chính control_station
+  làm receiver (nếu có) và MỌI topic khác đều 0% tổn thất.**
+- Đây là 1 tín hiệu CỰC KỲ đặc thù, KHÔNG ngẫu nhiên, KHÔNG đồng đều —
+  chỉ ra khả năng cao: có điều gì đó ĐẶC BIỆT về CÁCH control_station
+  gửi lệnh "control" xuống robot (khác với cách robot gửi uplink lên
+  control_station) là nguyên nhân gốc, KHÔNG PHẢI 1 vấn đề chung của
+  toàn bộ kernel/socket receive path (nếu là vấn đề chung, uplink cũng
+  phải bị ảnh hưởng).
+
+**KHÔNG kết luận cơ chế** — chỉ dừng ở LOCATION + phân bố, đúng STOP
+RULE đã thống nhất ("Once the first missing hop is identified with
+strong packet-level evidence: STOP. Do not fix it in the same phase").
+
+**137x amplification**: CHƯA kiểm tra tương quan trong bước này (đúng
+yêu cầu "keep it as a separate observation... do not assume 137x →
+DATA loss unless evidence connects them") — NOT YET TESTED.
+
+**File liên quan**: script batch (không thuộc repo):
+`/tmp/.../scratchpad/step26_packet_capture.py`,
+`step26c_lan16_hop_localization.py`, raw:
+`step26c_lan16_hop_localization.jsonl`. Image chẩn đoán
+`localhost/fleetrmw/rmw-netem:jazzy-tcpdump` (đã xoá sau khi dùng xong
+phiên này — cần build lại bằng đúng lệnh `apt-get install tcpdump` +
+`docker commit` nếu cần capture tiếp, không phải thay đổi thường trực).
+KHÔNG có code production nào bị sửa trong bước này.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
