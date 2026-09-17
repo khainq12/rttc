@@ -7939,6 +7939,98 @@ tiếp.
 `step24_lan16_causal_proof.jsonl`. Instrumentation: commit `8eefba5`
 (đã có sẵn từ bước trước, không sửa gì thêm ở bước này).
 
+## Receiver-side kernel UDP drop hypothesis: REJECTED (18/09/2026)
+
+**Hypothesis kiểm chứng**: "FleetRMW DATA loss chủ yếu do receiver-side
+Linux UDP/socket drops, có thể do traffic amplification làm receive
+path quá tải." Chỉ là hypothesis, KHÔNG optimize gì cho tới khi chứng
+minh được.
+
+**Phase 1 — audit socket path (đọc code, không đoán)**:
+- **1 socket UDP DUY NHẤT** (`fd_`, `SOCK_DGRAM`) dùng chung cho CẢ
+  gửi VÀ nhận, CẢ DATA lẫn ACK/NACK/graph/control — không tách port
+  theo loại frame.
+- Bind `0.0.0.0:9100` (xác nhận qua code + `FLEETQOX_RMW_BIND` do
+  harness set — LAN profile).
+- `SO_RCVBUF`/`SO_SNDBUF` = `FLEETQOX_RMW_UDP_SOCKET_BUFFER_BYTES`,
+  mặc định **4MB** (`4*1024*1024`), có thể chỉnh qua env (0-64MB).
+- `SO_RCVTIMEO=100ms`.
+- **`receive_loop()` CHỈ 1 THREAD, hoàn toàn ĐỒNG BỘ**: 1 vòng lặp
+  `recvfrom()` MỘT datagram MỘT LẦN, xử lý (`handle_received_datagram`
+  → decode/decrypt/mutex/subscription-match/ACK-NACK-encode-nếu-cần)
+  NGAY TRÊN CÙNG THREAD trước khi quay lại `recvfrom()` tiếp theo —
+  về mặt CẤU TRÚC hoàn toàn CÓ THỂ tạo áp lực kernel buffer nếu traffic
+  đến nhanh hơn xử lý xong 1 vòng.
+
+**Phase 2 — instrumentation kernel drop (observational, không đổi hành
+vi)**: sampler ĐỘC LẬP (bash loop trong container, KHÔNG chạm code
+FleetRMW) đọc `/proc/net/udp` (cột `drops`, cột `rx_queue` từ
+`tx_queue:rx_queue`) VÀ `/proc/net/snmp` dòng `Udp:` (`InDatagrams`,
+`InErrors`, `RcvbufErrors`, `NoPorts`) mỗi 200ms, khớp đúng port `238C`
+(hex của 9100) trong namespace RIÊNG của từng container (không nhầm
+lẫn giữa 17 endpoint vì mỗi container có `/proc/net/udp` riêng).
+
+**Phase 4 — LAN N=16, FleetRMW-only, n=3, đúng config lịch sử**
+(traffic thật khớp mọi rep trước: `frames_sent_total=2289` cả 3 rep,
+đúng `packet_rows` lịch sử):
+
+| rep | missing (SEND_SUCCESS_NOT_RECEIVED) | **socket drops delta** | **RcvbufErrors delta** | fraction giải thích |
+|---|---|---|---|---|
+| 1 | 590 | **0** | **0** | **0.0%** |
+| 2 | 609 | **0** | **0** | **0.0%** |
+| 3 | 549 | **0** | **0** | **0.0%** |
+
+**0 socket drop, 0 RcvbufErrors ở TẤT CẢ 17 endpoint, cả 3 rep** —
+kernel KHÔNG BAO GIỜ báo drop ở tầng UDP socket, dù buffer chỉ 4MB mặc
+định và traffic khuếch đại rất lớn.
+
+**Phase 3 — traffic decomposition** (đo lại, thay số ước lượng "~77.6x"
+cũ): `data_frames_received_total` ≈1680-1740/rep,
+`non_data_received_total` (chủ yếu ACK/NACK) ≈170394-176191/rep —
+**~137-140x khuếch đại so với DATA thật**, tức CAO HƠN ước lượng cũ
+(~77.6x) — số cũ đó tính trên tổng `frames_received`/`frames_sent`
+(gộp cả broadcast fanout), số mới này tính trên
+`non_data/data_frames_received` cụ thể hơn, không trực tiếp so sánh
+được 1-1 nhưng cả 2 đều xác nhận: **tuyệt đại đa số traffic nhận được
+là non-DATA (ACK/NACK)**.
+
+**Ghi chú chất lượng dữ liệu (không ảnh hưởng kết luận chính)**: script
+đo thiếu tham số `policies=(policy,)` khi gọi `generate_trace_events()`
+khiến `packet_rows` (chỉ dùng để BÁO CÁO, không dùng để phát traffic
+thật) bị thổi phồng (~16810 thay vì ~2289) — đã xác nhận traffic THẬT
+GỬI ĐI (`frames_sent_total=2289`, khớp CHÍNH XÁC mọi rep sạch trước
+đó) không bị ảnh hưởng, chỉ 1 trường báo cáo phụ bị sai, không dùng nó
+trong bất kỳ tính toán drops/missing nào ở trên.
+
+**PROOF GATE #1: REJECTED.** Theo đúng phân loại đã thống nhất
+("C. REJECTED: Drops are absent/tiny compared with missing DATA — STOP
+before buffer intervention"): **KHÔNG chạy Phase 7 (diagnostic buffer
+A/B)** — tăng `SO_RCVBUF` không có cơ sở để cải thiện gì, vì kernel
+CHƯA BAO GIỜ báo hiệu áp lực buffer ở tầng này.
+
+**Ranh giới bằng chứng hiện tại đã thu hẹp CHÍNH XÁC**: `sendto()`
+SUCCESS (xác nhận ở tầng RMW) → **KHÔNG BAO GIỜ** thấy socket kernel
+drop (xác nhận ở tầng kernel UDP) → nhưng vẫn KHÔNG BAO GIỜ thấy DATA
+đến ứng dụng nhận (xác nhận ở tầng receive-trace). Tổn thất nằm ở MỘT
+TRONG các khả năng: (a) gói không bao giờ thực sự rời khỏi interface
+người gửi dù `sendto()` trả OK (egress drop cục bộ), (b) gói rời người
+gửi nhưng mất trên bridge/veth LAN giữa 2 container, (c) gói đến
+interface người nhận nhưng bị drop TRƯỚC KHI tới tầng UDP socket (vd
+IP-layer discard, khác với UDP-socket-layer drop vừa đo).
+
+**Chưa điều tra (next step, KHÔNG tự ý làm tiếp trong bước này)**:
+packet capture (`tcpdump`) đồng thời trên interface gửi VÀ interface
+nhận, bracket theo đúng `event_id` của các tin đã biết là
+`SEND_SUCCESS_NOT_RECEIVED` (từ trace message×target đã có sẵn), để
+phân biệt CHÍNH XÁC gói biến mất ở sender egress / bridge / receiver
+ingress-trước-socket.
+
+**File liên quan**: script batch (không thuộc repo):
+`/tmp/.../scratchpad/step25_lan16_udp_drop_correlation.py`, raw:
+`step25_lan16_udp_drop_correlation.jsonl`. KHÔNG có code thay đổi
+trong bước này (sampler hoàn toàn bên ngoài FleetRMW, chỉ đọc
+`/proc/net/udp`+`/proc/net/snmp` qua `docker exec`).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
