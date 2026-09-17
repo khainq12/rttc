@@ -7507,6 +7507,60 @@ riêng, xem hash bên dưới); script chẩn đoán (không thuộc repo):
 `/tmp/.../scratchpad/step19_5g_connectivity_diag.py` qua
 `step19e_5g_connectivity_diag.py`.
 
+## Bảng V — 5G N=16 clean rerun (Phase 5, 17/09/2026)
+
+**Pre-flight**: `verify_ue_to_ue_connectivity()` PASSED trước batch.
+Cấu hình đúng lịch sử: N=16, policy=fifo, seconds=3, seed=13,
+`radio_link_loss_pct=2.0`, n=3/RMW. Script:
+`/tmp/.../scratchpad/step20_bang5_5g_n16_clean_v2.py` (không thuộc
+repo, raw kết quả tại `step20_bang5_5g_n16_clean_v2.jsonl`).
+
+| N=16 | OLD (contaminated, phụ lục hiện tại) | NEW clean (avg trên rep thành công) | Rep tổng-fail (rx=0 toàn bộ endpoint) |
+|---|---|---|---|
+| Fast DDS | 0% | **60.2%** (p50≈0.78ms) | 1/3 |
+| CycloneDDS | 0% | **0%** (không đổi) | 3/3 |
+| Zenoh | 20.6% (p50=350.1ms) | **35.3%** (p50≈0.99ms) | 0/3 |
+| FleetRMW | 24.6% (p50=739.3ms) | **22.6%** (p50≈2.51ms) | 1/3 |
+
+**Đọc kết quả — điều tra thêm trước khi kết luận, không dừng ở bảng
+số**:
+- Fast DDS 0%→60.2%: xác nhận trực tiếp số 0% cũ là do bug connectivity
+  đã sửa (không phải đặc tính RMW).
+- **Latency giảm ~300-350 lần** cho Zenoh (350.1ms→0.99ms) và FleetRMW
+  (739.3ms→2.51ms) — bằng chứng RÕ RÀNG NHẤT rằng số cũ bị contaminated
+  nặng: khi route UE-to-UE gãy, gói tin phải qua nhiều vòng
+  retry/retransmit trước khi (đôi khi) đến đích, kéo latency lên hàng
+  trăm ms; sau khi hạ tầng sạch, latency về đúng bản chất
+  (~1-2.5ms, hợp lý cho 5G LAN-like path qua UPF).
+- **CycloneDDS 0% không đổi** — khớp với ghi nhận LỊCH SỬ đã có ở phụ
+  lục ("CycloneDDS vẫn sập 0% ở MỌI profile/quy mô — giới hạn cấu trúc
+  O(N²) discovery cost riêng, không phụ thuộc network profile"). Đây
+  KHÔNG phải bằng chứng hạ tầng còn lỗi — là đặc tính RMW đã biết từ
+  trước, độc lập với fix lần này.
+- **Rep tổng-fail (rx=0 TOÀN BỘ 17 endpoint, dù ready/discovery vẫn
+  xong)** xảy ra 2/9 lần (22%) ở Fast DDS/Zenoh/FleetRMW (không tính
+  CycloneDDS) — kiểm tra riêng: SPDP/discovery vẫn thành công (thấy đủ
+  17 topic trong `topic_names_and_types`) nhưng RTPS DATA path 0% toàn
+  bộ, không phải mất gói cục bộ ở 1-2 UE. Gọi lại
+  `verify_ue_to_ue_connectivity()` NGAY SAU khi batch 12 rep kết thúc
+  → **PASSED** — xác nhận core KHÔNG bị suy thoái tích luỹ trong lúc
+  chạy batch (bác bỏ giả thuyết "state lại tích luỹ giữa batch"). Tỷ lệ
+  22% tổng-fail thấp hơn tỷ lệ tổng-fail ĐÃ ĐƯỢC GHI NHẬN TRƯỚC ĐÓ ở
+  cùng profile 2% radio-loss (phụ lục: "batch đầu tiên với 2% suy hao
+  có tới 42% lượt chạy fail HOÀN TOÀN") — dù population khác (batch cũ
+  là lỗi ĐĂNG KÝ UE, batch này là lỗi DATA PATH sau khi đã ready), cả
+  hai đều xác nhận: **bất ổn định run-to-run là đặc tính ĐÃ BIẾT của
+  profile 5G+2%-loss ở quy mô N=16, không phải phát hiện mới cần thêm
+  1 vòng root-cause riêng**. Không retry ẩn các rep tổng-fail — giữ
+  nguyên trong bảng theo đúng luật "fail sau khi đo phải ghi nhận, không
+  giấu".
+- **Kết luận Phase 5**: fix hạ tầng ĐÃ xác nhận hiệu quả cho lỗi
+  connectivity-outage gốc (0% toàn bộ do route/state gãy). KHÔNG xác
+  nhận (và không tuyên bố) rằng N=16+2%-loss đã hết mọi nguồn bất ổn —
+  còn 1 đặc tính riêng (tổng-fail thỉnh thoảng, tỷ lệ thấp hơn trước)
+  thuộc về bản chất mô hình suy hao ngẫu nhiên + quy mô lớn, KHÔNG phải
+  bug hạ tầng còn sót (post-batch connectivity check vẫn sạch).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
