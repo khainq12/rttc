@@ -283,6 +283,92 @@ def start_open5gs_core(*, ready_timeout_s: float = 90.0) -> None:
     )
 
 
+def restart_open5gs_core(*, ready_timeout_s: float = 90.0) -> None:
+    """Restarts every core NF + the gNB (all of CORE_SERVICES plus
+    GNB_CONTAINER_NAME) to clear accumulated PFCP/session state -- the
+    fix for a real infrastructure bug found 17/09/2026 (see
+    docs/AUDIT_ACCEPTANCE_TRACKING.md "5G root-cause: UE-to-UE
+    connectivity"): after enough UE registration/deregistration churn
+    across repeated probe runs (each run's teardown() only does `docker
+    rm -f` on the UE/endpoint/rigger containers -- see that method's own
+    comment for why the core+gNB deliberately outlive any single probe
+    run -- never a graceful NAS/PFCP session release), UE-to-UE
+    connectivity degrades and becomes asymmetric/unreliable (confirmed
+    via tcpdump on the UPF's ogstun interface + systematic all-pairs
+    ping probes: some pairs 100% loss in ONE direction only, inconsistent
+    between identical repeat runs). Root cause is internal Open5GS
+    NF-fleet state (which specific NF(s) hold the stale state was not
+    pinned down further -- restarting the WHOLE core+gNB is the minimal
+    fix confirmed to work via live A/B: `docker restart` on just
+    smf+upf was NOT sufficient, restarting the full CORE_SERVICES set +
+    gNB was, verified reproducible across 3 repeat connectivity probes
+    after the fix). NOT a code/config bug in this repo's own scripts --
+    no FleetQoX/RMW change involved. Call this (or ensure a truly fresh
+    `docker compose up`) before any batch that needs reliable UE-to-UE
+    delivery, especially after a burst of ad-hoc/diagnostic UE churn or
+    after Docker itself was restarted."""
+    docker("restart", *CORE_SERVICES, GNB_CONTAINER_NAME, check=False)
+    deadline = time.monotonic() + ready_timeout_s
+    while time.monotonic() < deadline:
+        check = docker("exec", "amf", "pgrep", "-f", "open5gs-amfd", check=False)
+        if check.returncode == 0:
+            time.sleep(5.0)  # let SBI re-registration between NFs settle
+            return
+        time.sleep(2.0)
+    log = docker("logs", "--tail", "80", "amf", check=False)
+    raise TimeoutError(
+        f"open5gs-amfd did not come back up within {ready_timeout_s}s after core restart; "
+        f"amf log tail:\n{log.stdout}\n{log.stderr}"
+    )
+
+
+def verify_ue_to_ue_connectivity(
+    *, subscribers: list[dict[str, str]], image: str = DEFAULT_IMAGE,
+    ping_count: int = 5, min_success_both_directions: int = 3,
+) -> None:
+    """Minimal RED-test-style connectivity probe (see docs/AUDIT_ACCEPTANCE_TRACKING.md
+    17/09/2026, Phase 2/4): brings up 2 throwaway UEs, pings BOTH
+    directions, tears down, and raises RuntimeError if either direction
+    doesn't meet min_success_both_directions/ping_count -- fails fast
+    with a clear diagnosis instead of silently proceeding into a full
+    RMW batch that would just produce garbage 0%-delivery data for every
+    peer-discovery-based RMW (the exact failure mode this was added
+    after: FastDDS/CycloneDDS/FleetRMW all showed frames_received=0
+    while status stayed "ok", easy to miss without an explicit check).
+    Needs >=2 provisioned subscribers; does not touch the real batch's
+    own subscriber/UE state (uses its own throwaway run_id)."""
+    if len(subscribers) < 2:
+        raise ValueError("verify_ue_to_ue_connectivity needs at least 2 subscribers")
+    probe = Open5gsTopologyProbe(
+        run_id="connectivity_check", image=image, num_robots=1,
+        output_dir=ROOT / "results_rmw_socket" / ".connectivity_check",
+        subscribers=subscribers[:2], radio_link_loss_pct=0.0,
+    )
+    try:
+        probe.start_containers()
+        ue_a, ue_b = probe.ue_container_names[0], probe.ue_container_names[1]
+        ip_a = probe.ips[probe.endpoints[0]]
+        ip_b = probe.ips[probe.endpoints[1]]
+
+        def _ping_success_count(src: str, dst_ip: str) -> int:
+            result = docker("exec", src, "ping", "-c", str(ping_count), "-W", "2", dst_ip, check=False)
+            match = re.search(r"(\d+) packets transmitted, (\d+) received", result.stdout)
+            return int(match.group(2)) if match else 0
+
+        a_to_b = _ping_success_count(ue_a, ip_b)
+        b_to_a = _ping_success_count(ue_b, ip_a)
+    finally:
+        probe.teardown()
+
+    if a_to_b < min_success_both_directions or b_to_a < min_success_both_directions:
+        raise RuntimeError(
+            f"UE-to-UE connectivity check FAILED: {ip_a}->{ip_b} = {a_to_b}/{ping_count}, "
+            f"{ip_b}->{ip_a} = {b_to_a}/{ping_count} (need >={min_success_both_directions} "
+            "each direction). Try restart_open5gs_core() -- see its docstring for the known "
+            "root cause (accumulated PFCP/session state after UE churn)."
+        )
+
+
 def apply_radio_link_loss(
     container_name: str, *, loss_pct: float = RADIO_LINK_LOSS_PCT, port: int = RADIO_LINK_UDP_PORT
 ) -> None:
