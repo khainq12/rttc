@@ -7401,6 +7401,44 @@ riêng, không thuộc phạm vi "làm sạch harness dispatch-gap" đang làm.
 **File liên quan**: `/tmp/.../scratchpad/step17_bang5_5g_n16_clean.py`
 (không thuộc repo).
 
+**Wi-Fi validity boundary (Phase C) — RANH GIỚI KHÁC NHAU THEO TỪNG
+RMW, không phải 1 ngưỡng N chung.**
+
+Dùng ĐÚNG tiêu chí degraded đã đóng băng từ trước (`status!="ok" or
+wifi_stats is None or degraded_no_snapshot_reached_target or sim_lag_s
+> MAX_HEALTHY_SIM_LAG_S=10.0`), KHÔNG đổi threshold sau khi nhìn kết
+quả. Cùng workload/config Wi-Fi xuyên suốt (`policy=fifo seconds=3
+start_offset_ms=2000 drain_s=10 sim_duration_s=30 ns3_seed=42 seed=13`).
+
+| N | RMW | degraded | sim_lag_s (2 rep cùng seed) | ns3sim_cpu_pct | Ghi chú |
+|---|---|---|---|---|---|
+| 2 | FleetRMW | **false** | (đã xác nhận tất định xuyên suốt Bước 5-13 phiên trước) | — | VALID, đã dùng làm testbed chính |
+| 4 | FleetRMW | **false** | 6.27 / 7.31 | ~101% | VALID, lặp lại tốt |
+| 4 | FastDDS | **true** | 11.97 / **24.58** | 1.54% / 0.01% | DEGRADED cả 2 rep, độ lớn lag KHÔNG lặp lại (12s vs 25s cùng config) |
+| 8 | FleetRMW | **true** | 11.42 / 11.43 | ~100.7% | DEGRADED cả 2 rep, lag KHÁ ỔN ĐỊNH lần này |
+| 16 | cả 4 RMW | **true** | 21-42 | 0.01-103% | Đã xác nhận trước (Phase 5 đầu) |
+
+**Kết luận ranh giới**: KHÔNG có một N chung cho "Wi-Fi profile" — mỗi
+RMW tạo tải control-plane khác nhau lên kênh mô phỏng dùng chung.
+**FleetRMW**: ranh giới nằm CHÍNH XÁC giữa N=4 (valid) và N=8
+(degraded, lặp lại nhất quán ~11.4s). **FastDDS**: đã degraded từ N=4
+(chưa xác định N=2/N=3 cho riêng FastDDS — ngoài phạm vi câu hỏi chính
+của investigation này). Theo đúng nhánh quyết định đã đặt ra ("Nếu N=8
+DEGRADED: → không chạy N=16/32 thêm để lấy performance claims"):
+**KHÔNG chạy thêm N=16/32 Wi-Fi cho FleetRMW để làm bằng chứng
+performance** — N=4 là quy mô Wi-Fi lớn nhất còn VALID cho FleetRMW với
+kiến trúc benchmark hiện tại (802.11g, 1 AP, `RealtimeSimulatorImpl`).
+Chưa probe N=5/6/7 để tìm ranh giới chính xác hơn giữa 4 và 8 — ngoài
+phạm vi yêu cầu hiện tại (user chỉ định N=10/12/14 cho trường hợp khác:
+N=8 valid nhưng N=16 degraded).
+
+**KHÔNG "sửa" ns-3 trong bước này** (đúng chỉ định): không giảm PHY
+fidelity, không đổi chuẩn Wi-Fi, không đổi topology/AP, không giảm
+traffic, không đổi scheduler, không tune FleetQoX để "cứu" N cao hơn.
+
+**File liên quan**: `/tmp/.../scratchpad/step18_wifi_validity_boundary.py`,
+`/tmp/.../scratchpad/step18b_wifi_fleetrmw_n8.py` (không thuộc repo).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
