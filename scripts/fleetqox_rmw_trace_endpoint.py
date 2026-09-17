@@ -159,6 +159,48 @@ def fleetqox_receive_timeline() -> list[dict[str, Any]]:
         return []
 
 
+def fleetqox_loss_funnel_trace() -> dict[str, list[dict[str, Any]]]:
+    """Read rmw_pubsub.cpp's message x target loss-funnel trace (send-side
+    ATTEMPT_SUCCESS/ATTEMPT_FAILED/SKIPPED_AFTER_FAILURE per intended
+    target, and receive-side DATA frame arrivals), keyed by
+    (source_id=publisher_id, source_sequence, topic) -- added for the
+    Optimization #2 causal-proof investigation (see
+    docs/AUDIT_ACCEPTANCE_TRACKING.md 17-18/09/2026): does
+    send_datagram_to_targets()'s abort-on-first-failure actually explain
+    a substantial fraction of observed missing deliveries, at the level
+    of a specific message never reaching a specific intended recipient
+    because an earlier target in the same send call failed? Only
+    populated when FLEETQOX_RMW_LOSS_FUNNEL_TRACE_PROFILING is set (same
+    opt-in, zero-cost-otherwise pattern as the other profiling env vars
+    here). Returns {"send": [...], "recv": [...]}.
+    """
+    empty: dict[str, list[dict[str, Any]]] = {"send": [], "recv": []}
+    if os.environ.get("RMW_IMPLEMENTATION") != "rmw_fleetqox_cpp":
+        return empty
+    if not os.environ.get("FLEETQOX_RMW_LOSS_FUNNEL_TRACE_PROFILING"):
+        return empty
+    try:
+        library = ctypes.CDLL("librmw_fleetqox_cpp.so")
+    except OSError:
+        return empty
+    result: dict[str, list[dict[str, Any]]] = {}
+    for key, symbol_name in (
+        ("send", "rmw_fleetqox_cpp_loss_funnel_send_trace_json"),
+        ("recv", "rmw_fleetqox_cpp_loss_funnel_recv_trace_json"),
+    ):
+        fn = getattr(library, symbol_name)
+        fn.restype = ctypes.c_char_p
+        raw = fn()
+        if not raw:
+            result[key] = []
+            continue
+        try:
+            result[key] = json.loads(raw.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            result[key] = []
+    return result
+
+
 def fleetqox_publish_stage_metrics(library: "ctypes.CDLL") -> dict[str, Any]:
     """publish_payload()'s stage-resolved micro-profiler (see PublishStage
     in rmw_pubsub.cpp) -- only non-zero when the process was launched with
@@ -707,6 +749,7 @@ def main() -> int:
         "received": received,
         "fleetqox_transport_metrics": fleetqox_transport_metrics(),
         "fleetqox_receive_timeline": fleetqox_receive_timeline(),
+        "fleetqox_loss_funnel_trace": fleetqox_loss_funnel_trace(),
         "discovery_convergence_s": discovery_convergence_s,
         "discovery_peers_seen": len(discovery_peers_seen),
         "discovery_expected_peers": args.expected_peer_count,

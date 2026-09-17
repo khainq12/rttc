@@ -529,6 +529,73 @@ bool receive_timeline_profiling_enabled()
 std::mutex g_receive_timeline_mutex;
 std::vector<std::pair<std::string, std::int64_t>> g_receive_timeline;
 
+// Message x target loss-funnel trace (Optimization #2 causal-proof
+// investigation, see docs/AUDIT_ACCEPTANCE_TRACKING.md). Env-gated,
+// default OFF, zero cost otherwise -- same pattern as
+// receive_timeline_profiling_enabled() above. Records, per DATA frame
+// publish() and per intended target, exactly one outcome
+// (ATTEMPT+SUCCESS, ATTEMPT+FAILED, or SKIPPED_AFTER_FAILURE) keyed by
+// (source_id=publisher_id, source_sequence, topic, target) so the
+// Python harness can join this against a matching receive-side arrival
+// trace and determine, message-by-message, whether a specific missing
+// delivery is explained by send_datagram_to_targets() skipping that
+// target after an earlier target in the same call failed -- the
+// causal test this instrumentation exists for. Purely observational:
+// does not change send ordering, retry behavior, or which targets get
+// attempted.
+bool loss_funnel_trace_profiling_enabled()
+{
+  static const bool enabled =
+    std::getenv("FLEETQOX_RMW_LOSS_FUNNEL_TRACE_PROFILING") != nullptr;
+  return enabled;
+}
+
+struct LossFunnelSendEvent
+{
+  std::string source_id;
+  std::uint64_t source_sequence{0};
+  std::string topic;
+  std::string target;
+  std::string outcome;  // "ATTEMPT_SUCCESS" | "ATTEMPT_FAILED" | "SKIPPED_AFTER_FAILURE"
+  int send_errno{0};    // only meaningful for ATTEMPT_FAILED
+  int retry_count{0};   // only meaningful for ATTEMPT_FAILED
+  std::string failed_target;  // only meaningful for SKIPPED_AFTER_FAILURE
+  std::int64_t wall_ns{0};
+};
+
+struct LossFunnelRecvEvent
+{
+  std::string source_id;
+  std::uint64_t source_sequence{0};
+  std::string topic;
+  std::int64_t wall_ns{0};
+};
+
+std::mutex g_loss_funnel_trace_mutex;
+std::vector<LossFunnelSendEvent> g_loss_funnel_send_events;
+std::vector<LossFunnelRecvEvent> g_loss_funnel_recv_events;
+
+// Smuggles the currently-publishing DATA frame's identity from
+// send_frame_with_qos() (which has the decoded DataFrame) down into
+// send_datagram_to_targets() (which only sees an already-encoded byte
+// string + a raw target list) without threading a new parameter through
+// every intermediate call site (send_payload_to_targets(),
+// send_frame_with_qos()'s send_once lambda, the ack-nack/retransmission/
+// graph callers that also funnel through send_payload_to_targets() but
+// have no DataFrame at all). Safe as thread_local, not a bare global:
+// publish() is called synchronously on the app's own thread per FleetRMW's
+// contract, and the identity is set immediately before and cleared
+// immediately after the one send_payload_to_targets() call it covers, so
+// no other thread's concurrent publish() can observe a stale value.
+struct LossFunnelCurrentSendIdentity
+{
+  bool active{false};
+  std::string source_id;
+  std::uint64_t source_sequence{0};
+  std::string topic;
+};
+thread_local LossFunnelCurrentSendIdentity g_loss_funnel_current_send;
+
 // scripts/fleetqox_rmw_trace_endpoint.py's build_payload() embeds
 // event_id as plaintext JSON `"e":"<digits>"` inside the serialized
 // payload -- decoded_frame->serialized_payload already holds that
@@ -2715,6 +2782,29 @@ public:
     if (targets.empty() && !shared_memory_only() && !quic_gateway_enabled) {
       RMW_SET_ERROR_MSG("socket transport has no local or peer target for frame");
       return RMW_RET_ERROR;
+    }
+    // Loss-funnel trace identity (see LossFunnelCurrentSendIdentity's doc
+    // comment): set for the duration of this function only, for real DATA
+    // frames, only when explicitly enabled. RAII-cleared on every return
+    // path (including the early returns above already having passed) so a
+    // later non-DATA send_payload_to_targets() call (ack/nack, graph,
+    // retransmission) on this same thread never inherits a stale identity.
+    struct LossFunnelIdentityGuard
+    {
+      bool armed{false};
+      ~LossFunnelIdentityGuard()
+      {
+        if (armed) {
+          g_loss_funnel_current_send = LossFunnelCurrentSendIdentity{};
+        }
+      }
+    } loss_funnel_identity_guard;
+    if (is_data_frame && loss_funnel_trace_profiling_enabled()) {
+      g_loss_funnel_current_send.active = true;
+      g_loss_funnel_current_send.source_id = data_frame->publisher_id;
+      g_loss_funnel_current_send.source_sequence = data_frame->source_sequence_number;
+      g_loss_funnel_current_send.topic = data_frame->topic;
+      loss_funnel_identity_guard.armed = true;
     }
     auto send_once = [&]() -> rmw_ret_t {
       rmw_ret_t send_ret = RMW_RET_OK;
@@ -6930,6 +7020,28 @@ private:
     if (profiling) {
       record_publish_stage(PublishStage::kUdpSendMutexWait, monotonic_timestamp_ns() - mutex_wait_t0);
     }
+    const bool loss_funnel_tracing =
+      loss_funnel_trace_profiling_enabled() && g_loss_funnel_current_send.active;
+    auto record_loss_funnel_event = [&](
+      const std::string & event_target, const std::string & outcome,
+      int send_errno, int retry_count, const std::string & failed_target)
+    {
+      if (!loss_funnel_tracing) {
+        return;
+      }
+      LossFunnelSendEvent event;
+      event.source_id = g_loss_funnel_current_send.source_id;
+      event.source_sequence = g_loss_funnel_current_send.source_sequence;
+      event.topic = g_loss_funnel_current_send.topic;
+      event.target = event_target;
+      event.outcome = outcome;
+      event.send_errno = send_errno;
+      event.retry_count = retry_count;
+      event.failed_target = failed_target;
+      event.wall_ns = monotonic_timestamp_ns();
+      std::lock_guard<std::mutex> trace_lock(g_loss_funnel_trace_mutex);
+      g_loss_funnel_send_events.push_back(std::move(event));
+    };
     size_t targets_attempted_this_call = 0;
     for (const sockaddr_in & target : targets) {
       pace_udp_send_locked();
@@ -6943,6 +7055,7 @@ private:
         sizeof(target));
       if (sent < 0 || static_cast<size_t>(sent) != payload.size()) {
         const int first_errno = errno;
+        int actual_retry_attempts = 0;
         const bool is_buffer_transient =
           first_errno == ENOBUFS || first_errno == EAGAIN || first_errno == EWOULDBLOCK;
         const bool is_unreachable_transient =
@@ -6966,6 +7079,7 @@ private:
             is_buffer_transient ? kSendRetryBackoffMs : kUnreachableRetryBackoffMs;
           bool retried_ok = false;
           for (int attempt = 0; attempt < retry_limit; ++attempt) {
+            ++actual_retry_attempts;
             std::this_thread::sleep_for(std::chrono::milliseconds(retry_backoff_ms));
             if (is_unreachable_transient) {
               unreachable_retry_attempts_.fetch_add(1, std::memory_order_relaxed);
@@ -6990,6 +7104,10 @@ private:
             }
           }
           if (retried_ok) {
+            if (loss_funnel_tracing) {
+              record_loss_funnel_event(
+                endpoint_to_string(target), "ATTEMPT_SUCCESS", 0, actual_retry_attempts, "");
+            }
             continue;
           }
           if (is_unreachable_transient) {
@@ -7007,11 +7125,13 @@ private:
             *out_exceeds_path_mtu = true;
           }
         }
+        int final_send_errno = 0;
         {
           // Include errno/strerror -- a bare generic string previously
           // hid exactly this class of transient-but-unretried failure
           // (see the ENETUNREACH/EHOSTUNREACH retry class above).
           const int send_errno = errno;
+          final_send_errno = send_errno;
           std::string diag = std::string("failed to send FleetRMW payload through UDP transport: errno=") +
             std::to_string(send_errno) + " (" + std::strerror(send_errno) + ")";
           RMW_SET_ERROR_MSG(diag.c_str());
@@ -7028,7 +7148,22 @@ private:
           targets_attempted_this_call, std::memory_order_relaxed);
         send_datagram_targets_skipped_.fetch_add(
           targets.size() - targets_attempted_this_call, std::memory_order_relaxed);
+        if (loss_funnel_tracing) {
+          const std::string failed_target_str = endpoint_to_string(target);
+          record_loss_funnel_event(
+            failed_target_str, "ATTEMPT_FAILED", final_send_errno, actual_retry_attempts, "");
+          for (size_t skip_index = targets_attempted_this_call; skip_index < targets.size();
+            ++skip_index)
+          {
+            record_loss_funnel_event(
+              endpoint_to_string(targets[skip_index]), "SKIPPED_AFTER_FAILURE", 0, 0,
+              failed_target_str);
+          }
+        }
         return RMW_RET_ERROR;
+      }
+      if (loss_funnel_tracing) {
+        record_loss_funnel_event(endpoint_to_string(target), "ATTEMPT_SUCCESS", 0, 0, "");
       }
     }
     send_datagram_full_success_calls_.fetch_add(1, std::memory_order_relaxed);
@@ -8472,7 +8607,9 @@ private:
     if (rmw_fleetqox_cpp_handle_service_frame(encoded_frame.data(), encoded_frame.size())) {
       return;
     }
-    if (!rmw_fleetqox_cpp::decode_data_frame(encoded_frame)) {
+    const std::optional<rmw_fleetqox_cpp::DataFrame> loss_funnel_decoded =
+      rmw_fleetqox_cpp::decode_data_frame(encoded_frame);
+    if (!loss_funnel_decoded.has_value()) {
       // Loss-funnel instrumentation: a received, decrypted (if AEAD/
       // peer-auth enabled) payload that isn't any recognized frame type
       // (not unrecoverable-loss-notice/ack-nack/graph/service/data) --
@@ -8482,6 +8619,22 @@ private:
       return;
     }
     data_frames_received_.fetch_add(1, std::memory_order_relaxed);
+    if (loss_funnel_trace_profiling_enabled()) {
+      // Receive-side half of the message x target loss-funnel trace (see
+      // LossFunnelSendEvent's doc comment): this process's socket
+      // physically received a DATA frame with this (source_id,
+      // source_sequence, topic) -- correlated by the Python harness
+      // against the sender's own trace to determine whether a specific
+      // missing (source_sequence, this receiver) pair was ever attempted,
+      // attempted-and-failed, or skipped after an earlier target failed.
+      LossFunnelRecvEvent event;
+      event.source_id = loss_funnel_decoded->publisher_id;
+      event.source_sequence = loss_funnel_decoded->source_sequence_number;
+      event.topic = loss_funnel_decoded->topic;
+      event.wall_ns = monotonic_timestamp_ns();
+      std::lock_guard<std::mutex> trace_lock(g_loss_funnel_trace_mutex);
+      g_loss_funnel_recv_events.push_back(std::move(event));
+    }
     enqueue_received_frame(encoded_frame);
   }
 
@@ -15074,6 +15227,67 @@ const char * rmw_fleetqox_cpp_receive_timeline_json()
     }
     built += "{\"event_id\":\"" + g_receive_timeline[i].first + "\",";
     built += "\"rmw_ready_wall_ns\":" + std::to_string(g_receive_timeline[i].second) + "}";
+  }
+  built += "]";
+  json = std::move(built);
+  return json.c_str();
+}
+
+namespace
+{
+std::string loss_funnel_json_escape(const std::string & value)
+{
+  std::string escaped;
+  escaped.reserve(value.size());
+  for (char ch : value) {
+    if (ch == '"' || ch == '\\') {
+      escaped.push_back('\\');
+    }
+    escaped.push_back(ch);
+  }
+  return escaped;
+}
+}  // namespace
+
+const char * rmw_fleetqox_cpp_loss_funnel_send_trace_json()
+{
+  static std::string json;
+  std::lock_guard<std::mutex> lock(g_loss_funnel_trace_mutex);
+  std::string built = "[";
+  for (size_t i = 0; i < g_loss_funnel_send_events.size(); ++i) {
+    if (i != 0) {
+      built += ",";
+    }
+    const LossFunnelSendEvent & event = g_loss_funnel_send_events[i];
+    built += "{\"source_id\":\"" + loss_funnel_json_escape(event.source_id) + "\",";
+    built += "\"source_sequence\":" + std::to_string(event.source_sequence) + ",";
+    built += "\"topic\":\"" + loss_funnel_json_escape(event.topic) + "\",";
+    built += "\"target\":\"" + loss_funnel_json_escape(event.target) + "\",";
+    built += "\"outcome\":\"" + event.outcome + "\",";
+    built += "\"errno\":" + std::to_string(event.send_errno) + ",";
+    built += "\"retry_count\":" + std::to_string(event.retry_count) + ",";
+    built += "\"failed_target\":\"" + loss_funnel_json_escape(event.failed_target) + "\",";
+    built += "\"wall_ns\":" + std::to_string(event.wall_ns) + "}";
+  }
+  built += "]";
+  json = std::move(built);
+  return json.c_str();
+}
+
+const char * rmw_fleetqox_cpp_loss_funnel_recv_trace_json()
+{
+  static std::string json;
+  std::lock_guard<std::mutex> lock(g_loss_funnel_trace_mutex);
+  std::string built = "[";
+  for (size_t i = 0; i < g_loss_funnel_recv_events.size(); ++i) {
+    if (i != 0) {
+      built += ",";
+    }
+    const LossFunnelRecvEvent & event = g_loss_funnel_recv_events[i];
+    built += "{\"source_id\":\"" + loss_funnel_json_escape(event.source_id) + "\",";
+    built += "\"source_sequence\":" + std::to_string(event.source_sequence) + ",";
+    built += "\"topic\":\"" + loss_funnel_json_escape(event.topic) + "\",";
+    built += "\"wall_ns\":" + std::to_string(event.wall_ns) + "}";
   }
   built += "]";
   json = std::move(built);
