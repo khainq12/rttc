@@ -7561,6 +7561,97 @@ số**:
   thuộc về bản chất mô hình suy hao ngẫu nhiên + quy mô lớn, KHÔNG phải
   bug hạ tầng còn sót (post-batch connectivity check vẫn sạch).
 
+## Bảng VI — clean rerun N=8/16/32 (Phase 6, 17/09/2026)
+
+**Config xác nhận từ lịch sử** (13/09 sensitivity test + 15/09 batch
+2%-loss, đọc trực tiếp `run_open5gs_coordination_probe()` — TẤT CẢ đều
+là default hiện tại của code, không đổi gì): `num_crossings=5`,
+`crossing_duration_ms=300.0`, `reply_timeout_s=5.0`,
+`defer_release_timeout_s=8.0`, `priority_mode="lamport"`,
+`scenario_timeout_s=120.0` (trần chưa từng bị chạm trong lịch sử —
+hoàn thành thật ~90.3-90.6s — nhưng KHÔNG giả định điều đó còn đúng ở
+bản mới, xem ghi chú bên dưới), `radio_link_loss_pct=2.0`. Script:
+`/tmp/.../scratchpad/step21_bang6_5g_clean.py`, raw:
+`step21_bang6_5g_clean.jsonl` (36/36 `status=ok`).
+
+| N | RMW | OLD forced_entry (2%-loss, đã công bố) | NEW clean forced_entry | Ghi chú |
+|---|---|---|---|---|
+| 8 | Fast DDS | 100% | **46.6%** (n=58 crossings) | cải thiện rõ |
+| 8 | CycloneDDS | 100% | **100%** (n=27) | không đổi — khớp giới hạn cấu trúc O(N²) đã biết |
+| 8 | Zenoh | 69% | **12.6%** (n=95) | cải thiện MẠNH |
+| 8 | FleetRMW | 100% | **100%** (n=27) | không đổi |
+| 16 | Fast DDS | 100% | **100%** (n=51) | không đổi |
+| 16 | CycloneDDS | 100% | **100%** (n=51) | không đổi |
+| 16 | Zenoh | 64% | **37.7%** (n=106) | cải thiện |
+| 16 | FleetRMW | 100% | **100%** (n=51) | không đổi |
+| 32 | Fast DDS | 100% | **100%** (n=99) | không đổi |
+| 32 | CycloneDDS | 100% | **100%** (n=99) | không đổi |
+| 32 | Zenoh | 100% | **100%** (n=99) | không đổi |
+| 32 | FleetRMW | 100% | **100%** (n=99) | không đổi |
+
+`n=` ở cột NEW là tổng crossings thật gộp 3 rep (không phải giả định
+15/rep — số crossings hoàn thành trong 120s giờ THẤP HƠN lịch sử đáng
+kể ở nhiều cell, xem ghi chú "biến động timing" dưới đây; số liệu vẫn
+dùng được vì `forced_entry`/`age` được tính trên crossings THẬT xảy
+ra, không suy diễn).
+
+**Coordination update age (ms, weighted mean qua 3 rep)**:
+
+| N | Fast DDS | CycloneDDS | Zenoh | FleetRMW |
+|---|---|---|---|---|
+| 8 | 5.68 | — (0 tin) | 5.46 | 5.44 |
+| 16 | 3.01 | — (0 tin) | 6.75 | 17.20 |
+| 32 | 7.39 | — (0 tin) | 34.43 | 39.23 |
+
+So với OLD (Fast DDS 2398.1/17420.6/21343.0ms, Zenoh 107.3/6818.4/
+21362.6ms, FleetRMW 8129.9/23799.9/36802.2ms ở N=8/16/32) — **giảm
+2-3 bậc độ lớn** (ví dụ FleetRMW N=8: 8129.9ms→5.44ms), cùng loại bằng
+chứng contamination như đã thấy ở Bảng V (route gãy → gói phải qua
+nhiều vòng retry/GTP-U trước khi đến, kéo latency giả tạo lên hàng
+giây; hạ tầng sạch → latency về đúng bản chất ms).
+
+**Đọc kết quả, không chỉ dừng ở bảng số**:
+- **Zenoh cải thiện RÕ RỆT nhất ở N=8/16** (69%→12.6%, 64%→37.7%
+  forced) — xác nhận trực tiếp: số cũ CÓ bị contaminated bởi bug
+  connectivity 5G đã sửa ở Phase 1-4, không thuần là đặc tính RMW.
+- **CycloneDDS/FleetRMW KHÔNG đổi (100% mọi N)** — khớp hoàn toàn với
+  2 nguyên nhân ĐÃ xác định từ trước, ĐỘC LẬP với bug connectivity vừa
+  sửa: CycloneDDS là giới hạn cấu trúc O(N²) discovery cost (không tin
+  nào từng đến — `age=None` mọi N, giống lịch sử); FleetRMW nhận tin
+  thật (age có giá trị, tăng dần theo N: 5.44→17.2→39.2ms) nhưng vẫn
+  không đạt đủ N-1 reply trong `reply_timeout_s`, đúng như đã điều tra
+  14/09 ("vấn đề độ tin cậy broadcast N-chiều, không phải bug thuật
+  toán"). Việc 2 con số này KHÔNG đổi sau khi sửa hạ tầng là bằng chứng
+  ỦNG HỘ (không phải mâu thuẫn) kết luận cũ: 2 nguyên nhân này thật, độc
+  lập với connectivity bug.
+- **N=32: cả 4 RMW đều 100% forced, không đổi** — khớp lịch sử, quy mô
+  N-way broadcast-consensus lớn vẫn là giới hạn thật của kịch bản/thuật
+  toán, không phải hạ tầng.
+- **Ghi chú biến động timing (đã điều tra, KHÔNG sửa)**: số crossings
+  hoàn thành/rep trong 120s ở nhiều cell THẤP HƠN lịch sử (ví dụ Fast
+  DDS N=8: lịch sử ~40 crossings/rep hoàn thành trong ~90.3s xong sớm
+  trước trần; bản mới nhiều rep chỉ hoàn thành ĐÚNG 1 crossing rồi hết
+  giờ ở 120.3s). Đọc code retry loop
+  (`fleetqox_coordination_endpoint.py`) xác nhận: thời lượng
+  stagger/jitter wait và `attempt_deadline` mỗi lần thử
+  (`reply_timeout_s`) HOÀN TOÀN không đổi bởi fix harness (fix chỉ đổi
+  CÁCH chờ — active-spin thay vì blind sleep — không đổi THỜI LƯỢNG
+  chờ) → fix harness KHÔNG PHẢI nguyên nhân trực tiếp của biến động
+  này. Nhiều khả năng do độ tin cậy broadcast thật của core Open5GS
+  hiện tại (sau nhiều giờ churn tích luỹ từ các phiên chẩn đoán trong
+  session này) khác với lúc lấy số liệu 15/09 — MỘT CONFOUND CHƯA LOẠI
+  TRỪ HẾT, nhưng KHÔNG đổi kết luận CHẤT (forced_entry cao ở N lớn vẫn
+  do độ tin cậy broadcast, không phải thuật toán) — không chase thêm
+  trong phase này (ngoài phạm vi "chỉ áp fix harness đã có, không sửa
+  FleetQoX/RMW/protocol").
+- **publish_failures=0 mọi rep** — không còn lặp lại crash N=32 đã sửa
+  trước đó (`safe_publish()`), hạ tầng ổn định trong suốt batch 36 lần
+  chạy liên tục.
+
+**File liên quan**: không có code thay đổi trong bước này (chỉ chạy
+batch bằng harness+infra đã fix ở các bước trước) — commit CHỈ gồm
+cập nhật doc này.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
