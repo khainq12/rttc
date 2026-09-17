@@ -7778,6 +7778,84 @@ trên phỏng đoán.
 `/tmp/.../scratchpad/step22b_lan_n16_fleetrmw_funnel.py`, raw:
 `step22b_lan_n16_fleetrmw_funnel.jsonl`.
 
+## Phase 1 clean instrumentation verification (tiếp, 17/09/2026) — 2 bug hạ tầng thật phát hiện + sửa
+
+Theo yêu cầu "rebuild + verify hash bên trong container đang chạy,
+fix field `data_frames_received` bị stale, không tiếp tục cho tới khi
+chắc chắn sạch": phát hiện `data_frames_received` LUÔN LUÔN đọc về 0 ở
+mọi batch LAN N=16 dù `frames_enqueued_to_subscriptions` (cùng process,
+cùng singleton, tính SAU khi `data_frames_received_` phải tăng trước
+theo đúng thứ tự code) lại đúng — một mâu thuẫn logic không thể xảy ra
+nếu code chạy đúng như đọc. Điều tra loại trừ TỪNG giả thuyết bằng
+evidence (không đoán):
+
+1. **Symbol/`.so` sai/cũ** — BÁC BỎ: `nm -D` xác nhận symbol tồn tại
+   duy nhất; `md5sum` từ HOST và từ BÊN TRONG container mới khớp
+   tuyệt đối cho cả `.py` và `.so`.
+2. **`__pycache__` cũ do 17 container cùng ghi vào 1 thư mục
+   `/work` dùng chung** (giả thuyết ban đầu, có vẻ hợp lý vì N=2 luôn
+   đúng còn N=16 luôn sai) — thêm `python3 -B` (tắt hẳn đọc/ghi
+   bytecode) cho CẢ 2 launch site (`fleetqox_rmw_trace_endpoint.py`,
+   `fleetqox_coordination_endpoint.py`) — **BÁC BỎ bằng evidence**:
+   rerun sau khi thêm `-B` VẪN cho kết quả sai y hệt (giữ `-B` lại vì
+   vẫn là thực hành tốt, loại bỏ 1 nguồn rủi ro race dù không phải
+   nguyên nhân chính ở đây).
+3. **Exception khi resolve symbol qua ctypes** — thêm try/except tạm
+   quanh từng `getattr()` để bắt lỗi cụ thể — chạy N=2: không lỗi, số
+   đúng. Không kết luận được cho N=16 ở bước này vì phát hiện #4 chặn
+   trước.
+4. **PHÁT HIỆN THẬT #1 — process CRASH hoàn toàn khi publish() lỗi
+   `errno=111 (ECONNREFUSED)`**: chạy lại với thư mục HOÀN TOÀN MỚI
+   (chưa từng dùng) để loại trừ khả năng đọc nhầm file cũ — lần này
+   `run_lan_probe()` trả `status=failed` (timeout, MẤT HẲN toàn bộ 17
+   `result_N.json`). Log endpoint cho thấy traceback thật:
+   `rclpy._rclpy_pybind11.RCLError: Failed to publish: ... errno=111
+   (Connection refused)`. Đọc lại `send_datagram_to_targets()`
+   (`rmw_pubsub.cpp`): `ECONNREFUSED` KHÔNG nằm trong 2 nhóm được retry
+   (`ENOBUFS/EAGAIN/EWOULDBLOCK` hay `ENETUNREACH/EHOSTUNREACH`) — lỗi
+   NGAY LẬP TỨC không retry, và rclpy RAISE exception (không chỉ trả
+   error code) khi `rmw_publish()` khác OK — script harness KHÔNG bắt
+   exception này trước đó, làm CHẾT TOÀN BỘ process, mất MỌI message
+   còn lại của endpoint đó cho hết phần đời run (không chỉ 1 gói tin bị
+   mất — mất hẳn 1 sender).
+   **Fix** (harness robustness, KHÔNG đụng `send_datagram_to_targets()`'s
+   retry/error semantics — đúng loại fix như `wait_until_deadline_while_spinning`
+   trước đây): bọc `publisher.publish(msg)` trong try/except, ghi nhận
+   vào `publish_failures` list (event_id + wall_ns + error string), rồi
+   `continue` sang message kế tiếp thay vì crash.
+5. **PHÁT HIỆN THẬT #2 — output_dir tái sử dụng để lại file rác
+   `ready_N`/`result_N.json` từ lần chạy TRƯỚC**: `start_containers()`
+   chỉ `docker rm -f` CONTAINER, không bao giờ xoá các file marker
+   phía HOST — khi tôi tái sử dụng CÙNG `output_dir` nhiều lần liên
+   tiếp trong lúc debug (không phải batch benchmark chính thức — các
+   batch Bảng IV/V/VI luôn dùng tên thư mục MỚI mỗi rep nên KHÔNG bị
+   ảnh hưởng), `wait_for_ready_then_start()`/`wait_for_completion()`
+   có thể đọc nhầm file cũ. **Fix**: thêm `shutil.rmtree(...,
+   ignore_errors=True)` xoá sạch `container_results/` trước khi tạo
+   mới, áp dụng cho cả 4 hàm probe dùng chung pattern này
+   (`run_probe`, `run_lan_probe`, `run_open5gs_probe`,
+   `run_open5gs_coordination_probe`).
+
+**Xác nhận GREEN sau cả 2 fix**: chạy LẠI 2 lần liên tiếp, mỗi lần thư
+mục MỚI hoàn toàn — CẢ 2 lần `status=ok`, `data_frames_received`
+KHỚP CHÍNH XÁC với `frames_enqueued_to_subscriptions` ở TẤT CẢ 17
+endpoint (vd `96=96`, `663≥200` cho control_station có nhiều
+subscription hơn) — mâu thuẫn logic đã biến mất hoàn toàn. Lần 1 bắt
+được đúng 1 `publish_failures` (ECONNREFUSED, đã bắt gọn, không crash);
+lần 2 `publish_failures=0` (không phải lần nào cũng xảy ra — lỗi
+transient thật, không phải lỗi cấu hình cố định).
+
+Full test suite sau tất cả thay đổi Phase 1: 786/794 pass, đúng 8 fail
+cũ đã biết, không regression.
+
+**File liên quan**: `scripts/fleetqox_rmw_trace_endpoint.py` (publish
+try/except, `publish_failures` field), `scripts/run_ns3_docker_container_fleet_probe.py`
+(`python3 -B` ở 2 launch site, `shutil.rmtree` trước mkdir
+`container_results` ở 4 hàm probe) — commit riêng, xem hash bên dưới.
+Script chẩn đoán (không thuộc repo):
+`/tmp/.../scratchpad/step22c_lan16_single_debug.py`,
+`step22d_lan16_verify_crash_fix.py`.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
