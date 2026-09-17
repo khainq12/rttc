@@ -62,6 +62,7 @@ import csv
 import json
 import re
 import shlex
+import shutil
 import statistics
 import subprocess
 import sys
@@ -1161,7 +1162,19 @@ class ReferenceTopologyProbe:
             inner = (
                 "source /opt/ros/jazzy/setup.bash && "
                 f"{rmw_setup}&& "
-                f"python3 /work/scripts/fleetqox_rmw_trace_endpoint.py "
+                # -B: disable .pyc read/write. Every endpoint container
+                # shares the SAME host-mounted /work directory (see
+                # _mount_args()), so up to N concurrent containers would
+                # otherwise race to compile+cache the SAME
+                # scripts/__pycache__/*.pyc file -- confirmed via a live
+                # N=16 run where a freshly-edited script's own change
+                # (a new field added to fleetqox_transport_metrics())
+                # was silently absent from several endpoints' output even
+                # though the .py source and the .so were both verified
+                # current, while an N=2 run (far less concurrency) showed
+                # no such staleness. -B removes this whole class of race
+                # rather than trying to invalidate/lock the shared cache.
+                f"python3 -B /work/scripts/fleetqox_rmw_trace_endpoint.py "
                 f"--trace={shlex.quote(trace_container_path)} "
                 f"--endpoint={shlex.quote(endpoint)} "
                 f"--policy={shlex.quote(policy)} "
@@ -1307,7 +1320,10 @@ class ReferenceTopologyProbe:
             inner = (
                 "source /opt/ros/jazzy/setup.bash && "
                 f"{rmw_setup}&& "
-                f"python3 /work/scripts/fleetqox_coordination_endpoint.py "
+                # -B: see the matching comment on the trace-endpoint launch
+                # above -- same shared-/work __pycache__ race risk applies
+                # here too.
+                f"python3 -B /work/scripts/fleetqox_coordination_endpoint.py "
                 f"--endpoint={shlex.quote(endpoint)} "
                 f"--peers={shlex.quote(peers_env)} "
                 f"--num-crossings={num_crossings} "
@@ -1601,6 +1617,17 @@ def run_probe(
         build_static_subscriptions(trace_path, policy, endpoints) if effective_static_mode else None
     )
     results_dir_container = f"{output_dir.relative_to(ROOT)}/container_results"
+    # Clear any stale ready/result/log files from a PRIOR run at this same
+    # output_dir before creating fresh -- confirmed live (17/09/2026, see
+    # docs/AUDIT_ACCEPTANCE_TRACKING.md) that reusing an output_dir across
+    # repeated invocations (e.g. iterative debugging re-running the same
+    # rep path) leaves stale ready_N/result_N.json files that can be read
+    # back as if they were this run's real output when a later run's
+    # container relaunch races with or short-circuits past
+    # wait_for_ready_then_start()/wait_for_completion()'s file-presence
+    # checks -- start_containers() only removes CONTAINERS (`docker rm
+    # -f`), never these host-side marker files.
+    shutil.rmtree(ROOT / results_dir_container, ignore_errors=True)
     (ROOT / results_dir_container).mkdir(parents=True, exist_ok=True)
 
     probe = ReferenceTopologyProbe(
@@ -1862,6 +1889,17 @@ def run_coordination_probe(
     run_id = output_dir.name.lstrip(".")
     endpoints = endpoint_list(num_robots)
     results_dir_container = f"{output_dir.relative_to(ROOT)}/container_results"
+    # Clear any stale ready/result/log files from a PRIOR run at this same
+    # output_dir before creating fresh -- confirmed live (17/09/2026, see
+    # docs/AUDIT_ACCEPTANCE_TRACKING.md) that reusing an output_dir across
+    # repeated invocations (e.g. iterative debugging re-running the same
+    # rep path) leaves stale ready_N/result_N.json files that can be read
+    # back as if they were this run's real output when a later run's
+    # container relaunch races with or short-circuits past
+    # wait_for_ready_then_start()/wait_for_completion()'s file-presence
+    # checks -- start_containers() only removes CONTAINERS (`docker rm
+    # -f`), never these host-side marker files.
+    shutil.rmtree(ROOT / results_dir_container, ignore_errors=True)
     (ROOT / results_dir_container).mkdir(parents=True, exist_ok=True)
 
     probe = ReferenceTopologyProbe(
@@ -2014,6 +2052,17 @@ def run_lan_probe(
         build_static_subscriptions(trace_path, policy, endpoints) if effective_static_mode else None
     )
     results_dir_container = f"{output_dir.relative_to(ROOT)}/container_results"
+    # Clear any stale ready/result/log files from a PRIOR run at this same
+    # output_dir before creating fresh -- confirmed live (17/09/2026, see
+    # docs/AUDIT_ACCEPTANCE_TRACKING.md) that reusing an output_dir across
+    # repeated invocations (e.g. iterative debugging re-running the same
+    # rep path) leaves stale ready_N/result_N.json files that can be read
+    # back as if they were this run's real output when a later run's
+    # container relaunch races with or short-circuits past
+    # wait_for_ready_then_start()/wait_for_completion()'s file-presence
+    # checks -- start_containers() only removes CONTAINERS (`docker rm
+    # -f`), never these host-side marker files.
+    shutil.rmtree(ROOT / results_dir_container, ignore_errors=True)
     (ROOT / results_dir_container).mkdir(parents=True, exist_ok=True)
 
     probe = ReferenceTopologyProbe(
@@ -2164,6 +2213,17 @@ def run_nr_probe(
         build_static_subscriptions(trace_path, policy, endpoints) if effective_static_mode else None
     )
     results_dir_container = f"{output_dir.relative_to(ROOT)}/container_results"
+    # Clear any stale ready/result/log files from a PRIOR run at this same
+    # output_dir before creating fresh -- confirmed live (17/09/2026, see
+    # docs/AUDIT_ACCEPTANCE_TRACKING.md) that reusing an output_dir across
+    # repeated invocations (e.g. iterative debugging re-running the same
+    # rep path) leaves stale ready_N/result_N.json files that can be read
+    # back as if they were this run's real output when a later run's
+    # container relaunch races with or short-circuits past
+    # wait_for_ready_then_start()/wait_for_completion()'s file-presence
+    # checks -- start_containers() only removes CONTAINERS (`docker rm
+    # -f`), never these host-side marker files.
+    shutil.rmtree(ROOT / results_dir_container, ignore_errors=True)
     (ROOT / results_dir_container).mkdir(parents=True, exist_ok=True)
 
     probe = ReferenceTopologyProbe(

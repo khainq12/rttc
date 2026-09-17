@@ -71,6 +71,7 @@ def fleetqox_transport_metrics() -> dict[str, Any]:
     names = (
         "frames_sent",
         "frames_received",
+        "data_frames_received",
         "fragment_nacks_sent",
         "fragment_nacks_received",
         "fragments_selectively_retransmitted",
@@ -598,6 +599,7 @@ def main() -> int:
     start_wall = time.monotonic()
     sent: list[str] = []
     send_timing: list[dict[str, Any]] = []
+    publish_failures: list[dict[str, Any]] = []
     # --discovery-only: every publisher/subscription above was still
     # created and matched normally (so discovery/control-plane traffic is
     # unaffected), but the send loop itself is skipped entirely -- isolates
@@ -645,7 +647,31 @@ def main() -> int:
         # inside this RMW), not just the scheduled offset already captured
         # by scheduled_offset_s.
         before_wall_ns = time.monotonic_ns()
-        publishers[_topic_for(row["dst"], row["flow_class"])].publish(msg)
+        try:
+            publishers[_topic_for(row["dst"], row["flow_class"])].publish(msg)
+        except Exception as exc:  # noqa: BLE001 -- rclpy raises RCLError (not
+            # a plain return code) when rmw_publish() returns non-OK, e.g.
+            # errno=111 (ECONNREFUSED) from send_datagram_to_targets():
+            # unlike ENOBUFS/EAGAIN/EWOULDBLOCK/ENETUNREACH/EHOSTUNREACH,
+            # ECONNREFUSED has NO retry class in that function at all, so
+            # it surfaces immediately as an exception here. Previously
+            # uncaught -- confirmed live (17/09/2026, see
+            # docs/AUDIT_ACCEPTANCE_TRACKING.md) that this silently killed
+            # the WHOLE endpoint process on a single transient send
+            # failure, losing every subsequent scheduled message from that
+            # endpoint for the rest of the run, not just the one that
+            # failed. Recording and continuing (harness robustness fix,
+            # same category as the earlier dispatch-gap/5G harness fixes)
+            # -- does NOT touch send_datagram_to_targets' own retry/error
+            # semantics, which stay exactly as-is.
+            publish_failures.append(
+                {
+                    "event_id": row["event_id"],
+                    "wall_ns": time.monotonic_ns(),
+                    "error": str(exc),
+                }
+            )
+            continue
         after_wall_ns = time.monotonic_ns()
         sent.append(row["event_id"])
         send_timing.append(
@@ -677,6 +703,7 @@ def main() -> int:
         "rx": len(received),
         "sent_event_ids": sent,
         "send_timing": send_timing,
+        "publish_failures": publish_failures,
         "received": received,
         "fleetqox_transport_metrics": fleetqox_transport_metrics(),
         "fleetqox_receive_timeline": fleetqox_receive_timeline(),
