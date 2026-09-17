@@ -7652,6 +7652,132 @@ giây; hạ tầng sạch → latency về đúng bản chất ms).
 batch bằng harness+infra đã fix ở các bước trước) — commit CHỈ gồm
 cập nhật doc này.
 
+## Optimization #2 candidate: FleetRMW loss-funnel investigation (Phase 1-3, 17/09/2026)
+
+**Mục tiêu**: tìm ROOT CAUSE thật của delivery/reliability thấp của
+FleetRMW (LAN N=16 ~55% vs Fast DDS ~87-90%), KHÔNG implement gì cho
+tới khi có evidence mechanism-level. `MEASURE → LOCALIZE LOSS → PROVE
+MECHANISM → RED TEST → MINIMAL FIX → A/B`.
+
+**Phase 1 — audit production path** (đọc trực tiếp
+`rmw_pubsub.cpp`, 17800 dòng, qua Explore agent + tự đọc lại các điểm
+quan trọng nhất): map đầy đủ `rmw_publish()→publish_payload()→
+send_frame_with_qos()→send_datagram_to_targets()→sendto()` và
+`receive_loop()→handle_received_datagram()→try_reassemble_fragment()→
+handle_received_payload()→decode_data_frame()→enqueue_received_frame()→
+deliver_decoded_frame_to_subscriptions_locked()→enqueue_frame_...→
+rmw_take()`. Phát hiện quan trọng nhất:
+
+1. **Không có `tier_capacity`/`packet_cap`/`remaining_tier_capacity_fraction`
+   nào trong C++ RMW** — đã tìm khắp package, không tồn tại. Cơ chế đó
+   (Optimization #1) sống ở tầng mô phỏng Python
+   (`fleetqox/control_plane.py`), KHÔNG áp dụng cho pipeline C++ thật
+   đang benchmark ở Bảng IV/V/VI. Không nhầm 2 tầng này.
+2. **`send_datagram_to_targets()` (dòng ~6843) gửi TUẦN TỰ cho từng
+   target trong `targets`, và `return RMW_RET_ERROR` NGAY LẬP TỨC ở
+   target đầu tiên hết ngân sách retry** (dòng ~7017 cũ) — **mọi
+   target đứng SAU trong cùng vector KHÔNG BAO GIỜ được thử gửi cho
+   lần publish() đó**. Xác nhận trực tiếp bằng đọc code (không suy
+   đoán).
+3. **`peer_policy_` mặc định = `"all"`** (dòng ~8662 cũ, chỉ đổi qua
+   env `FLEETQOX_RMW_PEER_POLICY`) — **MỌI publish() gửi cho TẤT CẢ
+   peer đã cấu hình, bất kể có subscriber thật hay không** (comment
+   trong chính code đã xác nhận đây là gap đã biết trước, chưa đo).
+   Kết hợp với (2): 1 peer chậm/tắc nghẽn ở ĐẦU danh sách có thể chặn
+   đứng delivery cho MỌI peer đứng sau nó trong CÙNG 1 lần publish.
+4. Không có drop nào khác đủ lớn để giải thích ~44% loss: encode
+   không thể fail (hàm `void`, không validate); ACK/NACK
+   fire-and-forget chỉ ảnh hưởng RELIABLE stream cuối cùng; fragment
+   TTL 60s quá dài so với `seconds=3` của benchmark; unrecognized-frame
+   fallthrough (dòng ~8415 cũ) trước đây KHÔNG có counter — đã thêm.
+
+**Phase 2 — instrumentation, purely observational** (commit `a72577e`):
+thêm atomic counter mới, KHÔNG đổi hành vi/timing/admission/retry/queue:
+`frames_received_unrecognized`, `data_frames_matched_zero_subscriptions`,
+`frames_enqueued_to_subscriptions`, `send_datagram_partial_abort_calls`/
+`full_success_calls`/`targets_attempted`/`targets_skipped`. Rebuild
+`rmw_fleetqox_cpp` (phát hiện + dọn 1 build cache CŨ dính cờ
+`-fsanitize=address` từ 1 phiên ASan trước đó gây crash "ASan runtime
+does not come first" — xoá `ros2_ws/build|install/rmw_fleetqox_cpp`,
+build lại sạch). RED N=2 smoke test: không crash, số liệu hợp lý.
+Full test suite: 786/794 pass, đúng 8 fail cũ không liên quan (không
+regression).
+
+**Phase 3 — LAN N=16 FleetRMW-only, n=3, đúng config lịch sử
+(`policy=fifo seconds=3 seed=13`)**:
+
+| rep | packet_rows | n_delivered | delivery | frames_sent | frames_received | frames_enqueued_to_subscriptions | send_datagram partial_abort/full_success | targets_skipped |
+|---|---|---|---|---|---|---|---|---|
+| 2 | 2289 | 1283 | 56.1% | 2289 | 177749 | 1283 | 319/14660 | 1589 |
+| 3 | 2289 | 1261 | 55.1% | 2289 | 176730 | 1262 | 354/14611 | 1760 |
+
+(rep 1 mất do lỗi thao tác của agent — vô tình `docker rm -f` container
+đang chạy giữa batch khi dọn dẹp rep khác; đã loại khỏi kết quả, KHÔNG
+tính là finding, script/container rerun sạch cho rep 2-3.)
+
+**Đọc funnel**:
+- `frames_sent` = `packet_rows` CHÍNH XÁC (2289=2289) ở MỌI rep — **0
+  loss ở giai đoạn app publish() → RMW attempt gửi**. Loại trừ hẳn giả
+  thuyết A (app không publish), B (policy/admission drop — đã xác
+  nhận Phase 1 không tồn tại cơ chế này), C (encode fail — không thể
+  fail theo code).
+- `frames_enqueued_to_subscriptions` ≈ `n_delivered` SÁT (1283≈1283,
+  1262≈1261, lệch tối đa 1) — **một khi frame match được subscription
+  và enqueue, gần như LUÔN LUÔN đến được app** (khớp với fix dispatch-
+  gap đã xác nhận trước đó trong phiên này). Loại trừ J (rmw_take/app
+  miss).
+- ⇒ **~44% loss nằm giữa "gửi" và "khớp subscription của người nhận
+  DỰ ĐỊNH"** — đúng vùng của giả thuyết D/E/F (sendto fail/kernel
+  socket loss/receiver never gets it).
+- `send_datagram_targets_skipped` (1589-1760/rep) — **cùng bậc độ lớn
+  với số tin nhắn bị mất** (2289-1283=1006 và 2289-1261=1028) — số
+  lượt gửi ĐÁNG LẼ PHẢI XẢY RA nhưng KHÔNG BAO GIỜ được thử (do target
+  đứng trước trong cùng lệnh gọi `send_datagram_to_targets()` đã hết
+  ngân sách retry) đủ lớn để giải thích phần lớn khoảng trống —
+  **plausibility mạnh về độ lớn, nhưng CHƯA chứng minh ở mức từng tin
+  nhắn** (chưa log target cụ thể nào bị skip khớp với topic/người nhận
+  cụ thể nào bị mất).
+- `data_frames_matched_zero_subscriptions` = 463 CỐ ĐỊNH ở cả 2 rep
+  thành công (không đổi dù n_delivered đổi 1283→1261) — có vẻ mang
+  tính CẤU TRÚC (topology/discovery-probe cố định theo N, không phải
+  random loss theo rep) — quá nhỏ (463 so với ~1000 tin mất) và KHÔNG
+  tương quan với biến động delivery giữa các rep ⇒ **không phải cơ chế
+  chính**.
+- `frames_received` (177749-179855, gộp 17 tiến trình) gấp ~77.6 lần
+  `frames_sent` (2289) — khuếch đại rất lớn, hợp lý nếu tính broadcast-
+  to-all (~16x, do `peer_policy_="all"`) NHÂN với overhead ACK/NACK/
+  redundant-resend/graph-heartbeat (còn lại ~4.85x) — **CHƯA tách được
+  chính xác DATA vs ACK/NACK** do 1 field đo thêm giữa chừng
+  (`data_frames_received`) bị đọc `None` ở batch N=16 (nghi do script
+  Python bên trong container dùng bản cache cũ hơn lúc rebuild .so,
+  KHÔNG phải bug đo đạc — xác nhận cơ chế đúng qua N=2 sanity test cho
+  giá trị hợp lý) — cần rerun riêng field này nếu cần con số tách bạch
+  chính xác.
+
+**ROOT-CAUSE LOCATION (chưa đủ bằng chứng mức từng tin nhắn để gọi là
+ROOT CAUSE đã chứng minh)**: `send_datagram_to_targets()`'s
+broadcast-to-all-peers-by-default (`peer_policy_="all"`) kết hợp
+abort-toàn-bộ-lệnh-gọi-khi-1-target-đầu-tiên-hết-retry — về mặt CODE
+chắc chắn CÓ THỂ gây đúng kiểu mất mát quan sát được, và về mặt SỐ
+LƯỢNG (`targets_skipped` cùng bậc với tin nhắn mất) rất phù hợp — nhưng
+CHƯA correlate được ở mức "tin nhắn X mất VÌ đúng lần skip Y" cụ thể.
+
+**Chưa làm (Phase 4-9 của yêu cầu)**: breakdown loss theo traffic
+class/topic/payload size/sender (Phase 4); coordination N=8 funnel
+(Phase 5); amplification DATA vs ACK/NACK vs retransmission tách bạch
+chính xác (Phase 6-7, hiện bị chặn bởi 1 field đo cần rerun); cross-
+validate cùng cơ chế trên 5G valid reps (Phase 8).
+
+**KHÔNG implement Optimization #2 trong bước này** — đúng yêu cầu, chỉ
+dừng ở LOCATION + evidence, không tune/sửa reliability protocol dựa
+trên phỏng đoán.
+
+**File liên quan**: `ros2_ws/src/rmw_fleetqox_cpp/src/rmw_pubsub.cpp`
+(instrumentation, commit `a72577e`), `scripts/fleetqox_rmw_trace_endpoint.py`
+(cùng commit), script batch (không thuộc repo):
+`/tmp/.../scratchpad/step22b_lan_n16_fleetrmw_funnel.py`, raw:
+`step22b_lan_n16_fleetrmw_funnel.jsonl`.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
