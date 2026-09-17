@@ -7856,6 +7856,89 @@ Script chẩn đoán (không thuộc repo):
 `/tmp/.../scratchpad/step22c_lan16_single_debug.py`,
 `step22d_lan16_verify_crash_fix.py`.
 
+## Optimization #2 hypothesis: PROOF GATE FAILED — send_datagram_to_targets() abort-on-first-failure KHÔNG phải nguyên nhân mất DATA frame (17-18/09/2026)
+
+**Hypothesis kiểm chứng**: "1 target fail + hết retry trong
+`send_datagram_to_targets()` → function return sớm → các target phía
+sau không được attempt → chính các skipped targets này tạo ra phần
+lớn missing deliveries."
+
+**Phương pháp**: instrument message×target ở CẢ 2 phía (commit
+`8eefba5`) — gửi: 1 event/`(source_id, source_sequence, topic,
+target)` với outcome `ATTEMPT_SUCCESS`/`ATTEMPT_FAILED`/
+`SKIPPED_AFTER_FAILURE`; nhận: 1 event/`(source_id, source_sequence,
+topic)` khi frame DATA thật sự đến socket của tiến trình. Join 2 phía
+bằng script Python đọc CẢ 17 endpoint's trace, ánh xạ target IP:port →
+tên endpoint (công thức cố định `BASE_IP_PREFIX{i+2}:RMW_PORT`, xác
+nhận khớp với `self.ips` trong code).
+
+**Kết quả LAN N=16, FleetRMW-only, n=3, đúng config lịch sử sạch**:
+
+| rep | missing (SEND_SUCCESS_NOT_RECEIVED) | SEND_FAILED_NOT_RECEIVED | **SKIPPED_NOT_RECEIVED** | fraction giải thích bởi skip |
+|---|---|---|---|---|
+| 1 | 574 | 0 | **0** | **0.0%** |
+| 2 | 567 | 0 | **0** | **0.0%** |
+| 3 | 552 | 0 | **0** | **0.0%** |
+
+**Không có 1 SKIPPED_AFTER_FAILURE event nào cho DATA frame ở CẢ 3
+rep** (`skipped_targets_total=0`) — trong khi CHÍNH quầy thô
+`send_datagram_partial_abort_calls`/`send_datagram_targets_skipped`
+(counter không gate theo loại frame) VẪN dương ở CÙNG lần chạy đó
+(vd rep 3: `partial_abort_calls=223`, `targets_skipped=1566`, đọc trực
+tiếp từ `fleetqox_transport_metrics` của CHÍNH run này) — **XÁC NHẬN
+cơ chế abort-on-first-failure THẬT SỰ XẢY RA, nhưng KHÔNG XẢY RA cho
+DATA frame ứng dụng mà benchmark đang đo** — do thiết kế trace (identity
+chỉ set trong `send_frame_with_qos`, không set cho ACK/NACK/graph/
+retransmission), 223 lần abort đó chắc chắn xảy ra trên traffic
+KHÔNG-PHẢI-DATA (ACK/NACK hoặc control), khớp với phát hiện khuếch đại
+lưu lượng ~77.6x đã ghi nhận trước đó (đa số traffic là ACK/NACK, không
+phải DATA).
+
+**100% (574/574, 567/567, 552/552) số lần "mất" đều rơi vào
+`SEND_SUCCESS_NOT_RECEIVED`**: `send_datagram_to_targets()` báo cáo
+THÀNH CÔNG (sendto() không lỗi) nhưng gói tin KHÔNG BAO GIỜ được ghi
+nhận đến socket của receiver dự định — đây là cơ chế HOÀN TOÀN KHÁC
+với hypothesis ban đầu, chỉ ra tổn thất nằm Ở SAU điểm sendto() thành
+công (kernel-level hoặc receiver-socket-level), KHÔNG PHẢI ở logic
+retry/abort phía sender.
+
+**Anomaly nhỏ, đã giải thích được**: `SEND_FAILED_RECEIVED_unexpected=14`
+CỐ ĐỊNH ở cả 3 rep — không phải lỗi đo: `proactive_data_repeats_` gửi
+LẶP LẠI cùng 1 `source_sequence` nhiều lần tới cùng target; nếu lần
+gửi ĐẦU thành công còn lần gửi SAU (cùng seq, cùng target) fail, join
+đơn giản của tôi (chỉ theo key `(source_id, seq, topic)`, không phân
+biệt lần gửi thứ mấy) vẫn thấy "received=true" cho record FAILED đó —
+đúng, không phải bug: tin đã đến từ lần gửi trước, không liên quan gì
+đến lần fail này.
+
+**ÁP DỤNG ĐÚNG PROOF GATE đã thống nhất trước**: KHÔNG dùng
+`targets_skipped ≈ messages_lost` (volume similarity) làm bằng chứng —
+đã CHỨNG MINH ĐƯỢC volume similarity đó (phát hiện Phase 3 trước) là
+**SAI LẦM QUY KẾT** (misattribution): 2 con số cùng bậc độ lớn hoàn
+toàn TRÙNG HỢP, không có quan hệ nhân quả — đúng như cảnh báo
+"volume similarity is not causal evidence" đã đặt ra trước khi đo.
+
+**ROOT CAUSE: NOT PROVEN cho hypothesis "abort-on-first-failure gây
+mất DATA frame".** Theo đúng STOP CONDITION đã thống nhất: **KHÔNG
+implement Optimization #2** (failure-isolation-per-target) — sửa cơ
+chế này sẽ không giải quyết được tổn thất DATA quan sát được, vì cơ
+chế đó không hề tác động tới DATA frame trong benchmark này.
+
+**Hướng bằng chứng mới, ĐỘ TIN CẬY CAO hơn, CHƯA điều tra (không tự ý
+làm tiếp trong bước này)**: 100% loss tập trung ở
+`SEND_SUCCESS_NOT_RECEIVED` — cần đo trực tiếp kernel-level UDP receive
+drops (`/proc/net/udp` cột `drops`, hoặc `netstat -su` "RcvbufErrors")
+tại các container receiver TRONG LÚC benchmark chạy, để kiểm tra liệu
+khối lượng ACK/NACK khổng lồ (~77.6x DATA) có tạo áp lực khiến kernel
+socket receive buffer tràn, làm rớt CHÍNH DATA frame xen giữa — đây là
+hypothesis D/E/F còn lại từ danh sách gốc (Phase 1), CHƯA được đo trực
+tiếp.
+
+**File liên quan**: script batch (không thuộc repo):
+`/tmp/.../scratchpad/step24_lan16_causal_proof.py`, raw:
+`step24_lan16_causal_proof.jsonl`. Instrumentation: commit `8eefba5`
+(đã có sẵn từ bước trước, không sửa gì thêm ở bước này).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
