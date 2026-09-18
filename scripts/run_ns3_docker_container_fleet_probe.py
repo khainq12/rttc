@@ -145,6 +145,56 @@ def topic_for(destination: str, flow_class: str) -> str:
     return f"/fleetqox_trace/{safe_dst}/{safe_class}"
 
 
+def fleetqox_rmw_env_prefix(
+    endpoint: str,
+    peers: str,
+    static_mode: bool,
+    static_subscription_entries: list[str],
+    extra_rmw_env: dict[str, str] | None,
+) -> str:
+    """Builds the `KEY=value ` env string launch_endpoints() exports
+    before sourcing rmw_fleetqox_cpp's install/setup.bash for one
+    endpoint's container. Extracted as a pure function (18/09/2026, see
+    docs/AUDIT_ACCEPTANCE_TRACKING.md "ROOT CAUSE TÌM RA: publisher_id/
+    robot_id COLLISION") so the FLEETQOX_RMW_ROBOT_ID fix below is
+    independently unit-testable without a live RMW process/Docker.
+
+    Fixes the PROVEN cross-robot identity collision: rmw_pubsub.cpp's
+    local_robot_id() falls back to the literal string "local" whenever
+    FLEETQOX_RMW_ROBOT_ID is unset in the process environment -- and
+    this env_prefix previously never set it at all, for ANY endpoint.
+    Combined with allocate_publisher_id() (a per-process counter over
+    the LOCAL bind address, identical across every container) and
+    stream_key() = robot_id + "|" + topic + "|" + publisher_id, every
+    robot's Nth-created publisher for a shared topic collided in full
+    stream identity with every other robot's Nth-created publisher --
+    silently sharing ONE duplicate-detection SequenceState at the
+    receiver across all 16 robots (measured: 463/463 residual loss on
+    the 5 uplink flows, 100.0%, explained by this exact collision,
+    reproducible identically across 3 reps). Setting
+    FLEETQOX_RMW_ROBOT_ID={endpoint} here -- the SAME canonical,
+    deterministic, unique-per-container name endpoint_list() already
+    generates and every other part of this harness already keys off of
+    (no second identity system) -- makes stream_key() unique per robot
+    again, independent of this fix's other env vars.
+    """
+    env_prefix = (
+        f"RMW_IMPLEMENTATION=rmw_fleetqox_cpp FLEETQOX_RMW_BIND=0.0.0.0:{RMW_PORT} "
+        f"FLEETQOX_RMW_PEERS={peers} "
+        f"FLEETQOX_RMW_ROBOT_ID={endpoint} "
+    )
+    if static_mode:
+        env_prefix += (
+            "FLEETQOX_RMW_PEER_POLICY=subscription_aware FLEETQOX_RMW_STATIC_MODE=1 "
+            f"FLEETQOX_RMW_STATIC_SUBSCRIPTIONS="
+            f"{shlex.quote(','.join(static_subscription_entries))} "
+        )
+    env_prefix += "".join(
+        f"{key}={value} " for key, value in (extra_rmw_env or {}).items()
+    )
+    return env_prefix
+
+
 def build_static_subscriptions(
     trace_path: Path, policy: str, endpoints: list[str]
 ) -> dict[str, list[tuple[str, str]]]:

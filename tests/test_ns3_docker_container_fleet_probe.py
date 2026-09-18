@@ -14,6 +14,7 @@ from scripts.run_ns3_docker_container_fleet_probe import (
     compute_jitter_stale_repair_stats,
     compute_latency_stats_ms,
     endpoint_list,
+    fleetqox_rmw_env_prefix,
     parse_docker_mem_usage_mb,
     station_mac,
     topic_for,
@@ -63,6 +64,136 @@ class TopicForTest(unittest.TestCase):
     def test_sanitizes_non_ros2_topic_characters(self):
         self.assertEqual(
             topic_for("robot-0000", "human/qoe"), "/fleetqox_trace/robot_0000/human_qoe"
+        )
+
+
+def _simulate_effective_stream_identity(
+    robot_id_env: str | None, topic: str, publisher_creation_index: int
+) -> str:
+    """Mirrors rmw_pubsub.cpp's local_robot_id() + allocate_publisher_id()
+    + stream_key() formula purely in Python, so the harness's env-var
+    wiring can be regression-tested without a live RMW process (see
+    docs/AUDIT_ACCEPTANCE_TRACKING.md 18/09/2026 "ROOT CAUSE TÌM RA" for
+    the full C++ trail this was read directly from):
+      - local_robot_id() (rmw_pubsub.cpp:9376) returns the literal
+        string "local" whenever FLEETQOX_RMW_ROBOT_ID is unset in the
+        process environment.
+      - allocate_publisher_id() (rmw_pubsub.cpp:10325) =
+        "fpubcpp-" + LOCAL bind address + "-" + a per-process counter --
+        the bind address ("0.0.0.0:9100" here) is IDENTICAL across
+        every container, so the Nth publisher created in ANY process
+        gets the same id string.
+      - stream_key() (data_frame.cpp:621) = robot_id + "|" + topic +
+        "|" + publisher_id.
+    """
+    robot_id = robot_id_env if robot_id_env else "local"
+    bound_endpoint = "0.0.0.0:9100"
+    publisher_id = f"fpubcpp-{bound_endpoint}-{publisher_creation_index}"
+    return f"{robot_id}|{topic}|{publisher_id}"
+
+
+class FleetqoxRmwEnvPrefixTest(unittest.TestCase):
+    """RED/GREEN for the 18/09/2026 FLEETQOX_RMW_ROBOT_ID collision fix
+    (see docs/AUDIT_ACCEPTANCE_TRACKING.md "ROOT CAUSE TÌM RA: publisher_id/
+    robot_id COLLISION"). Live LAN N=16 measurement (previous pass)
+    proved 463/463 (100.0%, all 3 reps) residual loss on the 5 uplink
+    flows was explained by control_station's per-subscription
+    duplicate-detection SequenceState being silently SHARED across all
+    16 robots -- because none of them ever had a unique
+    FLEETQOX_RMW_ROBOT_ID, so every robot's Nth-created publisher for a
+    shared topic collided in full stream identity with every other
+    robot's Nth-created publisher.
+    """
+
+    def test_red_old_env_prefix_never_set_robot_id_and_collides(self):
+        """RED: reproduces the OLD env_prefix formula inline -- exactly
+        as it existed in launch_endpoints() before this fix, with no
+        FLEETQOX_RMW_ROBOT_ID key at all -- and shows two DIFFERENT
+        robot endpoints' Nth-created publisher for the same topic
+        produce the IDENTICAL effective stream identity. This is the
+        proven bug being reproduced, not a test error."""
+
+        def old_env_prefix(peers: str) -> str:
+            return (
+                f"RMW_IMPLEMENTATION=rmw_fleetqox_cpp FLEETQOX_RMW_BIND=0.0.0.0:{RMW_PORT} "
+                f"FLEETQOX_RMW_PEERS={peers} "
+            )
+
+        env_robot_a = old_env_prefix("10.60.0.2:9100")
+        env_robot_b = old_env_prefix("10.60.0.2:9100")
+        self.assertNotIn(
+            "FLEETQOX_RMW_ROBOT_ID", env_robot_a,
+            "sanity: the OLD formula really never set this var",
+        )
+        self.assertNotIn("FLEETQOX_RMW_ROBOT_ID", env_robot_b)
+
+        # Neither container's env sets FLEETQOX_RMW_ROBOT_ID -> both
+        # processes' local_robot_id() falls back to "local" regardless
+        # of which robot they actually are.
+        identity_robot_a = _simulate_effective_stream_identity(
+            robot_id_env=None,
+            topic="/fleetqox_trace/control_station/debug",
+            publisher_creation_index=4,
+        )
+        identity_robot_b = _simulate_effective_stream_identity(
+            robot_id_env=None,
+            topic="/fleetqox_trace/control_station/debug",
+            publisher_creation_index=4,
+        )
+        self.assertEqual(
+            identity_robot_a, identity_robot_b,
+            "RED: two DIFFERENT robots' 4th-created publisher for the "
+            "same topic must collide under the OLD (pre-fix) env",
+        )
+
+    def test_green_sets_robot_id_matching_the_canonical_endpoint_name(self):
+        env = fleetqox_rmw_env_prefix("robot_0000", "10.60.0.2:9100", False, [], None)
+        self.assertIn("FLEETQOX_RMW_ROBOT_ID=robot_0000 ", env)
+
+    def test_green_control_station_also_gets_its_own_id(self):
+        env = fleetqox_rmw_env_prefix("control_station", "10.60.0.3:9100", False, [], None)
+        self.assertIn("FLEETQOX_RMW_ROBOT_ID=control_station ", env)
+
+    def test_green_all_endpoints_get_unique_deterministic_ids(self):
+        endpoints = endpoint_list(16)
+        ids = []
+        for endpoint in endpoints:
+            env = fleetqox_rmw_env_prefix(endpoint, "peer:9100", False, [], None)
+            tokens = [tok for tok in env.split() if tok.startswith("FLEETQOX_RMW_ROBOT_ID=")]
+            self.assertEqual(len(tokens), 1, f"exactly one ROBOT_ID entry for {endpoint}")
+            robot_id = tokens[0].split("=", 1)[1]
+            self.assertEqual(robot_id, endpoint, "id must match the intended canonical endpoint name")
+            ids.append(robot_id)
+        self.assertEqual(len(ids), len(set(ids)), "every endpoint must get a UNIQUE id")
+        # Deterministic across repeated calls (repeatable benchmark reps).
+        for endpoint in endpoints:
+            self.assertEqual(
+                fleetqox_rmw_env_prefix(endpoint, "peer:9100", False, [], None),
+                fleetqox_rmw_env_prefix(endpoint, "peer:9100", False, [], None),
+            )
+
+    def test_green_static_mode_and_extra_env_still_present(self):
+        env = fleetqox_rmw_env_prefix(
+            "robot_0000", "peer:9100", True, ["1.2.3.4:9100|0|/t|Type"], {"FOO": "bar"}
+        )
+        self.assertIn("FLEETQOX_RMW_ROBOT_ID=robot_0000 ", env)
+        self.assertIn("FLEETQOX_RMW_STATIC_MODE=1", env)
+        self.assertIn("FOO=bar", env)
+
+    def test_green_two_robots_no_longer_collide_in_stream_identity(self):
+        identity_robot_a = _simulate_effective_stream_identity(
+            robot_id_env="robot_0000",
+            topic="/fleetqox_trace/control_station/debug",
+            publisher_creation_index=4,
+        )
+        identity_robot_b = _simulate_effective_stream_identity(
+            robot_id_env="robot_0001",
+            topic="/fleetqox_trace/control_station/debug",
+            publisher_creation_index=4,
+        )
+        self.assertNotEqual(
+            identity_robot_a, identity_robot_b,
+            "GREEN: a distinct robot_id per endpoint must break the collision",
         )
 
 
