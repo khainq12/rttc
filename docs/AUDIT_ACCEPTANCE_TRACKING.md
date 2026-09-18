@@ -9006,6 +9006,129 @@ cho `__udp4_lib_lookup`, sửa `@known_udp9100_sk` → `@known_sk[daddr]`),
 `step37_lookup_input_and_livecheck.jsonl`). KHÔNG có code production/
 harness/kernel nào bị sửa.
 
+## Quan sát trực tiếp vòng đời socket 9100: MECHANISM PROVEN — socket bị ĐÓNG VĨNH VIỄN đúng lúc /control chuyển từ nhận-được sang mất (18/09/2026)
+
+**Mục tiêu**: quan sát TRỰC TIẾP thời điểm socket cổng 9100 được tạo
+(bind), và đóng (close), rồi đối chiếu với chính thời điểm `/control`
+chuyển từ trạng thái nhận-được sang mất — theo đúng yêu cầu, **KHÔNG
+sửa FleetRMW**.
+
+**2 camera MỚI, đặt trực tiếp vào cơ chế bảng băm** (không qua các hàm
+bọc bind()/close() ở tầng cao hơn): `udp_lib_get_port()` (hàm THỰC SỰ
+đưa 1 socket vào bảng băm cổng — bind() cuối cùng gọi tới hàm này) và
+`udp_lib_unhash()` (hàm gỡ 1 socket khỏi bảng băm — được gọi khi
+đóng/disconnect). Xác nhận `kprobe`-able qua `bpftrace -lv`, không
+đoán theo tên.
+
+**Vấn đề kỹ thuật quan trọng + cách giải quyết**: 2 hàm này thao tác
+trực tiếp trên `struct sock`, KHÔNG có `skb` — nên không dùng được
+cách định danh theo gói tin (IP/port) như các camera trước. Định danh
+duy nhất khả dụng là **PID** — nhưng CHỈ đúng ở đây vì bind()/close()
+chạy trong CHÍNH tiến trình gọi nó (khác với camera A/B/C/L/M/K/D chạy
+trong ngữ cảnh softirq, không phải tiến trình FleetRMW). Việc map
+PID→robot gặp 2 lỗi liên tiếp, TỰ PHÁT HIỆN VÀ SỬA trước khi tin kết
+quả:
+1. `docker inspect --format '{{.State.Pid}}'` chỉ cho PID của tiến
+   trình `sleep infinity` (tiến trình "vỏ" ban đầu của container) —
+   KHÔNG PHẢI tiến trình Python thật (được khởi chạy SAU đó, riêng,
+   qua `docker exec -d`). Phát hiện qua: 0/5 sự kiện GETPORT khớp được
+   với bất kỳ PID nào trong map.
+2. Đổi sang `docker top <container>` — vẫn có nguy cơ bắt nhầm/bỏ sót
+   nếu tiến trình fork/exec qua nhiều bước. **Fix cuối**: thay vì lấy
+   1 PID DUY NHẤT, liên tục polling (mỗi 100ms, suốt thời gian chạy,
+   trong 1 thread riêng — vì `run_lan_probe()` tự huỷ container trong
+   khối `finally` TRƯỚC KHI trả về, không thể query PID SAU khi hàm
+   trả về) và gom TẤT CẢ PID từng xuất hiện trong container đó thành 1
+   TẬP HỢP — xác nhận lại N=2: GETPORT khớp 5/5.
+
+**N=2 sanity (baseline khoẻ mạnh, không mất gói)**: mỗi endpoint (3
+endpoint ở N=2) có ĐÚNG 1 lần GETPORT(snum=9100) lúc khởi động, và
+ĐÚNG 1 lần UNHASH(num=9100) ở CUỐI benchmark (đóng khi tiến trình kết
+thúc bình thường) — không có bất thường giữa chừng. Cũng quan sát được
+1 hành vi ĐÃ BIẾT từ trước (không liên quan): mỗi robot tạo 1 socket
+tạm ở port ngẫu nhiên (`snum=0`) rồi đóng NGAY LẬP TỨC ~2.5s sau khi
+khởi động — khớp với thông báo lỗi "FleetRMW UDP payload exceeds
+automatically discovered path MTU" từng thấy ở phase rất sớm của
+investigation này (đây là cơ chế dò MTU đường đi, dùng 1 socket tạm
+thời, không phải cơ chế đang điều tra).
+
+**LAN N=16, n=3, CÙNG config các phase trước — KẾT QUẢ CHÍNH**:
+
+**ĐÚNG 17 sự kiện GETPORT(9100) và ĐÚNG 17 sự kiện UNHASH(9100) mỗi
+rep** — khớp CHÍNH XÁC với 17 endpoint (1 control_station + 16 robot),
+**MỖI endpoint CHỈ bind 1 LẦN DUY NHẤT và đóng 1 LẦN DUY NHẤT** —
+KHÔNG có hiện tượng đóng-mở lặp lại (loại bỏ giả thuyết "socket bị
+đóng/mở lại nhiều lần trong lúc chạy" — không đúng, cơ chế THỰC SỰ đơn
+giản hơn và dứt khoát hơn).
+
+**Đối chiếu thời điểm UNHASH với thời điểm transition (điểm `/control`
+chuyển từ nhận-được sang mất, đã xác định từ phase trước qua
+FleetRMW's own trace)**:
+
+| | |
+|---|---|
+| Tổng số robot×rep đối chiếu được | 48/48 |
+| Độ lệch (unhash_ts − transition_ts) nằm trong ±200ms | 33/48 |
+| Độ lệch nằm trong ±500ms | **48/48 (100%)** |
+| Độ lệch trung vị | +55.9ms |
+| Độ lệch min/max | −348.6ms / +464.8ms |
+| Độ dài trung bình 1 rep (tham chiếu) | ~19,000ms |
+
+**48/48 (100%) — socket cổng 9100 của CHÍNH robot đó bị đóng (UNHASH)
+trong vòng NỬA GIÂY quanh đúng thời điểm `/control` chuyển từ
+nhận-được sang mất — trên tổng thời lượng benchmark ~19 GIÂY (tức độ
+lệch chỉ ~2.6% độ dài run, ở MỌI lần đo, không ngoại lệ).**
+
+**Ví dụ cụ thể (robot_0000, rep 1)**: GETPORT lúc t=0 (khởi động,
+17.5s TRƯỚC transition) → 143 gói `/control` gửi tới, transition xảy
+ra ở gói thứ 90/143 (68.6% chiều dài traffic của robot này, KHỚP
+CHÍNH XÁC với mốc 0.60-0.73 đã đo 2 lần độc lập trước đó bằng 2
+phương pháp hoàn toàn khác — tcpdump wall-clock và kernel rank) → **UNHASH
+xảy ra chỉ 53ms SAU** → 53 gói CÒN LẠI (rank 91-142, trải dài suốt 6
+GIÂY tiếp theo) đều đến `checkpoint C` bình thường nhưng **không còn
+socket nào để tìm** — giải thích TRỌN VẸN vì sao mất mát là VĨNH VIỄN,
+không hồi phục (đã xác nhận từ phase rất sớm: `any_delivery_recovers_after_transition`
+= False tuyệt đối, 48/48).
+
+**Điều này CŨNG giải thích TRỌN VẸN phát hiện "socket đọc thấy zeroed"
+của phase trước** (`live_num=0, live_rcv_saddr=0.0.0.0, live_refcnt=0`
+ở 100% các lần miss) — KHÔNG PHẢI 1 hiện tượng lạ/race — đó CHÍNH LÀ
+trạng thái BÌNH THƯỜNG của 1 socket ĐÃ ĐÓNG THẬT SỰ (port/địa chỉ được
+reset về 0, refcount về 0 khi huỷ) — 2 phát hiện của 2 phase khác nhau,
+đo bằng 2 cách khác nhau, giờ khớp nhau hoàn toàn, củng cố lẫn nhau.
+
+**MECHANISM PROVEN**: `/control` bắt đầu mất KHÔNG PHẢI vì kernel có
+lỗi tra bảng băm, KHÔNG PHẢI vì socket bị đóng-mở lặp lại — mà vì
+**socket lắng nghe cổng 9100 của CHÍNH robot đó bị ĐÓNG (unhash khỏi
+bảng băm UDP) vào ĐÚNG một thời điểm cụ thể trong lúc benchmark đang
+chạy, và KHÔNG BAO GIỜ được mở lại** — từ thời điểm đó, MỌI gói
+`/control` gửi tới robot đó về sau đều thất bại ở bước tìm socket (như
+2 phase trước đã chứng minh), vì đơn giản LÀ KHÔNG CÒN SOCKET NÀO Ở ĐÓ
+NỮA.
+
+**Phạm vi của bằng chứng — điều ĐÃ chứng minh và điều CHƯA**: đã chứng
+minh CHẮC CHẮN: (1) socket đóng đúng 1 lần, đúng lúc, vĩnh viễn; (2)
+việc đóng này xảy ra trong NGỮ CẢNH TIẾN TRÌNH của chính robot đó (tức
+do 1 syscall close()/disconnect() nào đó của CHÍNH tiến trình FleetRMW
+gọi, không phải kernel tự ý đóng). **CHƯA xác định** (nằm ngoài phạm
+vi camera kernel-only, cần đọc code FleetRMW mới biết): dòng code cụ
+thể nào trong FleetRMW gọi việc đóng này, và TẠI SAO nó được gọi vào
+đúng thời điểm đó (lỗi/exception? logic timeout? resource cleanup theo
+điều kiện nào đó?).
+
+**KHÔNG đọc, KHÔNG sửa code FleetRMW trong pass này** — đúng yêu cầu
+người dùng. Đây là điểm dừng tự nhiên của nhánh điều tra "kernel-only,
+black-box" — bước tiếp theo (nếu người dùng muốn) sẽ cần nhìn vào
+CHÍNH code FleetRMW để biết dòng nào gọi close()/socket bị huỷ, nhưng
+đó là quyết định của người dùng, không phải của pass này.
+
+**File liên quan** (không thuộc repo): script bpftrace cập nhật
+`/tmp/.../scratchpad/rx_checkpoints.bt` (thêm probe `udp_lib_get_port`
++ `udp_lib_unhash`), `step38_socket_lifecycle.py` (gồm `PidPoller` —
+polling PID nền qua `docker top`, N=16 x3, kết quả:
+`step38_socket_lifecycle.jsonl`). KHÔNG có code production/harness/
+kernel/FleetRMW nào bị sửa hoặc đọc.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
