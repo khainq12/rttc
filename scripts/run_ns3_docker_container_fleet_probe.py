@@ -1070,18 +1070,8 @@ class ReferenceTopologyProbe:
                     f"{STATIC_SUBSCRIPTION_TYPE_NAME}"
                     for dst, flow_class in (static_subscriptions or {}).get(endpoint, [])
                 ]
-                env_prefix = (
-                    f"RMW_IMPLEMENTATION=rmw_fleetqox_cpp FLEETQOX_RMW_BIND=0.0.0.0:{RMW_PORT} "
-                    f"FLEETQOX_RMW_PEERS={peers} "
-                )
-                if static_mode:
-                    env_prefix += (
-                        "FLEETQOX_RMW_PEER_POLICY=subscription_aware FLEETQOX_RMW_STATIC_MODE=1 "
-                        f"FLEETQOX_RMW_STATIC_SUBSCRIPTIONS="
-                        f"{shlex.quote(','.join(static_subscription_entries))} "
-                    )
-                env_prefix += "".join(
-                    f"{key}={value} " for key, value in (extra_rmw_env or {}).items()
+                env_prefix = fleetqox_rmw_env_prefix(
+                    endpoint, peers, static_mode, static_subscription_entries, extra_rmw_env
                 )
                 rmw_setup = f"source /work/{FLEETQOX_RMW_INSTALL}/setup.bash && export {env_prefix}"
             else:
