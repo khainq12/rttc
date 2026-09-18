@@ -9433,6 +9433,194 @@ instrumentation thuần quan sát). Script đo + kết quả (không thuộc rep
 `/tmp/.../scratchpad/step40_actual_send_vs_shutdown.py`,
 `step40_socket_close_only.bt`, `step40_actual_send_vs_shutdown.jsonl`.
 
+## RED → MINIMAL FIX → GREEN: idle-timeout shutdown — HARNESS FIX VALIDATED cho /control, còn loss ở topic khác (18/09/2026)
+
+Thuật ngữ dùng trong phần này:
+- **idle timeout** = chỉ tắt receiver sau khi KHÔNG nhận được message thật nào trong một khoảng thời gian (`drain_s`), thay vì tắt theo 1 mốc giờ cố định tính trước.
+- **nominal timestamp** = thời gian message ĐÁNG LẼ được gửi theo kịch bản (trace CSV).
+- **actual timestamp** = thời gian message THỰC SỰ được gửi khi chạy benchmark.
+- **shutdown margin** = khoảng cách giữa lần gửi thực tế cuối cùng và lúc robot bắt đầu tắt (dương = tắt SAU khi gửi xong, an toàn; âm = tắt TRƯỚC, gây mất gói).
+
+### 1. ROOT CAUSE
+
+Bug đã CONFIRMED ở pass đo trước (xem mục ngay phía trên): fix `a6dffd1`
+tính deadline tắt máy MỘT LẦN, DUY NHẤT, dựa trên lịch trình DANH NGHĨA
+trong trace — nhưng ở LAN N=16, control_station gửi THỰC TẾ trễ hơn lịch
+danh nghĩa của chính nó tới ~15.5 giây trung bình. Robot vẫn tắt đúng
+theo deadline danh nghĩa (đã tính đúng lịch của MỌI peer, nhưng vẫn là
+MỘT con số cố định), nên tắt sớm hơn ~5-6 giây so với lúc gói `/control`
+thực sự cuối cùng được gửi tới. 100% phần mất còn lại sau `a6dffd1` được
+giải thích bởi cơ chế này (đã đo, không giả định).
+
+### 2. RED
+
+Test `test_fixed_deadline_elapses_before_late_actual_message_arrives`
+(class `OldFixedDeadlineStillShutsDownBeforeLateDataTest`): dùng CHÍNH
+hàm `wait_until_deadline_while_spinning` hiện có (không sửa), với deadline
+cố định = lịch danh nghĩa cuối (3s) + `drain_s` (10s) = 13s, và một
+message giả lập chỉ "đến" ở t=18s. **Kết quả: hàm trả về (quyết định
+tắt) ở t=13s, TRƯỚC KHI message ở t=18s từng được quan sát** — tái hiện
+đúng bug đã đo trực tiếp trên LAN N=16 (`sent_after_shutdown_total ==
+lost_total`, 100%, cả 3 rep).
+
+### 3. FIX
+
+Thêm hàm thuần `run_receive_idle_drain_loop()` vào
+`scripts/fleetqox_rmw_trace_endpoint.py` (sau `wait_until_deadline_while_spinning`).
+Logic: `deadline` bắt đầu bằng đúng giá trị floor hiện có (không đổi
+công thức `compute_receive_capable_deadline_s`), và MỖI LẦN
+`len(received)` tăng (tức `on_message()` — callback subscription CÓ SẴN
+của harness, CHỈ fire cho các topic benchmark của chính endpoint này,
+KHÔNG BAO GIỜ fire cho traffic nội bộ ACK/NACK/graph/discovery/repair
+của FleetRMW — nên không cần sửa gì bên C++ để có tín hiệu "đã nhận
+application DATA thật" này), `deadline = max(deadline, now + drain_s)`.
+Race condition (deadline đến đúng lúc message tới): vòng lặp luôn drain
+hết mọi thứ đã sẵn sàng (dùng lại đúng pattern burst 20x
+`spin_once(0.0)` đã có sẵn trong file, không thêm busy loop mới) TRƯỚC
+KHI kiểm tra deadline ở MỌI vòng lặp, kể cả vòng cuối cùng — nên message
+đến đúng lúc deadline hết hạn vẫn được quan sát và vẫn gia hạn.
+
+Nối vào `main()`: thay `while time.monotonic() < drain_deadline: ...`
+bằng gọi `run_receive_idle_drain_loop(initial_drain_deadline, args.drain_s,
+spin_once_fn, lambda: len(received))`. Thêm field báo cáo
+`final_drain_deadline_monotonic_ns` bên cạnh `drain_deadline_monotonic_ns`
+(nay là "initial", không đổi ý nghĩa).
+
+**Giới hạn thiết kế đã biết trước, không phải lỗ hổng**: một message là
+message ĐẦU TIÊN robot từng nhận, đến SAU khi floor danh nghĩa đã hết
+hạn mà TRƯỚC ĐÓ hoàn toàn im lặng, không thể chờ vô hạn định (sẽ vi
+phạm yêu cầu "không có DATA trong `drain_s` thì phải cho phép tắt").
+Traffic LAN N=16 thật không rơi vào trường hợp này: mỗi robot nhận
+32-143 gói `/control` trải đều suốt run, luôn có gói đến sớm để neo lần
+gia hạn đầu tiên — test dùng 2 lần đến (không phải 1 lần đến cô lập)
+đúng để khớp pattern thật này.
+
+### 4. GREEN
+
+8 test mới (RED + 7 edge case A-F + 1 race boundary), **TẤT CẢ PASS**.
+Toàn bộ suite: **806 test, cùng 8 lỗi cũ KHÔNG liên quan** (ngtcp2 x2,
+`test_remote_wait_for_all_acked`) — không có regression mới.
+
+### 5. N=2 SANITY
+
+`status=ok`, chạy xong bình thường trong 21.2s (không treo). tx/rx khớp
+đúng baseline đã biết (control_station tx=284 rx=142; robot_0000 tx=89
+rx=143; robot_0001 tx=67 rx=141). Idle timeout gia hạn nhẹ (~26-34ms cho
+2 robot) rồi hết hạn bình thường — đúng hành vi kỳ vọng ở quy mô nhỏ
+không tải.
+
+### 6. LAN N=16 RESULTS
+
+| rep | control sent | control delivered | control % | overall % |
+|---|---|---|---|---|
+| 1 | 1626 | 1626 | **100.0%** | 79.77% |
+| 2 | 1626 | 1626 | **100.0%** | 79.77% |
+| 3 | 1626 | 1626 | **100.0%** | 79.77% |
+
+(n=3, kết quả giống hệt nhau tới từng gói — không suy diễn ý nghĩa
+thống kê xa hơn từ n=3, chỉ ghi nhận: harness giờ đã đủ ổn định để tái
+lặp chính xác ở cùng seed/config.)
+
+### 7. BEFORE VS AFTER
+
+| giai đoạn | /control delivery | overall delivery |
+|---|---|---|
+| pre-fix (trước mọi sửa) | 64.15-66.73% | ~55-57%* |
+| `a6dffd1` (sửa bất đối xứng lịch trình) | 65.74-68.18% | 55.4-57.2% |
+| idle-timeout fix (pass này) | **100.0%** | **79.77%** |
+
+*overall delivery pre-fix (trước `a6dffd1`) không được đo tách riêng
+trong phase đó; số ~55-57% ở hàng "pre-fix" dùng lại con số đo được
+NGAY SAU `a6dffd1` làm tham chiếu gần nhất.
+
+### 8. SHUTDOWN PROOF
+
+| rep | sent_after_shutdown | lost_before_shutdown | lost_after_shutdown | shutdown_margin (mean) |
+|---|---|---|---|---|
+| 1 | **0** | 0 | 0 | **+10010 ms** |
+| 2 | **0** | 0 | 0 | **+10012 ms** |
+| 3 | **0** | 0 | 0 | **+10010 ms** |
+
+`shutdown_margin` nay LUÔN DƯƠNG (~+10.0-10.02 giây, tức đúng bằng
+`drain_s`) ở MỌI robot, MỌI rep — robot tắt ĐÚNG `drain_s` sau lần gửi
+`/control` thực tế cuối cùng nó nhận được, không còn tắt sớm. Deadline
+được gia hạn trung bình ~18.9-19.2 GIÂY so với floor danh nghĩa ban đầu
+(khớp với độ trễ thực tế ~15.5s đã đo trước đó, cộng thêm phần trôi dồn
+tích tới cuối run).
+
+### 9. TOPIC BREAKDOWN
+
+| topic (flow_class) | sent | delivered | % |
+|---|---|---|---|
+| control | 1626 | 1626 | **100.0%** |
+| state | 282 | 97 | 34.4% |
+| perception | 177 | 67 | 37.9% |
+| coordination | 169 | 23 | 13.6% |
+| debug | 24 | 6 | 25.0% |
+| human_qoe | 11 | 7 | 63.6% |
+
+(giống hệt cả 3 rep.)
+
+### 10. DID /CONTROL ROOT CAUSE DISAPPEAR?
+
+**YES.** Bằng chứng: `sent_after_shutdown = 0` ở CẢ 3 rep, `/control`
+delivery = 100.0% cả 3 rep, `lost_before_shutdown = lost_after_shutdown
+= 0` — không còn gói `/control` nào mất vì lý do shutdown-timing.
+
+### 11. RESIDUAL LOSS
+
+Overall delivery = 79.77% (không phải 100%). Các topic CÒN mất:
+`state` (34.4%), `perception` (37.9%), `coordination` (13.6%), `debug`
+(25.0%), `human_qoe` (63.6%). **KHÔNG điều tra thêm trong pass này**
+theo đúng yêu cầu dừng lại.
+
+Về câu hỏi bắt buộc "loss của các topic này có tương quan thời gian
+với receiver shutdown không": **UNKNOWN cho cả 5 topic**. Lý do: phân
+tích shutdown-margin per-message ở pass này CHỈ được xây dựng cho lớp
+`/control` (đúng phạm vi câu hỏi gốc); các file kết quả chi tiết per-
+endpoint của lần chạy N=16 đã bị dọn dẹp (teardown xoá `output_dir`)
+trước khi nhận ra cần mở rộng phân tích sang các flow_class khác, nên
+không còn dữ liệu thô để trả lời YES/NO mà không chạy đo lại — điều này
+nằm ngoài phạm vi "chỉ báo cáo, không điều tra thêm" của pass này.
+
+### 12. PRODUCTION CODE
+
+**UNCHANGED.** Không sửa `rmw_pubsub.cpp`, FleetRMW transport, scheduler,
+optimizer, packet cap, peer policy, ACK/NACK, kernel/Linux, QoS, hay
+traffic rate. Chỉ sửa `scripts/fleetqox_rmw_trace_endpoint.py` (harness).
+
+### 13. OPTIMIZATION #2
+
+**NOT IMPLEMENTED.**
+
+### 14. VERDICT
+
+**HARNESS FIX VALIDATED** — cho đúng phạm vi đã chứng minh: shutdown-
+timing bug gây mất `/control` đã được sửa dứt điểm (100% delivery, 0
+sent-after-shutdown, cả 3 rep). Verdict này KHÔNG mở rộng sang các
+topic khác vẫn còn mất (state/perception/coordination/debug/human_qoe)
+— cơ chế gây mất ở đó CHƯA được xác định (UNKNOWN, mục 11).
+
+### 15. EXACTLY ONE NEXT STEP
+
+Vì còn residual loss đáng kể ở các topic khác (13.6-63.6% delivery):
+đề xuất DUY NHẤT MỘT phép đo tiếp theo — mở rộng CHÍNH XÁC phương pháp
+"actual send vs shutdown" đã dùng cho `/control` (mục 8) sang các
+flow_class còn lại (`state`, `perception`, `coordination`, `debug`,
+`human_qoe`), để trả lời YES/NO/UNKNOWN cho câu hỏi ở mục 11 — tức xác
+định liệu 5 topic này có CÙNG cơ chế root cause với `/control` (shutdown-
+timing, nay đã có floor design tương tự áp dụng cho MỌI endpoint kể cả
+control_station) hay là MỘT cơ chế mất gói khác hẳn (vd nghẽn băng
+thông thật, nghẽn CPU, hay bản thân các flow_class này có traffic
+pattern/priority khác khiến drop theo cách khác). **CHƯA thực thi bước
+này** — chờ quyết định người dùng.
+
+**File liên quan**: `scripts/fleetqox_rmw_trace_endpoint.py` (đã sửa,
+commit `21f445d` test + `8d2ebcf` fix), `tests/test_fleetqox_rmw_trace_endpoint.py`
+(đã sửa, commit `21f445d`). Script đo N=16 (không thuộc repo):
+`/tmp/.../scratchpad/step41_idle_fix_lan16.py`, kết quả:
+`step41_idle_fix_lan16.jsonl`.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
