@@ -185,8 +185,21 @@ def fleetqox_loss_funnel_trace() -> dict[str, list[dict[str, Any]]]:
     payloads, which have no plaintext JSON yet at this point) -- absence
     here is not proof of loss for those cases, only for plain DATA
     frames like this benchmark's traffic.
+
+    "subscription_match" (added 18/09/2026, see
+    docs/AUDIT_ACCEPTANCE_TRACKING.md "đo trực tiếp domain_id/topic_name/
+    type_name lúc match"): one entry per decoded DATA frame that reached
+    deliver_decoded_frame_to_subscriptions_locked(), carrying the
+    frame's OWN domain_id/topic/type_name/partitions_csv exactly as the
+    match loop saw them, plus matched_subscriptions (0 = the
+    data_frames_matched_zero_subscriptions case). Cross-reference against
+    fleetqox_subscriptions_snapshot() to see whether the receiving
+    process's actual live subscription differs from what the frame
+    carries.
     """
-    empty: dict[str, list[dict[str, Any]]] = {"send": [], "recv": [], "raw_recvfrom": []}
+    empty: dict[str, list[dict[str, Any]]] = {
+        "send": [], "recv": [], "raw_recvfrom": [], "subscription_match": [],
+    }
     if os.environ.get("RMW_IMPLEMENTATION") != "rmw_fleetqox_cpp":
         return empty
     if not os.environ.get("FLEETQOX_RMW_LOSS_FUNNEL_TRACE_PROFILING"):
@@ -200,6 +213,7 @@ def fleetqox_loss_funnel_trace() -> dict[str, list[dict[str, Any]]]:
         ("send", "rmw_fleetqox_cpp_loss_funnel_send_trace_json"),
         ("recv", "rmw_fleetqox_cpp_loss_funnel_recv_trace_json"),
         ("raw_recvfrom", "rmw_fleetqox_cpp_loss_funnel_raw_recvfrom_trace_json"),
+        ("subscription_match", "rmw_fleetqox_cpp_subscription_match_trace_json"),
     ):
         fn = getattr(library, symbol_name)
         fn.restype = ctypes.c_char_p
@@ -212,6 +226,35 @@ def fleetqox_loss_funnel_trace() -> dict[str, list[dict[str, Any]]]:
         except (json.JSONDecodeError, UnicodeDecodeError):
             result[key] = []
     return result
+
+
+def fleetqox_subscriptions_snapshot() -> list[dict[str, Any]]:
+    """Read rmw_pubsub.cpp's rmw_fleetqox_cpp_subscriptions_snapshot_json()
+    -- a dump of this process's CURRENT live g_subscriptions entries
+    (topic_name/domain_id/type_name/partitions/endpoint_id), i.e.
+    exactly the fields the match condition in
+    deliver_decoded_frame_to_subscriptions_locked() compares a decoded
+    frame against. Added 18/09/2026 alongside the "subscription_match"
+    key of fleetqox_loss_funnel_trace() (see that function's own doc
+    comment) -- same opt-in gating (FLEETQOX_RMW_LOSS_FUNNEL_TRACE_PROFILING).
+    """
+    if os.environ.get("RMW_IMPLEMENTATION") != "rmw_fleetqox_cpp":
+        return []
+    if not os.environ.get("FLEETQOX_RMW_LOSS_FUNNEL_TRACE_PROFILING"):
+        return []
+    try:
+        library = ctypes.CDLL("librmw_fleetqox_cpp.so")
+    except OSError:
+        return []
+    fn = library.rmw_fleetqox_cpp_subscriptions_snapshot_json
+    fn.restype = ctypes.c_char_p
+    raw = fn()
+    if not raw:
+        return []
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return []
 
 
 def fleetqox_publish_stage_metrics(library: "ctypes.CDLL") -> dict[str, Any]:
@@ -923,6 +966,7 @@ def main() -> int:
         "fleetqox_transport_metrics": fleetqox_transport_metrics(),
         "fleetqox_receive_timeline": fleetqox_receive_timeline(),
         "fleetqox_loss_funnel_trace": fleetqox_loss_funnel_trace(),
+        "fleetqox_subscriptions_snapshot": fleetqox_subscriptions_snapshot(),
         "discovery_convergence_s": discovery_convergence_s,
         "discovery_peers_seen": len(discovery_peers_seen),
         "discovery_expected_peers": args.expected_peer_count,

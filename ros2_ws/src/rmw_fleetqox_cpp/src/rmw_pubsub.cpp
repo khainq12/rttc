@@ -592,6 +592,37 @@ std::vector<LossFunnelRecvEvent> g_loss_funnel_recv_events;
 // regardless of what this records.
 std::vector<LossFunnelRecvEvent> g_loss_funnel_raw_recvfrom_events;
 
+// SubscriptionMatchTraceEvent (added 18/09/2026, see
+// docs/AUDIT_ACCEPTANCE_TRACKING.md "đo trực tiếp domain_id/topic_name/
+// type_name lúc match"): records, for EVERY decoded DATA frame that
+// reaches deliver_decoded_frame_to_subscriptions_locked(), the frame's
+// OWN domain_id/topic/type_name/partitions_csv exactly as the match
+// loop sees them, plus how many subscriptions it matched
+// (matched_subscriptions). Read-only code review of the match condition
+// (subscription->domain_id == decoded_frame->domain_id &&
+// subscription->topic_name == decoded_frame->topic && ... ) and the
+// lifespan/ownership/security gates around it ruled out lifespan
+// expiry (unset by this benchmark's QoSProfile), exclusive ownership
+// (defaults to kShared, never overridden), and SROS2 security policy
+// (falls through to allow when unconfigured) as explanations for
+// data_frames_matched_zero_subscriptions -- this trace exists to
+// directly compare a LOST message's own frame identity against a
+// snapshot of the receiving process's actual live subscriptions
+// (see rmw_fleetqox_cpp_subscriptions_snapshot_json() below) instead of
+// guessing further from source alone.
+struct SubscriptionMatchTraceEvent
+{
+  std::string source_id;
+  std::uint64_t source_sequence{0};
+  std::string frame_topic;
+  std::string frame_type_name;
+  std::size_t frame_domain_id{0};
+  std::string frame_partitions_csv;
+  std::size_t matched_subscriptions{0};
+  std::int64_t wall_ns{0};
+};
+std::vector<SubscriptionMatchTraceEvent> g_subscription_match_trace_events;
+
 // Cheap substring-based identity extraction directly on just-received raw
 // bytes, mirroring the SAME regex logic already proven against tcpdump
 // capture text (see /tmp scratchpad step26_packet_capture.py's
@@ -14834,6 +14865,29 @@ void enqueue_received_frame(const std::string & encoded_frame)
   if (matched_subscriptions == 0) {
     g_data_frames_matched_zero_subscriptions.fetch_add(1, std::memory_order_relaxed);
   }
+  if (loss_funnel_trace_profiling_enabled()) {
+    // Records EVERY decoded frame's own identity exactly as the match
+    // loop in deliver_decoded_frame_to_subscriptions_locked() sees it
+    // (domain_id/topic/type_name/partitions_csv), alongside how many
+    // subscriptions it matched -- see SubscriptionMatchTraceEvent's own
+    // doc comment. Cross-referenced by the Python harness against
+    // rmw_fleetqox_cpp_subscriptions_snapshot_json()'s dump of this
+    // process's actual live g_subscriptions entries, to directly compare
+    // a LOST message's frame identity against what the receiver's
+    // subscription is really registered with instead of guessing
+    // further from source review alone.
+    SubscriptionMatchTraceEvent match_event;
+    match_event.source_id = decoded_frame->publisher_id;
+    match_event.source_sequence = decoded_frame->source_sequence_number;
+    match_event.frame_topic = decoded_frame->topic;
+    match_event.frame_type_name = decoded_frame->type_name;
+    match_event.frame_domain_id = decoded_frame->domain_id;
+    match_event.frame_partitions_csv = decoded_frame->partitions_csv;
+    match_event.matched_subscriptions = matched_subscriptions;
+    match_event.wall_ns = monotonic_timestamp_ns();
+    std::lock_guard<std::mutex> trace_lock(g_loss_funnel_trace_mutex);
+    g_subscription_match_trace_events.push_back(std::move(match_event));
+  }
 
   for (const auto & payload : ack_nack_payloads) {
     schedule_ack_nack_resend(payload.first, payload.second);
@@ -15411,6 +15465,75 @@ const char * rmw_fleetqox_cpp_loss_funnel_raw_recvfrom_trace_json()
     built += "\"source_sequence\":" + std::to_string(event.source_sequence) + ",";
     built += "\"topic\":\"" + loss_funnel_json_escape(event.topic) + "\",";
     built += "\"wall_ns\":" + std::to_string(event.wall_ns) + "}";
+  }
+  built += "]";
+  json = std::move(built);
+  return json.c_str();
+}
+
+// See SubscriptionMatchTraceEvent's doc comment.
+const char * rmw_fleetqox_cpp_subscription_match_trace_json()
+{
+  static std::string json;
+  std::lock_guard<std::mutex> lock(g_loss_funnel_trace_mutex);
+  std::string built = "[";
+  for (size_t i = 0; i < g_subscription_match_trace_events.size(); ++i) {
+    if (i != 0) {
+      built += ",";
+    }
+    const SubscriptionMatchTraceEvent & event = g_subscription_match_trace_events[i];
+    built += "{\"source_id\":\"" + loss_funnel_json_escape(event.source_id) + "\",";
+    built += "\"source_sequence\":" + std::to_string(event.source_sequence) + ",";
+    built += "\"frame_topic\":\"" + loss_funnel_json_escape(event.frame_topic) + "\",";
+    built += "\"frame_type_name\":\"" + loss_funnel_json_escape(event.frame_type_name) + "\",";
+    built += "\"frame_domain_id\":" + std::to_string(event.frame_domain_id) + ",";
+    built += "\"frame_partitions_csv\":\"" +
+      loss_funnel_json_escape(event.frame_partitions_csv) + "\",";
+    built += "\"matched_subscriptions\":" + std::to_string(event.matched_subscriptions) + ",";
+    built += "\"wall_ns\":" + std::to_string(event.wall_ns) + "}";
+  }
+  built += "]";
+  json = std::move(built);
+  return json.c_str();
+}
+
+// Dumps this process's CURRENT live g_subscriptions entries (topic_name/
+// domain_id/type_name/partitions), i.e. exactly the fields the match
+// condition in deliver_decoded_frame_to_subscriptions_locked() compares
+// a decoded frame against -- added alongside
+// rmw_fleetqox_cpp_subscription_match_trace_json() (18/09/2026, see
+// that event's own doc comment) so a LOST message's own frame identity
+// can be diffed directly against what this receiver's subscription is
+// actually registered with, instead of assuming they match. Subscriptions
+// in this benchmark are created once at startup and never
+// destroyed/recreated mid-run, so a single end-of-run snapshot is
+// representative of the whole run.
+const char * rmw_fleetqox_cpp_subscriptions_snapshot_json()
+{
+  static std::string json;
+  std::lock_guard<std::mutex> lock(g_bus_mutex);
+  std::string built = "[";
+  for (size_t i = 0; i < g_subscriptions.size(); ++i) {
+    if (i != 0) {
+      built += ",";
+    }
+    const FleetQoxSubscriptionData * subscription = g_subscriptions[i];
+    if (subscription == nullptr) {
+      built += "null";
+      continue;
+    }
+    built += "{\"topic_name\":\"" + loss_funnel_json_escape(subscription->topic_name) + "\",";
+    built += "\"domain_id\":" + std::to_string(subscription->domain_id) + ",";
+    built += "\"type_name\":\"" + loss_funnel_json_escape(subscription->type_name) + "\",";
+    built += "\"partitions\":[";
+    for (size_t p = 0; p < subscription->partitions.size(); ++p) {
+      if (p != 0) {
+        built += ",";
+      }
+      built += "\"" + loss_funnel_json_escape(subscription->partitions[p]) + "\"";
+    }
+    built += "],";
+    built += "\"endpoint_id\":\"" + loss_funnel_json_escape(subscription->endpoint_id) + "\"}";
   }
   built += "]";
   json = std::move(built);
