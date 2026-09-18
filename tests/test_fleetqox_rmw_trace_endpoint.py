@@ -6,6 +6,7 @@ import unittest
 from scripts.fleetqox_rmw_trace_endpoint import (
     _topic_for,
     build_payload,
+    compute_receive_capable_deadline_s,
     load_rows,
     wait_until_deadline_while_spinning,
 )
@@ -209,6 +210,120 @@ class WaitUntilDeadlineWhileSpinningTest(unittest.TestCase):
         )
         bounded_calls = [c for c in calls if c > 0]
         self.assertLess(len(bounded_calls), 100)
+
+
+def _asymmetric_workload_rows():
+    """Peer A ("fleet_controller", stands in for control_station) sends
+    4 messages to peer B ("robot_0000") spread out to t=15000ms -- a
+    long downlink schedule, matching control_station sending /control
+    to all 16 robots in the real benchmark. Peer B sends only 1 message
+    of its own, at t=0ms -- a MUCH shorter own-schedule, matching a
+    single robot's own 5-topic uplink versus control_station's combined
+    downlink to every robot."""
+    rows = []
+    for i, ts in enumerate([0.0, 5000.0, 10000.0, 15000.0]):
+        rows.append({
+            "event_id": f"a{i}", "policy": "fifo", "flow_class": "control",
+            "src": "fleet_controller", "dst": "robot_0000",
+            "bytes": "96", "deadline_ms": "45.0", "timestamp_ms": str(ts),
+        })
+    rows.append({
+        "event_id": "b0", "policy": "fifo", "flow_class": "state",
+        "src": "robot_0000", "dst": "fleet_controller",
+        "bytes": "320", "deadline_ms": "120.0", "timestamp_ms": "0.0",
+    })
+    return rows
+
+
+class ReceiveCapableDeadlineTest(unittest.TestCase):
+    """RED/GREEN for the receiver-closes-early harness bug found via the
+    18/09/2026 kernel-checkpoint investigation (see
+    docs/AUDIT_ACCEPTANCE_TRACKING.md "MECHANISM PROVEN" and "ROOT
+    CAUSE TÌM RA"):
+
+        Peer A vẫn còn gửi
+                v
+        Peer B đã gửi xong phần của B
+                v
+        B KHÔNG ĐƯỢC shutdown  [X]
+                v
+        B phải tiếp tục nhận cho đến
+        global experiment end / receive deadline
+
+    Direct kernel observation (48/48 robot x rep combinations) showed
+    each robot's own port-9100 socket being unhashed -- once,
+    permanently -- within ~500ms of that robot's own delivered->missing
+    transition, out of a ~19-second run. Reading fleetqox_rmw_trace_endpoint.py
+    found why: the OLD drain_deadline was `time.monotonic() + args.drain_s`,
+    computed the instant THIS endpoint's own outgoing loop finished --
+    with no awareness that a peer (e.g. control_station, whose combined
+    downlink schedule to all 16 robots is far longer than any single
+    robot's own uplink schedule) might still be mid-stream sending TO it.
+    """
+
+    def test_old_own_schedule_only_formula_cuts_off_before_peer_finishes(self):
+        """RED: proves the bug still present in main() at the time this
+        test was written. Replicates EXACTLY the old inline formula
+        (drain_deadline computed from only this endpoint's own outgoing
+        rows, ignoring incoming ones) and shows it yields a deadline
+        BEFORE peer A's last scheduled send -- i.e. robot_0000 would
+        destroy_node()/rclpy.shutdown() (closing its receiving socket,
+        confirmed via kprobe to be permanent -- no rebind ever follows)
+        while fleet_controller is still actively sending to it."""
+        rows = _asymmetric_workload_rows()
+        own_outgoing = [r for r in rows if r["src"] == "robot_0000"]
+        start_offset_ms = 1000.0
+        drain_s = 10.0
+
+        old_buggy_deadline_s = (
+            max(float(r["timestamp_ms"]) for r in own_outgoing) + start_offset_ms
+        ) / 1000.0 + drain_s
+        last_incoming_send_s = (15000.0 + start_offset_ms) / 1000.0
+
+        self.assertLess(
+            old_buggy_deadline_s, last_incoming_send_s,
+            "old own-schedule-only formula must finish BEFORE peer A's "
+            "last send for this fixture to actually reproduce the bug",
+        )
+
+    def test_new_formula_stays_alive_through_peers_last_send(self):
+        """GREEN: the fixed formula must cover every row where this
+        endpoint is dst (every peer's send TO it), not just its own
+        outgoing rows -- so it must stay alive at least drain_s past
+        peer A's LAST scheduled send, regardless of how short B's own
+        outgoing schedule is."""
+        rows = _asymmetric_workload_rows()
+        start_offset_ms = 1000.0
+        drain_s = 10.0
+
+        deadline_s = compute_receive_capable_deadline_s(rows, start_offset_ms, drain_s)
+        last_incoming_send_s = (15000.0 + start_offset_ms) / 1000.0
+
+        self.assertGreaterEqual(
+            deadline_s, last_incoming_send_s + drain_s,
+            "receiver must stay alive at least drain_s after the LAST "
+            "message ANY peer is scheduled to send it, not just after "
+            "its own (possibly much shorter) outgoing schedule",
+        )
+
+    def test_symmetric_workload_matches_old_behavior(self):
+        """Sanity check: when a peer's own outgoing schedule already IS
+        the longest one it's involved in (the common case this bug
+        does NOT affect, e.g. two peers with equal traffic), the new
+        formula should not needlessly extend the deadline beyond what
+        the schedule actually requires."""
+        rows = [
+            {
+                "event_id": "x0", "policy": "fifo", "flow_class": "state",
+                "src": "robot_0000", "dst": "fleet_controller",
+                "bytes": "320", "deadline_ms": "120.0", "timestamp_ms": "3000.0",
+            },
+        ]
+        deadline_s = compute_receive_capable_deadline_s(rows, 1000.0, 10.0)
+        self.assertAlmostEqual(deadline_s, (3000.0 + 1000.0) / 1000.0 + 10.0)
+
+    def test_empty_rows_falls_back_to_drain_s(self):
+        self.assertEqual(compute_receive_capable_deadline_s([], 1000.0, 10.0), 10.0)
 
 
 if __name__ == "__main__":

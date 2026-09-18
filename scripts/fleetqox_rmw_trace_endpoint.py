@@ -291,6 +291,42 @@ def load_rows(trace_path: Path, policy: str, endpoint: str) -> list[dict[str, st
     return rows
 
 
+def compute_receive_capable_deadline_s(
+    rows: list[dict[str, str]],
+    start_offset_ms: float,
+    drain_s: float,
+) -> float:
+    """Offset in seconds from this process's own start_wall at which it
+    is safe to destroy_node()/rclpy.shutdown() -- i.e. this endpoint has
+    stayed alive long enough to both finish its own outgoing schedule
+    AND receive every message any peer is scheduled to send it, plus
+    drain_s to let in-flight repair complete. `rows` must be exactly
+    what load_rows() returns: every row where this endpoint is EITHER
+    src OR dst -- both directions matter here, not just outgoing.
+
+    Fixes the harness bug found via the 18/09/2026 kernel-checkpoint
+    investigation (docs/AUDIT_ACCEPTANCE_TRACKING.md "MECHANISM
+    PROVEN" / "ROOT CAUSE TÌM RA"): the old deadline was
+    time.monotonic() + drain_s, computed right after THIS endpoint's
+    OWN outgoing loop finished -- with zero awareness of peers still
+    sending TO it. A sender with a much longer schedule than its
+    receivers (control_station sending /control to all 16 robots,
+    versus each robot's own short 5-topic uplink schedule) would still
+    be mid-stream when a robot -- done with its own much shorter
+    schedule -- already reached that deadline and closed its receiving
+    socket, permanently losing every later send from that point on
+    (confirmed via direct kernel observation: the socket's port-9100
+    entry is unhashed, once, within ~500ms of the robot's own
+    delivered->missing transition, in all 48 robot x rep combinations
+    measured). Using the max timestamp across ALL rows (both
+    directions) instead of just outgoing rows fixes this.
+    """
+    if not rows:
+        return drain_s
+    last_event_ms = max(float(row["timestamp_ms"]) for row in rows)
+    return (last_event_ms + start_offset_ms) / 1000.0 + drain_s
+
+
 def build_payload(row: dict[str, str], target_bytes: int) -> str:
     """Wire payload for one trace row.
 
