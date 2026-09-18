@@ -9228,6 +9228,89 @@ là của người dùng, phase sau.
 chỉ ĐỌC, không sửa), `scripts/fleetqox_rmw_trace_endpoint.py` (dòng
 644-776 — chỉ ĐỌC, không sửa).
 
+## RED → FIX → GREEN: sửa harness (receiver không tự đóng sớm) — rerun LAN N=16, cải thiện KHIÊM TỐN, không dứt điểm (18/09/2026)
+
+**Mục tiêu**: theo đúng nguyên tắc RED → FIX → GREEN, viết test chứng
+minh lỗi TRƯỚC, sửa `scripts/fleetqox_rmw_trace_endpoint.py` để thời
+điểm receiver tự đóng KHÔNG còn phụ thuộc riêng vào lịch gửi của chính
+nó, rồi chạy lại LAN N=16 để đo tác động thật.
+
+**RED — test chứng minh lỗi** (`tests/test_fleetqox_rmw_trace_endpoint.py`,
+class `ReceiveCapableDeadlineTest`, commit `5c7f4ce`): dựng fixture bất
+đối xứng đúng kịch bản user mô tả — peer A ("fleet_controller") gửi 4
+gói tới B ("robot_0000") trải dài tới t=15000ms; B chỉ gửi 1 gói của
+CHÍNH nó tại t=0ms. `test_old_own_schedule_only_formula_cuts_off_before_peer_finishes`
+lặp lại CHÍNH XÁC công thức CŨ còn trong `main()` lúc viết test này
+(deadline tính từ CHỈ lịch gửi riêng của B) và CHỨNG MINH bằng số:
+deadline đó luôn nhỏ hơn thời điểm A gửi lần cuối — tức B sẽ tự đóng
+socket TRƯỚC KHI A gửi xong.
+
+**FIX** (commit `a6dffd1`): thêm hàm thuần `compute_receive_capable_deadline_s(rows, start_offset_ms, drain_s)`
+— lấy MAX `timestamp_ms` trên TOÀN BỘ `rows` mà endpoint này tham gia
+(CẢ 2 chiều — `load_rows()` vốn đã trả về đúng tập này: mọi dòng có
+`src == endpoint` HOẶC `dst == endpoint`), không chỉ lịch gửi riêng.
+Nối vào `main()`, thay `drain_deadline = time.monotonic() + args.drain_s`
+bằng `drain_deadline = start_wall + compute_receive_capable_deadline_s(rows, ...)`.
+
+**GREEN**: 14/14 test trong file, VÀ toàn bộ 798 test hệ thống — cùng
+8 lỗi cũ KHÔNG liên quan (ngtcp2/QUIC canonical-artifact,
+`test_remote_wait_for_all_acked`) — KHÔNG có regression mới.
+
+**N=2 sanity sau fix**: status=ok, thời lượng chạy tăng lên ~37s (so
+với ~20s trước fix) — ĐÚNG NHƯ DỰ KIẾN vì mỗi endpoint giờ chờ tới
+đúng deadline chung thay vì tự đóng theo lịch riêng.
+
+**LAN N=16, n=3, CÙNG config lịch sử — SO SÁNH TRƯỚC/SAU FIX**:
+
+| rep | /control TRƯỚC fix | /control SAU fix | overall (mọi topic) SAU fix |
+|---|---|---|---|
+| 1 | 1085/1626 = 66.7% | 1108/1625 = **68.2%** | 1308/2288 = 57.2% |
+| 2 | 1043/1626 = 64.2% | 1069/1626 = **65.7%** | 1268/2289 = 55.4% |
+| 3 | 1052/1626 = 64.7% | 1082/1624 = **66.6%** | 1282/2287 = 56.1% |
+
+**Kết quả: CẢI THIỆN KHIÊM TỐN (~1.5-2 điểm %), KHÔNG dứt điểm** — tỷ
+lệ giao `/control` tăng nhẹ (64-67% → 66-68%) nhưng KHÔNG nhảy vọt như
+kỳ vọng ban đầu, và tỷ lệ TỔNG THỂ (mọi topic cộng lại, số mà user
+tham chiếu là "~55%") **HẦU NHƯ KHÔNG ĐỔI** (55-57%, gần như y hệt
+trước fix).
+
+**Diễn giải (giả thuyết, CHƯA kiểm chứng thêm)**: fix sửa ĐÚNG bất đối
+xứng TĨNH (so sánh ĐỘ DÀI lịch trình theo timestamp DANH NGHĨA trong
+trace) — nhưng công thức mới `compute_receive_capable_deadline_s` vẫn
+dùng `timestamp_ms` DANH NGHĨA của trace, KHÔNG dùng thời điểm gửi
+THỰC TẾ. Investigation TRƯỚC ĐÓ trong chính tài liệu này (phase đo
+socket lifecycle) đã đo được: cửa sổ traffic QUAN SÁT THỰC TẾ ở N=16
+dài ~18-19 GIÂY cho lịch trình DANH NGHĨA chỉ "seconds=3" — tức có độ
+trễ xử lý thực tế (sim-to-wall-clock lag) lớn hơn NHIỀU so với
+`drain_s` mặc định (10s). Nếu control_station THỰC SỰ gửi gói cuối
+cùng trễ hơn nhiều so với `timestamp_ms` danh nghĩa của nó (do tải xử
+lý ở N=16), thì `deadline = last_nominal_ts + drain_s` vẫn có thể đến
+SỚM HƠN thời điểm gói đó THỰC SỰ được gửi — tái tạo lại (một phần) hiện
+tượng đóng sớm, qua 1 cơ chế phụ KHÁC (lệch giữa lịch danh nghĩa và
+thời gian thực), không phải bug đã sửa (bất đối xứng lịch trình).
+**CHƯA xác nhận** — cần 1 phép đo riêng (so `timestamp_ms` danh nghĩa
+với thời điểm publish() THỰC TẾ, đã có sẵn `send_timing` trong output
+JSON) mới chứng minh được giả thuyết này.
+
+**QUAN TRỌNG — về việc dùng số liệu**: đúng như user lưu ý, **KHÔNG
+dùng con số delivery LAN FleetRMW từ TRƯỚC pass này để đánh giá hiệu
+năng** — những con số đó (~55% tổng thể, ~64-67% riêng `/control`) đo
+trên harness CÓ LỖI (đóng socket sớm). Con số SAU fix (bảng trên) là
+con số ĐÚNG HƠN nhưng **VẪN CHƯA PHẢI con số cuối cùng** vì khả năng
+còn ít nhất 1 nguyên nhân phụ (giả thuyết lag danh nghĩa-vs-thực tế ở
+trên) chưa được xử lý. Nếu cần con số CHÍNH THỨC để so sánh hiệu năng
+(vd Bảng V/VI), PHẢI đợi xác nhận/xử lý xong giả thuyết này, không
+dùng bảng trên làm số liệu cuối.
+
+**KHÔNG sửa thêm gì trong pass này** — đúng nguyên tắc STOP RULE, chờ
+quyết định của người dùng cho bước tiếp theo.
+
+**File liên quan**: `scripts/fleetqox_rmw_trace_endpoint.py` (đã sửa,
+commit `5c7f4ce` + `a6dffd1`), `tests/test_fleetqox_rmw_trace_endpoint.py`
+(đã sửa, commit `5c7f4ce`). Script rerun (không thuộc repo):
+`/tmp/.../scratchpad/step39_postfix_lan16_rerun.py`, kết quả:
+`step39_postfix_lan16_rerun.jsonl`.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
