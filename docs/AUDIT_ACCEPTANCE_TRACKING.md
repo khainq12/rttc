@@ -8610,6 +8610,109 @@ D_attempt=missing) đều ĐÚNG cùng lúc, không hề mâu thuẫn.
 kernel nào bị sửa — chỉ container chẩn đoán tạm thời dùng image
 `jazzy-krnldiag` đã có từ phase trước.
 
+## Camera M (udp_queue_rcv_skb): chia nhỏ khoảng lỗi C→D — NEW FIRST DIVERGENCE PROVEN, ranh giới thu hẹp còn C→M (18/09/2026)
+
+**Mục tiêu**: phase trước chứng minh gói `/control` mất tích ở đâu đó
+giữa checkpoint C (`__udp4_lib_rcv`, Linux bắt đầu xử lý UDP) và
+checkpoint D (`__udp_enqueue_schedule_skb`, bước Linux ĐƯA gói vào
+**receive queue** — hàng chờ trước khi `recvfrom()` lấy gói ra). Pass
+này thêm 1 camera MỚI ở GIỮA hai điểm đó để chia nhỏ khoảng lỗi.
+
+**Giải thích thuật ngữ**: **socket** = "hộp thư mạng" mà FleetRMW mở để
+nhận gói UDP (ở đây là cổng 9100). **UDP demux** = bước Linux đọc
+IP+port đích rồi quyết định gói thuộc socket nào. **receive queue** =
+hàng chờ gói trước khi `recvfrom()` lấy ra. **kprobe** = "camera" gắn
+vào 1 hàm bên trong Linux để quan sát, không sửa code kernel.
+
+**Xác nhận vị trí `udp_queue_rcv_skb` trên ĐÚNG kernel 6.8.0-138-generic**
+(không đoán theo tên hàm): xác nhận `kprobe`-able qua `bpftrace -lv`,
+và xác nhận qua đọc mã nguồn kernel `net/ipv4/udp.c` chuỗi gọi thực tế:
+
+```
+__udp4_lib_rcv (checkpoint C)
+  -> tìm socket đích ("UDP demux")
+  -> udp_unicast_rcv_skb   (CHỈ chạy nếu tìm thấy socket)
+       -> udp_queue_rcv_skb        (CAMERA M — MỚI thêm)
+            -> udp_queue_rcv_one_skb
+                 -> __udp_enqueue_schedule_skb (checkpoint D)
+```
+
+Tức: nếu Camera M "thấy" gói, nghĩa là bước tìm socket ĐÃ THÀNH CÔNG —
+nhưng M thấy gói KHÔNG tự động nghĩa là gói đã được đưa vào hàng chờ
+thành công (đó vẫn là việc của checkpoint D).
+
+**N=2 sanity**: 100% các gói DATA khớp
+A→B→C→**M**→D_attempt→D_result(ret=0) theo đúng thứ tự, ở CẢ 3
+endpoint (383/383 — sạch hơn cả lần trước, vốn có 1 sai lệch nhỏ).
+Việc thêm camera M KHÔNG làm hỏng cách định danh gói theo "vị trí thời
+gian" đã dùng từ trước.
+
+**Overhead đo được ở N=2**: baseline (không gắn probe) = 20.487s,
+có probe (đủ cả M) = 20.481s — KHÔNG có chênh lệch đáng kể (chênh lệch
+âm, nằm trong nhiễu đo bình thường giữa các lần chạy).
+
+**LAN N=16, n=3, CÙNG config với phase trước (seed=13, seconds=3,
+policy=fifo, không đổi traffic/drain/behavior)** — phân loại MỌI gói
+missing theo đúng nơi nó dừng lại:
+
+| rep | missing | C✓ M✕ (dừng TRƯỚC M) | M✓ D✕ (dừng TRONG/SAU M) | D✓ nhưng recv✕ (race đo lường) |
+|---|---|---|---|---|
+| 1 | 554 | 528 (95.3%) | **0 (0%)** | 26 (4.7%) |
+| 2 | 510 | 477 (93.5%) | **0 (0%)** | 33 (6.5%) |
+| 3 | 566 | 548 (96.8%) | **0 (0%)** | 18 (3.2%) |
+
+**`M✓ D✕` = 0 TUYỆT ĐỐI ở CẢ 3 REP** — chưa từng có 1 gói nào "vào
+được `udp_queue_rcv_skb` nhưng KHÔNG tới được bước enqueue". Nghĩa là:
+TOÀN BỘ khoảng lỗi C→D đã chứng minh trước đây (93.7-95.9%) giờ được
+xác nhận nằm HOÀN TOÀN ở đoạn **C→M** (93.5-96.8%, khớp rất gần với số
+cũ) — KHÔNG có phần nào nằm ở đoạn M→D cả. Phần còn lại nhỏ (3.2-6.5%)
+là "race" đã biết: kernel xác nhận enqueue THÀNH CÔNG (M✓ D✓ ret=0)
+nhưng bản ghi `recv` riêng của FleetRMW được lấy mẫu SỚM HƠN một chút
+so với lúc `recvfrom()` kịp lấy — không mâu thuẫn với phát hiện chính.
+
+**Ví dụ LAST GOOD / FIRST BAD chính xác cho camera M** (robot_0000,
+rep 1 — lưu ý: khác với "rank chuyển tiếp" theo FleetRMW's own record,
+vì vài gói đầu tiên "missing" theo FleetRMW thực ra vẫn `M✓ D✓` — thuộc
+nhóm race ở trên; ranh giới THỰC của camera M nằm SAU đó vài gói):
+
+| rank | seq | C | M | D_result | d_ret |
+|---|---|---|---|---|---|
+| 96 | 97 | ✓ | ✓ | ✓ | 0 |
+| 97 | 98 | ✓ | ✓ | ✓ | 0 |
+| **98** | **99** | ✓ | **✕** | **✕** | — |
+| 99 | 100 | ✓ | ✕ | ✕ | — |
+
+**FIRST DIVERGENCE MỚI: seq=99 — C✓ nhưng M✕** (Case 1 đúng như user dự
+đoán trước, giờ có bằng chứng trực tiếp, KHÔNG suy đoán).
+
+**Đồng bộ hoá**: vì `M✓ D✕` = 0 tuyệt đối, sự "biến mất" của M đồng bộ
+HOÀN TOÀN với sự biến mất của D đã đo ở phase trước — tức camera M
+cũng "ngừng thấy gói" tại đúng vị trí ~0.6-0.73 window-fraction đã xác
+nhận 2 lần độc lập trước đó (tcpdump wall-clock VÀ kernel rank).
+
+**PROOF GATE — "NEW FIRST DIVERGENCE PROVEN"**: (1) cùng 1 gói missing
+CÓ mặt ở checkpoint C — YES, 100%. (2) KHÔNG có mặt ở checkpoint M —
+YES, 93.5-96.8%. (3) pattern lặp lại trên PHẦN LỚN missing packets —
+YES. (4) gói delivered luôn qua M bình thường — YES (M luôn thành công
+khi gói được giao). (5) N=2 sanity gần 100% — YES, 383/383 = 100%.
+**ĐẠT ĐỦ 5 tiêu chí.**
+
+**KHÔNG được kết luận "socket lookup thất bại"** — M✕ CHỈ chứng minh
+gói KHÔNG tới `udp_queue_rcv_skb`, KHÔNG tự động chứng minh nguyên
+nhân là lookup thất bại (dù đây là giả thuyết dẫn đầu hợp lý cho bước
+tiếp theo — chưa có camera nào trực tiếp quan sát KẾT QUẢ lookup).
+
+**MECHANISM STATUS: vẫn UNKNOWN** — biết CHÍNH XÁC gói dừng ở đâu (giữa
+C và M cụ thể hơn), nhưng chưa biết TẠI SAO.
+
+**KHÔNG sửa gì, KHÔNG thử workaround** — đúng STOP RULE.
+
+**File liên quan** (không thuộc repo): script bpftrace cập nhật
+`/tmp/.../scratchpad/rx_checkpoints.bt` (thêm probe `udp_queue_rcv_skb`),
+`step32_rx_checkpoint_analysis.py` (N=2 + overhead), `step34_lan16_checkpoint_m.py`
+(N=16 x3, kết quả: `step34_lan16_checkpoint_m.jsonl`). KHÔNG có code
+production/harness/kernel nào bị sửa.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
