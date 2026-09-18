@@ -9940,6 +9940,114 @@ mới (không thuộc repo): `/tmp/.../scratchpad/step43_uplink_checkpoints.bt`,
 `step43_loss_funnel_localization.py`, kết quả:
 `step43_loss_funnel_localization.jsonl`.
 
+## ROOT CAUSE TÌM RA: publisher_id/robot_id COLLISION giữa 16 robot — PROVEN, 100% explained (18/09/2026)
+
+**Câu hỏi**: tại sao 5 flow residual (`state`/`perception`/`coordination`/
+`debug`/`human_qoe`) có `matched_subscriptions=0` dù topic/domain/type/
+partition đều khớp đúng (đã xác nhận ở pass đọc code trước)?
+
+### Instrumentation mới (đo trực tiếp, env-gated, y hệt pattern loss_funnel_trace có sẵn)
+
+Thêm vào `rmw_pubsub.cpp` (commit `0c830c1`):
+- `SubscriptionMatchTraceEvent` — ghi lại, cho MỌI decoded DATA frame,
+  chính xác `domain_id`/`topic`/`type_name`/`partitions_csv` của frame
+  TẠI THỜI ĐIỂM match, cộng `matched_subscriptions`.
+- `rmw_fleetqox_cpp_subscriptions_snapshot_json()` — dump toàn bộ
+  `g_subscriptions` ĐANG SỐNG của tiến trình (đúng các field mà match
+  condition so sánh).
+
+Build lại `librmw_fleetqox_cpp.so` (docker + colcon, cùng install path
+`.tmp_fleetrmw_matched_v2_install` harness đã dùng sẵn — không cần đổi
+gì ở Python). 806 test vẫn pass, cùng 8 lỗi cũ không liên quan.
+
+### Kết quả đo trực tiếp (N=2 sanity)
+
+`control_station`'s subscriptions_snapshot: **HOÀN TOÀN ĐÚNG** — đúng 5
+subscription, mỗi flow 1 cái, `domain_id=0`, `type_name="std_msgs/msg/String"`,
+`partitions=[]` cho tất cả — không có gì bất thường ở phía subscription.
+
+Nhưng `subscription_match` trace cho thấy điều bất ngờ: NHIỀU entry có
+CÙNG `source_id` (vd `"fpubcpp-0.0.0.0:9100-4"`) và CÙNG `source_sequence`
+xuất hiện HAI LẦN — một lần `matched_subscriptions=1` (thành công), một
+lần `matched_subscriptions=0` — dù `frame_domain_id`/`frame_topic`/
+`frame_type_name`/`frame_partitions_csv` in ra Y HỆT subscription. Match
+condition (chỉ so domain/topic/type/partition) không thể nào tạo ra kết
+quả khác nhau cho 2 entry giống hệt nhau như vậy — phải có nguyên nhân
+KHÁC gây `continue` trước khi `++matched_subscriptions`.
+
+### Đọc code xác nhận: publisher_id VÀ robot_id đều COLLISION giữa các robot
+
+- `local_robot_id()` ([rmw_pubsub.cpp:9376](ros2_ws/src/rmw_fleetqox_cpp/src/rmw_pubsub.cpp:9376)):
+  đọc env `FLEETQOX_RMW_ROBOT_ID`; nếu KHÔNG set thì trả về hằng số
+  `"local"`. Grep xác nhận: harness (`run_ns3_docker_container_fleet_probe.py`,
+  `fleetqox_rmw_trace_endpoint.py`) **KHÔNG BAO GIỜ set biến này** — tức
+  MỌI process (cả 16 robot lẫn control_station) đều có `robot_id="local"`.
+- `allocate_publisher_id()` ([:10325](ros2_ws/src/rmw_fleetqox_cpp/src/rmw_pubsub.cpp:10325)):
+  `"fpubcpp-" + socket_transport().bound_endpoint() + "-" + (per-process counter)`.
+  `bound_endpoint()` là địa chỉ bind CỤC BỘ ("0.0.0.0:9100") — GIỐNG HỆT
+  ở MỌI container (vì mỗi container tự bind trong netns riêng nhưng
+  cùng địa chỉ/port). Publisher thứ N được tạo trong BẤT KỲ robot nào
+  đều nhận CÙNG một id string.
+- `stream_key()` ([data_frame.cpp:621](ros2_ws/src/rmw_fleetqox_cpp/src/data_frame.cpp:621)):
+  `robot_id + "|" + topic + "|" + publisher_id`. Với CẢ `robot_id` VÀ
+  `publisher_id` đều trùng giữa các robot, `stream_key` cho "publisher
+  thứ N, topic T" là **GIỐNG HỆT NHAU Ở CẢ 16 ROBOT**.
+- `subscription->sequence_states[stream_key(...)]` — MỘT `SequenceState`
+  DUY NHẤT bị 16 robot CÙNG DÙNG CHUNG cho mỗi topic.
+- `observe_frame()` ([data_frame.cpp:1243](ros2_ws/src/rmw_fleetqox_cpp/src/data_frame.cpp:1243)):
+  `duplicate = state.observed_sequences.find(sequence) != end()` — kiểm
+  tra TRÙNG LẶP chỉ dựa vào SỐ THỨ TỰ (sequence number) có nằm trong tập
+  đã thấy CHUNG hay không — KHÔNG hề biết đây là robot nào. Message
+  sequence=1 CỦA robot_0005 (hoàn toàn mới, hợp lệ) bị coi là "trùng"
+  nếu robot_0002 đã gửi sequence=1 của CHÍNH NÓ trước đó trên "stream"
+  bị nhầm lẫn là chung.
+- `deliver_decoded_frame_to_subscriptions_locked()`: `if (feedback.duplicate)
+  { ...; continue; }` — dòng `continue` này nằm TRƯỚC `++matched_subscriptions`
+  → message bị coi là "trùng" (dù thực ra là message THẬT của MỘT ROBOT
+  KHÁC) không bao giờ được đếm vào `matched_subscriptions`, dẫn thẳng
+  tới `g_data_frames_matched_zero_subscriptions++` và KHÔNG BAO GIỜ tới
+  app callback.
+
+### LAN N=16, n=3 — định lượng CHÍNH XÁC (giống hệt cả 3 rep)
+
+- 663 message intended (5 flow residual) → chỉ có **200 identity
+  `(source_id, source_sequence, topic)` PHÂN BIỆT** trong toàn bộ
+  subscription_match trace (663 entry) — tức TRUNG BÌNH mỗi identity
+  "slot" bị 3.3 robot khác nhau tranh nhau dùng chung.
+- **156/200 identity group** cho thấy dấu hiệu collision (có CẢ entry
+  match VÀ entry không-match cho CÙNG identity).
+- Tổng entry `matched_subscriptions=0`: **463** — CHÍNH XÁC bằng tổng số
+  message MẤT đã đo ở pass trước (463/463).
+- Số entry zero-match nằm TRONG các collision-group: **463/463 = 100.0%**.
+
+**KẾT LUẬN: 100% residual loss (463/463, cả 3 rep, không ngoại lệ) được
+giải thích CHÍNH XÁC bởi collision publisher_id/robot_id giữa các
+robot** — không phải mạng, không phải kernel, không phải capacity,
+không phải FleetRMW's subscription-matching logic tự nó có bug (logic
+domain/topic/type/partition hoàn toàn đúng) — mà là **identity của
+message bị đụng độ giữa các tiến trình khác nhau**, khiến cơ chế
+duplicate-detection (vốn đúng đắn cho retry NỘI BỘ một robot) hiểu lầm
+sang robot khác gửi CÙNG.
+
+**Vì sao `/control` sạch 100%**: chỉ CÓ MỘT tiến trình publisher
+(control_station) cho `/control` — không có tiến trình thứ hai nào để
+đụng độ identity với chính nó. Bug này CHỈ xảy ra khi CÓ NHIỀU tiến
+trình độc lập (nhiều robot) publish tới CÙNG một topic — đúng topology
+riêng của 5 flow uplink, không phải `/control`.
+
+**Quan trọng — pass này CHỈ ĐO, KHÔNG SỬA**: đã tìm ra root cause chính
+xác nhưng KHÔNG thay đổi `local_robot_id()`, `allocate_publisher_id()`,
+`stream_key()`, hay logic duplicate-detection. `FLEETQOX_RMW_ROBOT_ID`
+KHÔNG được set trong harness — đây là bug CÓ THẬT trong benchmark
+harness (thiếu 1 biến môi trường mỗi container lẽ ra phải set), CHƯA
+sửa. Không implement Optimization #2.
+
+**File liên quan**: `ros2_ws/src/rmw_fleetqox_cpp/src/rmw_pubsub.cpp`
+(đã sửa, thêm instrumentation, commit `0c830c1`), `scripts/fleetqox_rmw_trace_endpoint.py`
+(đã sửa, cùng commit). Script đo (không thuộc repo):
+`/tmp/.../scratchpad/step44_publisher_id_collision.py`, kết quả:
+`step44_publisher_id_collision.jsonl`.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
