@@ -10048,6 +10048,155 @@ sửa. Không implement Optimization #2.
 `/tmp/.../scratchpad/step44_publisher_id_collision.py`, kết quả:
 `step44_publisher_id_collision.jsonl`.
 
+## FIX: FLEETQOX_RMW_ROBOT_ID collision — HARNESS IDENTITY FIX VALIDATED, LAN N=16 = 100.0% (18/09/2026)
+
+**Mục tiêu DUY NHẤT pass này**: sửa lỗi harness đã PROVEN (collision
+publisher_id/robot_id giữa các robot), rồi chạy lại đúng benchmark LAN
+N=16. Không optimize FleetRMW, không sửa production RMW behavior,
+không implement Optimization #2, không tune tham số, không điều tra
+retry.
+
+### 1. SIMPLE ANSWER
+
+**CÓ — gán mỗi robot một ID duy nhất đã sửa DỨT ĐIỂM collision đã
+proven.** LAN N=16 sau fix: **100.0% delivery ở MỌI flow, MỌI rep,
+không ngoại lệ.**
+
+### 2. RED → FIX → GREEN
+
+- **RED** (`test_red_old_env_prefix_never_set_robot_id_and_collides`):
+  tái hiện CHÍNH XÁC công thức `env_prefix` CŨ (không có
+  `FLEETQOX_RMW_ROBOT_ID`), kết hợp mô phỏng Python thuần của
+  `local_robot_id()+allocate_publisher_id()+stream_key()` (khớp 1:1 với
+  code C++) — chứng minh 2 robot KHÁC NHAU, publisher thứ N giống nhau
+  trên cùng topic, cho ra **CÙNG MỘT stream identity** — đúng bug đã đo
+  trực tiếp (463/463 loss, 100%).
+- **FIX**: thêm `fleetqox_rmw_env_prefix()` (hàm thuần, testable) vào
+  `scripts/run_ns3_docker_container_fleet_probe.py`, set
+  `FLEETQOX_RMW_ROBOT_ID={endpoint}` dùng ĐÚNG tên canonical đã có sẵn
+  từ `endpoint_list()` (không tạo hệ thống identity thứ hai). Nối vào
+  `launch_endpoints()`, thay khối `env_prefix` inline cũ.
+- **GREEN**: 6 test mới (RED + 5 GREEN: unique-per-endpoint, khớp tên
+  canonical, deterministic qua nhiều lần gọi, static_mode/extra_env vẫn
+  còn, 2 robot không còn collision) — TẤT CẢ PASS.
+
+### 3. EXACT CODE/CONFIG CHANGE
+
+- `scripts/run_ns3_docker_container_fleet_probe.py` — thêm hàm
+  `fleetqox_rmw_env_prefix()` (commit `010ca96`), nối vào
+  `launch_endpoints()` (commit `1544008`, DUY NHẤT thay đổi hành vi:
+  set thêm 1 biến môi trường mỗi container).
+- `tests/test_ns3_docker_container_fleet_probe.py` — 6 test mới (cùng
+  commit `010ca96`).
+- **KHÔNG đụng tới** `ros2_ws/src/rmw_fleetqox_cpp/` trong pass này
+  (không cần thêm instrumentation nào — đã có sẵn từ pass trước).
+
+### 4. RUNTIME IDENTITY SANITY (đo TRỰC TIẾP qua `/proc/<pid>/environ`, không chỉ đọc config text)
+
+| endpoint | FLEETQOX_RMW_ROBOT_ID thực tế (runtime) | khớp tên canonical |
+|---|---|---|
+| control_station | `control_station` | ✓ |
+| robot_0000 | `robot_0000` | ✓ |
+| robot_0001 | `robot_0001` | ✓ |
+
+Tất cả duy nhất, đúng tên endpoint.
+
+### 5. N=2 SANITY
+
+- `subscription_match` trace: **0 entry `matched_subscriptions=0`** —
+  MỌI frame decoded đều match đúng subscription (trước fix N=2 có
+  14/156 zero-match).
+  Ví dụ 2 publisher_id KHÁC NHAU cho cùng topic `state`
+  (`fpubcpp-0.0.0.0:9100-6` và `-7`) — publisher_id VẪN có thể trùng số
+  thứ tự theo công thức cũ, nhưng `stream_key` giờ luôn khác nhau nhờ
+  `robot_id` khác nhau — đúng thiết kế fix.
+- APP_SEND→RMW_SEND→RMW_RECV→APP_CALLBACK: robot_0000 89 APP_SEND
+  (172 RMW_SEND — retry vẫn còn, không điều tra); robot_0001 67
+  APP_SEND (123 RMW_SEND); control_station RMW_RECV=156,
+  APP_CALLBACK=**156** (KHỚP CHÍNH XÁC, trước fix chỉ 142/156).
+- **overall N=2: 440/440 = 100.0%** (trước fix: 426/440 = 96.8%).
+
+### 6. LAN N=16 RESULTS (giống hệt cả 3 rep)
+
+| flow | intended | delivered | lost | delivery % |
+|---|---|---|---|---|
+| control | 1626 | 1626 | 0 | **100.0%** |
+| state | 282 | 282 | 0 | **100.0%** |
+| perception | 177 | 177 | 0 | **100.0%** |
+| coordination | 169 | 169 | 0 | **100.0%** |
+| debug | 24 | 24 | 0 | **100.0%** |
+| human_qoe | 11 | 11 | 0 | **100.0%** |
+| **TỔNG** | **2289** | **2289** | **0** | **100.0%** |
+
+### 7. BEFORE → AFTER
+
+| | trước fix | sau fix |
+|---|---|---|
+| overall | 1826/2289 = 79.8% | **2289/2289 = 100.0%** |
+| control | 1626/1626 = 100% | **1626/1626 = 100.0%** (không regression) |
+| 5 flow residual | 200/663 = 30.2% | **663/663 = 100.0%** |
+
+### 8. OLD COLLISION COUNT AFTER FIX
+
+`collision_gate_zero_match_entries` = **0 / 2289** (cả 3 rep) — ĐÚNG kỳ
+vọng.
+
+### 9. LEGITIMATE FRAMES FALSELY MARKED DUPLICATE DO OLD COLLISION
+
+**0** — cross-check bằng counter GỐC của FleetRMW
+(`data_frames_matched_zero_subscriptions`), TỔNG cả 17 endpoint = **0**
+cả 3 rep, khớp chính xác với `collision_gate_zero_match_entries`.
+
+### 10. REMAINING LOSS
+
+**0.** Không có gì để localize thêm.
+
+### 11. TEST SUITE
+
+**812 test, 804 pass, 8 fail** — ĐÚNG 8 lỗi CŨ không liên quan (ngtcp2
+x2 canonical-artifact, `test_remote_wait_for_all_acked`) đã biết từ
+trước. **0 regression mới.**
+
+### 12. PRODUCTION CODE: **UNCHANGED**
+
+Không sửa `rmw_pubsub.cpp`, FleetRMW transport, scheduler, QoS,
+`drain_s`, idle-timeout logic, duplicate-detection logic (`observe_frame()`
+giữ nguyên), retry policy, traffic schedule, network topology.
+
+### 13. OPTIMIZATION #2: **NOT IMPLEMENTED**
+
+### 14. VERDICT
+
+**HARNESS IDENTITY FIX VALIDATED.**
+
+Theo đúng CASE A của quy tắc diễn giải: kết luận CHỈ Ở MỨC — "Toàn bộ
+loss ở mức application-layer đã quan sát được trước đây trên LAN N=16
+FleetRMW, với đúng workload này, được giải thích bởi các vấn đề harness
+đã xác định cho tới nay." **KHÔNG suy rộng** thành "FleetRMW đáng tin
+cậy 100% dưới MỌI tải LAN bất kỳ" — kết luận chỉ áp dụng cho đúng
+workload/quy mô đã đo (N=16, seed=13, seconds=3, policy=fifo).
+
+**Retry side-finding**: vẫn còn quan sát thấy nhiều lần gửi lại cùng
+`source_sequence` ở N=2 sau fix (robot_0000: 89 message → 172
+RMW_SEND entry, ~1.9x) — CHỈ ghi nhận, KHÔNG điều tra/tối ưu trong pass
+này, đúng yêu cầu.
+
+### 15. EXACTLY ONE NEXT STEP (CHƯA thực thi)
+
+Vì đã VALIDATED và không còn residual loss: đề xuất DUY NHẤT — chạy lại
+baseline SẠCH, CÙNG harness đã sửa, cho cả 4 phương pháp
+(FleetRMW / Fast DDS / CycloneDDS / Zenoh) trên LAN N=16, để có con số
+so sánh công bằng (harness semantics đã thay đổi, KHÔNG so trực tiếp
+con số FleetRMW mới với số Fast DDS/CycloneDDS/Zenoh CŨ). **Không thực
+thi baseline rerun này trong pass này.**
+
+**File liên quan**: `scripts/run_ns3_docker_container_fleet_probe.py`
+(đã sửa, commit `010ca96` test + `1544008` fix),
+`tests/test_ns3_docker_container_fleet_probe.py` (đã sửa, commit
+`010ca96`). Script đo (không thuộc repo):
+`/tmp/.../scratchpad/step45_n2_identity_sanity.py`,
+`step46_postfix_lan16.py`, kết quả: `step46_postfix_lan16.jsonl`.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
