@@ -9764,6 +9764,182 @@ thuần tái sử dụng field có sẵn). Script đo (không thuộc repo):
 `/tmp/.../scratchpad/step42_all_flows_shutdown_proof.py`, kết quả:
 `step42_all_flows_shutdown_proof.jsonl`.
 
+## RESIDUAL LOSS LOCALIZATION — MEASUREMENT ONLY: boundary = subscription-matching bên trong FleetRMW, KHÔNG phải mạng/kernel (18/09/2026)
+
+**Nguyên tắc pass này**: CHỈ LOCALIZE. Không fix, không optimize, không
+sửa production, không đổi `drain_s`/workload/QoS, không implement
+Optimization #2.
+
+### Phương pháp
+
+Tái sử dụng đúng phương pháp "loss funnel" đã dùng thành công cho
+`/control` ở các pass trước: theo CÙNG MỘT message qua các checkpoint
+liên tiếp tới checkpoint ĐẦU TIÊN nó biến mất. Định danh message dùng
+identity MẠNH NHẤT có sẵn ở từng tầng (event_id ở tầng Python,
+`(source_id, source_sequence, topic)` ở tầng C++ FleetRMW), KHÔNG chỉ
+dựa vào timestamp khi có identity chính xác hơn.
+
+Checkpoint funnel dùng (điều chỉnh theo instrumentation THỰC TẾ có
+sẵn, không tự nhận có checkpoint chưa từng quan sát được):
+- **APP_SEND** — `send_timing` (Python, có sẵn từ trước, identity = event_id trực tiếp).
+- **RMW_SEND** — `loss_funnel_trace.send` (C++, có sẵn từ trước) — khớp
+  với event_id qua rank-matching 1:1 trong từng nhóm (sender, topic)
+  SAU KHI khử trùng lặp theo `source_sequence` (phát hiện quan trọng ở
+  N=2 sanity: xem mục dưới).
+- **KERNEL** (NETIF/UDP_RCV/SOCK_FOUND/ENQ) — bpftrace mới
+  (`step43_uplink_checkpoints.bt`), tái sử dụng NGUYÊN VẸN logic kprobe
+  A/C/L/D đã có (`rx_checkpoints.bt`), CHỈ thêm capture địa chỉ NGUỒN
+  (saddr) — cần thiết vì 5 flow này đều hội tụ về CÙNG MỘT địa chỉ đích
+  (control_station), khác với `/control` (có địa chỉ đích riêng từng
+  robot).
+- **RAW_RECVFROM** — `loss_funnel_trace.raw_recvfrom` tại control_station
+  (C++, có sẵn) — identity CHÍNH XÁC (trích trực tiếp từ byte thô).
+- **RMW_RECV** — `loss_funnel_trace.recv` tại control_station (C++, có
+  sẵn) — identity CHÍNH XÁC.
+- **APP_CALLBACK** — `received` list tại control_station (Python, có
+  sẵn) — identity = event_id trực tiếp.
+
+**Không có file production/harness nào bị sửa trong pass này** — mọi
+checkpoint Python/C++ đều TÁI SỬ DỤNG field đã thêm ở các pass trước.
+Chỉ có 1 file MỚI (không thuộc repo): script bpftrace mở rộng thêm
+saddr, dựa trên kprobe đã proven.
+
+### Phát hiện quan trọng ở N=2 sanity: retry làm vỡ giả định rank 1:1
+
+Sanity ban đầu phát hiện: `loss_funnel_trace.send` KHÔNG phải 1 entry
+mỗi message — với các flow ít traffic này, CÙNG một `source_sequence`
+xuất hiện NHIỀU LẦN (vd robot_0000 gửi 4 message `debug` với sequence
+1-4, nhưng có tới 16 entry gửi — mỗi sequence lặp lại đúng 4 lần) —
+tức tầng reliable QoS của FleetRMW đang RETRY (gửi lại) các message
+này ở tầng wire. Đã sửa: khử trùng lặp theo `source_sequence` TRƯỚC khi
+rank-match (coi 1 nhóm cùng sequence = 1 message logic, thành công nếu
+CÓ ÍT NHẤT 1 lần attempt outcome=ATTEMPT_SUCCESS). Sau khi sửa: số
+lượng message logic khớp CHÍNH XÁC với số message thực tế mỗi robot đã
+gửi (xác nhận qua ground truth: robot_0000 gửi đúng 4 debug message,
+robot_0001 đúng 6 — khớp số lượng sequence riêng biệt). **Bản thân
+hiện tượng retry này CHỈ được ghi nhận, KHÔNG suy diễn nguyên nhân**
+(đúng nguyên tắc "no causal claim from volume alone").
+
+### Sanity N=2: identity correlation hoạt động + cross-validate với counter GỐC có sẵn
+
+Ở N=2: 156 intended, 142 delivered, 14 lost — CẢ 14 gói mất đều rơi
+đúng 1 boundary: **`RMW_RECV->APP_CALLBACK missing`**. Đối chiếu với
+counter GỐC đã có sẵn từ trước trong `fleetqox_transport_metrics()`
+(`data_frames_matched_zero_subscriptions`) — **khớp CHÍNH XÁC: 14 = 14**.
+Đây là 1 counter FleetRMW tự ghi (không phải suy diễn của investigation
+này) đo đúng câu hỏi: "đã decode DATA frame thành công nhưng logic
+matching-subscription nội bộ của FleetRMW không tìm thấy subscriber
+nào" — khớp CHÍNH XÁC với kết luận độc lập rút ra từ việc đối chiếu
+identity `raw_recvfrom`/`recv` do investigation này tự xây dựng. Hai
+phương pháp ĐỘC LẬP cho CÙNG một con số → cross-validate mạnh.
+
+### LAN N=16, n=3 (config y hệt pass trước: seed=13, seconds=3, policy=fifo)
+
+**Kết quả GIỐNG HỆT cả 3 rep**:
+
+| flow | intended | delivered | lost | boundary duy nhất |
+|---|---|---|---|---|
+| state | 282 | 97 | 185 | RMW_RECV→APP_CALLBACK missing: 185 (100%) |
+| perception | 177 | 67 | 110 | RMW_RECV→APP_CALLBACK missing: 110 (100%) |
+| coordination | 169 | 23 | 146 | RMW_RECV→APP_CALLBACK missing: 146 (100%) |
+| debug | 24 | 6 | 18 | RMW_RECV→APP_CALLBACK missing: 18 (100%) |
+| human_qoe | 11 | 7 | 4 | RMW_RECV→APP_CALLBACK missing: 4 (100%) |
+| **TỔNG** | **663** | **200** | **463** | **463/463 = 100%** |
+
+`kernel_crosscheck_per_sender_ip` = **RỖNG** ở cả 3 rep — nghĩa là
+KHÔNG một gói mất nào cần soi tới tầng kernel, vì TẤT CẢ 463 gói mất
+đều đã ĐI QUA `raw_recvfrom` (tức đã rời sender, qua mạng, qua kernel
+UDP, được socket enqueue, VÀ được luồng nhận riêng của FleetRMW đọc ra
+thành công) — kernel/network/socket layer hoàn toàn KHÔNG liên quan.
+
+**Native counter cross-check, cả 3 rep GIỐNG HỆT nhau**:
+`data_frames_received=663`, `data_frames_matched_zero_subscriptions=463`,
+`frames_enqueued_to_subscriptions=200` → 663-463=200 = đúng số delivered.
+
+**Accounting gate**: 663 (residual) + 1626 (`/control`) = 2289 = khớp
+CHÍNH XÁC benchmark tổng thể; 200 (residual) + 1626 (`/control`) = 1826
+= khớp CHÍNH XÁC. Không có sai lệch.
+
+### FINAL REPORT
+
+**1. SIMPLE ANSWER**: Message KHÔNG bị mất ở đường truyền mạng, ở
+kernel Linux, hay ở tầng UDP. Chúng ĐI TỚI ĐÚNG nơi (control_station),
+được FleetRMW GIẢI MÃ THÀNH CÔNG (biết đây là 1 DATA frame hợp lệ) —
+nhưng ngay bước tiếp theo, FleetRMW tìm KHÔNG THẤY subscription nội bộ
+nào để giao message này tới, nên callback của app KHÔNG BAO GIỜ được
+gọi. Nói đơn giản: **gói tin "tới nơi nhưng bị lạc ngay TRONG chính
+FleetRMW"**, không phải lạc trên đường.
+
+**2. SANITY**: N=2, identity correlation hoạt động đúng — 14/14 gói
+mất được localize sạch tới 1 boundary duy nhất, khớp CHÍNH XÁC với
+counter gốc có sẵn (`data_frames_matched_zero_subscriptions=14`).
+
+**3. N=16 ACCOUNTING**: intended=663, delivered=200, lost=463, overall
+= 30.2% (chỉ 5 flow residual). Khớp benchmark tổng: 663+1626=2289,
+200+1626=1826 — chính xác, không có sai lệch cần giải thích.
+
+**4. PER-FLOW RESULTS**: xem bảng trên — cả 5 flow ĐỀU 100% lost tại
+CÙNG một boundary, cả 3 rep.
+
+**5. LOSS FUNNEL** (mọi flow, cả 3 rep):
+```
+APP_SEND → RMW_SEND: missing 0
+RMW_SEND(no success): 0
+RMW_SEND_SUCCESS → RAW_RECVFROM: missing 0
+RAW_RECVFROM → RMW_RECV: missing 0
+RMW_RECV → APP_CALLBACK: missing 463 (100% của loss)
+```
+
+**6. COMMON BOUNDARY? YES.** Cả 5 flow chia sẻ CHÍNH XÁC 1 boundary,
+100% trường hợp, cả 3 rep — không có ngoại lệ.
+
+**7. PROOF STRENGTH: PROVEN.** Lý do: (a) identity CHÍNH XÁC (không
+phải rank/timing suy diễn) ở raw_recvfrom/recv (trích trực tiếp từ
+byte thô) và ở APP_CALLBACK (event_id trực tiếp); (b) checkpoint liền
+kề TRƯỚC boundary (RAW_RECVFROM, RMW_RECV) đều XÁC NHẬN CÓ ở 100% gói
+mất — không phải suy luận từ vắng mặt; (c) CROSS-VALIDATE độc lập bằng
+1 counter GỐC của FleetRMW (`data_frames_matched_zero_subscriptions`),
+khớp CHÍNH XÁC tuyệt đối (463=463, cả 3 rep) — hai phương pháp hoàn
+toàn độc lập cho cùng 1 số.
+
+**8. WHAT HAS BEEN RULED OUT** (bởi checkpoint, không suy diễn):
+- Sender KHÔNG gửi message (APP_SEND): loại trừ — mọi message đều có APP_SEND.
+- FleetRMW gửi thất bại (RMW_SEND no success): loại trừ — 0 trường hợp.
+- Gói bị mất trên mạng/route (RMW_SEND_SUCCESS→RAW_RECVFROM): loại trừ — 0 trường hợp, kernel_crosscheck rỗng.
+- Linux UDP không xử lý / socket lookup thất bại / enqueue thất bại: loại trừ — vì RAW_RECVFROM tự nó chứng minh recvfrom() đã đọc được bytes, nghĩa là toàn bộ chuỗi kernel/socket phía trước ĐÃ thành công.
+- FleetRMW không decode được frame (RAW_RECVFROM→RMW_RECV): loại trừ — 0 trường hợp.
+- Cơ chế shutdown-timing (đã loại trừ ở pass trước): vẫn giữ nguyên kết luận.
+
+**9. WHAT HAS NOT BEEN PROVED** (còn để ngỏ, KHÔNG suy diễn trong pass này):
+- TẠI SAO subscription-matching trả về zero cho CHÍNH XÁC những message
+  này (mismatch topic/type? race điều kiện thời điểm subscription được
+  đăng ký trong bảng nội bộ FleetRMW vs lúc message tới? subscription
+  bị loại bỏ/không hợp lệ vì lý do nào đó riêng cho các flow ít traffic
+  này?).
+- Có liên hệ gì giữa retry-tầng-wire đã phát hiện (nhiều lần gửi lại
+  cùng source_sequence) với hiện tượng zero-subscription-match hay
+  không — CHƯA đo, CHƯA suy diễn.
+- Cơ chế CHÍNH XÁC bên trong FleetRMW dẫn tới zero-match (đọc code là
+  bước tiếp theo, KHÔNG thực hiện trong pass này).
+
+**10. PRODUCTION CODE: UNCHANGED.**
+
+**11. OPTIMIZATION #2: NOT IMPLEMENTED.**
+
+**12. EXACTLY ONE NEXT STEP (CHƯA thực thi)**: đọc code FleetRMW
+(`rmw_pubsub.cpp`) ở đúng đoạn tính `data_frames_matched_zero_subscriptions`
+/ logic subscription-matching cho DATA frame vừa decode — để xác định
+CHÍNH XÁC điều kiện nào khiến matching trả về zero cho 5 flow này
+nhưng KHÔNG cho `/control` (READ ONLY, không sửa code — đúng tinh thần
+"giờ đọc code FleetRMW xem chỗ nào..." đã dùng thành công ở phase
+trước để tìm root cause shutdown-timing). Không thực thi bước này
+trong pass này.
+
+**File liên quan**: KHÔNG có file production/harness nào bị sửa. File
+mới (không thuộc repo): `/tmp/.../scratchpad/step43_uplink_checkpoints.bt`,
+`step43_loss_funnel_localization.py`, kết quả:
+`step43_loss_funnel_localization.jsonl`.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
