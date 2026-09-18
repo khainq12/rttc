@@ -573,6 +573,16 @@ def main() -> int:
 
     def on_message(msg: String) -> None:
         recv_wall_ns = time.time_ns()
+        # recv_monotonic_ns (added 18/09/2026, see
+        # docs/AUDIT_ACCEPTANCE_TRACKING.md "actual-send-vs-shutdown"
+        # measurement pass): CLOCK_MONOTONIC companion to recv_wall_ns
+        # (CLOCK_REALTIME) -- lets a receive event be compared directly,
+        # on the same clock basis, against this process's own
+        # shutdown_actual_monotonic_ns and against another process's
+        # send_timing entries (also monotonic_ns), without relying on
+        # wall-clock sync across containers. Purely additive, does not
+        # change on_message()'s existing behavior.
+        recv_monotonic_ns = time.monotonic_ns()
         payload = json.loads(msg.data)
         received.append(
             {
@@ -580,6 +590,7 @@ def main() -> int:
                 "deadline_ms": payload["d"],
                 "sent_wall_ns": payload["s"],
                 "recv_wall_ns": recv_wall_ns,
+                "recv_monotonic_ns": recv_monotonic_ns,
             }
         )
 
@@ -688,6 +699,17 @@ def main() -> int:
             raise RuntimeError("timed out waiting for data-plane start gate")
 
     start_wall = time.monotonic()
+    # start_wall_ns (added 18/09/2026, same measurement pass as
+    # recv_monotonic_ns above): a monotonic_ns() twin of start_wall,
+    # captured at the exact same call site, purely so this run's
+    # scheduled_offset_s values (already in send_timing) can be turned
+    # back into ABSOLUTE monotonic_ns timestamps by another process's
+    # post-hoc analysis -- CLOCK_MONOTONIC is host-wide (shared across
+    # containers on this VM, not per-namespace), so start_wall_ns from
+    # one endpoint is directly comparable to another endpoint's own
+    # monotonic_ns() readings. Does not affect start_wall's own value or
+    # any scheduling decision.
+    start_wall_ns = time.monotonic_ns()
     sent: list[str] = []
     send_timing: list[dict[str, Any]] = []
     publish_failures: list[dict[str, Any]] = []
@@ -786,6 +808,12 @@ def main() -> int:
     drain_deadline = start_wall + compute_receive_capable_deadline_s(
         rows, args.start_offset_ms, args.drain_s
     )
+    # drain_deadline_ns: ns-precision twin of drain_deadline, purely for
+    # reporting in the result JSON below (added 18/09/2026, same
+    # measurement pass as start_wall_ns/recv_monotonic_ns) -- the while
+    # condition just below still compares against drain_deadline itself,
+    # unchanged.
+    drain_deadline_ns = int(drain_deadline * 1_000_000_000)
     while time.monotonic() < drain_deadline:
         # Same fix as the send loop above: drain every already-ready
         # entity in a tight non-blocking burst before falling back to a
@@ -796,6 +824,14 @@ def main() -> int:
         for _ in range(20):
             rclpy.spin_once(node, timeout_sec=0.0)
         rclpy.spin_once(node, timeout_sec=0.1)
+    # shutdown_actual_monotonic_ns: the actual moment (not just the
+    # target deadline above) this endpoint stops draining and falls
+    # through toward destroy_node()/rclpy.shutdown() below -- added
+    # 18/09/2026 for the "does control_station's actual last /control
+    # send land before or after the receiver has already started
+    # shutting down" measurement pass (see
+    # docs/AUDIT_ACCEPTANCE_TRACKING.md). Purely observational.
+    shutdown_actual_monotonic_ns = time.monotonic_ns()
 
     result = {
         "schema_version": "fleetqox.rmw_trace_endpoint.v1",
@@ -813,6 +849,9 @@ def main() -> int:
         "discovery_convergence_s": discovery_convergence_s,
         "discovery_peers_seen": len(discovery_peers_seen),
         "discovery_expected_peers": args.expected_peer_count,
+        "start_wall_monotonic_ns": start_wall_ns,
+        "drain_deadline_monotonic_ns": drain_deadline_ns,
+        "shutdown_actual_monotonic_ns": shutdown_actual_monotonic_ns,
     }
     args.summary_json.parent.mkdir(parents=True, exist_ok=True)
     args.summary_json.write_text(json.dumps(result, sort_keys=True), encoding="utf-8")
