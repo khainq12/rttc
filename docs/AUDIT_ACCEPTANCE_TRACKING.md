@@ -8886,6 +8886,126 @@ N=2 xác nhận 383/383 K fired + found=1),
 `step36_lan16_checkpoint_k.jsonl`). KHÔNG có code production/harness/
 kernel nào bị sửa.
 
+## Đính chính quan trọng: kernel thực sự là 6.12.76-linuxkit, KHÔNG PHẢI 6.8.0-138-generic (18/09/2026)
+
+**Phát hiện tình cờ trong lúc audit hàm `bpftool`** (không liên quan
+trực tiếp tới câu hỏi đang điều tra, nhưng ẢNH HƯỞNG tới TOÀN BỘ phần
+"kernel investigation" từ mục "LATEST KERNEL INVESTIGATION" trở đi):
+lệnh `uname -r` chạy trực tiếp trong shell (nơi Claude thực thi lệnh
+Bash) cho `6.8.0-138-generic` — đây là kernel của MÁY NGOÀI (outer
+host). Nhưng khi chạy `uname -r` BÊN TRONG bất kỳ container Docker
+nào (kể cả container chẩn đoán `--pid=host --privileged`, kể cả
+container CHÍNH của FleetRMW `rmw-netem:jazzy`), kết quả LÀ
+**`6.12.76-linuxkit`** — xác nhận thêm qua `docker info` (Kernel
+Version: 6.12.76-linuxkit) và `docker context ls` (context đang dùng
+là **`desktop-linux`** — tức Docker Desktop, chạy container bên trong
+1 VM LinuxKit riêng, KHÔNG chia sẻ kernel với máy ngoài).
+
+**Điều này có nghĩa**: TẤT CẢ kprobe/tracepoint đặt trong suốt investigation
+này (kfree_skb, checkpoint A/B/C/M/L/K, v.v.) từ đầu tới giờ đã LUÔN
+LUÔN chạy trên kernel **6.12.76-linuxkit** — vì `--pid=host` cho
+container chẩn đoán thấy được TOÀN BỘ tiến trình/kernel event của
+CHÍNH VM Docker Desktop đó (nơi container FleetRMW cũng chạy), KHÔNG
+PHẢI kernel của máy ngoài. Các con số/kết quả đo được KHÔNG SAI (kernel
+là 1 và duy nhất, nhất quán xuyên suốt, không đổi giữa các phase) —
+chỉ có NHÃN "6.8.0-138-generic" ghi trong các mục trước đó của tài
+liệu này là SAI, cần hiểu là **6.12.76-linuxkit** mọi nơi nó xuất
+hiện trong phần "kernel investigation" của tài liệu này.
+
+**Không sửa các mục cũ** (giữ nguyên lịch sử) — chỉ đính chính tại đây,
+theo đúng quy ước "không xoá lịch sử" ở cuối file.
+
+## So sánh input tra cứu (saddr/sport/daddr/dport) + kiểm tra trực tiếp trạng thái socket 9100 tại thời điểm miss — phát hiện: socket bị "zero-out" đúng lúc lookup thất bại (18/09/2026)
+
+**Mục tiêu** (theo đúng yêu cầu): (1) so sánh input của phép tìm kiếm
+socket (IP nguồn, IP đích, port nguồn, port đích) giữa gói TỐT (found=1)
+và gói LỖI (found=0) — nếu GIỐNG HỆT nhau mà kết quả đổi, (2) kiểm tra
+trực tiếp xem socket 9100 có còn "xuất hiện đúng" trong bảng của kernel
+tại đúng thời điểm đó không. **KHÔNG sửa FleetRMW.**
+
+**Xác nhận thứ tự tham số hàm `__udp4_lib_lookup()` bằng đo thật**
+(không suy đoán): hàm có 9 tham số — `net, saddr, sport, daddr, dport,
+dif, sdif, udptable, skb` — 6 tham số đầu truyền qua thanh ghi
+(`arg0..arg5`), lấy được trực tiếp. Chạy N=2 thật, kiểm tra: MỌI dòng
+K đều cho `lkdport=9100` (383/383) và `lksport=9100` (383/383), giá trị
+`lkdaddr` LUÔN khớp CHÍNH XÁC với `daddr` mà checkpoint C đã trích xuất
+từ gói — xác nhận việc gán `arg1=saddr, arg2=sport, arg3=daddr,
+arg4=dport, arg5=dif` là ĐÚNG, không phải đoán.
+
+**Kết quả Phần 1 — so sánh input**: `input_shape_mismatches_count = 0`
+ở CẢ 3 rep N=16 — **input của phép tra cứu LUÔN LUÔN đúng cấu trúc**
+(đúng IP đích = IP của chính robot đó, đúng port đích = 9100) dù kết
+quả found=0 hay found=1. Xác nhận đúng như dự đoán của user: input
+GIỐNG HỆT nhau, chỉ có KẾT QUẢ đổi từ FOUND sang NOT_FOUND.
+
+**Xác nhận field kernel struct bằng chính bpftrace's compiler** (không
+dùng `bpftool` vì nó không nhận diện được kernel 6.12.76-linuxkit —
+một hệ quả trực tiếp của lỗi nhãn kernel ở mục trên): `struct sock`
+trên kernel này KHÔNG có field `sk_num`/`sk_rcv_saddr`/`sk_refcnt`
+trực tiếp (đã tái cấu trúc so với kernel cũ) — các field thật nằm
+trong `__sk_common`: `skc_num`, `skc_rcv_saddr`,
+`skc_refcnt.refs.counter`, `skc_hash` — xác nhận bằng thử nghiệm trực
+tiếp, không đoán.
+
+**Lỗi instrumentation tự phát hiện + sửa TRƯỚC khi tin kết quả**: lần
+đo ĐẦU TIÊN dùng 1 biến toàn cục DUY NHẤT (`@known_udp9100_sk`) để giữ
+tham chiếu socket "tốt gần nhất" — SAI, vì MỖI robot chạy trong network
+namespace RIÊNG với struct sock RIÊNG cho "port 9100" của CHÍNH NÓ; 1
+biến toàn cục bị các robot khác nhau LIÊN TỤC GHI ĐÈ lên nhau, khiến
+lần kiểm tra "live state" tại thời điểm robot X bị miss thực ra đang
+đọc socket của MỘT ROBOT KHÁC hoàn toàn. Phát hiện qua: tỷ lệ
+"live_num sai" bất thường cao (92-96%) ở lần đo đầu — SAI đến mức đáng
+ngờ. **Fix**: đổi sang map có khoá theo ĐỊA CHỈ ĐÍCH (`@known_sk[daddr]`),
+đảm bảo tham chiếu dùng để so sánh LUÔN LÀ của ĐÚNG robot đang bị miss.
+Toàn bộ N=16 x3 được CHẠY LẠI sau khi sửa.
+
+**Kết quả Phần 2 — kiểm tra trực tiếp trạng thái socket tại thời điểm
+miss (SAU KHI SỬA lỗi trên)**:
+
+| rep | tổng số miss có K | live_num == 9100 | live_num SAI (=0) | không có tham chiếu |
+|---|---|---|---|---|
+| 1 | 540 | **0 (0%)** | **540 (100%)** | 0 |
+| 2 | 519 | **0 (0%)** | **519 (100%)** | 0 |
+| 3 | 476 | **0 (0%)** | **476 (100%)** | 0 |
+
+**TUYỆT ĐỐI 100% (1535/1535) trường hợp miss**: khi đọc TRỰC TIẾP
+trạng thái của CHÍNH socket đã từng tìm thấy thành công TRƯỚC ĐÓ cho
+đúng robot này, tại đúng thời điểm 1 lần tra cứu khác cho robot đó
+THẤT BẠI, thu được **CHÍNH XÁC**: `live_num=0`, `live_rcv_saddr=0.0.0.0`,
+`live_refcnt=0` — nhất quán TUYỆT ĐỐI, không có giá trị nào khác xuất
+hiện (không phải "rác"/giá trị ngẫu nhiên nếu bộ nhớ bị dùng lại cho
+mục đích khác — đó SẼ cho ra nhiều giá trị KHÁC NHAU, không phải MỘT
+mẫu duy nhất lặp lại 1535/1535 lần).
+
+**Ý NGHĨA (mô tả hiện tượng đo được, KHÔNG suy diễn nguyên nhân xa
+hơn)**: con trỏ socket đã capture từ 1 lần tìm-thấy-thành-công TRƯỚC
+ĐÓ, khi đọc lại sau, cho thấy ĐÚNG dấu hiệu của 1 socket đã bị **gỡ
+bỏ/reset hoàn toàn** (port về 0, địa chỉ về 0.0.0.0, refcount về 0 —
+đây là trạng thái kernel thường thấy khi 1 socket bị đóng/unbind, KHÔNG
+PHẢI trạng thái của 1 socket đang mở bình thường). Điều này khớp với 1
+khả năng cụ thể (nêu ra như QUAN SÁT, không phải kết luận đã chứng
+minh cơ chế): **socket lắng nghe cổng 9100 của robot có thể đang bị
+ĐÓNG rồi MỞ LẠI (hoặc unbind/rebind) nhiều lần trong lúc benchmark
+chạy**, và khoảng thời gian ngắn giữa lúc socket cũ bị huỷ và socket
+mới (nếu có) được bind xong chính là lúc bất kỳ gói `/control` nào tới
+đúng khoảnh khắc đó sẽ KHÔNG tìm thấy socket nào cả — giải thích được
+ĐỒNG THỜI: (a) tại sao lookup thật sự trả về "không tìm thấy" (không
+phải bug tra bảng băm), (b) tại sao input luôn đúng cấu trúc (gói vẫn
+gửi đúng, chỉ là không có ai đang lắng nghe đúng lúc đó).
+
+**KHÔNG xác nhận đây LÀ nguyên nhân** — chỉ có 1 checkpoint MỚI (quan
+sát hành vi mở/đóng socket thật sự, ví dụ qua `inet_release`/
+`udp_lib_unhash`/`sock_create`) mới CHỨNG MINH được giả thuyết "socket
+bị đóng-mở lại" này. Investigation dừng ở đây theo đúng yêu cầu người
+dùng: KHÔNG sửa FleetRMW, KHÔNG suy đoán xa hơn dữ liệu đã đo.
+
+**File liên quan** (không thuộc repo): script bpftrace cập nhật
+`/tmp/.../scratchpad/rx_checkpoints.bt` (thêm entry-probe capture input
+cho `__udp4_lib_lookup`, sửa `@known_udp9100_sk` → `@known_sk[daddr]`),
+`step37_lookup_input_and_livecheck.py` (N=16 x3, kết quả:
+`step37_lookup_input_and_livecheck.jsonl`). KHÔNG có code production/
+harness/kernel nào bị sửa.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
