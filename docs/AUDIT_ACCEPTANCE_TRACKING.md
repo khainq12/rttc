@@ -9311,6 +9311,128 @@ commit `5c7f4ce` + `a6dffd1`), `tests/test_fleetqox_rmw_trace_endpoint.py`
 `/tmp/.../scratchpad/step39_postfix_lan16_rerun.py`, kết quả:
 `step39_postfix_lan16_rerun.jsonl`.
 
+## MEASURE ONLY: kiểm chứng giả thuyết "actual send vs shutdown" sau fix a6dffd1 — HYPOTHESIS CONFIRMED (18/09/2026)
+
+**Nguyên tắc pass này**: CHỈ ĐO. Không sửa thêm công thức shutdown, không
+tăng `drain_s`, không sửa code production FleetRMW, không optimization.
+
+**Câu hỏi duy nhất**: sau fix `a6dffd1` (deadline dựa trên MAX
+`timestamp_ms` danh nghĩa của mọi peer), có gói `/control` nào
+control_station gửi THỰC TẾ SAU KHI robot nhận đã bắt đầu
+shutdown/đóng socket không?
+
+### Instrumentation (đo thêm, KHÔNG đổi hành vi)
+
+Thêm 4 trường thuần quan sát vào `scripts/fleetqox_rmw_trace_endpoint.py`
+(không đổi bất kỳ điều kiện/luồng điều khiển nào đang có):
+- `on_message()`: thêm `recv_monotonic_ns` (bạn của `recv_wall_ns` hiện
+  có, dùng CLOCK_MONOTONIC thay vì CLOCK_REALTIME).
+- `start_wall_monotonic_ns`: bạn `monotonic_ns()` của `start_wall` hiện
+  có, ghi tại đúng cùng thời điểm.
+- `drain_deadline_monotonic_ns`: giá trị `drain_deadline` (đã tính bởi
+  công thức HIỆN CÓ, không đổi) ở dạng ns, chỉ để báo cáo.
+- `shutdown_actual_monotonic_ns`: thời điểm THỰC TẾ vòng lặp drain thoát
+  (trước `destroy_node()`/`rclpy.shutdown()`).
+
+Tất cả đều dùng CLOCK_MONOTONIC (`time.monotonic_ns()`), CÙNG cơ sở đồng
+hồ với `std::chrono::steady_clock` bên C++ (`wall_ns` trong
+`fleetqox_loss_funnel_trace`) và với `nsecs` của bpftrace — đồng hồ này
+là HOST-WIDE (dùng chung giữa mọi container trên CÙNG 1 VM kernel, không
+dùng time namespace), đã được ngầm dựa vào và xác nhận gián tiếp qua
+tương quan sạch 48/48 ở phase "socket lifecycle" trước đó.
+
+14/14 test cũ vẫn pass, không cần test mới (đây là field thêm thuần
+quan sát, không phải thay đổi hành vi/công thức).
+
+T_socket_close: tái sử dụng kprobe UNHASH đã có (tách riêng thành script
+bpftrace tối giản `step40_socket_close_only.bt`, chỉ giữ
+GETPORT/UNHASH, bỏ các camera A/B/C/K/L/M/D không cần cho pass này để
+giảm overhead).
+
+**N=2 sanity**: 100% delivered, `actual_send_lateness` ~6-11ms (gần 0,
+đúng như kỳ vọng khi không có tải/contention), `shutdown_margin`
+~10003-10082ms (≈ đúng `drain_s`=10s như thiết kế), 0 gói sau
+shutdown/close — xác nhận instrumentation hoạt động đúng trước khi chạy
+N=16.
+
+### Đo LAN N=16, n=3 (config y hệt pass trước: seed=13, seconds=3,
+policy=fifo, rmw_fleetqox_cpp, default discovery)
+
+| rep | `/control` gửi | mất | actual_send_lateness (mean) | shutdown_margin (mean) | gửi SAU shutdown | gửi SAU socket close |
+|---|---|---|---|---|---|---|
+| 1 | 1626 | 546 | **+15781 ms** | **-5739 ms** | 546 | 517 |
+| 2 | 1626 | 517 | **+15269 ms** | **-5243 ms** | 517 | 489 |
+| 3 | 1626 | 543 | **+15518 ms** | **-5484 ms** | 543 | 519 |
+
+**Phát hiện mấu chốt, cả 3 rep**: `sent_after_shutdown_total ==
+lost_total` CHÍNH XÁC (546==546, 517==517, 543==543) ở CẢ 3 rep. Đây là
+một phép chia bimodal HOÀN TOÀN SẠCH: **MỌI gói gửi TRƯỚC shutdown đều
+được giao (0 mất), và MỌI gói mất đều được gửi SAU shutdown (0
+exception)** — không có overlap, không có trường hợp mơ hồ. `sent after
+socket close` giải thích 94.6-95.6% số mất (phần chênh ~5% là các gói
+gửi vào khoảng hẹp SAU khi robot bắt đầu shutdown nhưng TRƯỚC khi kernel
+thực sự unhash socket — vẫn mất vì rclpy/FleetRMW đã ngừng
+spin/xử lý, dù socket kỹ thuật còn mở thêm vài chục ms).
+
+`actual_send_lateness` trung bình ~15.3-15.8 **GIÂY** (không phải ms) —
+khớp gần như chính xác với con số đã đo ở phase trước: cửa sổ traffic
+thực tế ở N=16 kéo dài ~18-19s cho lịch danh nghĩa "seconds=3" (~6x
+sim-to-wall-clock lag). `shutdown_margin` âm ~5.1-5.9 giây ở MỌI
+robot, MỌI rep — receiver đóng socket sớm hơn ~5-6 giây so với lần gửi
+`/control` thực tế cuối cùng control_station gửi cho nó.
+
+### FINAL REPORT (theo đúng khung yêu cầu)
+
+**1. SIMPLE ANSWER: YES** — receiver vẫn shutdown quá sớm, nhưng qua
+MỘT CƠ CHẾ KHÁC với bug đã sửa ở `a6dffd1`.
+
+**2. Giải thích đơn giản**: fix trước tính deadline từ timestamp DANH
+NGHĨA trong trace (đúng: đã bao phủ lịch của MỌI peer, không chỉ lịch
+riêng). Nhưng dưới tải N=16, control_station gửi THỰC TẾ trễ hơn lịch
+danh nghĩa của chính nó tới ~15.5 giây (do nghẽn xử lý ở quy mô lớn, đã
+biết từ trước). Robot vẫn đóng socket theo deadline tính từ lịch DANH
+NGHĨA (đúng + drain_s), nên đóng sớm hơn ~5-6 giây so với lúc
+control_station THỰC SỰ gửi xong. Toàn bộ phần mất còn lại sau fix
+trước là do khoảng lệch NÀY, không phải do bug bất đối xứng lịch trình
+cũ (đã sửa đúng).
+
+**3. Per rep**: xem bảng trên (giá trị trung bình fleet) + chi tiết đầy
+đủ 16 robot × 3 rep trong
+`step40_actual_send_vs_shutdown.jsonl` (scratchpad, không thuộc repo).
+
+**4. Số `/control` gửi trước/sau shutdown/sau socket close**: bảng
+trên ("gửi SAU shutdown", "gửi SAU socket close"); "trước shutdown" =
+1626 - cột đó (1080/1109/1083 mỗi rep).
+
+**5. % lost giải thích được**: **100.0%** bởi shutdown (cả 3 rep, không
+có ngoại lệ), **94.6-95.6%** cụ thể bởi socket đã đóng thật sự (phần
+còn thiếu ~5% là do process ngừng xử lý trước khi kernel unhash xong,
+không phải do kernel từ chối gói).
+
+**6. HYPOTHESIS STATUS: CONFIRMED** — không phải PARTIAL: 100% khớp ở
+cả 3 rep, không có ngoại lệ nào cần giải thích thêm.
+
+**7. Đề xuất DUY NHẤT MỘT fix tối giản (CHƯA implement)**: thay vì tính
+`drain_deadline` MỘT LẦN trước khi vào vòng lặp (dựa trên timestamp danh
+nghĩa cuối cùng + drain_s), làm deadline "trôi" theo hoạt động THỰC TẾ:
+mỗi khi `on_message()` nhận được MỘT gói từ peer, gia hạn deadline thêm
+`drain_s` kể từ thời điểm nhận đó (idle-timeout kiểu "im lặng liên tục
+drain_s giây thì mới đóng", thay vì "một mốc thời gian cố định tính
+trước"). Không cần biết trước độ trễ thực tế của peer là bao nhiêu.
+
+**8. N/A** (hypothesis CONFIRMED, không REJECTED).
+
+**9. Không thay đổi hành vi production nào trong pass này** — công
+thức `compute_receive_capable_deadline_s`, `drain_s`, và code
+`rmw_fleetqox_cpp` giữ nguyên y hệt. Chỉ thêm 4 trường quan sát (JSON
+output) + 1 script bpftrace tối giản (ngoài repo). Đề xuất ở mục 7
+CHƯA được implement — chờ quyết định người dùng.
+
+**File liên quan**: `scripts/fleetqox_rmw_trace_endpoint.py` (đã sửa,
+instrumentation thuần quan sát). Script đo + kết quả (không thuộc repo):
+`/tmp/.../scratchpad/step40_actual_send_vs_shutdown.py`,
+`step40_socket_close_only.bt`, `step40_actual_send_vs_shutdown.jsonl`.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
