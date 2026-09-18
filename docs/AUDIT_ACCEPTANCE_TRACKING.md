@@ -9129,6 +9129,105 @@ polling PID nền qua `docker top`, N=16 x3, kết quả:
 `step38_socket_lifecycle.jsonl`). KHÔNG có code production/harness/
 kernel/FleetRMW nào bị sửa hoặc đọc.
 
+## ROOT CAUSE TÌM RA: đọc code FleetRMW — close() tới từ shutdown chuẩn của ROS2, do harness Python tự đóng SỚM vì không biết peer khác còn đang gửi (18/09/2026)
+
+**Mục tiêu**: đọc code FleetRMW để tìm CHÍNH XÁC dòng nào gọi
+`close()` trên socket cổng 9100 — theo yêu cầu trực tiếp của người
+dùng, tiếp nối phát hiện "MECHANISM PROVEN" ở mục trên (socket bị đóng
+đúng 1 lần, vĩnh viễn, đúng lúc `/control` bắt đầu mất).
+
+**Chuỗi gọi đầy đủ, lần theo TỪNG bước bằng code thật (không đoán)**:
+
+1. `ros2_ws/src/rmw_fleetqox_cpp/src/rmw_pubsub.cpp` — tìm tất cả
+   `::close(fd_)` (11 chỗ). **10/11 chỗ** nằm trong các nhánh LỖI của
+   hàm khởi tạo (`setsockopt`/`bind`/`getsockname`/parse peer/quic
+   gateway config/shm start/thread start thất bại) — chỉ xảy ra lúc
+   KHỞI ĐỘNG, không thể giải thích việc đóng xảy ra 13-17 GIÂY sau khi
+   chạy bình thường. **1/11 chỗ còn lại** nằm trong hàm `stop()`
+   (dòng 7706-7754) — hàm dọn dẹp TOÀN DIỆN (join threads, xoá hàng
+   đợi, VÀ đóng `fd_`) — đây là ứng viên DUY NHẤT hợp lý.
+
+2. `stop()` được gọi từ `LoopbackSocketTransport::shutdown()` (dòng
+   2807-2811) — và TỪ destructor `~LoopbackSocketTransport()` (dòng
+   2793-2796, khi đối tượng bị huỷ — không áp dụng ở đây vì đối tượng
+   này sống suốt process, chỉ huỷ khi process kết thúc).
+
+3. `LoopbackSocketTransport::shutdown()` được gọi TỪ ĐÚNG 1 nơi:
+   `rmw_fleetqox_cpp_shutdown_pubsub_runtime()` (dòng 16366-16376) —
+   hàm dừng TOÀN BỘ background thread (retransmit, deadline monitor,
+   graph renewal, ...) RỒI đóng socket transport.
+
+4. `rmw_fleetqox_cpp_shutdown_pubsub_runtime()` được gọi TỪ ĐÚNG 1
+   nơi: `rmw_context_fini()` trong `rmw_lifecycle.cpp` (dòng 357-392)
+   — **ĐÂY LÀ HÀM CHUẨN CỦA ROS2 RMW API** (không phải code riêng của
+   FleetRMW — mọi RMW implementation đều có hàm này), được gọi bởi
+   `rclpy.shutdown()`. Quan trọng: chỉ đóng NẾU
+   `no_local_nodes == true` (dòng 372-383) — tức TẤT CẢ node của
+   context này đã bị `destroy_node()` trước đó.
+
+**KẾT LUẬN VỀ NƠI GỌI CLOSE()**: `close(fd_)` xảy ra qua ĐƯỜNG CHUẨN,
+KHÔNG BẤT THƯỜNG của ROS2 (`rclpy.shutdown()` → `rmw_context_fini()`
+→ `shutdown_pubsub_runtime()` → `stop()` → `close(fd_)`) — **FleetRMW
+tự nó không có lỗi gì trong đường đóng socket này**. Câu hỏi thật sự
+là: TẠI SAO `rclpy.shutdown()` được gọi SỚM, ngay giữa lúc benchmark
+đang chạy, cho từng robot?
+
+**Đọc tiếp `scripts/fleetqox_rmw_trace_endpoint.py` (harness Python,
+CŨNG thuộc phạm vi "FleetRMW" investigation của tài liệu này) — TÌM
+ĐƯỢC NGUYÊN NHÂN TRỰC TIẾP**:
+
+```python
+for row in replay_rows:        # lịch gửi CỦA RIÊNG endpoint này thôi
+    ...publish...
+drain_deadline = time.monotonic() + args.drain_s   # bắt đầu đếm NGAY
+                                                     # sau khi lịch gửi
+                                                     # CỦA RIÊNG NÓ xong
+while time.monotonic() < drain_deadline:
+    ...spin (nhận/service incoming)...
+
+node.destroy_node()            # <- đóng socket 9100 tại đây
+rclpy.shutdown()
+```
+
+**Phát hiện cốt lõi**: thời điểm mỗi endpoint tự đóng (`destroy_node`
++ `rclpy.shutdown`) chỉ phụ thuộc vào **ĐỘ DÀI LỊCH GỬI CỦA CHÍNH NÓ**
+(`replay_rows`, tức những gì CHÍNH endpoint đó phải publish) cộng 1
+khoảng `drain_s` CỐ ĐỊNH — **HOÀN TOÀN KHÔNG kiểm tra xem các peer
+KHÁC (cụ thể là control_station, bên đang GỬI `/control` TỚI nó) đã
+gửi xong chưa**. `control_station` phải gửi `/control` cho CẢ 16
+robot (khối lượng lớn hơn nhiều lần so với 1 robot chỉ gửi 5 topic
+uplink của riêng nó) — nên lịch gửi của `control_station` DÀI HƠN
+NHIỀU so với lịch gửi của TỪNG robot riêng lẻ. Kết quả: **từng robot
+gửi xong phần việc CỦA MÌNH, drain, rồi tự đóng socket nhận — TRONG
+KHI control_station VẪN ĐANG GIỮA CHỪNG gửi `/control` tới nó** — mọi
+gói gửi SAU thời điểm đó đều rơi vào 1 socket ĐÃ ĐÓNG, vĩnh viễn,
+không hồi phục (khớp CHÍNH XÁC với mọi bằng chứng đã thu thập: đóng
+đúng 1 lần, đồng bộ tương đối giữa các robot vì lịch gửi uplink của
+chúng có độ dài tương tự nhau, và giải thích tại sao CHỈ `/control`
+downlink bị ảnh hưởng — uplink không hề bị vì `control_station` không
+tự đóng sớm theo cách này với khối lượng nhận lớn của chính nó).
+
+**Đây LÀ lời giải hoàn chỉnh cho TOÀN BỘ investigation, từ đầu tới
+cuối**: không phải bug kernel, không phải bug tra bảng băm UDP, không
+phải bug C++ core của FleetRMW trong đường xử lý socket — mà là **lỗi
+thiết kế trong HARNESS BENCHMARK** (cùng NHÓM lỗi với các harness bug
+đã tìm và sửa trước đó trong investigation này, ví dụ
+`wait_until_deadline_while_spinning`, thư mục kết quả cũ, crash do
+ECONNREFUSED không bắt được): logic drain/shutdown của TỪNG endpoint
+không tính đến việc CÁC PEER KHÁC có khối lượng công việc KHÔNG ĐỐI
+XỨNG (1 sender gửi cho 16 receiver, receiver nào cũng gửi ít hơn
+nhiều).
+
+**KHÔNG SỬA GÌ trong pass này** — đúng yêu cầu người dùng (chỉ đọc, chưa
+sửa). Quyết định có sửa `drain_s`/logic shutdown của harness hay không
+là của người dùng, phase sau.
+
+**File liên quan**: `ros2_ws/src/rmw_fleetqox_cpp/src/rmw_pubsub.cpp`
+(dòng 2785-2821, 7512-7754, 16352-16376 — chỉ ĐỌC, không sửa),
+`ros2_ws/src/rmw_fleetqox_cpp/src/rmw_lifecycle.cpp` (dòng 339-392 —
+chỉ ĐỌC, không sửa), `scripts/fleetqox_rmw_trace_endpoint.py` (dòng
+644-776 — chỉ ĐỌC, không sửa).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
