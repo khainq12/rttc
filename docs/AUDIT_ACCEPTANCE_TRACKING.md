@@ -8478,6 +8478,138 @@ teardown distance, per-robot transition, tất cả 3 rep). KHÔNG có
 code/production/harness/kernel nào bị sửa — không có container mới
 nào được tạo trong phase này (thuần đọc file có sẵn).
 
+## Explicit Linux RX-path checkpoints (A/B/C/D): FIRST DIVERGENCE PROVEN — giữa __udp4_lib_rcv và __udp_enqueue_schedule_skb (18/09/2026)
+
+**Mục tiêu**: đặt "camera" (checkpoint quan sát, không sửa hành vi) tại
+TỪNG bước cụ thể trong đường nhận UDP của Linux, để tìm CAMERA CUỐI
+CÙNG còn thấy gói `/control` bị mất — thu hẹp ranh giới từ "đâu đó
+giữa `netif_receive_skb` và `recvfrom()`" xuống MỘT cặp hàm kernel cụ
+thể.
+
+**Giải thích thuật ngữ (dùng xuyên suốt mục này)**:
+- **UDP demux**: bước Linux đọc IP đích + port đích của gói UDP, rồi
+  quyết định gói này thuộc về socket/chương trình nào đang lắng nghe.
+- **socket enqueue**: bước Linux đưa gói vào "hàng đợi nhận" của đúng
+  socket đó — hàng đợi mà `recvfrom()` sẽ lấy gói ra.
+- **kprobe**: một cách gắn "camera" quan sát vào một hàm cụ thể bên
+  trong kernel Linux, không cần sửa code kernel.
+
+**4 checkpoint (camera) đặt trong pass này**:
+
+| Camera | Hàm kernel | Ý nghĩa |
+|---|---|---|
+| A | `netif_receive_skb` (tracepoint có sẵn) | Gói được driver mạng giao cho tầng mạng chung của Linux |
+| B | `ip_local_deliver` | Linux xác định gói IPv4 này là gửi ĐẾN MÁY NÀY, chuyển tiếp lên tầng transport |
+| C | `__udp4_lib_rcv` | Hàm xử lý nhận UDP của Linux bắt đầu chạy — sắp làm "UDP demux" |
+| D | `__udp_enqueue_schedule_skb` (entry + giá trị trả về) | Linux ĐANG THỬ đưa gói vào "socket enqueue" — trả về 0 = thành công, âm = thất bại |
+
+Camera E (`recvfrom()`) KHÔNG làm lại — tái dùng checkpoint
+`raw_recvfrom` đã có từ phase trước.
+
+**Audit kernel trước khi instrument**: xác nhận qua `bpftrace -l` rằng
+CẢ 4 hàm trên (`ip_local_deliver`, `__udp4_lib_rcv`,
+`__udp_enqueue_schedule_skb`, cùng `__udp4_lib_lookup`/`udp_queue_rcv_skb`
+dự phòng) đều kprobe-able trên ĐÚNG kernel 6.8.0-138-generic này —
+không đoán tên hàm.
+
+**2 vấn đề instrumentation tự phát hiện + sửa trước khi tin kết quả**:
+1. IPv4 header ID field LUÔN LUÔN = 0 cho traffic này (Linux gửi UDP
+   nội bộ với cờ DF, không cần ID) — không dùng được làm định danh gói
+   như dự định ban đầu, phát hiện qua kiểm tra thực tế trước khi tin.
+2. UDP checksum field CŨNG không đủ duy nhất — nhiều gói DATA có nội
+   dung TRÙNG NHAU (dẫn tới checksum trùng), phát hiện qua việc dedup
+   theo checksum làm SỐ LƯỢNG SỤT MẠNH bất thường (766→25 thay vì
+   766→383). **Fix cuối cùng**: bỏ hẳn việc định danh theo nội dung,
+   chuyển sang định danh theo **VỊ TRÍ THEO THỜI GIAN cho từng robot**
+   (gói thứ K gửi tới robot X, sắp theo thời gian, giả định KHÔNG bị
+   đảo thứ tự qua 1 bridge đơn đường — đã xác nhận đúng ở bước N=2).
+   Cũng phát hiện: checkpoint A tự nhiên bắn 2 LẦN cho mỗi gói (1 lần ở
+   phía bridge, 1 lần ở phía interface nhận — cả hai đều trong cùng
+   host) — dedup bằng khoảng cách thời gian (<100μs).
+3. Lọc RIÊNG gói DATA (`kind="sidecar_packet_frame"`) khỏi gói
+   ACK/NACK (`kind="source_sequence_ack_nack"`, chiếm đa số traffic
+   port 9100) ngay TRONG bpftrace bằng cách so khớp 5 byte đầu payload
+   với magic string `"FRMW1"` (ACK/NACK dùng format khác, KHÔNG có
+   magic này) — giảm khối lượng ~15 lần, xác nhận qua đếm thực tế.
+
+**N=2 validation**: 100% các gói DATA khớp A→B→C→D_attempt→D_result
+(ret=0) theo đúng vị trí, ở CẢ 3 endpoint (382/382, chỉ 1 sai lệch nhỏ
+±1 tại control_station's own uplink — 99.7% sạch). Đạt chuẩn trước khi
+chạy N=16.
+
+**LAN N=16, n=3, đúng config lịch sử — KẾT QUẢ CHÍNH**:
+
+| rep | fleet missing | kernel_A=B=C | kernel_D (attempt=result) | kernel gap (C→D) | % missing giải thích |
+|---|---|---|---|---|---|
+| 1 | 542 | 1626 | 1118 | 508 | 93.7% |
+| 2 | 517 | 1626 | 1130 | 496 | 95.9% |
+| 3 | 547 | 1626 | 1108 | 518 | 94.7% |
+
+**A = B = C = 1626/1626 TUYỆT ĐỐI** (100%, cả 3 rep, cả 16 robot) — MỌI
+gói `/control` đã gửi đều tới được `netif_receive_skb`, `ip_local_deliver`,
+VÀ `__udp4_lib_rcv` (bắt đầu xử lý UDP), không rơi rớt ở 3 bước đầu.
+
+**Nhưng chỉ ~1108-1130/1626 tới được checkpoint D** (`__udp_enqueue_schedule_skb`
+— bước THỬ đưa vào hàng đợi socket) — **KHÔNG PHẢI thất bại tại D** (mọi
+lần D CÓ chạy đều trả về 0 = thành công, KHÔNG một lần enqueue nào thất
+bại) mà là **D KHÔNG BAO GIỜ ĐƯỢC GỌI** cho phần còn lại. Khoảng chênh
+này (508/496/518 gói) khớp GẦN NHƯ CHÍNH XÁC với số gói "missing" mà
+FleetRMW tự ghi nhận (542/517/547) — sai lệch chỉ 21-34 gói/rep, và số
+sai lệch đó lại chính là các gói mà kernel nói ĐÃ enqueue thành công
+(D_ret=0) nhưng snapshot kết quả của FleetRMW lấy SỚM HƠN một chút so
+với lúc `recvfrom()` kịp lấy — một hiệu ứng đo lường nhỏ, KHÔNG mâu
+thuẫn với phát hiện chính.
+
+**Ví dụ cụ thể (robot_0000, rep 1) — LAST GOOD / FIRST BAD**:
+
+| rank | seq | fleet delivered? | A | B | C | D_attempt | D_result | D_ret |
+|---|---|---|---|---|---|---|---|---|
+| 93 | 94 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | 0 |
+| 94 | 95 | ✕ (race, xem trên) | ✓ | ✓ | ✓ | ✓ | ✓ | 0 |
+| 95 | 96 | ✕ (race) | ✓ | ✓ | ✓ | ✓ | ✓ | 0 |
+| **96** | **97** | ✕ | ✓ | ✓ | ✓ | **✕** | **✕** | — |
+| 97 | 98 | ✕ | ✓ | ✓ | ✓ | ✕ | ✕ | — |
+
+**FIRST DIVERGENCE tại seq=97**: A✓ B✓ C✓ **D✕** — đây là ranh giới mới,
+CHẶT hơn hẳn so với "đâu đó giữa netif_receive_skb và recvfrom()" của
+phase trước.
+
+**Đồng bộ hoá (section 13 user)**: tỷ lệ vị trí xảy ra "ngừng nhận"
+(transition_rank / tổng số gửi cho robot đó) đo được **0.627–0.729**
+(median 0.671) trên 48/48 tổ hợp robot×rep — khớp GẦN NHƯ TRÙNG KHỚP
+với phát hiện 0.60–0.71 của phase trước (đo bằng phương pháp HOÀN TOÀN
+khác — tcpdump wall-clock thay vì kernel rank) — 2 phương pháp độc lập
+xác nhận lẫn nhau.
+
+**PROOF GATE — ĐẠT "FIRST DIVERGENCE PROVEN"**: (1) cùng 1 gói missing
+xác nhận CÓ mặt tại checkpoint C — YES, 100% MỌI gói (kể cả missing)
+đều qua C. (2) KHÔNG có mặt tại D — YES, cho phần lớn (93.7-95.9%).
+(3) giải thích phần lớn missing — YES. (4) gói delivered luôn qua D
+bình thường — YES, D_ret=0 tuyệt đối khi D CÓ chạy, không một lần thất
+bại. **KHÔNG đạt "MECHANISM PROVEN"** — chưa biết TẠI SAO
+`__udp_enqueue_schedule_skb` không được gọi (socket lookup thất bại
+âm thầm? một điều kiện khác bên trong `__udp4_lib_rcv`? — CHƯA CÓ BẰNG
+CHỨNG, không đoán).
+
+**Vì sao đây KHÔNG mâu thuẫn với phát hiện "kfree_skb = 0" của phase
+trước**: `kfree_skb_reason()` chỉ bắn khi kernel CHỦ ĐỘNG "vứt" một skb
+đã tồn tại. Nếu code bên trong `__udp4_lib_rcv()` rẽ nhánh theo cách
+KHÔNG BAO GIỜ gọi tới `__udp_enqueue_schedule_skb()` VÀ CŨNG KHÔNG
+BAO GIỜ gọi `kfree_skb_reason()` (ví dụ: return sớm theo 1 nhánh không
+được instrument đầy đủ, hoặc một lần gọi hàm trung gian bị compiler
+inline khác đi tại call-site này) — thì CẢ HAI phép đo (kfree_skb=0 VÀ
+D_attempt=missing) đều ĐÚNG cùng lúc, không hề mâu thuẫn.
+
+**KHÔNG kết luận cơ chế, KHÔNG sửa gì** — đúng STOP RULE.
+
+**File liên quan** (không thuộc repo): script bpftrace
+`/tmp/.../scratchpad/rx_checkpoints.bt`, orchestration
+`step32_rx_checkpoint_analysis.py` (N=2 validate),
+`step33_lan16_rx_checkpoints.py` (N=16 x3, kết quả:
+`step33_lan16_rx_checkpoints.jsonl`). KHÔNG có code production/harness/
+kernel nào bị sửa — chỉ container chẩn đoán tạm thời dùng image
+`jazzy-krnldiag` đã có từ phase trước.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
