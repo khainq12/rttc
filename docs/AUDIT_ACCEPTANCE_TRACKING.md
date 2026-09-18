@@ -8345,6 +8345,139 @@ delta sạch, ghi nhận limitation). KHÔNG có code production/FleetRMW/
 Docker LAN topology nào bị sửa trong phase này — chỉ container chẩn
 đoán tạm thời (đã cleanup).
 
+## Offline re-analysis: measurement-window/teardown hypothesis REJECTED — phát hiện MỚI: "sudden synchronized permanent cutoff" (18/09/2026)
+
+**Mục tiêu**: kiểm tra hypothesis "gói /control 'missing' thực ra là gói
+ĐẾN TRỄ gần cuối cửa sổ đo, container bị teardown trước khi
+`recvfrom()` kịp lấy nó — không phải mất mát mạng thật." Đây là OFFLINE
+RE-ANALYSIS THUẦN TUÝ trên dữ liệu ĐÃ CÓ SẴN — không chạy benchmark
+mới, không sửa code/harness/kernel.
+
+**Dữ liệu dùng**: 3 rep của phase packet-level hop-localization TRƯỚC
+đó (`results_rmw_socket/.step26_lan16_hop_{1,2,3}/`, LAN N=16, seed=13,
+`seconds=3`, `drain_s=10.0`, `start_offset_ms=2000`) — vẫn còn nguyên
+trên đĩa: `captures/endpoint_{0..16}.log` (tcpdump `-nn -tt -A` raw,
+mỗi endpoint tự capture `eth0` của chính nó — vừa thấy gói NÓ GỬI ra
+vừa thấy gói NÓ NHẬN vào) và `container_results/result_{0..16}.json`
+(loss-funnel send/recv trace gốc của FleetRMW).
+
+**Clock validity — XÁC NHẬN AN TOÀN, có giới hạn rõ ràng**: đọc trực
+tiếp `monotonic_timestamp_ns()` trong `rmw_pubsub.cpp` — dùng
+`std::chrono::steady_clock` (map tới `CLOCK_MONOTONIC` trên Linux),
+epoch KHÔNG xác định, KHÔNG so sánh trực tiếp được với tcpdump's `-tt`
+(wall-clock `CLOCK_REALTIME` qua `SO_TIMESTAMP`) nếu không có bước
+align offset. **Cách né hoàn toàn vấn đề này**: TOÀN BỘ phân tích thời
+gian (T_send, T_receiver_if, window bounds, teardown proxy) chỉ dùng
+tcpdump timestamps — cả gói ĐI (bắt trên `eth0` của chính
+`control_station`) lẫn gói ĐẾN (bắt trên `eth0` của robot đích) đều
+trên CÙNG 1 host, CÙNG 1 wall-clock, không cần convert gì. FleetRMW's
+`steady_clock` field CHỈ dùng để xác định DELIVERED/MISSING (có mặt
+hay không trong mảng `recv` — chỉ cần IDENTITY, không cần TIMING) —
+không hề dùng monotonic timestamp cho bất kỳ so sánh thời gian nào.
+Docker container KHÔNG dùng time namespace riêng (`--network=none` chỉ
+cô lập network namespace) nên `CLOCK_MONOTONIC`/`CLOCK_REALTIME` bên
+trong container = CHÍNH XÁC của host. **Kết luận: timestamps AN TOÀN
+để so sánh.**
+
+**Window definition**: `window_start`/`window_end` = min/max
+`T_receiver_if` (tcpdump) trên MỌI gói `/control` downlink (đã gửi
+thành công) quan sát được. `teardown_proxy` = timestamp CUỐI CÙNG của
+BẤT KỲ gói nào (không chỉ DATA) trong capture của MỖI robot — cận trên
+chặt cho "container/capture còn sống tới đây".
+
+**PHÁT HIỆN CHÍNH — decile bucket theo % vị trí trong window** (giống
+hệt mẫu hình ở CẢ 3 rep):
+
+| decile | rep1 miss% | rep2 miss% | rep3 miss% |
+|---|---|---|---|
+| 0–60% (6 decile đầu) | **0.0%** | **0.0%** | **0.0%** |
+| 60–70% | 24.5% | 3.2% | 13.0% |
+| 70–80% | 100.0% | 95.2% | 100.0% |
+| 80–100% (2 decile cuối) | **100.0%** | **100.0%** | **100.0%** |
+
+Đây là **SỰ CHUYỂN TRẠNG THÁI ĐỘT NGỘT** (step function), KHÔNG PHẢI
+suy giảm dần (gradual decay) hay mất mát đều (~37-43% throughout mà
+Phase kernel trước đã đo tổng thể) — tổng 37-43% chính là TRUNG BÌNH
+của "0% trong 60-65% đầu" + "100% trong 35-40% cuối".
+
+**Phase 6 — per-robot, per-rep**: với MỌI robot (16/16) ở CẢ 3 rep,
+tính vị trí (theo % window CHUNG, không phải window riêng từng robot)
+của message /control CUỐI CÙNG được delivered — kết quả: **0.60-0.71
+ở TẤT CẢ 48 tổ hợp robot×rep**, và **KHÔNG MỘT robot nào** có delivery
+thành công SAU điểm chuyển tiếp của nó (`any_delivery_recovers_after_transition`
+= False tuyệt đối, 48/48). Tức: TẤT CẢ 16 robot dừng nhận `/control`
+gần như CÙNG LÚC (cùng 1 khoảng ~65-70% window, dao động rất hẹp), và
+KHÔNG BAO GIỜ hồi phục trong suốt phần còn lại của run — dù đó là
+control_station (1 sender DUY NHẤT) gửi tới 16 robot ĐỘC LẬP. Tín hiệu
+này gợi ý mạnh: nguyên nhân gắn với **1 sự kiện DÙNG CHUNG** (ở phía
+sender hoặc 1 tài nguyên kernel dùng chung), KHÔNG PHẢI 16 sự cố độc
+lập ngẫu nhiên ở từng receiver.
+
+**Phase 7 — T_send → T_receiver_if (độ trễ mạng thực đo qua tcpdump,
+KHÔNG dùng steady_clock)**: delivered vs missing GẦN NHƯ GIỐNG HỆT
+NHAU — delivered median≈0.011ms/p99≈0.025-0.027ms/max≈0.03-0.044ms;
+missing median≈0.010ms/p99≈0.025-0.027ms/max≈0.03-0.053ms (đơn vị:
+MILLISECOND, tức ~10 MICROGIÂY độ trễ, gần như tức thời — wire delay
+bình thường của LAN). **KHÔNG có khác biệt có ý nghĩa** giữa 2 nhóm —
+loại trừ "sent muộn" HOẶC "delay lâu hơn trước khi tới interface" như
+lời giải thích; gói missing đến ĐÚNG GIỜ, nhanh y hệt gói delivered,
+chỉ đơn giản KHÔNG BAO GIỜ tới `recvfrom()` sau khi đến interface.
+
+**Phase 8 — TEARDOWN DISTANCE (bài test phủ định quan trọng nhất)**:
+
+| rep | min | median | max | drain_s cấu hình |
+|---|---|---|---|---|
+| 1 | 9.46s | 12.23s | 16.45s | 10.0s |
+| 2 | 10.10s | 12.67s | 16.70s | 10.0s |
+| 3 | 9.80s | 12.36s | 16.72s | 10.0s |
+
+Gói missing GẦN teardown NHẤT vẫn còn **9.46-10.10 GIÂY** trước khi
+container bị teardown — tức container/`receive_loop()` VẪN CÒN SỐNG
+VÀ CHẠY suốt gần trọn `drain_s=10.0` sau khi những gói này đến, nhưng
+`recvfrom()` VẪN KHÔNG BAO GIỜ trả về chúng. **PHỦ ĐỊNH RÕ RÀNG** cơ
+chế "không đủ thời gian drain trước teardown" — có ĐỦ THỜI GIAN, và
+trạng thái mất mát KHÔNG tự hồi phục dù có thêm hàng chục giây.
+
+**Phase 9 — counterfactual upper bound** (nếu kéo dài drain thêm X ms,
+tối đa BAO NHIÊU gói missing thậm chí CÓ THỂ nằm trong khung đó — chỉ
+là cận trên, KHÔNG khẳng định sẽ được cứu):
+
+| rep | +100ms | +250ms | +500ms | +1000ms | % tổng missing (@1000ms) |
+|---|---|---|---|---|---|
+| 1 | 11 | 29 | 58 | 118 | 18.1% |
+| 2 | 13 | 31 | 60 | 120 | 19.7% |
+| 3 | 13 | 31 | 62 | 123 | 20.0% |
+
+Ngay cả kéo dài drain thêm TRỌN 1 GIÂY cũng chỉ "chạm" tối đa ~18-20%
+tổng số gói missing — 80%+ gói missing đến SỚM HƠN 1 giây trước khi
+window/capture kết thúc, hoàn toàn không phải hiện tượng biên.
+
+**PROOF GATE — REJECTED** (đúng tiêu chí Phase 8 của user: "nếu hàng
+trăm gói missing đến từ RẤT LÂU TRƯỚC teardown thì teardown không thể
+giải thích được chúng" — ĐÚNG NHƯ VẬY, 610-652 gói/rep đến 9.4-16.7
+GIÂY trước teardown). Cơ chế "đo không đủ thời gian/teardown cắt
+ngang" bị BÁC BỎ dứt điểm bằng bằng chứng trực tiếp.
+
+**NHƯNG phát hiện MỚI, quan trọng hơn cả hypothesis gốc**: đây KHÔNG
+PHẢI hiện tượng biên (boundary artifact) — đây là 1 **SỰ CHUYỂN TRẠNG
+THÁI ĐỘT NGỘT, VĨNH VIỄN, ĐỒNG BỘ TRÊN TOÀN BỘ 16 RECEIVER** xảy ra ở
+~65-70% thời lượng chạy thực tế (window quan sát thực tế ~18.4-19.1s,
+DÀI HƠN NHIỀU so với "seconds=3" trong lịch gửi — bản thân sự chênh
+lệch này cũng đáng chú ý nhưng KHÔNG được điều tra sâu trong phase
+này, chỉ ghi nhận làm bối cảnh). Sau điểm chuyển tiếp: 95-100% mất mát
+tuyệt đối, không dao động, không hồi phục — khác hẳn 1 hiện tượng mất
+gói ngẫu nhiên/liên tục.
+
+**KHÔNG kết luận cơ chế cụ thể, KHÔNG sửa gì** — đúng OFFLINE-ONLY +
+STOP RULE.
+
+**File liên quan** (không thuộc repo, offline re-analysis, tái dùng dữ
+liệu cũ): `/tmp/.../scratchpad/step31_measurement_window_analysis.py`
++ `.json` (kết quả đầy đủ, gồm decile buckets, final-window analysis,
+teardown distance, per-robot transition, tất cả 3 rep). KHÔNG có
+code/production/harness/kernel nào bị sửa — không có container mới
+nào được tạo trong phase này (thuần đọc file có sẵn).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
