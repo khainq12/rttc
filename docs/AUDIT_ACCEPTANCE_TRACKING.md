@@ -8713,6 +8713,90 @@ C và M cụ thể hơn), nhưng chưa biết TẠI SAO.
 (N=16 x3, kết quả: `step34_lan16_checkpoint_m.jsonl`). KHÔNG có code
 production/harness/kernel nào bị sửa.
 
+## Camera L (udp_unicast_rcv_skb): SOCKET LOOKUP THẤT BẠI — chứng minh trực tiếp, không suy đoán (18/09/2026)
+
+**Mục tiêu**: phase trước chứng minh gói `/control` dừng lại đâu đó
+giữa checkpoint C (`__udp4_lib_rcv`) và checkpoint M
+(`udp_queue_rcv_skb`), và ĐÃ CẢNH BÁO KHÔNG được tự ý kết luận "socket
+lookup thất bại" vì chưa có camera nào quan sát TRỰC TIẾP kết quả tìm
+socket. Pass này thêm CHÍNH XÁC 1 camera đó.
+
+**Xác nhận vị trí trên ĐÚNG kernel 6.8.0-138-generic** (đọc mã nguồn
+`net/ipv4/udp.c`, không đoán theo tên hàm): `__udp4_lib_rcv()` (C) tìm
+socket đích theo 1 trong 2 cách — (a) "đường nhanh": đọc socket đã
+được gắn sẵn vào gói từ TRƯỚC đó (lúc `ip_rcv_finish`, qua
+`udp_v4_early_demux()`), hoặc (b) "đường chậm": tìm mới ngay lúc này
+qua `__udp4_lib_lookup_skb()`. **CẢ HAI đường đều hội tụ về cùng 1
+lệnh gọi tiếp theo**: `udp_unicast_rcv_skb(sk, skb, uh)` **CHỈ được gọi
+khi 1 trong 2 cách TÌM THẤY socket** — nên việc hàm này CÓ chạy hay
+KHÔNG là bằng chứng TRỰC TIẾP, không phụ thuộc đường nào, cho câu hỏi
+"đã tìm thấy đúng socket cho gói này chưa". Xác nhận `kprobe`-able qua
+`bpftrace -lv`.
+
+```
+__udp4_lib_rcv (C)
+  -> tìm socket (đường nhanh HOẶC đường chậm)
+  -> udp_unicast_rcv_skb (CAMERA L — MỚI) -- CHỈ chạy nếu TÌM THẤY
+       -> udp_queue_rcv_skb (M)
+            -> ... -> __udp_enqueue_schedule_skb (D)
+```
+
+**N=2 sanity**: 100% các gói DATA khớp
+A→B→C→**L**→M→D_attempt→D_result(ret=0) theo đúng thứ tự (383/383,
+sạch tuyệt đối ở CẢ 3 endpoint).
+
+**Overhead đo ở N=2**: có probe (đủ L) = 20.149s so với baseline
+20.487s trước đó — KHÔNG có overhead đáng kể.
+
+**LAN N=16, n=3, CÙNG config với 2 phase trước** — phân loại MỌI gói
+missing:
+
+| rep | missing | C✓ L✕ (lookup THẤT BẠI) | L✓ M✕ | M✓ D✕ | D✓ recv✕ (race) |
+|---|---|---|---|---|---|
+| 1 | 547 | 522 (95.4%) | **0 (0%)** | **0 (0%)** | 25 (4.6%) |
+| 2 | 576 | 552 (95.8%) | **0 (0%)** | **0 (0%)** | 24 (4.2%) |
+| 3 | 585 | 563 (96.2%) | **0 (0%)** | **0 (0%)** | 22 (3.8%) |
+
+**`L✓ M✕` = 0 và `M✓ D✕` = 0 TUYỆT ĐỐI ở CẢ 3 REP**: số lượng camera L
+= số lượng camera M CHÍNH XÁC ở mọi rep (1555=1555, 1525=1525,
+1514=1514) — **100% gói tìm được socket (L chạy) đều đi tiếp trót lọt
+tới tận D thành công**. TOÀN BỘ khoảng lỗi trước đây (C→M) giờ dồn hết
+vào **đúng 1 điểm: C→L, tức bước TÌM SOCKET chính nó** — không phải
+bước nào sau đó.
+
+**Ví dụ LAST GOOD / FIRST BAD chính xác** (robot_0000, rep 1):
+
+| rank | seq | C | L | M | D_result |
+|---|---|---|---|---|---|
+| 95 | 96 | ✓ | ✓ | ✓ | ✓ (ret=0) |
+| **96** | **97** | ✓ | **✕** | **✕** | **✕** |
+
+**KẾT LUẬN — LẦN ĐẦU TIÊN TRONG TOÀN BỘ ĐIỀU TRA, có bằng chứng TRỰC
+TIẾP (không suy đoán) rằng: với 95.4-96.2% gói `/control` bị mất,
+Linux kernel KHÔNG TÌM ĐƯỢC socket 9100 của FleetRMW cho gói đó** — dù
+gói đã xác nhận đến đúng `__udp4_lib_rcv` (checkpoint C), dù
+`recvfrom()` VẪN đang chờ trên CHÍNH socket đó tại CÙNG thời điểm (các
+gói khác VẪN đang được giao bình thường qua đúng socket này). Đây là
+bằng chứng TRỰC TIẾP nhất thu được trong toàn bộ investigation —
+không còn là "vùng chưa biết", mà là **tìm socket thất bại, tại 1 bước
+kernel cụ thể, có tên**.
+
+**MECHANISM STATUS: vẫn UNKNOWN ở mức SÂU HƠN** — biết CHÍNH XÁC bước
+nào thất bại (tìm socket), nhưng CHƯA biết TẠI SAO 1 socket ĐANG MỞ,
+ĐANG hoạt động bình thường cho các gói khác, lại "biến mất" khỏi kết
+quả tìm kiếm cho MỘT SỐ gói cụ thể — không đoán (có thể liên quan tới
+cách 2 đường tìm socket dùng bảng băm/route cache khác nhau, nhưng
+CHƯA có camera nào xác nhận điều này).
+
+**KHÔNG sửa gì** — đúng STOP RULE.
+
+**File liên quan** (không thuộc repo): script bpftrace cập nhật
+`/tmp/.../scratchpad/rx_checkpoints.bt` (thêm probe
+`udp_unicast_rcv_skb`), `step32_rx_checkpoint_analysis.py` (N=2 +
+overhead), `step35_lan16_checkpoint_l.py` (N=16 x3, kết quả:
+`step35_lan16_checkpoint_l.jsonl`). KHÔNG có code production/harness/
+kernel nào bị sửa.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
