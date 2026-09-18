@@ -9621,6 +9621,149 @@ commit `21f445d` test + `8d2ebcf` fix), `tests/test_fleetqox_rmw_trace_endpoint.
 `/tmp/.../scratchpad/step41_idle_fix_lan16.py`, kết quả:
 `step41_idle_fix_lan16.jsonl`.
 
+## MEASURE ONLY: localize residual loss trên 5 flow còn lại — TẤT CẢ NOT-SHUTDOWN (18/09/2026)
+
+**Nguyên tắc pass này**: CHỈ ĐO / LOCALIZE. Không fix, không optimize,
+không sửa production FleetRMW, không đổi `drain_s`/workload/QoS/rate,
+không implement Optimization #2.
+
+**Phát hiện topology quan trọng** (từ CSV, xác nhận trước khi đo):
+`control` là control_station → MỌI robot (downlink dài). **5 flow còn
+lại (`state`, `perception`, `coordination`, `debug`, `human_qoe`) ĐỀU
+là robot → control_station (uplink)** — tức control_station là
+receiver DUY NHẤT cho cả 5 flow này. Nhờ vậy 1 vòng lặp phân loại
+CHUNG (theo từng dòng CSV: sender=src, receiver=dst) phủ được TẤT CẢ 6
+flow, dùng lại NGUYÊN VẸN các trường đã có sẵn từ các pass trước
+(`send_timing`, `received`, `shutdown_actual_monotonic_ns` — không cần
+thêm field nào, không sửa `scripts/fleetqox_rmw_trace_endpoint.py`)
+cộng với bpftrace UNHASH đã có (`step40_socket_close_only.bt`).
+
+**Phân loại từng "intended delivery"** (đúng 4 loại, theo yêu cầu):
+- A. DELIVERED_BEFORE_SHUTDOWN — gửi trước khi receiver shutdown, có giao.
+- B. LOST_SENT_BEFORE_SHUTDOWN — gửi trước khi receiver shutdown, KHÔNG giao.
+- C. LOST_SENT_AFTER_SHUTDOWN — gửi SAU khi receiver shutdown, KHÔNG giao (tách thêm: trước/sau khi socket thực sự đóng).
+- D. DELIVERED_AFTER_SHUTDOWN — race hiếm gặp, báo riêng.
+
+**Dry-run N=2** trước khi chạy N=16: accounting reconciled CHÍNH XÁC
+(440 intended = 440 tx báo cáo, 426 delivered = 426 rx báo cáo,
+96.8%=96.8%) — xác nhận logic đúng trước khi tốn 1 lần chạy N=16 đầy
+đủ.
+
+### LAN N=16, n=3 (config y hệt pass idle-timeout: seed=13, seconds=3, policy=fifo)
+
+**1. SIMPLE ANSWER**
+
+| flow | verdict |
+|---|---|
+| control | **CLEAN** (100%, sent_after_shutdown=0) |
+| state | **NOT-SHUTDOWN** |
+| perception | **NOT-SHUTDOWN** |
+| coordination | **NOT-SHUTDOWN** |
+| debug | **NOT-SHUTDOWN** |
+| human_qoe | **NOT-SHUTDOWN** |
+
+**2. N=16 RESULTS** (giống hệt cả 3 rep):
+
+| flow | intended | delivered | lost | delivery % |
+|---|---|---|---|---|
+| control | 1626 | 1626 | 0 | 100.0% |
+| state | 282 | 97 | 185 | 34.4% |
+| perception | 177 | 67 | 110 | 37.9% |
+| coordination | 169 | 23 | 146 | 13.6% |
+| debug | 24 | 6 | 18 | 25.0% |
+| human_qoe | 11 | 7 | 4 | 63.6% |
+| **TỔNG** | **2289** | **1826** | **463** | **79.8%** |
+
+**3. LOSS VS SHUTDOWN** (giống hệt cả 3 rep):
+
+| flow | lost_before_shutdown | lost_after_shutdown | % loss explained by shutdown |
+|---|---|---|---|
+| control | 0 | 0 | n/a (0 lost) |
+| state | 185 | **0** | **0.0%** |
+| perception | 110 | **0** | **0.0%** |
+| coordination | 146 | **0** | **0.0%** |
+| debug | 18 | **0** | **0.0%** |
+| human_qoe | 4 | **0** | **0.0%** |
+
+**MỌI gói mất ở CẢ 5 flow residual đều được gửi trong khi
+control_station VẪN CÒN SỐNG** (chưa hề bắt đầu shutdown) — 0 ngoại lệ,
+cả 3 rep.
+
+**4. SHUTDOWN MARGINS** (min/median/max, ms — theo rep, ổn định qua cả 3 rep):
+
+| flow | rep1 (min/med/max) | rep2 | rep3 |
+|---|---|---|---|
+| control | 10006/20686/32049 | 10006/21078/32105 | 10005/20925/32026 |
+| state | 19195/20834/22219 | 19250/20883/22255 | 19181/20824/22185 |
+| perception | 19220/20636/22210 | 19277/20696/22248 | 19231/20645/22181 |
+| coordination | 19239/20717/22175 | 19277/20768/22228 | 19205/20704/22183 |
+| debug | 19259/20696/21844 | 19295/20743/21887 | 19221/20660/21816 |
+| human_qoe | 19328/20201/22059 | 19380/20228/22098 | 19287/20164/22022 |
+
+Giải thích đơn giản: margin ÂM = receiver chết quá sớm (bug đã sửa
+trước đó). Margin ở BẢNG TRÊN **LUÔN DƯƠNG**, rất lớn (~19-22 giây) ở
+CẢ 6 FLOW — control_station vẫn còn sống rất lâu sau khi mọi gói (kể
+cả gói bị mất) đã được gửi xong.
+
+**5. /CONTROL SANITY** — **XÁC NHẬN KHÔNG REGRESSION**: 100% delivery
+cả 3 rep, `sent_after_shutdown=0`, `lost_before_shutdown=0`,
+`lost_after_shutdown=0` — đúng y hệt kết quả đã validate ở pass trước.
+
+**6. OVERALL ACCOUNTING** — khớp CHÍNH XÁC, cả 3 rep:
+
+| | reconstructed (từ per-intended-delivery) | benchmark báo cáo |
+|---|---|---|
+| intended/tx | 2289 | 2289 |
+| delivered/rx | 1826 | 1826 |
+| % | 79.8% | 79.8% |
+
+Không có sai lệch cần giải thích.
+
+**7. ROOT-CAUSE CLASSIFICATION**
+
+Cả 5 flow residual: **NOT-SHUTDOWN**. Bằng chứng (mục 3+4 trên): 100%
+số gói mất thuộc nhóm B (`lost_before_shutdown`), 0% thuộc nhóm C
+(`lost_after_shutdown`), margin luôn dương hàng chục giây — loại trừ
+dứt khoát khả năng đây là cùng cơ chế shutdown-timing đã sửa cho
+`/control`. Đây là MỘT cơ chế mất gói HOÀN TOÀN KHÁC, ảnh hưởng RIÊNG 5
+flow này (không ảnh hưởng `/control`).
+
+**8. IMPORTANT**
+
+Residual loss ở 5 flow này **CHƯA được quy kết cho FleetRMW/network**
+theo đúng nguyên tắc — measurement ở đây CHỈ chứng minh được: sender đã
+gửi trong khi receiver còn sống, nhưng gói vẫn không tới. Điều đó ĐỦ để
+loại trừ nguyên nhân shutdown-timing, nhưng **KHÔNG ĐỦ** để tự động quy
+kết cho FleetRMW, UDP, Linux, năng lực đường truyền (capacity), hay
+scheduler — cần MỘT phép đo nhân quả khác (mục 11) mới xác định được
+cơ chế thật sự.
+
+**9. PRODUCTION CODE: UNCHANGED.** Không sửa `rmw_pubsub.cpp`,
+FleetRMW transport, scheduler, optimizer, peer policy, ACK/NACK, QoS,
+packet cap, kernel, hay bất kỳ file harness nào (`scripts/fleetqox_rmw_trace_endpoint.py`
+không đổi trong pass này — mọi trường dùng để đo đều đã có sẵn từ các
+pass trước).
+
+**10. OPTIMIZATION #2: NOT IMPLEMENTED.**
+
+**11. NEXT STEP (CHƯA thực thi)**
+
+Vì phần lớn residual loss xảy ra TRƯỚC shutdown (không phải
+shutdown-explained): đề xuất DUY NHẤT MỘT phép đo tiếp theo — áp dụng
+LẠI đúng phương pháp "loss-funnel trace + kernel checkpoint" đã dùng
+thành công cho `/control` ở các pass trước (send-side ATTEMPT_SUCCESS/
+FAILED, receive-side raw_recvfrom vs decode, kernel UDP lookup/enqueue)
+nhưng lần này tập trung riêng vào 5 flow uplink (state/perception/
+coordination/debug/human_qoe) TẠI control_station — để localize gói
+mất giữa: application send → FleetRMW send → kernel/network → receiver
+FleetRMW → application callback. Không thực thi bước này trong pass
+này.
+
+**File liên quan**: KHÔNG có file nào trong repo bị sửa (measurement
+thuần tái sử dụng field có sẵn). Script đo (không thuộc repo):
+`/tmp/.../scratchpad/step42_all_flows_shutdown_proof.py`, kết quả:
+`step42_all_flows_shutdown_proof.jsonl`.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
