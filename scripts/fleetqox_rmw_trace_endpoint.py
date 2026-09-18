@@ -876,25 +876,31 @@ def main() -> int:
     # EITHER src or dst (load_rows()'s own filter), so the deadline now
     # covers the LAST message any peer is scheduled to send here too,
     # not just this endpoint's own (possibly much shorter) schedule.
-    drain_deadline = start_wall + compute_receive_capable_deadline_s(
+    initial_drain_deadline = start_wall + compute_receive_capable_deadline_s(
         rows, args.start_offset_ms, args.drain_s
     )
-    # drain_deadline_ns: ns-precision twin of drain_deadline, purely for
-    # reporting in the result JSON below (added 18/09/2026, same
-    # measurement pass as start_wall_ns/recv_monotonic_ns) -- the while
-    # condition just below still compares against drain_deadline itself,
-    # unchanged.
-    drain_deadline_ns = int(drain_deadline * 1_000_000_000)
-    while time.monotonic() < drain_deadline:
-        # Same fix as the send loop above: drain every already-ready
-        # entity in a tight non-blocking burst before falling back to a
-        # single bounded wait -- a bare spin_once(timeout_sec=0.1) here
-        # only services ONE ready entity per call, so N incoming messages
-        # that arrived close together previously needed N*(up to 100ms)
-        # of real wall-clock time to all be noticed and processed.
-        for _ in range(20):
-            rclpy.spin_once(node, timeout_sec=0.0)
-        rclpy.spin_once(node, timeout_sec=0.1)
+    # drain_deadline_ns: ns-precision twin of the INITIAL (nominal-
+    # schedule-based) deadline, kept for reporting continuity with the
+    # 18/09/2026 measurement pass's own field of the same name.
+    drain_deadline_ns = int(initial_drain_deadline * 1_000_000_000)
+    # Fixed 18/09/2026 (see docs/AUDIT_ACCEPTANCE_TRACKING.md "RED ->
+    # MINIMAL FIX -> GREEN: idle-timeout shutdown" and
+    # run_receive_idle_drain_loop()'s own docstring for the full causal
+    # trail): a single deadline computed ONCE from the nominal trace
+    # schedule (the line above, unchanged) can't account for real send
+    # lag under load -- measured at LAN N=16: control_station's actual
+    # /control sends land ~15.5s after their own nominal schedule, and
+    # 100% of residual /control loss after a6dffd1 was a receiver having
+    # already begun shutdown before that late actual send arrived. Stay
+    # alive as long as new benchmark messages keep arriving instead
+    # (idle timeout), never returning before initial_drain_deadline.
+    final_drain_deadline = run_receive_idle_drain_loop(
+        initial_drain_deadline,
+        args.drain_s,
+        lambda timeout_sec: rclpy.spin_once(node, timeout_sec=timeout_sec),
+        lambda: len(received),
+    )
+    final_drain_deadline_ns = int(final_drain_deadline * 1_000_000_000)
     # shutdown_actual_monotonic_ns: the actual moment (not just the
     # target deadline above) this endpoint stops draining and falls
     # through toward destroy_node()/rclpy.shutdown() below -- added
@@ -922,6 +928,7 @@ def main() -> int:
         "discovery_expected_peers": args.expected_peer_count,
         "start_wall_monotonic_ns": start_wall_ns,
         "drain_deadline_monotonic_ns": drain_deadline_ns,
+        "final_drain_deadline_monotonic_ns": final_drain_deadline_ns,
         "shutdown_actual_monotonic_ns": shutdown_actual_monotonic_ns,
     }
     args.summary_json.parent.mkdir(parents=True, exist_ok=True)
