@@ -8,6 +8,7 @@ from scripts.fleetqox_rmw_trace_endpoint import (
     build_payload,
     compute_receive_capable_deadline_s,
     load_rows,
+    run_receive_idle_drain_loop,
     wait_until_deadline_while_spinning,
 )
 
@@ -324,6 +325,296 @@ class ReceiveCapableDeadlineTest(unittest.TestCase):
 
     def test_empty_rows_falls_back_to_drain_s(self):
         self.assertEqual(compute_receive_capable_deadline_s([], 1000.0, 10.0), 10.0)
+
+
+def _make_fake_spin_with_arrivals(clock, arrival_times, received_counter):
+    """spin_once_fn for the idle-drain tests below: advances the fake
+    clock by timeout_sec each call (simulating a blocking rmw_wait()),
+    and increments received_counter[0] once for each scheduled arrival
+    time the clock has now reached (each fires exactly once, in
+    chronological order) -- stands in for on_message() appending to
+    the real `received` list when a benchmark DATA message shows up."""
+    pending = sorted(arrival_times)
+
+    def spin_once_fn(timeout_sec):
+        clock[0] += timeout_sec
+        while pending and clock[0] >= pending[0]:
+            pending.pop(0)
+            received_counter[0] += 1
+
+    return spin_once_fn
+
+
+class OldFixedDeadlineStillShutsDownBeforeLateDataTest(unittest.TestCase):
+    """RED (18/09/2026, see docs/AUDIT_ACCEPTANCE_TRACKING.md "RED ->
+    MINIMAL FIX -> GREEN: idle-timeout shutdown"): proves the bug that
+    SURVIVES the a6dffd1 fix, using a6dffd1's OWN unmodified
+    wait_until_deadline_while_spinning + a fixed deadline exactly as
+    main() computes it today (nominal peer schedule + drain_s, with no
+    awareness of when messages ACTUALLY arrive). Live LAN N=16
+    measurement (18/09/2026 "actual send vs shutdown" pass) found
+    real /control sends landing ~15.5s after their own nominal
+    schedule, and sent_after_shutdown_total == lost_total EXACTLY (100%
+    of residual loss, all 3 reps) -- this fixture reproduces that shape
+    at unit-test scale: nominal last send at t=3s, but the ACTUAL
+    message only arrives at t=18s.
+    """
+
+    def test_fixed_deadline_elapses_before_late_actual_message_arrives(self):
+        clock = [0.0]
+        received_counter = [0]
+        # Nominal peer schedule says last send at t=3s; drain_s=10s ->
+        # fixed deadline = 13s, exactly how a6dffd1's main() computes it
+        # today (compute_receive_capable_deadline_s + drain_s, no idle
+        # extension).
+        fixed_deadline = 3.0 + 10.0
+        spin_once_fn = _make_fake_spin_with_arrivals(
+            clock, arrival_times=[18.0], received_counter=received_counter
+        )
+
+        wait_until_deadline_while_spinning(
+            deadline_monotonic=fixed_deadline,
+            spin_once_fn=spin_once_fn,
+            poll_interval_s=0.5,
+            now_fn=lambda: clock[0],
+        )
+
+        self.assertLess(
+            clock[0], 18.0,
+            "the CURRENT (a6dffd1) fixed-deadline behavior must return "
+            "-- i.e. this endpoint decides to shut down -- BEFORE the "
+            "late actual message at t=18s ever arrives, reproducing the "
+            "exact bug proven live: sent_after_shutdown_total == "
+            "lost_total, 100%, all 3 reps",
+        )
+        self.assertEqual(
+            received_counter[0], 0,
+            "the late message must NOT have been observed yet when the "
+            "current implementation already decided to shut down",
+        )
+
+
+class ReceiveIdleDrainLoopTest(unittest.TestCase):
+    """GREEN + edge cases (18/09/2026) for run_receive_idle_drain_loop(),
+    the minimal fix for the bug OldFixedDeadlineStillShutsDownBeforeLateDataTest
+    proves above: instead of a single a-priori deadline, stay alive as
+    long as new benchmark messages keep arriving (extend by drain_s each
+    time), never returning before the existing nominal-schedule lower
+    bound. All tests use a fake clock/spin_once_fn -- no real sleep.
+
+    Deliberate design boundary, not a gap: an arrival must be OBSERVED
+    (i.e. happen before the deadline in force AT THAT TIME) to extend
+    anything -- a message that would be the very FIRST ever received,
+    arriving strictly AFTER the initial nominal-schedule floor has
+    already elapsed with zero prior receive activity, cannot be waited
+    for indefinitely (that would violate requirement C: "no data for
+    drain_s allows shutdown" -- an endpoint with genuinely no incoming
+    traffic must still be able to exit). Real LAN N=16 traffic doesn't
+    hit this edge: each robot receives 32-143 /control messages spread
+    continuously across the run (not one isolated ping), so an early
+    arrival is always available to anchor the first extension -- these
+    tests use two/several arrivals for that reason, matching the real
+    measured pattern, not a single isolated late message with nothing
+    before it.
+    """
+
+    def test_a_late_actual_data_extends_lifetime(self):
+        clock = [0.0]
+        received_counter = [0]
+        # Nominal-only floor = 3s + drain_s(10s) = 13s. An actual
+        # message arrives at t=8s -- already "late" vs. the nominal
+        # t=3s schedule, but still observed BEFORE the floor elapses --
+        # and must extend the deadline to 8+10=18, past the floor.
+        spin_once_fn = _make_fake_spin_with_arrivals(
+            clock, arrival_times=[8.0], received_counter=received_counter
+        )
+
+        final_deadline = run_receive_idle_drain_loop(
+            initial_deadline_monotonic=13.0,
+            drain_s=10.0,
+            spin_once_fn=spin_once_fn,
+            received_count_fn=lambda: received_counter[0],
+            poll_interval_s=0.5,
+            now_fn=lambda: clock[0],
+        )
+
+        self.assertEqual(received_counter[0], 1, "the late message must have been observed")
+        self.assertGreaterEqual(
+            final_deadline, 8.0 + 10.0 - 0.5,  # - poll_interval_s slack
+            "after receiving the late (t=8s) message, must stay alive "
+            "until roughly 8s + drain_s = 18s, not just until the "
+            "original nominal-only floor of 13s",
+        )
+
+    def test_b_second_later_data_extends_lifetime_again(self):
+        clock = [0.0]
+        received_counter = [0]
+        # First arrival at t=8 pushes the deadline to ~18 -- but a
+        # SECOND arrival at t=15 (still before 18, so still observed)
+        # must push it further, to ~25, not let the endpoint shut down
+        # at the first extension alone.
+        spin_once_fn = _make_fake_spin_with_arrivals(
+            clock, arrival_times=[8.0, 15.0], received_counter=received_counter
+        )
+
+        final_deadline = run_receive_idle_drain_loop(
+            initial_deadline_monotonic=13.0,
+            drain_s=10.0,
+            spin_once_fn=spin_once_fn,
+            received_count_fn=lambda: received_counter[0],
+            poll_interval_s=0.5,
+            now_fn=lambda: clock[0],
+        )
+
+        self.assertEqual(received_counter[0], 2, "both messages must have been observed")
+        self.assertGreaterEqual(
+            clock[0], 15.0,
+            "must not have shut down before the SECOND late message arrived",
+        )
+        self.assertGreaterEqual(
+            final_deadline, 15.0 + 10.0 - 0.5,
+            "the second arrival (t=15) must extend the deadline again, "
+            "to ~25s -- past what the first arrival alone would have "
+            "set (~18s)",
+        )
+        self.assertLess(
+            final_deadline, 18.0 + 10.0,
+            "sanity: final deadline should track the SECOND arrival's "
+            "own extension (~25s), not some unrelated larger value",
+        )
+
+    def test_c_no_data_for_drain_s_allows_shutdown(self):
+        clock = [0.0]
+        received_counter = [0]
+        # No arrivals at all -- the loop must not wait forever or
+        # needlessly extend past the initial nominal-schedule deadline.
+        spin_once_fn = _make_fake_spin_with_arrivals(
+            clock, arrival_times=[], received_counter=received_counter
+        )
+
+        final_deadline = run_receive_idle_drain_loop(
+            initial_deadline_monotonic=13.0,
+            drain_s=10.0,
+            spin_once_fn=spin_once_fn,
+            received_count_fn=lambda: received_counter[0],
+            poll_interval_s=0.5,
+            now_fn=lambda: clock[0],
+        )
+
+        self.assertAlmostEqual(final_deadline, 13.0, delta=0.5)
+        self.assertAlmostEqual(clock[0], 13.0, delta=0.5)
+
+    def test_d_internal_non_application_activity_does_not_extend(self):
+        """received_count_fn is deliberately wired to len(received) in
+        main() -- on_message()'s OWN list, which only grows for this
+        endpoint's subscribed benchmark trace topics. FleetRMW's
+        internal ACK/NACK/graph/discovery/repair traffic never touches
+        that list. Simulate that here: spin_once_fn is called just as
+        often (representing internal protocol activity happening under
+        the hood), but received_count_fn NEVER increases -- the
+        deadline must be unaffected by that internal churn."""
+        clock = [0.0]
+        internal_traffic_processed = [0]
+
+        def spin_once_fn(timeout_sec):
+            clock[0] += timeout_sec
+            internal_traffic_processed[0] += 1  # e.g. an ACK/NACK/graph packet
+
+        final_deadline = run_receive_idle_drain_loop(
+            initial_deadline_monotonic=13.0,
+            drain_s=10.0,
+            spin_once_fn=spin_once_fn,
+            received_count_fn=lambda: 0,  # no APPLICATION message ever arrives
+            poll_interval_s=0.5,
+            now_fn=lambda: clock[0],
+        )
+
+        self.assertGreater(
+            internal_traffic_processed[0], 0,
+            "sanity: spin_once_fn really was called many times (internal traffic happened)",
+        )
+        self.assertAlmostEqual(
+            final_deadline, 13.0, delta=0.5,
+            msg="internal/non-application traffic must NOT extend the deadline",
+        )
+
+    def test_e_does_not_shut_down_merely_because_own_schedule_finished(self):
+        """Integration with compute_receive_capable_deadline_s (the
+        a6dffd1 fix, unchanged): using the SAME asymmetric-workload
+        fixture as ReceiveCapableDeadlineTest (robot_0000's own outgoing
+        schedule finishes at t=0s, but peer fleet_controller is still
+        scheduled to send until t=15s), confirm the idle-drain loop's
+        INITIAL floor alone (with zero actual messages arriving) already
+        keeps the endpoint alive through the peer's nominal schedule --
+        it does not exit early just because robot_0000's own send loop
+        is done."""
+        rows = _asymmetric_workload_rows()
+        start_offset_ms = 1000.0
+        drain_s = 10.0
+        initial_deadline = compute_receive_capable_deadline_s(rows, start_offset_ms, drain_s)
+        last_incoming_send_s = (15000.0 + start_offset_ms) / 1000.0
+
+        clock = [0.0]
+        spin_once_fn = _make_fake_spin_with_arrivals(clock, arrival_times=[], received_counter=[0])
+
+        final_deadline = run_receive_idle_drain_loop(
+            initial_deadline_monotonic=initial_deadline,
+            drain_s=drain_s,
+            spin_once_fn=spin_once_fn,
+            received_count_fn=lambda: 0,
+            poll_interval_s=0.5,
+            now_fn=lambda: clock[0],
+        )
+
+        self.assertGreaterEqual(final_deadline, last_incoming_send_s + drain_s)
+
+    def test_f_nominal_schedule_provides_sensible_initial_lower_bound(self):
+        """The initial nominal-schedule deadline must be respected
+        EXACTLY as a floor when no application data ever arrives -- not
+        overshot by some unrelated margin, and never undershot (the
+        endpoint must not exit before expected traffic could plausibly
+        still show up)."""
+        clock = [0.0]
+        spin_once_fn = _make_fake_spin_with_arrivals(clock, arrival_times=[], received_counter=[0])
+
+        final_deadline = run_receive_idle_drain_loop(
+            initial_deadline_monotonic=42.0,
+            drain_s=10.0,
+            spin_once_fn=spin_once_fn,
+            received_count_fn=lambda: 0,
+            poll_interval_s=0.5,
+            now_fn=lambda: clock[0],
+        )
+
+        self.assertGreaterEqual(final_deadline, 42.0, "must never undershoot the nominal floor")
+        self.assertAlmostEqual(final_deadline, 42.0, delta=0.5, msg="must not overshoot it either, absent any data")
+
+    def test_race_message_arrives_exactly_at_deadline_still_extends(self):
+        """Requirement 7 (race condition check): a message that becomes
+        ready in the SAME instant the deadline is reached must still be
+        observed and still extend the deadline, via the loop's existing
+        drain-burst-then-check pattern (no new busy loop)."""
+        clock = [0.0]
+        received_counter = [0]
+        # Arrival exactly AT the initial deadline.
+        spin_once_fn = _make_fake_spin_with_arrivals(
+            clock, arrival_times=[13.0], received_counter=received_counter
+        )
+
+        final_deadline = run_receive_idle_drain_loop(
+            initial_deadline_monotonic=13.0,
+            drain_s=10.0,
+            spin_once_fn=spin_once_fn,
+            received_count_fn=lambda: received_counter[0],
+            poll_interval_s=0.5,
+            now_fn=lambda: clock[0],
+        )
+
+        self.assertEqual(received_counter[0], 1, "the boundary message must have been observed")
+        self.assertGreaterEqual(
+            final_deadline, 13.0 + 10.0 - 0.5,
+            "a message arriving exactly at the deadline must still extend it",
+        )
 
 
 if __name__ == "__main__":

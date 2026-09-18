@@ -406,6 +406,77 @@ def wait_until_deadline_while_spinning(
         spin_once_fn(min(remaining, poll_interval_s))
 
 
+def run_receive_idle_drain_loop(
+    initial_deadline_monotonic: float,
+    drain_s: float,
+    spin_once_fn: Callable[[float], None],
+    received_count_fn: Callable[[], int],
+    *,
+    poll_interval_s: float = 0.01,
+    now_fn: Callable[[], float] = time.monotonic,
+) -> float:
+    """Blocks until this endpoint has gone drain_s seconds without a NEW
+    application-level benchmark message arriving, never returning before
+    initial_deadline_monotonic. Returns the final deadline actually used
+    (for reporting).
+
+    Fixes the harness bug found via the 18/09/2026 "actual send vs
+    shutdown" measurement pass (see docs/AUDIT_ACCEPTANCE_TRACKING.md):
+    the a6dffd1 fix computes drain_deadline ONCE, up front, from the
+    NOMINAL trace schedule (compute_receive_capable_deadline_s) -- but
+    at LAN N=16, control_station's ACTUAL sends lag that nominal
+    schedule by ~15.5s on average (measured: sent_after_shutdown_total
+    == lost_total EXACTLY, all 3 reps, 100% of residual /control loss).
+    A single a-priori deadline can never account for real-world send
+    lag it has no way to predict.
+
+    Fix: instead of a fixed deadline, keep the endpoint alive as long as
+    relevant traffic keeps arriving -- an "idle timeout" -- while still
+    respecting initial_deadline_monotonic (== the existing, unchanged
+    compute_receive_capable_deadline_s value) as a LOWER BOUND, so an
+    endpoint with truly no incoming traffic doesn't exit before its
+    peers' nominal schedule even finishes (requirement F/E from the
+    18/09/2026 "RED -> MINIMAL FIX -> GREEN" pass).
+
+    received_count_fn: MUST be something like `lambda: len(received)`,
+    i.e. the count of messages the harness's OWN on_message() callback
+    has appended -- this is deliberately the NARROWEST existing
+    application-level receive signal already in this file: on_message()
+    only fires for this endpoint's OWN subscribed
+    /fleetqox_trace/<dst>/<flow_class> topics (real benchmark DATA), and
+    is structurally blind to FleetRMW's internal ACK/NACK/graph/
+    discovery/repair traffic (those never surface as a ROS String
+    message on a trace topic) -- so growth in this count can ONLY mean
+    "a real benchmark message arrived," never "some internal protocol
+    packet happened," with no new FleetRMW instrumentation needed to
+    get that guarantee.
+
+    Race handling (deadline reached vs. message arriving at the same
+    moment): each iteration re-drains everything already ready (the
+    SAME existing 20x spin_once_fn(0.0) burst pattern used by
+    wait_until_deadline_while_spinning above and the send loop
+    elsewhere in this file -- no new busy loop) and re-checks
+    received_count_fn() BEFORE testing the deadline, every single
+    iteration, including the one that would otherwise be the last --
+    so a message that becomes ready in the same instant the deadline is
+    reached is still observed and still extends the deadline before
+    this function is allowed to return.
+    """
+    deadline = initial_deadline_monotonic
+    last_count = received_count_fn()
+    while True:
+        for _ in range(20):
+            spin_once_fn(0.0)
+        new_count = received_count_fn()
+        if new_count > last_count:
+            deadline = max(deadline, now_fn() + drain_s)
+            last_count = new_count
+        remaining = deadline - now_fn()
+        if remaining <= 0:
+            return deadline
+        spin_once_fn(min(remaining, poll_interval_s))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--trace", type=Path, required=True)
