@@ -774,7 +774,18 @@ def main() -> int:
             }
         )
 
-    drain_deadline = time.monotonic() + args.drain_s
+    # Was time.monotonic() + args.drain_s -- computed from THIS
+    # endpoint's own outgoing loop finishing, with no awareness of
+    # peers still sending TO it. Fixed 18/09/2026 (see
+    # docs/AUDIT_ACCEPTANCE_TRACKING.md "ROOT CAUSE TÌM RA" /
+    # compute_receive_capable_deadline_s's own docstring for the full
+    # trail): `rows` already contains every row where this endpoint is
+    # EITHER src or dst (load_rows()'s own filter), so the deadline now
+    # covers the LAST message any peer is scheduled to send here too,
+    # not just this endpoint's own (possibly much shorter) schedule.
+    drain_deadline = start_wall + compute_receive_capable_deadline_s(
+        rows, args.start_offset_ms, args.drain_s
+    )
     while time.monotonic() < drain_deadline:
         # Same fix as the send loop above: drain every already-ready
         # entity in a tight non-blocking burst before falling back to a
