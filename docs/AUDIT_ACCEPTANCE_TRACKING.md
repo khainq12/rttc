@@ -8797,6 +8797,95 @@ overhead), `step35_lan16_checkpoint_l.py` (N=16 x3, kết quả:
 `step35_lan16_checkpoint_l.jsonl`). KHÔNG có code production/harness/
 kernel nào bị sửa.
 
+## Camera K (__udp4_lib_lookup return value): TẠI SAO lookup thất bại — hash-table lookup MISS thật sự, không phải "chưa từng gọi" (18/09/2026)
+
+**Mục tiêu**: phase trước chứng minh checkpoint L (`udp_unicast_rcv_skb`)
+không chạy cho ~95% gói missing — tức "tìm socket thất bại" — nhưng
+CHƯA biết bước tìm socket đó có thực sự CHẠY và trả về "không tìm
+thấy", hay đơn giản KHÔNG BAO GIỜ được gọi (vì 1 nhánh khác). Pass này
+trả lời câu hỏi đó.
+
+**Xác nhận hàm lookup lõi trên ĐÚNG kernel 6.8.0-138-generic**: đọc kỹ
+qua `bpftrace -l` — hàm wrapper `__udp4_lib_lookup_skb()` mà
+`__udp4_lib_rcv()` thường gọi KHÔNG tồn tại như 1 symbol riêng (bị
+compiler **inline** vào hàm gọi nó, xác nhận qua việc nó vắng mặt hoàn
+toàn trong danh sách kprobe) — nhưng hàm LÕI bên trong nó,
+`__udp4_lib_lookup()` (hàm thực sự tra bảng băm/hash table tìm
+socket), VẪN tồn tại như 1 symbol độc lập và kprobe-able.
+
+**Vấn đề kỹ thuật + cách giải quyết**: `__udp4_lib_lookup()` có 9 tham
+số — nhiều hơn 6 thanh ghi mà x86_64 dùng để truyền tham số, nên
+`skb` (tham số cuối) không lấy được trực tiếp qua `argN`. **Giải
+pháp**: tái dùng đúng pattern đã dùng cho checkpoint D — "đánh dấu" tại
+checkpoint C (nơi CÓ `skb`, đã lọc đúng gói `/control` DATA) bằng 1 map
+theo `tid` (thread ID), rồi tại `kretprobe` của `__udp4_lib_lookup`,
+đọc map đó để biết chính xác GIÁ TRỊ TRẢ VỀ (tìm thấy socket hay
+không) thuộc về ĐÚNG gói nào — an toàn vì `__udp4_lib_rcv()` xử lý
+đồng bộ, không xen kẽ, trên cùng 1 luồng cho 1 gói tại 1 thời điểm.
+
+**Phát hiện phụ quan trọng ở bước N=2 sanity**: checkpoint K CHẠY cho
+100% gói DATA đã gửi (383/383) — nghĩa là hệ thống này LUÔN LUÔN đi
+"đường chậm" (gọi `__udp4_lib_lookup()` tươi mới), KHÔNG BAO GIỜ dùng
+"đường nhanh" (socket gắn sẵn từ early-demux) cho traffic loại này —
+xác nhận bằng đo thật, không giả định.
+
+**Overhead N=2**: 20.439s so với baseline ~20.4-20.5s — không đáng kể.
+
+**LAN N=16, n=3, CÙNG config 3 phase trước** — với MỌI gói missing,
+kiểm tra `__udp4_lib_lookup()` có được gọi không, và nếu có, trả về gì:
+
+| rep | missing | K found=0 (lookup MISS thật) | K found=1 (lạ, race) | K không được gọi |
+|---|---|---|---|---|
+| 1 | 541 | 507 (93.7%) | 34 (6.3%) | **0** |
+| 2 | 583 | 560 (96.1%) | 23 (3.9%) | **0** |
+| 3 | 574 | 550 (95.8%) | 24 (4.2%) | **0** |
+
+**`K không được gọi` = 0 TUYỆT ĐỐI** — mọi gói missing ĐỀU đi qua
+đường chậm (khớp N=2). **93.7-96.1% có `__udp4_lib_lookup()` CHẠY THẬT
+và TRẢ VỀ "không tìm thấy socket"** — tức đây KHÔNG PHẢI 1 nhánh code
+bị bỏ qua, mà là bảng băm socket của kernel THẬT SỰ không khớp được
+gói này với socket 9100 của FleetRMW tại đúng thời điểm gói đó tới,
+dù CHÍNH socket đó đang mở và giao gói khác bình thường ngay trước/sau
+đó chỉ vài micro giây. Phần còn lại (3.9-6.3%) khớp CHÍNH XÁC với
+"race" benign đã thấy xuyên suốt các phase trước (kernel xác nhận
+thành công, bản ghi `recv` riêng của FleetRMW lấy mẫu sớm hơn 1 chút).
+
+**Ví dụ LAST GOOD / FIRST BAD chính xác** (robot_0000, rep 1):
+
+| rank | seq | C | K (found?) | L |
+|---|---|---|---|---|
+| 96 | 97 | ✓ | ✓ (found=1) | ✓ |
+| **97** | **98** | ✓ | **✕ (found=0)** | **✕** |
+
+**KẾT LUẬN — điểm sâu nhất đạt được trong toàn bộ investigation**: với
+93.7-96.1% gói `/control` bị mất, hàm tra cứu socket LÕI của kernel
+(`__udp4_lib_lookup`) THỰC SỰ CHẠY và THỰC SỰ trả về "không tìm thấy" —
+1 cú MISS thật trên bảng băm socket, không phải nhánh code bị bỏ qua.
+
+**KHÔNG suy đoán xa hơn**: CHƯA biết TẠI SAO 1 bảng băm chứa 1 socket
+đang hoạt động bình thường lại "trượt" tra cứu cho MỘT SỐ gói cụ thể.
+Các khả năng CHƯA được kiểm chứng (liệt kê để tham khảo hướng điều tra
+tiếp theo, KHÔNG khẳng định): socket bị unhash/rehash tạm thời do 1
+lệnh gọi nào đó từ CHÍNH FleetRMW (vd gọi lại `bind()`/`connect()`/
+`setsockopt()` trong lúc chạy), hoặc 1 điều kiện race nội bộ kernel
+khi nhiều CPU cùng truy cập bảng băm UDP đồng thời dưới tải cao. **Đây
+chỉ là hướng gợi ý, KHÔNG PHẢI kết luận** — cần checkpoint riêng mới để
+kiểm chứng.
+
+**MECHANISM STATUS: vẫn UNKNOWN ở lớp sâu hơn** — biết CHÍNH XÁC "bảng
+băm miss thật", nhưng chưa biết NGUYÊN NHÂN của cú miss đó.
+
+**KHÔNG sửa gì** — đúng STOP RULE.
+
+**File liên quan** (không thuộc repo): script bpftrace cập nhật
+`/tmp/.../scratchpad/rx_checkpoints.bt` (thêm probe+kretprobe
+`__udp4_lib_lookup`, dùng tid-stash từ checkpoint C),
+`step32_rx_checkpoint_analysis.py` (thêm `k_presence_per_c_rank()`,
+N=2 xác nhận 383/383 K fired + found=1),
+`step36_lan16_checkpoint_k.py` (N=16 x3, kết quả:
+`step36_lan16_checkpoint_k.jsonl`). KHÔNG có code production/harness/
+kernel nào bị sửa.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
