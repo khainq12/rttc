@@ -13863,6 +13863,139 @@ post-`recvfrom()` duplicate-drop issue (proven present, never
 localized). Either would be the natural next measurement-only
 investigation; neither is started here.
 
+## TABLE VI N=8 POST-RECVFROM DUPLICATE-DROP LOCALIZATION
+
+Measurement-only. Scope: for FleetRMW N=8 seed=7, robot IDs are already
+unique (commit `977f777`), yet many frames that DO reach `recvfrom()`
+and DO decode successfully are still being rejected by
+`observe_frame()`'s duplicate check (`matched_subscriptions == 0` in
+the `subscription_match` loss-funnel trace). Goal: explain 100% of
+these drops via exact message-level correlation, not aggregate
+inference. ACK/NACK redundancy (already proven a contributor to
+network-level loss, see the sections above) is explicitly out of scope
+here; `robot_0007`'s connectivity break is also out of scope.
+
+### Instrumentation change (additive only)
+
+The existing `SubscriptionMatchTraceEvent`/
+`rmw_fleetqox_cpp_subscription_match_trace_json()` instrumentation
+(already gated behind `FLEETQOX_RMW_LOSS_FUNNEL_TRACE_PROFILING`,
+unchanged from prior sections) recorded only `publisher_id` (as
+`source_id`) -- textually IDENTICAL across every sender in a run by
+construction (`allocate_publisher_id()` derives it from this process's
+own bind address, not `robot_id`), so a dropped event's ACTUAL sender
+could not be determined from the trace alone. Added two fields to
+`rmw_pubsub.cpp`'s `SubscriptionMatchTraceEvent`/its one recording
+site in `enqueue_received_frame()`/its JSON accessor:
+- `robot_id` -- completes the identity `source_id` alone cannot.
+- `payload_hex` -- the first 512 bytes of the decoded application
+  payload, **hex-encoded** (via the already-existing
+  `hex_encode_bytes()` helper), so two events sharing the same full
+  identity can be checked for byte-identical content.
+
+**Self-caught bug during this change**: the first version stored the
+payload as raw bytes (`payload_text`). Since the JSON accessor embeds
+every field as a JSON string and the Python side decodes the whole
+returned buffer as UTF-8 before `json.loads()`, one invalid-UTF-8 byte
+anywhere in an arbitrary application payload silently discarded the
+**entire** `subscription_match` trace (caught as `UnicodeDecodeError`,
+defaulted to `[]`) -- confirmed live: a first N=8 seed=7 run showed
+`subscription_match: 0` events on all 9 endpoints despite
+`duplicate_data_frames_deduped` being 146-184 per endpoint (the same
+underlying event, counted by a sibling counter incremented right next
+to the trace-push site). A temporary `stderr` probe confirmed the
+trace-push code itself executed hundreds of times per endpoint with
+`matched_subscriptions` both 0 and >=1 -- ruling out a control-flow
+bug and pointing at the JSON/decode boundary. Fixed by hex-encoding
+the payload instead (always valid ASCII regardless of content);
+re-verified full pytest suite (835 passed / 8 pre-existing unrelated
+failures, same baseline as every prior section) after each rebuild.
+Purely additive/observational: no send/retry/ACK/NACK/QoS/timeout/
+duplicate-detection/robot-ID/broadcast/ns-3/Ricart-Agrawala behavior
+changed.
+
+### Message-level correlation method
+
+For each receiving endpoint's own `subscription_match` trace (already
+proven, in an earlier pass, that `matched_subscriptions == 0` for this
+scenario is caused only by the duplicate flag -- lifespan/ownership/
+security gates confirmed inactive), grouped events by the full
+identity `(robot_id, topic, publisher_id, source_sequence)`. For every
+dropped event (`matched_subscriptions == 0`), found the first
+chronologically-earlier ACCEPTED event (`matched_subscriptions >= 1`)
+with the same identity on the same receiver, and compared:
+`payload_hex` equality (byte-identical or not) and `wall_ns`
+inter-arrival time.
+
+### 1. Duplicate-drop count
+
+**1330** dropped `subscription_match` events across all 9 endpoints,
+N=8 seed=7 (`control_station` 170, `robot_0000` 147, `robot_0001` 180,
+`robot_0002` 190, `robot_0003` 126, `robot_0004` 162, `robot_0005` 109,
+`robot_0006` 167, `robot_0007` 79).
+
+### 2. Classification counts A/B/C/D
+
+| Class | Count | Meaning |
+|---|---|---|
+| A -- legitimate retransmitted duplicate | **1330** | same identity, byte-identical `payload_hex` |
+| B -- another identity collision | 0 | none found |
+| C -- sequence-number reuse/reset | 0 | none found |
+| D -- another/unexplained mechanism | 0 | none found (every dropped event had a matching prior accepted event) |
+
+**100% of drops are Class A.** All drops are on one topic,
+`/fleetqox_coordination/control` (the Ricart-Agrawala mutex
+request/reply/release traffic) -- the only traffic in this scenario
+whose sender retries under loss.
+
+### 3. One exact dropped-frame example
+
+- Receiver: `control_station`
+- Identity: `robot_id=robot_0000`, `source_id=fpubcpp-0.0.0.0:9100-3`,
+  `topic=/fleetqox_coordination/control`, `source_sequence=2`
+- Prior accepted event: `wall_ns=512688724960`, `matched_subscriptions=1`
+- Dropped event: `wall_ns=519916471029`, `matched_subscriptions=0`
+- Inter-arrival: `7,227,746,069 ns` (~7.23 s)
+- `payload_hex` identical on both (decodes to a JSON `"type": "request"`
+  message from `robot_0000`, `req_id: robot_0000:0`)
+
+### 4. First causal mechanism
+
+The sender re-transmits an already-successfully-delivered,
+byte-identical DATA frame because it never received (or received too
+late) the acknowledgment for it -- consistent with the wide spread of
+inter-arrival times measured (396,817 ns to 68.4 s; median ~2.89 s,
+mean ~6.48 s across all 1330 drops), which tracks a retry/backoff
+schedule, not a near-instantaneous link-layer duplicate. The receiver
+correctly recognizes the repeat via `observe_frame()`'s sequence-based
+duplicate check, now unambiguous because `stream_key()` (robot_id +
+topic + publisher_id) is unique per sender since the identity fix.
+
+### 5. Bug vs expected behavior
+
+**Expected behavior, not a bug.** Under a reliable-delivery scheme
+layered over lossy UDP/Wi-Fi, a sender that does not know its ACK
+arrived is required to retry; a receiver is required to dedupe. Both
+halves are working as designed. This is a real, measured cost (1330
+redundant deliveries suppressed at N=8/seed=7 alone) but it is the
+duplicate-suppression mechanism doing its job, not a defect in it.
+
+### 6. Exactly one next step (not implemented)
+
+Quantify how much of the coordination-traffic reliability retry
+mechanism's resend volume (the sender side generating these 1330
+byte-identical re-deliveries) overlaps with, or is independent of, the
+already-proven ACK/NACK-redundancy amplification -- i.e., whether
+reducing `FLEETQOX_RMW_ACK_NACK_REDUNDANT_RESEND_COUNT` (already tested
+in the sections above) also reduces this DATA-frame retry count, or
+whether this is a fully separate resend path. Not started here.
+
+**Files changed**: `ros2_ws/src/rmw_fleetqox_cpp/src/rmw_pubsub.cpp`
+(additive: two new `SubscriptionMatchTraceEvent` fields, hex-encoded
+payload), `scripts/investigate_table6_n8_duplicate_drops.py` (new).
+Raw output: `results_rmw_socket/table6_n8_duplicate_drop_investigation/`
+(gitignored).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
