@@ -561,6 +561,15 @@ struct LossFunnelSendEvent
   int retry_count{0};   // only meaningful for ATTEMPT_FAILED
   std::string failed_target;  // only meaningful for SKIPPED_AFTER_FAILURE
   std::int64_t wall_ns{0};
+  // Added for the "TABLE VI N=8 RETRANSMISSION FEEDBACK-LOOP" investigation
+  // (see docs/AUDIT_ACCEPTANCE_TRACKING.md): without this, an original
+  // publish's send event and a later NACK-driven retransmission's send
+  // event of the SAME (source_id, source_sequence, topic) identity were
+  // indistinguishable except by inference from wall_ns clustering -- this
+  // makes the distinction exact instead of inferred. Set from
+  // g_loss_funnel_current_send.is_retransmission (see that struct's own
+  // doc comment for how it gets there), purely observational.
+  bool is_retransmission{false};
 };
 
 struct LossFunnelRecvEvent
@@ -569,6 +578,13 @@ struct LossFunnelRecvEvent
   std::uint64_t source_sequence{0};
   std::string topic;
   std::int64_t wall_ns{0};
+  // Added for the "TABLE VI N=8 RETRANSMISSION FEEDBACK-LOOP" investigation
+  // (see docs/AUDIT_ACCEPTANCE_TRACKING.md): source_id (publisher_id) alone
+  // is not guaranteed unique across different senders in a run (same
+  // reason SubscriptionMatchTraceEvent needed this field -- see that
+  // struct's own doc comment), so correlating a SPECIFIC sender's send
+  // trace against receivers' recv traces needs robot_id too.
+  std::string robot_id;
 };
 
 std::mutex g_loss_funnel_trace_mutex;
@@ -725,8 +741,20 @@ struct LossFunnelCurrentSendIdentity
   std::string source_id;
   std::uint64_t source_sequence{0};
   std::string topic;
+  // Copied in from g_loss_funnel_next_send_is_retransmission at the same
+  // point this identity itself gets set (see send_frame_with_qos()) --
+  // see that flag's own doc comment.
+  bool is_retransmission{false};
 };
 thread_local LossFunnelCurrentSendIdentity g_loss_funnel_current_send;
+// Set by send_retransmission_frame() immediately before the one send_frame()
+// call it makes for a NACK-driven retransmission, consumed and reset by
+// send_frame_with_qos() the moment it sets g_loss_funnel_current_send for
+// that same call -- thread_local for the same reason g_loss_funnel_current_
+// send is (see its doc comment): the ack/nack-receive thread that runs
+// send_retransmission_frame() is not the app's own publish() thread, so
+// there is no cross-thread interleaving to guard against either way.
+thread_local bool g_loss_funnel_next_send_is_retransmission{false};
 
 // scripts/fleetqox_rmw_trace_endpoint.py's build_payload() embeds
 // event_id as plaintext JSON `"e":"<digits>"` inside the serialized
@@ -2936,8 +2964,13 @@ public:
       g_loss_funnel_current_send.source_id = data_frame->publisher_id;
       g_loss_funnel_current_send.source_sequence = data_frame->source_sequence_number;
       g_loss_funnel_current_send.topic = data_frame->topic;
+      g_loss_funnel_current_send.is_retransmission = g_loss_funnel_next_send_is_retransmission;
       loss_funnel_identity_guard.armed = true;
     }
+    // Consumed exactly once per send_frame_with_qos() call regardless of
+    // whether tracing is enabled above, so a stale `true` can never survive
+    // past the one call it was set for.
+    g_loss_funnel_next_send_is_retransmission = false;
     auto send_once = [&]() -> rmw_ret_t {
       rmw_ret_t send_ret = RMW_RET_OK;
       if (shared_memory_active()) {
@@ -3039,6 +3072,17 @@ public:
       repair_targets_for_path_ids(repair_rule->path_ids) : std::vector<sockaddr_in>{};
     rmw_ret_t ret = RMW_RET_OK;
     if (repair_targets.empty()) {
+      // RAII, not a bare set/call/reset: send_frame() -> send_frame_with_qos()
+      // has several early-return paths (not ready, empty frame, no targets)
+      // before it ever reaches the point that consumes and clears this flag
+      // itself -- without this guard, one of those early returns would leave
+      // the flag set `true` for whatever unrelated send this thread makes
+      // next (see g_loss_funnel_next_send_is_retransmission's own comment).
+      struct RetransmissionFlagGuard
+      {
+        ~RetransmissionFlagGuard() { g_loss_funnel_next_send_is_retransmission = false; }
+      } retransmission_flag_guard;
+      g_loss_funnel_next_send_is_retransmission = true;
       ret = send_frame(encoded_frame);
     } else {
       ret = send_payload_to_targets(
@@ -7171,6 +7215,7 @@ private:
       event.retry_count = retry_count;
       event.failed_target = failed_target;
       event.wall_ns = monotonic_timestamp_ns();
+      event.is_retransmission = g_loss_funnel_current_send.is_retransmission;
       std::lock_guard<std::mutex> trace_lock(g_loss_funnel_trace_mutex);
       g_loss_funnel_send_events.push_back(std::move(event));
     };
@@ -8788,6 +8833,7 @@ private:
       event.source_id = loss_funnel_decoded->publisher_id;
       event.source_sequence = loss_funnel_decoded->source_sequence_number;
       event.topic = loss_funnel_decoded->topic;
+      event.robot_id = loss_funnel_decoded->robot_id;
       event.wall_ns = monotonic_timestamp_ns();
       std::lock_guard<std::mutex> trace_lock(g_loss_funnel_trace_mutex);
       g_loss_funnel_recv_events.push_back(std::move(event));
@@ -15462,7 +15508,10 @@ const char * rmw_fleetqox_cpp_loss_funnel_send_trace_json()
     built += "\"errno\":" + std::to_string(event.send_errno) + ",";
     built += "\"retry_count\":" + std::to_string(event.retry_count) + ",";
     built += "\"failed_target\":\"" + loss_funnel_json_escape(event.failed_target) + "\",";
-    built += "\"wall_ns\":" + std::to_string(event.wall_ns) + "}";
+    built += "\"wall_ns\":" + std::to_string(event.wall_ns) + ",";
+    built += "\"is_retransmission\":";
+    built += event.is_retransmission ? "true" : "false";
+    built += "}";
   }
   built += "]";
   json = std::move(built);
@@ -15482,7 +15531,8 @@ const char * rmw_fleetqox_cpp_loss_funnel_recv_trace_json()
     built += "{\"source_id\":\"" + loss_funnel_json_escape(event.source_id) + "\",";
     built += "\"source_sequence\":" + std::to_string(event.source_sequence) + ",";
     built += "\"topic\":\"" + loss_funnel_json_escape(event.topic) + "\",";
-    built += "\"wall_ns\":" + std::to_string(event.wall_ns) + "}";
+    built += "\"wall_ns\":" + std::to_string(event.wall_ns) + ",";
+    built += "\"robot_id\":\"" + loss_funnel_json_escape(event.robot_id) + "\"}";
   }
   built += "]";
   json = std::move(built);
