@@ -14990,6 +14990,70 @@ negative result, reported in full rather than hidden.
 **Files changed**: `scripts/run_table6_n8_acknack_redundancy_sweep_
 phase4.py` (new). No production config changed. Commit: `e718630`.
 
+## OVERNIGHT PHASE 6 -- FINAL REASSESSMENT: N=8 IS NOT HEALTHY
+
+One production fix was KEPT tonight (Phase 1). Reassessing N=8 against
+the same frozen scenario (seed=7, plus seeds 11/17 from the Phase 4
+sweep's default-config runs for multi-seed context) with that fix
+applied.
+
+### Before -> after, N=8 seed=7 (single seed, detailed)
+
+| Metric | Before (pre-Phase-1) | After (Phase-1-fixed) |
+|---|---:|---:|
+| Unique DATA frames | 623 | 587 |
+| (identity, target) pairs | 4,984 | 4,696 |
+| Permanent loss | 75.28% | 65.42% |
+| `nack_retransmissions_sum` | 737 | 5,130 |
+| `duplicate_data_frames_deduped_sum` | 905 | 894 |
+| crossings_completed (sum, 9 endpoints) | 9 | 10 |
+| forced_entry (all endpoints) | true | true |
+| task_completion_s | ~120.30-120.35 | ~120.31-120.33 |
+
+### After-fix wire composition, seeds 11 & 17, default ACK/NACK config (fresh pcap capture)
+
+| Class | Seed 11 | Seed 17 | (pre-Phase-1 reference, seed 7, from earlier section) |
+|---|---:|---:|---:|
+| DATA | 12.8% | 7.6% | 3.5% |
+| ACK | 19.9% | 26.2% | 13.5% |
+| NACK | 61.8% | 60.8% | 46.6% |
+| UNRECOVERABLE | 5.5% | 5.4% | 36.3% |
+
+Useful-wire efficiency (DATA share) more than doubled to tripled after
+the Phase 1 fix (3.5% -> 7.6-12.8%), and UNRECOVERABLE-loss-notice
+control traffic collapsed from over a third of all bytes to ~5% --
+consistent with the fix eliminating wasted/misdirected processing that
+was previously generating spurious unrecoverable-loss notices for
+cross-robot mismatches. NACK remains completely dominant (~61%) either
+way -- the Phase 1 fix improved wire EFFICIENCY, it did not change
+WHICH mechanism dominates the channel.
+
+### End-outcome metrics across all seeds run tonight (post-Phase-1-fix)
+
+| Seed | Config | DATA loss% | forced_entry | task_completion_s |
+|---:|---|---:|:---:|---:|
+| 7 | default | -- (permanent-loss framing used instead, 65.4%) | true | ~120.3 |
+| 11 | default | 90.2% | true | ~120.3-121.1 |
+| 17 | default | 83.0% | true | ~120.3-121.5 |
+| 11 | ACK/NACK=0 | 47.9% | true | ~120.3 |
+| 17 | ACK/NACK=0 | 56.1% | true | ~120.5 |
+
+Every single N=8 trial run tonight -- 1 fix applied, 5 ACK/NACK
+values, 3 seeds, ~15 total trials -- ended in universal forced entry
+and ~120s task completion. The Phase 1 fix measurably improves wire
+efficiency and reduces permanent DATA loss on the one seed measured in
+detail; it does not change the scenario-level outcome.
+
+### Verdicts
+
+- **Is N=8 healthy? NO.** Forced entry is universal in every trial run
+  tonight, with or without the one kept fix, across every tested
+  ACK/NACK configuration.
+- **Does evidence support moving to N=16? NO.** N=8 itself remains
+  unhealthy; per this investigation's own instruction ("Do NOT jump to
+  N=16 until N=8 is understood and reasonably stable"), N=16 is not
+  warranted yet.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
