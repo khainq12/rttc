@@ -590,6 +590,66 @@ struct LossFunnelRecvEvent
 std::mutex g_loss_funnel_trace_mutex;
 std::vector<LossFunnelSendEvent> g_loss_funnel_send_events;
 std::vector<LossFunnelRecvEvent> g_loss_funnel_recv_events;
+
+// Added for the "TABLE VI N=8 PERMANENT-LOSS RETRANSMISSION CAUSE"
+// investigation (see docs/AUDIT_ACCEPTANCE_TRACKING.md): the send/recv
+// traces above only see DATA frames -- they cannot say WHY a
+// permanently-lost (identity, target) pair's retransmissions stopped.
+// These three trace types make the ACK/NACK side and the retransmit
+// ledger's own lifecycle directly observable, gated behind the SAME
+// loss_funnel_trace_profiling_enabled() flag, purely additive.
+
+// Recorded once per (missing sequence range) at the RECEIVER/subscriber
+// side, at the exact point a fresh AckNackFeedback is constructed (every
+// received frame from a RELIABLE publisher regenerates one reflecting
+// current gap state -- see observe_frame()'s call site) -- i.e. this is
+// "the target's own intent to report this range as missing", independent
+// of whether the resulting UDP send(s) ever arrive.
+struct OutgoingAckNackTraceEvent
+{
+  std::string publisher_id;
+  std::string subscriber_id;
+  std::string robot_id;  // the reporting (target) robot's own id
+  std::string topic;
+  std::uint64_t range_start{0};
+  std::uint64_t range_end{0};
+  std::int64_t wall_ns{0};
+};
+std::vector<OutgoingAckNackTraceEvent> g_outgoing_ack_nack_trace_events;
+
+// Recorded once per (requested range or found sequence) at the SENDER/
+// publisher side, inside handle_ack_nack_feedback(), reusing that
+// function's own already-computed retransmit_sequences/unavailable_ranges
+// -- found_in_ledger=true entries have range_start==range_end (a single
+// sequence this process still holds and will retransmit);
+// found_in_ledger=false entries are the [start,end] gaps the ledger could
+// NOT satisfy for this ack/nack message (Case D evidence when a
+// permanently-lost target's own sequence falls in one of these ranges).
+struct IncomingAckNackTraceEvent
+{
+  std::string publisher_id;
+  std::string subscriber_id;
+  std::string robot_id;  // the reporting (target) robot's own id, from ack_nack->robot_id
+  std::string topic;
+  std::uint64_t range_start{0};
+  std::uint64_t range_end{0};
+  bool found_in_ledger{false};
+  std::int64_t wall_ns{0};
+};
+std::vector<IncomingAckNackTraceEvent> g_incoming_ack_nack_trace_events;
+
+// Recorded at each of g_retransmit_ledger's three erase() call sites,
+// capturing the entry's own identity BEFORE it disappears -- direct proof
+// of Case D (ledger entry already gone) instead of inferring it from
+// absence alone.
+struct RetransmitLedgerErasureTraceEvent
+{
+  std::string publisher_id;
+  std::uint64_t sequence{0};
+  std::string reason;  // "acknowledged" | "lifespan_exceeded" | "capacity_evicted" | "publisher_destroyed"
+  std::int64_t wall_ns{0};
+};
+std::vector<RetransmitLedgerErasureTraceEvent> g_retransmit_ledger_erasure_trace_events;
 // Earlier checkpoint than g_loss_funnel_recv_events: recorded directly in
 // receive_loop() right after recvfrom() returns, BEFORE
 // handle_received_datagram()/reassembly/handle_received_payload()'s
@@ -9299,6 +9359,43 @@ bool handle_ack_nack_feedback(const std::string & encoded_frame)
         unavailable_ranges.emplace_back(cursor, range.second);
       }
     }
+    if (loss_funnel_trace_profiling_enabled()) {
+      // See IncomingAckNackTraceEvent's own doc comment. Reuses
+      // retransmit_frames/unavailable_ranges as already computed above --
+      // no re-derivation, no new lookup logic.
+      const std::int64_t now_ns = monotonic_timestamp_ns();
+      std::vector<IncomingAckNackTraceEvent> new_events;
+      for (const auto & found : retransmit_frames) {
+        IncomingAckNackTraceEvent ie;
+        ie.publisher_id = ack_nack->publisher_id;
+        ie.subscriber_id = ack_nack->subscriber_id;
+        ie.robot_id = ack_nack->robot_id;
+        ie.topic = ack_nack->topic;
+        ie.range_start = found.first;
+        ie.range_end = found.first;
+        ie.found_in_ledger = true;
+        ie.wall_ns = now_ns;
+        new_events.push_back(std::move(ie));
+      }
+      for (const auto & missing : unavailable_ranges) {
+        IncomingAckNackTraceEvent ie;
+        ie.publisher_id = ack_nack->publisher_id;
+        ie.subscriber_id = ack_nack->subscriber_id;
+        ie.robot_id = ack_nack->robot_id;
+        ie.topic = ack_nack->topic;
+        ie.range_start = missing.first;
+        ie.range_end = missing.second;
+        ie.found_in_ledger = false;
+        ie.wall_ns = now_ns;
+        new_events.push_back(std::move(ie));
+      }
+      if (!new_events.empty()) {
+        std::lock_guard<std::mutex> trace_lock(g_loss_funnel_trace_mutex);
+        for (auto & ie : new_events) {
+          g_incoming_ack_nack_trace_events.push_back(std::move(ie));
+        }
+      }
+    }
     if (local_reliable_publisher && !ack_nack->subscriber_id.empty()) {
       loss_notice = rmw_fleetqox_cpp::UnrecoverableLossNotice{
         ack_nack->robot_id,
@@ -12979,6 +13076,17 @@ rmw_ret_t publish_payload(FleetQoxPublisherData * data, const std::vector<std::u
         continue;
       }
       if (entry.acknowledged || frame_exceeds_lifespan(entry.qos, entry.source_timestamp_ns)) {
+        if (loss_funnel_trace_profiling_enabled()) {
+          // See RetransmitLedgerErasureTraceEvent's own doc comment.
+          // Captured BEFORE the move below leaves it->second moved-from.
+          RetransmitLedgerErasureTraceEvent ee;
+          ee.publisher_id = entry.publisher_id;
+          ee.sequence = entry.source_sequence_number;
+          ee.reason = entry.acknowledged ? "acknowledged" : "lifespan_exceeded";
+          ee.wall_ns = monotonic_timestamp_ns();
+          std::lock_guard<std::mutex> trace_lock(g_loss_funnel_trace_mutex);
+          g_retransmit_ledger_erasure_trace_events.push_back(std::move(ee));
+        }
         retire_retransmit_entry_locked(data, std::move(it->second));
         it = g_retransmit_ledger.erase(it);
         continue;
@@ -12999,6 +13107,15 @@ rmw_ret_t publish_payload(FleetQoxPublisherData * data, const std::vector<std::u
       }
       if (oldest == g_retransmit_ledger.end()) {
         break;
+      }
+      if (loss_funnel_trace_profiling_enabled()) {
+        RetransmitLedgerErasureTraceEvent ee;
+        ee.publisher_id = oldest->second.publisher_id;
+        ee.sequence = oldest->second.source_sequence_number;
+        ee.reason = "capacity_evicted";
+        ee.wall_ns = monotonic_timestamp_ns();
+        std::lock_guard<std::mutex> trace_lock(g_loss_funnel_trace_mutex);
+        g_retransmit_ledger_erasure_trace_events.push_back(std::move(ee));
       }
       retire_retransmit_entry_locked(data, std::move(oldest->second));
       g_retransmit_ledger.erase(oldest);
@@ -13238,6 +13355,15 @@ void reliable_retransmit_loop()
       for (auto it = g_retransmit_ledger.begin(); it != g_retransmit_ledger.end();) {
         ReliableRetransmitEntry & entry = it->second;
         if (entry.acknowledged || frame_exceeds_lifespan(entry.qos, entry.source_timestamp_ns)) {
+          if (loss_funnel_trace_profiling_enabled()) {
+            RetransmitLedgerErasureTraceEvent ee;
+            ee.publisher_id = entry.publisher_id;
+            ee.sequence = entry.source_sequence_number;
+            ee.reason = entry.acknowledged ? "acknowledged" : "lifespan_exceeded";
+            ee.wall_ns = monotonic_timestamp_ns();
+            std::lock_guard<std::mutex> trace_lock(g_loss_funnel_trace_mutex);
+            g_retransmit_ledger_erasure_trace_events.push_back(std::move(ee));
+          }
           it = g_retransmit_ledger.erase(it);
           continue;
         }
@@ -14322,6 +14448,33 @@ std::vector<std::string> idle_repair_ack_nacks(FleetQoxSubscriptionData * data)
       continue;
     }
     state.last_repair_request_ns = now;
+    if (loss_funnel_trace_profiling_enabled()) {
+      // See OutgoingAckNackTraceEvent's own doc comment. This is the
+      // IDLE-REPAIR path (triggered from take()/rmw_take() finding an
+      // empty frame_queue, NOT from a newly-received frame) -- the one
+      // that would keep re-requesting a persisting gap on its own timer
+      // (repair_nack_interval_ms(), default 75ms) even if this publisher
+      // never sends this subscriber anything else again.
+      const std::int64_t trace_now_ns = monotonic_timestamp_ns();
+      std::vector<OutgoingAckNackTraceEvent> new_events;
+      for (const auto & range : feedback.missing_sequence_ranges) {
+        OutgoingAckNackTraceEvent oe;
+        oe.publisher_id = marker->publisher_id;
+        oe.subscriber_id = data->endpoint_id;
+        oe.robot_id = local_robot_id();
+        oe.topic = marker->topic;
+        oe.range_start = range.first;
+        oe.range_end = range.second;
+        oe.wall_ns = trace_now_ns;
+        new_events.push_back(std::move(oe));
+      }
+      if (!new_events.empty()) {
+        std::lock_guard<std::mutex> trace_lock(g_loss_funnel_trace_mutex);
+        for (auto & oe : new_events) {
+          g_outgoing_ack_nack_trace_events.push_back(std::move(oe));
+        }
+      }
+    }
     payloads.push_back(
       rmw_fleetqox_cpp::encode_ack_nack(*marker, feedback, data->endpoint_id));
   }
@@ -14792,6 +14945,30 @@ void deliver_decoded_frame_to_subscriptions_locked(
         if (subscription->qos.reliability == RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT) {
           track_best_effort_sequence_gaps_locked(&sequence_state, feedback, receive_ns);
         } else {
+          if (loss_funnel_trace_profiling_enabled() && !feedback.missing_sequence_ranges.empty()) {
+            // See OutgoingAckNackTraceEvent's own doc comment. This is the
+            // per-received-frame path (a NEW frame from this publisher just
+            // arrived, regenerating feedback reflecting CURRENT gap state)
+            // -- distinct from the idle-repair path traced in
+            // idle_repair_ack_nacks(), which fires even without a new frame.
+            const std::int64_t trace_now_ns = monotonic_timestamp_ns();
+            std::vector<OutgoingAckNackTraceEvent> new_events;
+            for (const auto & range : feedback.missing_sequence_ranges) {
+              OutgoingAckNackTraceEvent oe;
+              oe.publisher_id = decoded_frame->publisher_id;
+              oe.subscriber_id = subscription->endpoint_id;
+              oe.robot_id = local_robot_id();
+              oe.topic = decoded_frame->topic;
+              oe.range_start = range.first;
+              oe.range_end = range.second;
+              oe.wall_ns = trace_now_ns;
+              new_events.push_back(std::move(oe));
+            }
+            std::lock_guard<std::mutex> trace_lock(g_loss_funnel_trace_mutex);
+            for (auto & oe : new_events) {
+              g_outgoing_ack_nack_trace_events.push_back(std::move(oe));
+            }
+          }
           const std::string ack_nack_payload = rmw_fleetqox_cpp::encode_ack_nack(
             *decoded_frame, feedback, subscription->endpoint_id);
           ack_nack_payloads.emplace_back(
@@ -15555,6 +15732,77 @@ const char * rmw_fleetqox_cpp_loss_funnel_raw_recvfrom_trace_json()
     built += "{\"source_id\":\"" + loss_funnel_json_escape(event.source_id) + "\",";
     built += "\"source_sequence\":" + std::to_string(event.source_sequence) + ",";
     built += "\"topic\":\"" + loss_funnel_json_escape(event.topic) + "\",";
+    built += "\"wall_ns\":" + std::to_string(event.wall_ns) + "}";
+  }
+  built += "]";
+  json = std::move(built);
+  return json.c_str();
+}
+
+// See OutgoingAckNackTraceEvent's own doc comment.
+const char * rmw_fleetqox_cpp_outgoing_ack_nack_trace_json()
+{
+  static std::string json;
+  std::lock_guard<std::mutex> lock(g_loss_funnel_trace_mutex);
+  std::string built = "[";
+  for (size_t i = 0; i < g_outgoing_ack_nack_trace_events.size(); ++i) {
+    if (i != 0) {
+      built += ",";
+    }
+    const OutgoingAckNackTraceEvent & event = g_outgoing_ack_nack_trace_events[i];
+    built += "{\"publisher_id\":\"" + loss_funnel_json_escape(event.publisher_id) + "\",";
+    built += "\"subscriber_id\":\"" + loss_funnel_json_escape(event.subscriber_id) + "\",";
+    built += "\"robot_id\":\"" + loss_funnel_json_escape(event.robot_id) + "\",";
+    built += "\"topic\":\"" + loss_funnel_json_escape(event.topic) + "\",";
+    built += "\"range_start\":" + std::to_string(event.range_start) + ",";
+    built += "\"range_end\":" + std::to_string(event.range_end) + ",";
+    built += "\"wall_ns\":" + std::to_string(event.wall_ns) + "}";
+  }
+  built += "]";
+  json = std::move(built);
+  return json.c_str();
+}
+
+// See IncomingAckNackTraceEvent's own doc comment.
+const char * rmw_fleetqox_cpp_incoming_ack_nack_trace_json()
+{
+  static std::string json;
+  std::lock_guard<std::mutex> lock(g_loss_funnel_trace_mutex);
+  std::string built = "[";
+  for (size_t i = 0; i < g_incoming_ack_nack_trace_events.size(); ++i) {
+    if (i != 0) {
+      built += ",";
+    }
+    const IncomingAckNackTraceEvent & event = g_incoming_ack_nack_trace_events[i];
+    built += "{\"publisher_id\":\"" + loss_funnel_json_escape(event.publisher_id) + "\",";
+    built += "\"subscriber_id\":\"" + loss_funnel_json_escape(event.subscriber_id) + "\",";
+    built += "\"robot_id\":\"" + loss_funnel_json_escape(event.robot_id) + "\",";
+    built += "\"topic\":\"" + loss_funnel_json_escape(event.topic) + "\",";
+    built += "\"range_start\":" + std::to_string(event.range_start) + ",";
+    built += "\"range_end\":" + std::to_string(event.range_end) + ",";
+    built += "\"found_in_ledger\":";
+    built += event.found_in_ledger ? "true" : "false";
+    built += ",\"wall_ns\":" + std::to_string(event.wall_ns) + "}";
+  }
+  built += "]";
+  json = std::move(built);
+  return json.c_str();
+}
+
+// See RetransmitLedgerErasureTraceEvent's own doc comment.
+const char * rmw_fleetqox_cpp_retransmit_ledger_erasure_trace_json()
+{
+  static std::string json;
+  std::lock_guard<std::mutex> lock(g_loss_funnel_trace_mutex);
+  std::string built = "[";
+  for (size_t i = 0; i < g_retransmit_ledger_erasure_trace_events.size(); ++i) {
+    if (i != 0) {
+      built += ",";
+    }
+    const RetransmitLedgerErasureTraceEvent & event = g_retransmit_ledger_erasure_trace_events[i];
+    built += "{\"publisher_id\":\"" + loss_funnel_json_escape(event.publisher_id) + "\",";
+    built += "\"sequence\":" + std::to_string(event.sequence) + ",";
+    built += "\"reason\":\"" + loss_funnel_json_escape(event.reason) + "\",";
     built += "\"wall_ns\":" + std::to_string(event.wall_ns) + "}";
   }
   built += "]";
@@ -17015,6 +17263,15 @@ rmw_ret_t rmw_destroy_publisher(rmw_node_t * node, rmw_publisher_t * publisher)
       const std::string prefix = data->publisher_id + "|";
       for (auto it = g_retransmit_ledger.begin(); it != g_retransmit_ledger.end();) {
         if (it->first.rfind(prefix, 0) == 0) {
+          if (loss_funnel_trace_profiling_enabled()) {
+            RetransmitLedgerErasureTraceEvent ee;
+            ee.publisher_id = it->second.publisher_id;
+            ee.sequence = it->second.source_sequence_number;
+            ee.reason = "publisher_destroyed";
+            ee.wall_ns = monotonic_timestamp_ns();
+            std::lock_guard<std::mutex> trace_lock(g_loss_funnel_trace_mutex);
+            g_retransmit_ledger_erasure_trace_events.push_back(std::move(ee));
+          }
           it = g_retransmit_ledger.erase(it);
         } else {
           ++it;

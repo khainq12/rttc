@@ -392,10 +392,13 @@ def fleetqox_loss_funnel_trace() -> dict[str, list[dict[str, Any]]]:
     (see that file's docstring for the full rationale) -- reused
     verbatim here for the Table VI investigation rather than
     reinventing a second tracing scheme. Returns {"send": [...],
-    "recv": [...], "raw_recvfrom": [...], "subscription_match": [...]}.
+    "recv": [...], "raw_recvfrom": [...], "subscription_match": [...],
+    "outgoing_ack_nack": [...], "incoming_ack_nack": [...],
+    "retransmit_ledger_erasure": [...]}.
     """
     empty: dict[str, list[dict[str, Any]]] = {
         "send": [], "recv": [], "raw_recvfrom": [], "subscription_match": [],
+        "outgoing_ack_nack": [], "incoming_ack_nack": [], "retransmit_ledger_erasure": [],
     }
     if os.environ.get("RMW_IMPLEMENTATION") != "rmw_fleetqox_cpp":
         return empty
@@ -411,6 +414,11 @@ def fleetqox_loss_funnel_trace() -> dict[str, list[dict[str, Any]]]:
         ("recv", "rmw_fleetqox_cpp_loss_funnel_recv_trace_json"),
         ("raw_recvfrom", "rmw_fleetqox_cpp_loss_funnel_raw_recvfrom_trace_json"),
         ("subscription_match", "rmw_fleetqox_cpp_subscription_match_trace_json"),
+        # Added for the "TABLE VI N=8 PERMANENT-LOSS RETRANSMISSION CAUSE"
+        # investigation (see docs/AUDIT_ACCEPTANCE_TRACKING.md).
+        ("outgoing_ack_nack", "rmw_fleetqox_cpp_outgoing_ack_nack_trace_json"),
+        ("incoming_ack_nack", "rmw_fleetqox_cpp_incoming_ack_nack_trace_json"),
+        ("retransmit_ledger_erasure", "rmw_fleetqox_cpp_retransmit_ledger_erasure_trace_json"),
     ):
         fn = getattr(library, symbol_name)
         fn.restype = ctypes.c_char_p
