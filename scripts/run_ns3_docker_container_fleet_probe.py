@@ -1286,6 +1286,18 @@ class ReferenceTopologyProbe:
         """
         docker("exec", self.rigger_name, "mkdir", "-p", f"/work/{results_dir_container}")
         self._ready_files = [f"{results_dir_container}/ready_{i}" for i in range(len(self.endpoints))]
+        # Measurement-only (see docs/AUDIT_ACCEPTANCE_TRACKING.md, "TABLE
+        # VI POST-READINESS ROOT-CAUSE INVESTIGATION"): a SEPARATE file
+        # from ready_i, written unconditionally by every endpoint right
+        # after its own discovery loop exits, regardless of whether it
+        # converged -- unlike result_i.json, which an INVALID_READINESS
+        # endpoint never reaches (wait_for_ready_then_start() raises
+        # ReadinessFailure and the process is killed before getting
+        # there). Read back by collect_readiness_diagnostics() even on
+        # the invalid-readiness path.
+        self._readiness_diag_files = [
+            f"{results_dir_container}/readiness_diag_{i}.json" for i in range(len(self.endpoints))
+        ]
         self._start_file = f"{results_dir_container}/start"
         order = launch_order if launch_order is not None else list(range(len(self.endpoints)))
         for i in order:
@@ -1392,6 +1404,7 @@ class ReferenceTopologyProbe:
                 f"--expected-peer-count={expected_peer_count}"
                 f"{skip_discovery_wait_flag} "
                 f"--summary-json=/work/{result_json} "
+                f"--discovery-diag-json=/work/{self._readiness_diag_files[i]} "
                 f"--ready-file=/work/{self._ready_files[i]} "
                 f"--start-file=/work/{self._start_file}"
             )
@@ -1487,6 +1500,29 @@ class ReferenceTopologyProbe:
                 json.loads(local_path.read_text()) if local_path.exists() else None
             )
         return endpoint_results
+
+    def collect_readiness_diagnostics(self, results_dir_container: str) -> dict[str, Any]:
+        """Best-effort read-back of every endpoint's --discovery-diag-json
+        (Table VI only -- see launch_coordination_endpoints() and
+        docs/AUDIT_ACCEPTANCE_TRACKING.md, "TABLE VI POST-READINESS
+        ROOT-CAUSE INVESTIGATION"). Unlike collect_results(), this is
+        meaningful to call even after a ReadinessFailure: each endpoint
+        writes its own diag file unconditionally, right after its own
+        discovery loop exits, before the (possibly fatal) --start-file
+        wait -- so a run that never became ready can still yield
+        per-endpoint required/observed/missing PEER IDENTITY data here,
+        where result_i.json would not exist at all. None per-endpoint
+        just means that specific endpoint's container never even reached
+        that point (e.g. crashed earlier, or wasn't launched with this
+        flag by an older caller) -- not itself a reportable finding."""
+        diagnostics: dict[str, Any] = {}
+        for i, endpoint in enumerate(self.endpoints):
+            diag_json = f"{results_dir_container}/readiness_diag_{i}.json"
+            local_path = ROOT / diag_json
+            diagnostics[endpoint] = (
+                json.loads(local_path.read_text()) if local_path.exists() else None
+            )
+        return diagnostics
 
     def ns3_log(self, log_path: str = "/tmp/ns3.log") -> str:
         result = docker("exec", self.ns3sim_name, "cat", log_path, check=False)
@@ -1988,6 +2024,7 @@ def run_coordination_probe(
     status = "ok"
     error_text = ""
     endpoint_results: dict[str, Any] = {}
+    readiness_diagnostics: dict[str, Any] = {}
     ns3_log_text = ""
     try:
         probe.start_containers()
@@ -2033,6 +2070,7 @@ def run_coordination_probe(
         )
         endpoint_results = probe.collect_results(results_dir_container)
         ns3_log_text = probe.ns3_log()
+        readiness_diagnostics = probe.collect_readiness_diagnostics(results_dir_container)
     except ReadinessFailure as exc:
         # A setup/readiness-validity failure, not a coordination-protocol
         # result -- the start gate was never released, so no
@@ -2043,6 +2081,14 @@ def run_coordination_probe(
         error_text = str(exc)
         try:
             ns3_log_text = probe.ns3_log()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            # See collect_readiness_diagnostics()'s docstring -- this is
+            # exactly the case it exists for: result_i.json never gets
+            # written on this path, but each endpoint's own
+            # readiness_diag_i.json still can have been.
+            readiness_diagnostics = probe.collect_readiness_diagnostics(results_dir_container)
         except Exception:  # noqa: BLE001
             pass
     except Exception as exc:  # noqa: BLE001 -- report to caller, don't hide the traceback
@@ -2077,6 +2123,7 @@ def run_coordination_probe(
             max(discovery_convergence_samples_s) if discovery_convergence_samples_s else None
         ),
         "graph_join_failures": compute_graph_join_failures(endpoint_results),
+        "readiness_diagnostics": readiness_diagnostics,
     }
 
 

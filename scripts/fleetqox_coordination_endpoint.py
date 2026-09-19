@@ -245,6 +245,57 @@ def coordination_discovery_converged(
     return True
 
 
+def build_discovery_diagnostic(
+    *,
+    endpoint: str,
+    required_peers: set[str] | frozenset[str],
+    peers_seen: set[str] | frozenset[str],
+    converged: bool,
+    beacon_active: bool,
+    skip_discovery_wait: bool,
+    expected_peer_count: int,
+    discovery_timeout_s: float,
+    discovery_convergence_s: float,
+    peer_first_seen_s: dict[str, float],
+) -> dict[str, Any]:
+    """Measurement-only, IDENTITY-level readiness diagnostic for the
+    Table VI post-readiness root-cause investigation (see
+    docs/AUDIT_ACCEPTANCE_TRACKING.md, "TABLE VI POST-READINESS
+    ROOT-CAUSE INVESTIGATION"). Pure function so the exact
+    missing-peer-identity computation is unit-testable in isolation
+    from rclpy/argparse plumbing -- same pattern as
+    coordination_discovery_converged() above.
+
+    Written to a SEPARATE file (--discovery-diag-json) from
+    --summary-json, and written BEFORE the --start-file wait (which
+    raises RuntimeError, killing the process without ever reaching
+    --summary-json, on any run this endpoint itself judges NOT
+    converged). Without this, an INVALID_READINESS run leaves ZERO
+    artifacts behind for its own endpoints -- confirmed true of every
+    Table VI readiness-failure run so far in this project -- making it
+    impossible to ever ask "which peer identities, specifically, did
+    this endpoint fail to see" after the fact. This function does not
+    itself decide readiness (coordination_discovery_converged() still
+    does that) and does not change control flow -- it only describes,
+    for later inspection, the readiness state at the moment convergence
+    was (or wasn't) reached.
+    """
+    missing = sorted(set(required_peers) - set(peers_seen))
+    return {
+        "endpoint": endpoint,
+        "required_peers": sorted(required_peers),
+        "peers_seen": sorted(peers_seen),
+        "missing_peers": missing,
+        "converged": converged,
+        "beacon_active": beacon_active,
+        "skip_discovery_wait": skip_discovery_wait,
+        "expected_peer_count": expected_peer_count,
+        "discovery_timeout_s": discovery_timeout_s,
+        "discovery_convergence_s": discovery_convergence_s,
+        "peer_first_seen_s": dict(peer_first_seen_s),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--endpoint", required=True)
@@ -285,6 +336,16 @@ def main() -> int:
         "collect all replies (e.g. a peer crashed) doesn't hang the run forever",
     )
     parser.add_argument("--summary-json", type=Path, required=True)
+    parser.add_argument(
+        "--discovery-diag-json",
+        type=Path,
+        default=None,
+        help="measurement-only, written unconditionally right after the discovery loop "
+        "exits (before --start-file, which can kill this process before --summary-json "
+        "is ever written) -- captures required/observed/missing PEER IDENTITIES and "
+        "per-peer first-seen timestamps, for the Table VI post-readiness root-cause "
+        "investigation. Never read by this process itself; purely for offline analysis.",
+    )
     parser.add_argument("--ready-file", type=Path, default=None)
     parser.add_argument("--start-file", type=Path, default=None)
     parser.add_argument("--expected-peer-count", type=int, default=0)
@@ -431,8 +492,21 @@ def main() -> int:
     # rate. Moving the actual publish() out to the main loop fixed it.
     pending_immediate_replies: list[tuple[str, str]] = []
 
+    # Measurement-only, for the Table VI post-readiness root-cause
+    # investigation's Question B (per-message REQUEST/REPLY funnel, see
+    # docs/AUDIT_ACCEPTANCE_TRACKING.md). Every message THIS endpoint
+    # sends -- joined, offline, against every other endpoint's
+    # raw_received_log (which already records what each endpoint
+    # RECEIVED, see on_control_message() below) -- lets a message be
+    # classified as never-generated / send-failed / sent-but-not-received
+    # / received-late, rather than guessed at from aggregate counters
+    # alone. Capped defensively; N=4/num_crossings=5 (the reproducible
+    # case this was written for) needs at most ~30 entries per endpoint.
+    sent_log: list[dict[str, Any]] = []
+
     def send_reply(to: str, req_id: str) -> None:
         debug_counters["replies_sent"] += 1
+        reply_wall_ns = time.time_ns()
         msg = String()
         msg.data = json.dumps(
             {
@@ -440,9 +514,13 @@ def main() -> int:
                 "from": args.endpoint,
                 "to": to,
                 "req_id": req_id,
-                "wall_ns": time.time_ns(),
+                "wall_ns": reply_wall_ns,
             }
         )
+        if len(sent_log) < 2000:
+            sent_log.append(
+                {"type": "reply", "to": to, "req_id": req_id, "wall_ns": reply_wall_ns}
+            )
         safe_publish(reply_pub, msg)
 
     def drain_pending_replies() -> None:
@@ -551,13 +629,21 @@ def main() -> int:
 
     def on_control_message(msg: String) -> None:
         payload = json.loads(msg.data)
-        if len(raw_received_log) < 200:
+        recv_wall_ns = time.time_ns()
+        # Cap raised 200->2000 (measurement-only, see sent_log's comment
+        # above for the sizing rationale) -- 200 was sized for the
+        # aggregate debug_counters investigation this log was originally
+        # added for, not for reconstructing a full per-message funnel,
+        # which needs every receive event, not just the first ~200.
+        if len(raw_received_log) < 2000:
             raw_received_log.append(
                 {
                     "type": payload.get("type"),
                     "from": payload.get("from"),
                     "to": payload.get("to"),
                     "req_id": payload.get("req_id"),
+                    "wall_ns": payload.get("wall_ns"),
+                    "recv_wall_ns": recv_wall_ns,
                 }
             )
         if payload.get("type") == "reply":
@@ -571,6 +657,14 @@ def main() -> int:
     # fleetqox_rmw_trace_endpoint.py, kept for methodological consistency
     # with Bảng IV/V (not required for the mutex protocol itself). ----
     discovery_peers_seen: set[str] = set()
+    # Measurement-only, for build_discovery_diagnostic() below: WHEN
+    # (relative to discovery_start) each peer identity was first
+    # observed -- lets the post-readiness investigation tell apart
+    # "never saw peer X" from "saw peer X only after the deadline had
+    # effectively already been lost" (LATE vs NEVER, see
+    # docs/AUDIT_ACCEPTANCE_TRACKING.md, "TABLE VI POST-READINESS
+    # ROOT-CAUSE INVESTIGATION").
+    discovery_peer_first_seen_monotonic: dict[str, float] = {}
     beacon_pub = None
     if args.expected_peer_count > 0:
         beacon_topic = "/fleetqox_coordination/_discovery_probe"
@@ -583,6 +677,8 @@ def main() -> int:
 
         def on_beacon(msg: String) -> None:
             if msg.data != args.endpoint:
+                if msg.data not in discovery_peers_seen:
+                    discovery_peer_first_seen_monotonic[msg.data] = time.monotonic()
                 discovery_peers_seen.add(msg.data)
 
         node.create_subscription(String, beacon_topic, on_beacon, beacon_qos)
@@ -611,6 +707,36 @@ def main() -> int:
         required_peers=frozenset(peers),
         peers_seen=frozenset(discovery_peers_seen),
     )
+
+    if args.discovery_diag_json:
+        # Written UNCONDITIONALLY here, before --start-file below (which
+        # raises RuntimeError -- killing this process before
+        # --summary-json is ever written -- on any run this endpoint
+        # itself judges not converged). See build_discovery_diagnostic()'s
+        # docstring: without this, an INVALID_READINESS run leaves zero
+        # artifacts behind for its own endpoints.
+        args.discovery_diag_json.parent.mkdir(parents=True, exist_ok=True)
+        args.discovery_diag_json.write_text(
+            json.dumps(
+                build_discovery_diagnostic(
+                    endpoint=args.endpoint,
+                    required_peers=set(peers),
+                    peers_seen=set(discovery_peers_seen),
+                    converged=converged,
+                    beacon_active=beacon_pub is not None,
+                    skip_discovery_wait=args.skip_discovery_wait,
+                    expected_peer_count=args.expected_peer_count,
+                    discovery_timeout_s=args.discovery_timeout_s,
+                    discovery_convergence_s=discovery_convergence_s,
+                    peer_first_seen_s={
+                        peer: round(t - discovery_start, 3)
+                        for peer, t in discovery_peer_first_seen_monotonic.items()
+                    },
+                ),
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
 
     if args.ready_file:
         args.ready_file.parent.mkdir(parents=True, exist_ok=True)
@@ -731,6 +857,16 @@ def main() -> int:
             )
             safe_publish(request_pub, msg)
             debug_counters["requests_sent"] += 1
+            if len(sent_log) < 2000:
+                sent_log.append(
+                    {
+                        "type": "request",
+                        "req_id": current_req_id,
+                        "wall_ns": request_wall_ns,
+                        "crossing_index": crossing_index,
+                        "retry_index": retries_this_crossing,
+                    }
+                )
 
             attempt_deadline = time.monotonic() + args.reply_timeout_s
             while (
@@ -831,6 +967,7 @@ def main() -> int:
         "discovery_expected_peers": args.expected_peer_count,
         "debug_counters": debug_counters,
         "raw_received_log": raw_received_log,
+        "sent_log": sent_log,
     }
     args.summary_json.parent.mkdir(parents=True, exist_ok=True)
     args.summary_json.write_text(json.dumps(result, sort_keys=True), encoding="utf-8")

@@ -1,6 +1,7 @@
 import unittest
 
 from scripts.fleetqox_coordination_endpoint import (
+    build_discovery_diagnostic,
     coordination_discovery_converged,
     wait_until_deadline_while_spinning,
 )
@@ -236,6 +237,104 @@ class CoordinationDiscoveryConvergedReadinessContractTest(unittest.TestCase):
                 peers_seen=frozenset(),
             )
         )
+
+
+class BuildDiscoveryDiagnosticTest(unittest.TestCase):
+    """RED/GREEN for the Table VI post-readiness root-cause investigation
+    (see docs/AUDIT_ACCEPTANCE_TRACKING.md, "TABLE VI POST-READINESS
+    ROOT-CAUSE INVESTIGATION"). build_discovery_diagnostic() is the pure
+    core of a NEW measurement-only diagnostic file
+    (--discovery-diag-json), written unconditionally right after the
+    discovery loop exits -- unlike --summary-json, which an
+    INVALID_READINESS endpoint never reaches. It must report IDENTITIES
+    (not just counts), computing missing_peers itself rather than
+    trusting a caller-supplied value, so a caller cannot accidentally
+    pass mismatched required/missing sets."""
+
+    def test_missing_peers_is_required_minus_seen(self):
+        diag = build_discovery_diagnostic(
+            endpoint="R1",
+            required_peers={"R2", "R3", "R4"},
+            peers_seen={"R2"},
+            converged=False,
+            beacon_active=True,
+            skip_discovery_wait=False,
+            expected_peer_count=3,
+            discovery_timeout_s=15.0,
+            discovery_convergence_s=15.0,
+            peer_first_seen_s={"R2": 0.4},
+        )
+        self.assertEqual(diag["missing_peers"], ["R3", "R4"])
+        self.assertEqual(diag["required_peers"], ["R2", "R3", "R4"])
+        self.assertEqual(diag["peers_seen"], ["R2"])
+        self.assertFalse(diag["converged"])
+
+    def test_full_convergence_has_no_missing_peers(self):
+        diag = build_discovery_diagnostic(
+            endpoint="R1",
+            required_peers={"R2", "R3"},
+            peers_seen={"R2", "R3"},
+            converged=True,
+            beacon_active=True,
+            skip_discovery_wait=False,
+            expected_peer_count=2,
+            discovery_timeout_s=15.0,
+            discovery_convergence_s=1.2,
+            peer_first_seen_s={"R2": 0.1, "R3": 1.2},
+        )
+        self.assertEqual(diag["missing_peers"], [])
+        self.assertTrue(diag["converged"])
+
+    def test_correct_count_wrong_identity_reports_the_real_missing_name(self):
+        # Same CASE G scenario as
+        # CoordinationDiscoveryConvergedReadinessContractTest -- the
+        # diagnostic must surface WHICH identity was actually missing
+        # (R4), not just that the count matched.
+        diag = build_discovery_diagnostic(
+            endpoint="R1",
+            required_peers={"R2", "R3", "R4"},
+            peers_seen={"R2", "R3", "unrelated_peer"},
+            converged=False,
+            beacon_active=True,
+            skip_discovery_wait=False,
+            expected_peer_count=3,
+            discovery_timeout_s=15.0,
+            discovery_convergence_s=15.0,
+            peer_first_seen_s={"R2": 0.2, "R3": 0.3, "unrelated_peer": 0.5},
+        )
+        self.assertEqual(diag["missing_peers"], ["R4"])
+
+    def test_peer_first_seen_s_is_passed_through_unmodified(self):
+        diag = build_discovery_diagnostic(
+            endpoint="R1",
+            required_peers={"R2"},
+            peers_seen={"R2"},
+            converged=True,
+            beacon_active=True,
+            skip_discovery_wait=False,
+            expected_peer_count=1,
+            discovery_timeout_s=15.0,
+            discovery_convergence_s=0.05,
+            peer_first_seen_s={"R2": 0.05},
+        )
+        self.assertEqual(diag["peer_first_seen_s"], {"R2": 0.05})
+
+    def test_result_is_json_serializable(self):
+        import json
+
+        diag = build_discovery_diagnostic(
+            endpoint="R1",
+            required_peers={"R2", "R3"},
+            peers_seen=set(),
+            converged=False,
+            beacon_active=True,
+            skip_discovery_wait=False,
+            expected_peer_count=2,
+            discovery_timeout_s=15.0,
+            discovery_convergence_s=15.0,
+            peer_first_seen_s={},
+        )
+        json.dumps(diag, sort_keys=True)  # must not raise
 
 
 if __name__ == "__main__":
