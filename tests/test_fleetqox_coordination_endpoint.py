@@ -1,6 +1,9 @@
 import unittest
 
-from scripts.fleetqox_coordination_endpoint import wait_until_deadline_while_spinning
+from scripts.fleetqox_coordination_endpoint import (
+    coordination_discovery_converged,
+    wait_until_deadline_while_spinning,
+)
 
 
 class WaitUntilDeadlineWhileSpinningTest(unittest.TestCase):
@@ -102,6 +105,137 @@ class WaitUntilDeadlineWhileSpinningTest(unittest.TestCase):
         )
         self.assertEqual(spin_calls, [])
         self.assertEqual(drain_calls, [])
+
+
+class CoordinationDiscoveryConvergedReadinessContractTest(unittest.TestCase):
+    """RED/GREEN for Table VI's own independent false-ready bug (see
+    docs/AUDIT_ACCEPTANCE_TRACKING.md, "TABLE VI READINESS CORRECTNESS
+    FIX"): fleetqox_coordination_endpoint.py had a structurally
+    IDENTICAL bug to the one already fixed in
+    fleetqox_rmw_trace_endpoint.py, in its own separate copy of the
+    discovery loop -- args.ready_file.touch() ran unconditionally after
+    the loop regardless of whether it exited via genuine convergence or
+    via --discovery-timeout-s expiring.
+
+    Unlike the Table IV/V fix, this one can and should check PEER
+    IDENTITY, not just a count: discovery_peers_seen already collects
+    NAMES (each endpoint publishes its own args.endpoint as the beacon
+    payload), and the required peer set (--peers, already excludes self
+    by construction in the orchestrator's peers_env) is available too --
+    so "correct count, wrong identity" (CASE G) can be told apart from
+    genuine convergence, which a pure count check could not do.
+    """
+
+    def test_case_a_all_required_peers_seen_is_converged(self):
+        self.assertTrue(
+            coordination_discovery_converged(
+                skip_discovery_wait=False,
+                beacon_active=True,
+                required_peers=frozenset({"R2", "R3", "R4"}),
+                peers_seen=frozenset({"R2", "R3", "R4"}),
+            )
+        )
+
+    def test_case_b_missing_one_required_peer_is_not_converged(self):
+        self.assertFalse(
+            coordination_discovery_converged(
+                skip_discovery_wait=False,
+                beacon_active=True,
+                required_peers=frozenset({"R2", "R3", "R4"}),
+                peers_seen=frozenset({"R2", "R3"}),
+            )
+        )
+
+    def test_case_c_zero_peers_is_not_converged(self):
+        self.assertFalse(
+            coordination_discovery_converged(
+                skip_discovery_wait=False,
+                beacon_active=True,
+                required_peers=frozenset({"R2", "R3", "R4"}),
+                peers_seen=frozenset(),
+            )
+        )
+
+    def test_case_d_progressive_convergence_reaches_ready(self):
+        required = frozenset({"R2", "R3", "R4"})
+        # Modeled as 3 successive evaluations of the same pure function
+        # against a growing peers_seen set -- discovery_converged() has
+        # no memory of "when", only "what was seen so far", which is
+        # exactly why it's safe to unit test without a real clock.
+        self.assertFalse(
+            coordination_discovery_converged(
+                skip_discovery_wait=False, beacon_active=True,
+                required_peers=required, peers_seen=frozenset({"R2"}),
+            )
+        )
+        self.assertFalse(
+            coordination_discovery_converged(
+                skip_discovery_wait=False, beacon_active=True,
+                required_peers=required, peers_seen=frozenset({"R2", "R3"}),
+            )
+        )
+        self.assertTrue(
+            coordination_discovery_converged(
+                skip_discovery_wait=False, beacon_active=True,
+                required_peers=required, peers_seen=frozenset({"R2", "R3", "R4"}),
+            )
+        )
+
+    def test_case_e_convergence_evaluated_at_timeout_missing_one_stays_invalid(self):
+        # The exact "convergence after timeout" scenario: if the decision
+        # is evaluated (as the real loop does, once, at the moment the
+        # deadline fires) while R4 is still missing, it must be
+        # INVALID -- a peer that shows up a moment later must not
+        # retroactively rewrite an already-made decision. This function
+        # being pure/stateless is exactly what guarantees that: it only
+        # ever sees the snapshot it's given.
+        self.assertFalse(
+            coordination_discovery_converged(
+                skip_discovery_wait=False,
+                beacon_active=True,
+                required_peers=frozenset({"R2", "R3", "R4"}),
+                peers_seen=frozenset({"R2", "R3"}),
+            )
+        )
+
+    def test_case_f_required_peers_never_include_self_by_construction(self):
+        # For N=4, R1's required set is {R2,R3,R4} -- R1 is simply never
+        # a member of either set passed in (guaranteed upstream by the
+        # orchestrator's peers_env = "every OTHER endpoint", unchanged by
+        # this fix). The function itself needs no special-casing for
+        # self-exclusion; this test documents that contract.
+        self.assertTrue(
+            coordination_discovery_converged(
+                skip_discovery_wait=False,
+                beacon_active=True,
+                required_peers=frozenset({"R2", "R3", "R4"}),
+                peers_seen=frozenset({"R2", "R3", "R4"}),
+            )
+        )
+
+    def test_case_g_correct_count_wrong_identity_is_not_converged(self):
+        # 3 required, 3 seen -- a COUNT-only check would wrongly pass
+        # this. Identity-based checking correctly rejects it because R4
+        # itself was never actually seen.
+        self.assertFalse(
+            coordination_discovery_converged(
+                skip_discovery_wait=False,
+                beacon_active=True,
+                required_peers=frozenset({"R2", "R3", "R4"}),
+                peers_seen=frozenset({"R2", "R3", "unrelated_peer"}),
+            )
+        )
+
+    def test_skip_discovery_wait_is_always_converged(self):
+        # FleetRMW's static-mode contract, unaffected by this fix.
+        self.assertTrue(
+            coordination_discovery_converged(
+                skip_discovery_wait=True,
+                beacon_active=False,
+                required_peers=frozenset(),
+                peers_seen=frozenset(),
+            )
+        )
 
 
 if __name__ == "__main__":
