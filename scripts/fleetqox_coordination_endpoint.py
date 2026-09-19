@@ -349,6 +349,28 @@ def fleetqox_stream_identity_diagnostics() -> dict[str, Any]:
         ("duplicate_data_frames_deduped", "rmw_fleetqox_cpp_duplicate_data_frames_deduped", ctypes.c_uint64),
         ("out_of_order_data_frames_observed", "rmw_fleetqox_cpp_out_of_order_data_frames_observed", ctypes.c_uint64),
         ("socket_bound_endpoint", "rmw_fleetqox_cpp_socket_bound_endpoint", ctypes.c_char_p),
+        # Added for the "TABLE VI N=8 ACK/NACK-VS-DATA-RETRANSMISSION
+        # INDEPENDENCE" investigation (see
+        # docs/AUDIT_ACCEPTANCE_TRACKING.md): both symbols already existed
+        # and were already exposed to fleetqox_rmw_trace_endpoint.py's own
+        # fleetqox_transport_metrics() (Table IV/V) -- reusing the exact
+        # same, already-built accessors here rather than adding new C++,
+        # just exposing them from this endpoint script too.
+        # nack_retransmissions: socket_transport().send_retransmission_frame()
+        # call count, triggered when a received ACK/NACK's
+        # missing_sequence_ranges names a sequence this sender still has in
+        # g_retransmit_ledger -- the actual DATA-frame transport-retry path
+        # active in this scenario.
+        # reliable_timeout_retransmissions: the SEPARATE periodic
+        # reliable_retransmit_loop() path, gated by
+        # FLEETQOX_RMW_RELIABLE_ACK_TIMEOUT_MS (default 0 = disabled) --
+        # read back here to CONFIRM it stays 0, not assume it from the
+        # env var default alone.
+        ("nack_retransmissions", "rmw_fleetqox_cpp_socket_nack_retransmissions", ctypes.c_uint64),
+        (
+            "reliable_timeout_retransmissions",
+            "rmw_fleetqox_cpp_socket_reliable_timeout_retransmissions", ctypes.c_uint64,
+        ),
     ):
         try:
             fn = getattr(library, symbol_name)
