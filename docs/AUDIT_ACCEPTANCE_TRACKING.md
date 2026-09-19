@@ -14360,6 +14360,140 @@ outcomes.py` (new). Raw output: `results_rmw_socket/
 table6_n8_retransmission_feedback_loop/retransmission_loop_
 outcomes.json` (gitignored).
 
+## TABLE VI N=8 PERMANENT-LOSS RETRANSMISSION CAUSE -- DIRECTLY TRACED
+
+Measurement-only, N=8 seed=7, default config. Question: for the ~77%
+of `(DATA identity, target)` pairs that never recover (see the section
+above), why do retries stop? Implements that section's "exactly one
+next step" via direct tracing rather than the earlier timing-proxy
+heuristic.
+
+### Instrumentation (additive only)
+
+Three new trace types in `rmw_pubsub.cpp`, all gated behind the
+already-existing `loss_funnel_trace_profiling_enabled()` flag:
+- **`OutgoingAckNackTraceEvent`** -- receiver/subscriber side, once per
+  missing-sequence-range, at BOTH the per-received-frame site
+  (`observe_frame()`'s call site, fires when a NEW frame arrives) and
+  the idle-repair site (`idle_repair_ack_nacks()`, a ~75ms-default
+  periodic re-request that fires from `take()` finding an empty
+  queue -- active even with no new frame arriving).
+- **`IncomingAckNackTraceEvent`** -- sender/publisher side, inside
+  `handle_ack_nack_feedback()`, reusing that function's own
+  already-computed `retransmit_frames` (`found_in_ledger=true`) and
+  `unavailable_ranges` (`found_in_ledger=false`) -- no new lookup
+  logic, just observing what the existing logic already decided.
+- **`RetransmitLedgerErasureTraceEvent`** -- at every reachable
+  `g_retransmit_ledger.erase()` site, with the exact reason
+  (`acknowledged` / `lifespan_exceeded` / `capacity_evicted` /
+  `publisher_destroyed`).
+
+Re-verified full pytest suite (835 passed / 8 pre-existing unrelated
+failures) after the rebuild. No ACK/NACK count, retry/timeout, QoS,
+ns-3, broadcast, or production behavior changed.
+
+### Method
+
+For every never-delivered `(identity, target)` pair (reusing the exact
+round-clustering from the sections above), take the final DATA
+retransmission's own `wall_ns` as the cutoff, then check, in priority
+order (most direct evidence first):
+1. **A** -- an `incoming_ack_nack` event at the sender, from this exact
+   target, naming this exact sequence, `found_in_ledger=true`, AFTER
+   the cutoff.
+2. **D** -- same, but `found_in_ledger=false` (sender received it,
+   ledger no longer had it).
+3. **B** -- the target's OWN `outgoing_ack_nack` trace names this exact
+   sequence after the cutoff, but no matching `incoming_ack_nack`
+   exists at the sender.
+4. **C** -- the target never names this exact sequence in its
+   `outgoing_ack_nack` trace again, at all, after the cutoff.
+5. **E** -- none of the above cleanly applies.
+
+### 1. A/B/C/D/E counts and %
+
+| Class | Count | % |
+|---|---:|---:|
+| A -- sender saw a further NACK, ledger still had it, nothing happened | 0 | 0.0% |
+| B -- target re-NACKed, sender never received it | 446 | 10.83% |
+| **C -- target never named this sequence again** | **3,106** | **75.42%** |
+| D -- sender saw a further NACK, ledger no longer had it | 566 | 13.74% |
+| E -- ambiguous | 0 | 0.0% |
+| Total never-delivered pairs | 4,118 | 100% |
+
+### 2. Dominant mechanism: C
+
+**The receiver stops naming the missing sequence in its own ACK/NACK
+feedback, not because it goes silent, but because its own gap-tracking
+"ages out" old individual gaps while continuing to report newer
+ones on the same stream.** Breaking down the 3,107 pairs where the
+target's own trace shows no further mention of this exact sequence:
+- **565 (18.2%)**: the target goes completely silent about this
+  publisher (zero further `outgoing_ack_nack` events of ANY sequence)
+  -- consistent with that specific receiver stalling out entirely.
+- **2,542 (81.8%)**: the target KEEPS actively reporting OTHER missing
+  sequences on the exact same stream (in one sampled case, 267 further
+  outgoing events after the cutoff) but never again mentions this
+  specific one -- direct proof that this is a receiver-side
+  gap-reporting/tracking behavior, not a dead receiver.
+
+### 3. Exact permanent-loss example
+
+Sender `control_station`, `source_sequence=26`, topic
+`/fleetqox_coordination/control`, target `robot_0007`. Never
+retransmitted at all (0 retransmission rounds -- lost on the original
+send, `ATTEMPT_SUCCESS` at the sender's own socket). `robot_0007`
+continued sending 267 further `outgoing_ack_nack` events naming OTHER
+missing sequences from this same publisher over the following ~48
+seconds (ranges like `7-21`, `9-23`, `13`, `15`, `17`, `19-21`, `25` --
+note `25` is reported at the very end while the numerically-adjacent
+`26` never is again) -- yet not one of those 267 events ever names
+sequence 26 again. `robot_0007` never decoded sequence 26 at any point
+in the run.
+
+### 4. Ledger-entry status
+
+For this exact example: no `retransmit_ledger_erasure` event exists
+for `(fpubcpp-0.0.0.0:9100-3, 26)` -- the entry was never explicitly
+erased in the trace (not acknowledged, not lifespan-expired, not
+capacity-evicted, publisher never destroyed mid-run). Combined with
+zero further incoming NACKs naming it, this means the entry most
+likely just sits in `g_retransmit_ledger` for the rest of the run,
+functionally unreachable -- nobody ever asks about it again to
+trigger a lookup. (Separately, D -- confirmed ledger erasure -- is the
+proven cause for 13.74% of pairs; this example is not one of them.)
+
+### 5. Proven causal chain (plain text)
+
+The sender broadcasts a DATA frame; most targets under N=8's
+already-established heavy Wi-Fi loss never receive it. A receiver's
+own `observe_frame()`/idle-repair logic detects the resulting gap and
+reports it via ACK/NACK, prompting the sender to retransmit from its
+`g_retransmit_ledger` (proven in the section above). For the large
+majority of pairs that never recover, the receiver's OWN missing-
+sequence bookkeeping stops naming that specific gap in later feedback
+-- even while the SAME receiver keeps actively reporting newer gaps on
+the identical stream -- so no further NACK ever arrives at the sender
+to trigger another retransmission. The sender's ledger and retry logic
+are not the bottleneck here (A never occurs; D is a real but minority
+contributor at 13.74%); the receiver's own gap-reporting silently
+drops the specific sequence from what it keeps asking for.
+
+### 6. Exactly one next step (not implemented)
+
+Locate and instrument the exact mechanism inside `observe_frame()`/
+`feedback_from_sequence_state()` that causes an individual missing
+sequence to stop appearing in `AckNackFeedback.missing_sequence_ranges`
+over time (e.g. a bounded gap-list size, or `lowest_observed_sequence`
+advancing past it) -- this pass proved THAT it happens and how often,
+not the internal rule that decides WHICH gaps get dropped and when.
+
+**Files changed**: `ros2_ws/src/rmw_fleetqox_cpp/src/rmw_pubsub.cpp`
+(additive: 3 new trace types), `scripts/fleetqox_coordination_
+endpoint.py` (additive: exposes the 3 new trace types), `scripts/
+investigate_table6_n8_permanent_loss_cause.py` (new). Raw output:
+`results_rmw_socket/table6_n8_permanent_loss_cause/` (gitignored).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
