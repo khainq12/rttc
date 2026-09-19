@@ -620,6 +620,22 @@ struct SubscriptionMatchTraceEvent
   std::string frame_partitions_csv;
   std::size_t matched_subscriptions{0};
   std::int64_t wall_ns{0};
+  // Added for the "TABLE VI N=8 POST-RECVFROM DUPLICATE-DROP
+  // LOCALIZATION" investigation (see docs/AUDIT_ACCEPTANCE_TRACKING.md):
+  // source_id above is publisher_id ONLY -- proven identical across
+  // every sender in a benchmark run by construction
+  // (allocate_publisher_id() derives it from this process's own LOCAL
+  // bind address + a per-process counter, not from robot_id), so it
+  // alone cannot say WHICH sender a given event belongs to. robot_id
+  // completes the full stream_key() identity. payload_text is the
+  // decoded application payload verbatim (capped, see the recording
+  // site) so two events sharing the exact same (robot_id, topic,
+  // publisher_id, source_sequence) identity can be checked for
+  // byte-identical content without any new decode step -- purely
+  // observational, gated by the same loss_funnel_trace_profiling_enabled()
+  // flag as every other field here, adds no cost when disabled.
+  std::string robot_id;
+  std::string payload_text;
 };
 std::vector<SubscriptionMatchTraceEvent> g_subscription_match_trace_events;
 
@@ -14885,6 +14901,22 @@ void enqueue_received_frame(const std::string & encoded_frame)
     match_event.frame_partitions_csv = decoded_frame->partitions_csv;
     match_event.matched_subscriptions = matched_subscriptions;
     match_event.wall_ns = monotonic_timestamp_ns();
+    // robot_id completes the identity that source_id (publisher_id
+    // alone) cannot: every sender in a benchmark run shares the same
+    // publisher_id text (see allocate_publisher_id()), so without this
+    // two frames from different robots with the same sequence number
+    // would be indistinguishable here. payload_text is capped well
+    // below any real message size purely so a pathological future
+    // payload can't bloat this trace buffer; it is not a correctness
+    // boundary for this decode.
+    match_event.robot_id = decoded_frame->robot_id;
+    {
+      const std::size_t payload_cap =
+        std::min<std::size_t>(decoded_frame->serialized_payload.size(), 512);
+      match_event.payload_text = std::string(
+        decoded_frame->serialized_payload.begin(),
+        decoded_frame->serialized_payload.begin() + payload_cap);
+    }
     std::lock_guard<std::mutex> trace_lock(g_loss_funnel_trace_mutex);
     g_subscription_match_trace_events.push_back(std::move(match_event));
   }
@@ -15490,7 +15522,9 @@ const char * rmw_fleetqox_cpp_subscription_match_trace_json()
     built += "\"frame_partitions_csv\":\"" +
       loss_funnel_json_escape(event.frame_partitions_csv) + "\",";
     built += "\"matched_subscriptions\":" + std::to_string(event.matched_subscriptions) + ",";
-    built += "\"wall_ns\":" + std::to_string(event.wall_ns) + "}";
+    built += "\"wall_ns\":" + std::to_string(event.wall_ns) + ",";
+    built += "\"robot_id\":\"" + loss_funnel_json_escape(event.robot_id) + "\",";
+    built += "\"payload\":\"" + loss_funnel_json_escape(event.payload_text) + "\"}";
   }
   built += "]";
   json = std::move(built);
