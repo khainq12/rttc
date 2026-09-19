@@ -529,6 +529,19 @@ def container_pid(name: str) -> int:
     return int(pid_text)
 
 
+class ReadinessFailure(RuntimeError):
+    """Raised by wait_for_ready_then_start() when one or more endpoints'
+    ready-file reports "invalid_readiness" -- required convergence was
+    not reached within --discovery-timeout-s (see
+    fleetqox_rmw_trace_endpoint.py's discovery_converged()). This is a
+    setup/infrastructure-validity failure, not a data-plane delivery
+    result: the measured workload's start gate is never released, so no
+    application messages were ever sent. Callers must not report a run
+    that raises this as "0% delivery" -- see
+    docs/AUDIT_ACCEPTANCE_TRACKING.md, "ZENOH FALSE-READY HARNESS FIX
+    AND VALIDATION"."""
+
+
 def rigger_run(rigger_name: str, script: str, *, check: bool = True) -> subprocess.CompletedProcess:
     """Run `script` as root inside the rigger container. Every network-
     namespace-touching command in this file goes through here, NEVER
@@ -1387,12 +1400,37 @@ class ReferenceTopologyProbe:
 
     def wait_for_ready_then_start(self, ready_deadline_s: float) -> None:
         """Poll (via the rigger, which already has /work mounted) until
-        every endpoint's ready-file exists, then touch the shared start
-        file to release them all together."""
+        every endpoint's ready-file exists AND contains "ready" (content,
+        not mere existence -- see the false-ready benchmark-correctness
+        fix in docs/AUDIT_ACCEPTANCE_TRACKING.md, "ZENOH FALSE-READY
+        HARNESS FIX AND VALIDATION"), then touch the shared start file to
+        release them all together. Raises ReadinessFailure immediately
+        (rather than waiting out the full deadline) the moment ANY
+        endpoint's ready-file instead contains "invalid_readiness" --
+        required convergence was not achieved within
+        --discovery-timeout-s for that endpoint, so this run never had a
+        valid start condition and the measured workload must not be
+        silently entered."""
         deadline = time.monotonic() + ready_deadline_s
-        checks = " && ".join(f"[ -f /work/{f} ]" for f in self._ready_files)
+        ready_checks = " && ".join(
+            f'[ "$(cat /work/{f} 2>/dev/null)" = ready ]' for f in self._ready_files
+        )
+        invalid_checks = " || ".join(
+            f"grep -q invalid_readiness /work/{f} 2>/dev/null" for f in self._ready_files
+        )
+        poll_cmd = (
+            f"if {invalid_checks}; then echo INVALID_READINESS; "
+            f"elif {ready_checks}; then echo ALL_READY; fi"
+        )
         while time.monotonic() < deadline:
-            result = rigger_run(self.rigger_name, f"{checks} && echo ALL_READY", check=False)
+            result = rigger_run(self.rigger_name, poll_cmd, check=False)
+            if "INVALID_READINESS" in result.stdout:
+                raise ReadinessFailure(
+                    "one or more endpoints reported invalid_readiness "
+                    "(required convergence not reached within "
+                    "--discovery-timeout-s) -- run is invalid, not a 0% "
+                    "delivery measurement"
+                )
             if "ALL_READY" in result.stdout:
                 rigger_run(self.rigger_name, f"touch /work/{self._start_file}")
                 return
@@ -2147,6 +2185,13 @@ def run_lan_probe(
             results_dir_container=results_dir_container,
         )
         endpoint_results = probe.collect_results(results_dir_container)
+    except ReadinessFailure as exc:
+        # A setup/infrastructure-validity failure, not a data-plane
+        # delivery result -- the start gate was never released, so no
+        # application message was ever sent. Must not be reported or
+        # aggregated as "0% delivery" (see ReadinessFailure's docstring).
+        status = "invalid_readiness"
+        error_text = str(exc)
     except Exception as exc:  # noqa: BLE001 -- report to caller, don't hide the traceback
         status = "failed"
         error_text = str(exc)

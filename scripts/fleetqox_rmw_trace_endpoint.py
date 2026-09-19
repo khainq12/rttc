@@ -370,6 +370,50 @@ def compute_receive_capable_deadline_s(
     return (last_event_ms + start_offset_ms) / 1000.0 + drain_s
 
 
+def discovery_converged(
+    *,
+    skip_discovery_wait: bool,
+    beacon_active: bool,
+    peers_seen: int,
+    expected_peer_count: int,
+    subscription_fallback_ok: bool,
+) -> bool:
+    """The readiness CONTRACT --ready-file is allowed to promise: READY
+    only if the required convergence condition has actually been
+    satisfied, never merely because --discovery-timeout-s elapsed.
+
+    Fixes the false-ready benchmark-correctness bug found via the Zenoh
+    LAN N=16 variance investigation (see
+    docs/AUDIT_ACCEPTANCE_TRACKING.md, "ZENOH FALSE-READY HARNESS FIX
+    AND VALIDATION"): the discovery loop in main() used to fall through
+    to `args.ready_file.touch()` unconditionally after exiting, whether
+    it exited because convergence was reached OR because the deadline
+    was hit first -- so an endpoint that saw e.g. 1 of 16 expected peers
+    at timeout was marked ready exactly the same as one that saw all 16.
+    This function is the single place that now decides READY vs not,
+    extracted as a pure function (no clock, no rclpy) so the decision
+    itself is directly unit-testable.
+
+    - skip_discovery_wait=True (FleetRMW's static-mode contract, see
+      --skip-discovery-wait): this endpoint never entered the discovery
+      loop at all by design -- unaffected by this fix, always converged.
+    - beacon_active=True (Fast DDS/CycloneDDS/Zenoh, expected_peer_count>0):
+      converged only if this endpoint's beacon actually observed
+      peers_seen >= expected_peer_count distinct senders before the
+      deadline. A timeout that never reaches this is NOT convergence.
+    - beacon_active=False (the pub.get_subscription_count() fallback,
+      only reachable when expected_peer_count==0 and
+      skip_discovery_wait==False -- not exercised by any current caller,
+      kept for completeness): converged only if subscription_fallback_ok
+      is True.
+    """
+    if skip_discovery_wait:
+        return True
+    if beacon_active:
+        return peers_seen >= expected_peer_count
+    return subscription_fallback_ok
+
+
 def build_payload(row: dict[str, str], target_bytes: int) -> str:
     """Wire payload for one trace row.
 
@@ -755,6 +799,7 @@ def main() -> int:
     discovery_start = time.monotonic()
     discovery_deadline = discovery_start + args.discovery_timeout_s
     last_beacon_sent = 0.0
+    subscription_fallback_converged = False
     if not args.skip_discovery_wait:
         while time.monotonic() < discovery_deadline:
             if beacon_pub is not None:
@@ -782,8 +827,16 @@ def main() -> int:
             elif not publishers or all(
                 pub.get_subscription_count() > 0 for pub in publishers.values()
             ):
+                subscription_fallback_converged = True
                 break
     discovery_convergence_s = time.monotonic() - discovery_start
+    converged = discovery_converged(
+        skip_discovery_wait=args.skip_discovery_wait,
+        beacon_active=beacon_pub is not None,
+        peers_seen=len(discovery_peers_seen),
+        expected_peer_count=args.expected_peer_count,
+        subscription_fallback_ok=subscription_fallback_converged,
+    )
     if beacon_pub is not None and len(discovery_peers_seen) < args.expected_peer_count:
         # TEMPORARY diagnostic for the "last-launched endpoint never sees
         # any beacon" investigation (docs/AUDIT_ACCEPTANCE_TRACKING.md) --
@@ -804,7 +857,18 @@ def main() -> int:
 
     if args.ready_file:
         args.ready_file.parent.mkdir(parents=True, exist_ok=True)
-        args.ready_file.touch()
+        # Content, not mere existence, is now the readiness signal (see
+        # discovery_converged()'s docstring for the bug this fixes): a
+        # timeout that never reached convergence writes
+        # "invalid_readiness" instead of "ready", so an orchestrator that
+        # checks CONTENT (run_ns3_docker_container_fleet_probe.py's
+        # wait_for_ready_then_start(), updated alongside this) can tell
+        # a genuine readiness failure apart from real success instead of
+        # treating file-exists as proof either way. An orchestrator that
+        # still only checks existence (e.g. run_ns3_docker_wifi_tap_rmw_probe.py,
+        # not touched by this fix) sees no behavior change at all -- the
+        # file exists exactly when it always did.
+        args.ready_file.write_text("ready\n" if converged else "invalid_readiness\n")
     if args.start_file:
         start_deadline = time.monotonic() + args.start_wait_timeout_s
         while time.monotonic() < start_deadline and not args.start_file.exists():
