@@ -156,8 +156,10 @@ def classify(payload: bytes) -> str:
     return "UNKNOWN"
 
 
-def run_one(label: str, redundant_count_env: str | None, output_root: Path) -> dict[str, Any]:
-    output_dir = (output_root / f"fleetrmw_n{NUM_ROBOTS}_seed{SEED}_{label}").resolve()
+def run_one(
+    label: str, redundant_count_env: str | None, output_root: Path, seed: int = SEED,
+) -> dict[str, Any]:
+    output_dir = (output_root / f"fleetrmw_n{NUM_ROBOTS}_seed{seed}_{label}").resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     run_id = output_dir.name.lstrip(".")
     results_dir_container = f"{output_dir.relative_to(ROOT)}/container_results"
@@ -198,7 +200,7 @@ def run_one(label: str, redundant_count_env: str | None, output_root: Path) -> d
                          mobility_speed=0.0, ns3_seed=1, ns3_run=1)
         probe.launch_coordination_endpoints(
             num_crossings=5, crossing_duration_ms=300.0, reply_timeout_s=5.0,
-            defer_release_timeout_s=8.0, priority_mode="lamport", seed=SEED,
+            defer_release_timeout_s=8.0, priority_mode="lamport", seed=seed,
             start_offset_ms=2000.0, discovery_timeout_s=15.0,
             start_wait_timeout_s=start_wait_timeout_s, scenario_timeout_s=120.0,
             results_dir_container=results_dir_container, rmw_implementation="rmw_fleetqox_cpp",
@@ -239,6 +241,7 @@ def run_one(label: str, redundant_count_env: str | None, output_root: Path) -> d
 
     return {
         "label": label,
+        "seed": seed,
         "redundant_count_env": redundant_count_env,
         "status": status,
         "error": error_text,
@@ -303,6 +306,7 @@ def summarize(run: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "label": run["label"],
+        "seed": run["seed"],
         "redundant_count_env": run["redundant_count_env"],
         "status": run["status"],
         "traffic_composition": {
@@ -325,15 +329,37 @@ def summarize(run: dict[str, Any]) -> dict[str, Any]:
 
 
 def main() -> int:
-    output_root = ROOT / "results_rmw_socket" / "table6_n8_acknack_ab_experiment"
-    summaries = []
-    for label, redundant_count_env in RUNS:
-        run = run_one(label, redundant_count_env, output_root)
-        summary = summarize(run)
-        summaries.append(summary)
-        print(json.dumps({k: summary[k] for k in ("label", "status", "total_packets")}), flush=True)
+    import argparse
 
-    summary_path = output_root / "ab_summary.json"
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--seeds", type=int, nargs="+", default=[SEED],
+        help="one A1/B/A2 sequence run per seed listed (default: just the "
+        "original seed=7, preserving this script's original single-seed "
+        "invocation exactly).",
+    )
+    parser.add_argument(
+        "--output-root", type=Path,
+        default=ROOT / "results_rmw_socket" / "table6_n8_acknack_ab_experiment",
+    )
+    args = parser.parse_args()
+
+    summaries = []
+    for seed in args.seeds:
+        output_root = (
+            args.output_root if seed == SEED
+            else args.output_root.parent / f"{args.output_root.name}_seed{seed}"
+        )
+        for label, redundant_count_env in RUNS:
+            run = run_one(label, redundant_count_env, output_root, seed=seed)
+            summary = summarize(run)
+            summaries.append(summary)
+            print(
+                json.dumps({k: summary[k] for k in ("label", "seed", "status", "total_packets")}),
+                flush=True,
+            )
+
+    summary_path = args.output_root.parent / "table6_n8_acknack_ab_multiseed_summary.json"
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.write_text(json.dumps(summaries, indent=2, sort_keys=True), encoding="utf-8")
     print(f"Wrote {summary_path}", flush=True)
