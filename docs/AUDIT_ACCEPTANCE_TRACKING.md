@@ -14494,6 +14494,163 @@ endpoint.py` (additive: exposes the 3 new trace types), `scripts/
 investigate_table6_n8_permanent_loss_cause.py` (new). Raw output:
 `results_rmw_socket/table6_n8_permanent_loss_cause/` (gitignored).
 
+## TABLE VI N=8 NACK-SUPPRESSION RULE -- PROVEN (NOT A BUG)
+
+Measurement/source investigation only, N=8 seed=7. Question: what
+exact code condition turns a still-missing sequence from "request
+repair" into "never request again"? Implements the "exactly one next
+step" from the section above.
+
+### Source read: `observe_frame()` -> `feedback_from_sequence_state()`
+
+`SequenceState` (`data_frame.hpp`) tracks `observed_sequences` (a
+`std::set<uint64_t>`), `highest_contiguous_sequence`, and
+`highest_observed_sequence`. `feedback_from_sequence_state()`
+(`data_frame.cpp:1268-1313`) is a **pure, exhaustive, unbounded**
+function of this state: it walks every position from
+`highest_contiguous_sequence+1` to `highest_observed_sequence`,
+comparing against `observed_sequences` via `lower_bound`, and returns
+EVERY gap in that window as a range. There is no cap, no window, no
+aging, no "forget after N seconds/requests" logic anywhere in this
+function -- confirmed by full read, not by absence of a keyword.
+
+The ONLY other place `highest_contiguous_sequence` changes besides
+`observe_frame()`'s own `+1`-at-a-time advance loop is
+`finalize_best_effort_sequence_gaps_locked()` (`rmw_pubsub.cpp:13669`),
+which is a genuine grace-period/aging mechanism -- but it starts with
+`if (... qos.reliability != RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT)
+{ return 0; }`. This Table VI scenario uses **RELIABLE** QoS
+(confirmed in `fleetqox_coordination_endpoint.py`'s `QoSProfile`), so
+this function is dead code for this scenario -- it never runs, never
+touches `pending_missing_ranges`/`confirmed_lost_ranges`. Initial
+instrumentation was built to test this BEST_EFFORT-only mechanism as a
+candidate; source reading before running anything ruled it out for
+this scenario.
+
+### Self-caught measurement bug, corrected before drawing conclusions
+
+Initial instrumentation added `highest_observed_sequence`/
+`highest_contiguous_sequence` to `OutgoingAckNackTraceEvent` and
+produced an early result suggesting ~6% of class-C cases were a
+genuine "gap fell out of an otherwise-complete computation" defect.
+Cross-checking one such example's raw `recv` trace against the
+`outgoing_ack_nack` events used to build it revealed the true cause:
+`OutgoingAckNackTraceEvent.robot_id` is the REPORTING target's own
+identity, and `publisher_id` is the ambiguous literal text every
+robot's control-topic publisher shares -- there was no field recording
+WHICH SENDER's stream a given feedback event concerned. Python-side
+correlation by `(publisher_id, reporter robot_id)` alone silently
+conflated feedback about DIFFERENT senders that happen to share
+overlapping sequence ranges (e.g. robot_0007's genuine report about
+robot_0006's sequence 26 was mis-attributed to control_station's
+sequence 26). Added `stream_robot_id` (`decoded_frame->robot_id` /
+`marker->robot_id` at the two recording sites) to disambiguate
+correctly; re-verified full pytest suite (835/8 baseline unchanged)
+after the rebuild. All results below use the corrected field.
+
+### 1. Exact code rule
+
+A sequence N can appear in `AckNackFeedback.missing_sequence_ranges`
+**only when `state.highest_observed_sequence >= N`** for that exact
+`(robot_id, topic, publisher_id)` stream (`data_frame.cpp:1281-1313`).
+`highest_observed_sequence` only advances, in `observe_frame()`, when
+a frame with a HIGHER sequence number from THAT SAME sender is
+actually decoded. Additionally, `establish_reception_sequence_
+baseline()` (fired exactly once, on a stream's very first received
+frame) sets `highest_contiguous_sequence = highest_observed_sequence`
+immediately -- permanently excluding any sequence published before a
+reader's own first observation of that stream, by explicit design
+(see that function's own comment: "samples published before this
+reader's first observation are not provable losses").
+
+### 2. Simple explanation
+
+**You cannot report a gap you have no evidence exists.** A missing
+sequence disappears from a receiver's future NACK feedback for one of
+two reasons, both intentional: (a) this specific receiver has not
+received ANYTHING newer than the gap from that SAME sender since --
+so its own knowledge horizon (`highest_observed_sequence`) never
+reaches far enough to reveal the gap, or (b) the missing sequence
+predates the very first frame this receiver ever got from that
+sender, so it was never in view to begin with. Neither is "forgetting"
+an already-known gap; the code's own computation is exhaustive and
+correct for what it CAN observe.
+
+### 3. Exact message example
+
+Sender `control_station`, `source_sequence=27`, target `robot_0003`,
+never retransmitted (0 rounds -- never requested at all, consistent
+with (a) below). Final (only) send: `wall_ns=746357685218`. `robot_0003`
+kept reporting OTHER gaps on the SAME `control_station` stream
+afterward (ranges `3`, `7`, `11`, `14-16`, `7` again), with
+`highest_observed_sequence` climbing 17 -> 22 over the next ~20
+seconds -- still short of 27 at the last observed report. Sequence 27
+never appears in any of these reports because it has never been
+revealed as a gap: `highest_observed_sequence` (22) < 27 throughout.
+`robot_0003` never decoded sequence 27 at any point in the run.
+
+Separately, mechanism (b) is directly confirmed for a different pair:
+`robot_0007`'s very FIRST-ever received frame from `robot_0000` was
+sequence **2**, not 1 -- so sequence 1 was never reportable, from the
+very first frame onward, exactly matching `establish_reception_
+sequence_baseline()`'s documented behavior.
+
+### 4. % of class-C explained
+
+Of 2,886 never-delivered `(identity, target)` pairs where the target's
+own corrected `outgoing_ack_nack` trace never again names the exact
+missing sequence:
+- **1,461 (50.6%)** -- mechanism (a), total form: the target sends NO
+  further feedback about that sender's stream at all afterward.
+- **1,412 (48.9%)** -- mechanism (a), partial form: the target keeps
+  reporting OTHER gaps on the same stream, but `highest_observed_
+  sequence` never reaches the missing sequence in any later report.
+- **13 (0.45%)** -- ambiguous: `highest_observed_sequence` does reach
+  the sequence in a later report yet it's still not named. All 13
+  are low sequence numbers (1-2) consistent with mechanism (b)
+  (baseline exclusion) rather than a defect in the exhaustive
+  computation itself, though not individually re-verified past the
+  one confirmed case above.
+
+**Combined, mechanisms (a)+(b) account for ~99.5% (2,873/2,886) of
+class C.** No case was found where a sequence was validly requested,
+then genuinely excluded from a later otherwise-complete report while
+still within the observable window and not caught by the baseline
+rule.
+
+### 5. Bug / intentional bounded behavior / unclear: **intentional bounded behavior**
+
+Neither mechanism is a bug. The exhaustive gap computation has no
+defect; its scope is inherently bounded by what has actually been
+observed, which is an unavoidable property of sequence-gap detection,
+not a deliberately-added cap. The baseline-exclusion rule is
+explicitly documented in the source as an intentional design choice.
+The real, underlying driver of permanent loss is NOT a NACK-generation
+defect at all -- it is that specific `(sender, receiver)` pairs
+experience prolonged or permanent one-directional reception stalls
+under N=8's already-established heavy loss, shown here to be far more
+widespread across many pairs, not limited to the previously-known
+`robot_0007` anomaly.
+
+### 6. Exactly one next step (not implemented)
+
+Quantify, across ALL never-delivered pairs (not just class C), how
+many `(sender, receiver)` pairs experience a reception stall lasting
+more than some threshold (e.g. 10s) with zero frames of ANY sequence
+getting through in either direction -- to determine whether
+`robot_0007`'s previously-documented connectivity anomaly is one
+instance of a general per-pair blackout phenomenon (as this section's
+50.6% "total silence" figure suggests) or something qualitatively
+different from ordinary N=8 loss.
+
+**Files changed**: `ros2_ws/src/rmw_fleetqox_cpp/src/rmw_pubsub.cpp`
+(additive: `stream_robot_id`, `highest_observed_sequence`,
+`highest_contiguous_sequence` on `OutgoingAckNackTraceEvent`). No new
+script committed this pass (ad hoc analysis reused `investigate_
+table6_n8_retransmission_feedback_loop.py`'s helpers against the
+existing `permanent_loss_cause` run's raw data). Raw output:
+`results_rmw_socket/table6_n8_permanent_loss_cause/` (gitignored).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
