@@ -14252,6 +14252,114 @@ investigate_table6_n8_retransmission_feedback_loop.py` (new). Raw
 output: `results_rmw_socket/table6_n8_retransmission_feedback_loop/`
 (gitignored).
 
+## TABLE VI N=8 RETRANSMISSION LOOP OUTCOMES -- EVENTUAL DELIVERY VS PERMANENT LOSS
+
+Measurement-only, read-only re-analysis of the ALREADY-COLLECTED N=8
+seed=7 trace data from the section above (no rerun, no config change).
+Question: does the proven retransmission loop always eventually
+succeed, or does it sometimes end in permanent loss? Implements that
+section's "exactly one next step."
+
+### Method
+
+Same round-clustering method as the proof above, applied to EVERY
+`(DATA identity, target)` pair (5,392 = 674 identities x 8 possible
+targets each), not only the ones that succeeded on round >= 2. A pair
+with no recv arrival anywhere in its sender's or receiver's traces at
+all is "never delivered." "Why retries stopped" for never-delivered
+pairs is assessed two ways:
+- **Explicit budget/limit: ruled out at the source level, not
+  per-pair.** `FLEETQOX_RMW_REPAIR_RETRANSMISSION_BUDGET` defaults to
+  `-1` (disabled) and `FLEETQOX_RMW_REPAIR_MAX_ATTEMPTS_PER_SEQUENCE`
+  defaults to `0` (disabled) in `rmw_pubsub.cpp`; grep confirms
+  `launch_coordination_endpoints()`/`fleetqox_coordination_rmw_env_
+  prefix()` (the only code path that launches this Table VI scenario)
+  never sets either env var. `repair_budget_exhausted_`/`repair_
+  sequence_attempt_limit_exhausted_` are therefore structurally 0 for
+  this entire run.
+- **Scenario shutdown vs missing further NACKs: a timing proxy, not a
+  direct observation.** No incoming-ACK/NACK trace exists (only
+  outgoing retransmission sends are traced), so "a NACK arrived but
+  triggered nothing" cannot be directly distinguished from "no NACK
+  ever arrived." Uses each sender's own LAST observed wall_ns across
+  its combined send+recv trace as a proxy for when it stopped actively
+  recording. A never-delivered pair's last retransmission send within
+  2s of that proxy is classified `scenario_shutdown`; a larger gap
+  (during which that same sender demonstrably kept sending/receiving
+  other traffic) is classified `missing_further_nacks`. This is a
+  heuristic, not proof -- flagged explicitly rather than overclaimed.
+
+### 1. Compact outcome table
+
+| Outcome | Count | % of pairs |
+|---|---:|---:|
+| Delivered on original send | 802 | 14.9% |
+| Delivered after 1 retry round | 115 | 2.1% |
+| Delivered after 2-3 rounds | 151 | 2.8% |
+| Delivered after >3 rounds | 169 | 3.1% |
+| **Never delivered** | **4,155** | **77.1%** |
+| Total pairs | 5,392 | 100% |
+
+Eventual delivery: **22.94%**. Max rounds among successful pairs: 12.
+Max rounds among never-delivered pairs: 12 (some pairs receive the
+FULL retransmission effort -- up to 12 rounds, same as the most-
+retried identity found in the proof above -- and still never arrive).
+
+### 2. Permanent-loss count/rate
+
+**4,155 / 5,392 pairs (77.06%) never received the frame at all**,
+consistent with (not independently surprising given) this project's
+already-established ~77-90% overall N=8 DATA loss rate from the very
+first section of this investigation chain.
+
+### 3. Why retries stopped
+
+| Stop reason | Count |
+|---|---:|
+| Missing further NACKs (retries could have continued -- sender was still active) | 4,083 |
+| Scenario shutdown (within 2s of sender's last observed activity) | 72 |
+| Explicit budget/attempt-limit | 0 (ruled out at the source level for this whole run) |
+
+The overwhelming majority (98.3% of never-delivered pairs) stop
+retrying with plenty of scenario time left, not because the process
+was torn down -- the loop does not run out of TIME, it runs out of
+NACKs. Since NACK generation itself is receiver-driven and this pass
+has no trace of incoming ACK/NACK messages, the deeper "why did no
+further NACK arrive" question (target's own receive path silently
+failing, ledger entry erased before this straggler's own repair could
+land, or something else) is not resolved here.
+
+### 4. Exact permanent-loss example
+
+Sender `control_station`, `source_sequence=13`, topic
+`/fleetqox_coordination/control`, target `robot_0000`. 4 retransmission
+rounds (5 total including the original), **10 total send attempts** to
+this one target, every one returning `ATTEMPT_SUCCESS` at the sender's
+own socket. Final send: `wall_ns=706681762665`. Gap from that final
+send to `control_station`'s own last observed trace activity: **76.35
+seconds** -- more than half the 120s scenario remained, during which
+this same sender kept sending/receiving other traffic, yet no further
+retransmission to `robot_0000` for this sequence ever occurred.
+`robot_0000` never decoded this frame at any point in the run.
+
+### 5. Exactly one next step (not implemented)
+
+Add a trace event for INCOMING ack/nack processing (mirroring the
+existing send/recv loss-funnel traces) to directly observe, for a
+never-delivered pair, whether a NACK from that specific target ever
+arrived again after the last retransmission -- this would convert the
+current timing-proxy "missing_further_nacks" classification into a
+direct one, and would show whether the ledger entry was still present
+(and simply never re-requested) or had already been erased (e.g. via
+`acknowledged` from OTHER targets) before this target's own repair
+could land.
+
+**Files changed**: none in `rmw_pubsub.cpp` this pass (pure read-only
+re-analysis). `scripts/analyze_table6_n8_retransmission_loop_
+outcomes.py` (new). Raw output: `results_rmw_socket/
+table6_n8_retransmission_feedback_loop/retransmission_loop_
+outcomes.json` (gitignored).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
