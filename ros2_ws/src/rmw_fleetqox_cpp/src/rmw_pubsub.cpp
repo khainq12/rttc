@@ -610,10 +610,34 @@ struct OutgoingAckNackTraceEvent
   std::string publisher_id;
   std::string subscriber_id;
   std::string robot_id;  // the reporting (target) robot's own id
+  // Self-caught bug during the NACK-suppression-rule investigation (see
+  // docs/AUDIT_ACCEPTANCE_TRACKING.md): publisher_id alone is NOT unique
+  // across different senders (every robot's own control-topic publisher
+  // gets the identical literal text, same root cause as
+  // SubscriptionMatchTraceEvent/LossFunnelRecvEvent needing robot_id --
+  // see their own doc comments). Without this field, Python-side
+  // correlation by (publisher_id, reporting robot_id) alone silently
+  // conflated feedback about DIFFERENT senders' streams that happen to
+  // share a coincidentally-overlapping sequence range, producing false
+  // "sequence fell out of an otherwise-complete gap computation"
+  // findings. stream_robot_id is the robot_id of the DATA STREAM this
+  // feedback concerns (decoded_frame->robot_id / marker->robot_id) --
+  // distinct from robot_id above, which is the REPORTER's own identity.
+  std::string stream_robot_id;
   std::string topic;
   std::uint64_t range_start{0};
   std::uint64_t range_end{0};
   std::int64_t wall_ns{0};
+  // Added for the "TABLE VI N=8 NACK-SUPPRESSION RULE" investigation
+  // (see docs/AUDIT_ACCEPTANCE_TRACKING.md): distinguishes "this sequence
+  // is not YET revealed as missing" (highest_observed_sequence hasn't
+  // reached it -- expected, not a bug) from "this sequence fell out of an
+  // otherwise-complete gap computation" (would indicate a real defect) --
+  // see feedback_from_sequence_state()'s own exhaustive-walk logic in
+  // data_frame.cpp, which this field lets Python verify empirically
+  // instead of trusting from source review alone.
+  std::uint64_t highest_observed_sequence{0};
+  std::uint64_t highest_contiguous_sequence{0};
 };
 std::vector<OutgoingAckNackTraceEvent> g_outgoing_ack_nack_trace_events;
 
@@ -14462,10 +14486,13 @@ std::vector<std::string> idle_repair_ack_nacks(FleetQoxSubscriptionData * data)
         oe.publisher_id = marker->publisher_id;
         oe.subscriber_id = data->endpoint_id;
         oe.robot_id = local_robot_id();
+        oe.stream_robot_id = marker->robot_id;
         oe.topic = marker->topic;
         oe.range_start = range.first;
         oe.range_end = range.second;
         oe.wall_ns = trace_now_ns;
+        oe.highest_observed_sequence = feedback.highest_observed_sequence;
+        oe.highest_contiguous_sequence = feedback.highest_contiguous_sequence;
         new_events.push_back(std::move(oe));
       }
       if (!new_events.empty()) {
@@ -14958,10 +14985,13 @@ void deliver_decoded_frame_to_subscriptions_locked(
               oe.publisher_id = decoded_frame->publisher_id;
               oe.subscriber_id = subscription->endpoint_id;
               oe.robot_id = local_robot_id();
+              oe.stream_robot_id = decoded_frame->robot_id;
               oe.topic = decoded_frame->topic;
               oe.range_start = range.first;
               oe.range_end = range.second;
               oe.wall_ns = trace_now_ns;
+              oe.highest_observed_sequence = feedback.highest_observed_sequence;
+              oe.highest_contiguous_sequence = feedback.highest_contiguous_sequence;
               new_events.push_back(std::move(oe));
             }
             std::lock_guard<std::mutex> trace_lock(g_loss_funnel_trace_mutex);
@@ -15753,10 +15783,15 @@ const char * rmw_fleetqox_cpp_outgoing_ack_nack_trace_json()
     built += "{\"publisher_id\":\"" + loss_funnel_json_escape(event.publisher_id) + "\",";
     built += "\"subscriber_id\":\"" + loss_funnel_json_escape(event.subscriber_id) + "\",";
     built += "\"robot_id\":\"" + loss_funnel_json_escape(event.robot_id) + "\",";
+    built += "\"stream_robot_id\":\"" + loss_funnel_json_escape(event.stream_robot_id) + "\",";
     built += "\"topic\":\"" + loss_funnel_json_escape(event.topic) + "\",";
     built += "\"range_start\":" + std::to_string(event.range_start) + ",";
     built += "\"range_end\":" + std::to_string(event.range_end) + ",";
-    built += "\"wall_ns\":" + std::to_string(event.wall_ns) + "}";
+    built += "\"wall_ns\":" + std::to_string(event.wall_ns) + ",";
+    built += "\"highest_observed_sequence\":" +
+      std::to_string(event.highest_observed_sequence) + ",";
+    built += "\"highest_contiguous_sequence\":" +
+      std::to_string(event.highest_contiguous_sequence) + "}";
   }
   built += "]";
   json = std::move(built);
