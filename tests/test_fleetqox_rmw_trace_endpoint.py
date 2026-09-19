@@ -7,6 +7,7 @@ from scripts.fleetqox_rmw_trace_endpoint import (
     _topic_for,
     build_payload,
     compute_receive_capable_deadline_s,
+    discovery_converged,
     load_rows,
     run_receive_idle_drain_loop,
     wait_until_deadline_while_spinning,
@@ -614,6 +615,119 @@ class ReceiveIdleDrainLoopTest(unittest.TestCase):
         self.assertGreaterEqual(
             final_deadline, 13.0 + 10.0 - 0.5,
             "a message arriving exactly at the deadline must still extend it",
+        )
+
+
+class DiscoveryConvergedReadinessContractTest(unittest.TestCase):
+    """RED/GREEN for the false-ready benchmark-correctness bug (see
+    docs/AUDIT_ACCEPTANCE_TRACKING.md, "ZENOH FALSE-READY HARNESS FIX
+    AND VALIDATION"): a --discovery-timeout-s timeout must never by
+    itself be treated as READY. discovery_converged() is the pure,
+    directly-testable readiness decision extracted out of main()'s
+    discovery loop -- these tests exercise it without any wall clock,
+    rclpy, or subprocess dependency."""
+
+    def test_case_a_one_of_sixteen_peers_at_timeout_is_not_converged(self):
+        # The exact seed=41 Zenoh scenario from the root-cause
+        # investigation: control_station saw only 1/16 peers when its
+        # discovery loop hit the timeout. OLD behavior touched
+        # --ready-file unconditionally here (false ready). CORRECT
+        # behavior: NOT converged.
+        self.assertFalse(
+            discovery_converged(
+                skip_discovery_wait=False,
+                beacon_active=True,
+                peers_seen=1,
+                expected_peer_count=16,
+                subscription_fallback_ok=False,
+            )
+        )
+
+    def test_case_b_sixteen_of_sixteen_peers_is_converged(self):
+        self.assertTrue(
+            discovery_converged(
+                skip_discovery_wait=False,
+                beacon_active=True,
+                peers_seen=16,
+                expected_peer_count=16,
+                subscription_fallback_ok=False,
+            )
+        )
+
+    def test_case_c_fifteen_of_sixteen_at_timeout_is_not_converged(self):
+        self.assertFalse(
+            discovery_converged(
+                skip_discovery_wait=False,
+                beacon_active=True,
+                peers_seen=15,
+                expected_peer_count=16,
+                subscription_fallback_ok=False,
+            )
+        )
+
+    def test_case_d_zero_of_sixteen_at_timeout_is_not_converged(self):
+        self.assertFalse(
+            discovery_converged(
+                skip_discovery_wait=False,
+                beacon_active=True,
+                peers_seen=0,
+                expected_peer_count=16,
+                subscription_fallback_ok=False,
+            )
+        )
+
+    def test_case_e_convergence_reached_before_timeout_is_converged(self):
+        # Modeled as peers_seen already having reached expected_peer_count
+        # (the loop's own break condition) -- discovery_converged() does
+        # not need to know timing, only the final peer count, which is
+        # exactly what makes it a pure function safe to unit test without
+        # a real clock.
+        self.assertTrue(
+            discovery_converged(
+                skip_discovery_wait=False,
+                beacon_active=True,
+                peers_seen=16,
+                expected_peer_count=16,
+                subscription_fallback_ok=False,
+            )
+        )
+
+    def test_skip_discovery_wait_is_always_converged(self):
+        # FleetRMW's static-mode contract (--skip-discovery-wait): this
+        # endpoint never entered the discovery loop by design. Unaffected
+        # by this fix -- must remain immediately ready.
+        self.assertTrue(
+            discovery_converged(
+                skip_discovery_wait=True,
+                beacon_active=False,
+                peers_seen=0,
+                expected_peer_count=0,
+                subscription_fallback_ok=False,
+            )
+        )
+
+    def test_non_beacon_fallback_path_respects_its_own_flag(self):
+        # expected_peer_count==0 without skip_discovery_wait (not
+        # exercised by any current caller, kept for completeness): must
+        # defer to the subscription-count fallback's own outcome, not
+        # silently succeed.
+        self.assertTrue(
+            discovery_converged(
+                skip_discovery_wait=False,
+                beacon_active=False,
+                peers_seen=0,
+                expected_peer_count=0,
+                subscription_fallback_ok=True,
+            )
+        )
+        self.assertFalse(
+            discovery_converged(
+                skip_discovery_wait=False,
+                beacon_active=False,
+                peers_seen=0,
+                expected_peer_count=0,
+                subscription_fallback_ok=False,
+            )
         )
 
 
