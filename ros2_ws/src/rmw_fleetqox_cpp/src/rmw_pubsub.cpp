@@ -1140,6 +1140,7 @@ void enqueue_received_frame(const std::string & encoded_frame);
 bool apply_received_graph_advertisement(
   const std::string & encoded_frame, const sockaddr_in * source);
 bool handle_ack_nack_feedback(const std::string & encoded_frame);
+const std::string & local_robot_id();
 bool handle_unrecoverable_loss_notice(const std::string & encoded_frame);
 void record_fragment_repair_observation(const std::string & encoded_frame);
 void record_fragment_async_send_started(const std::string & encoded_frame);
@@ -9324,6 +9325,29 @@ bool handle_ack_nack_feedback(const std::string & encoded_frame)
   }
   socket_transport().record_ack_nack_received();
   socket_transport().record_ack_nack_feedback(*ack_nack);
+
+  // PROVEN identity collision fix (see docs/AUDIT_ACCEPTANCE_TRACKING.md,
+  // "TABLE VI PHASE 1 ACK/NACK LEDGER IDENTITY COLLISION"): everything
+  // below matches purely on (publisher_id, domain_id) against
+  // g_retransmit_ledger/g_publishers, which are BOTH exclusively
+  // populated with THIS process's own robot's entries -- but
+  // publisher_id text is not unique across robots (every robot's Nth-
+  // created publisher on a shared topic gets identical text, same root
+  // cause as the earlier robot_id/stream_key collision). An ack_nack
+  // broadcast by a peer about a DIFFERENT robot's stream that happens
+  // to share this process's own (publisher_id, domain_id, sequence)
+  // would otherwise be matched against this process's own unrelated
+  // ledger entry, causing it to retransmit its own irrelevant data in
+  // response to a repair request that was never about it. Measured
+  // directly at runtime (N=2, seed=1, deterministic single-sequence
+  // drop): 5/25 incoming ack_nack events matched found_in_ledger=true
+  // for a robot_id other than the processing endpoint's own. Since
+  // every entry this process could legitimately act on is its own,
+  // bailing out here for any other robot's feedback is exact, not an
+  // approximation.
+  if (ack_nack->robot_id != local_robot_id()) {
+    return true;
+  }
 
   std::vector<std::pair<std::uint64_t, std::string>> retransmit_frames;
   std::optional<rmw_fleetqox_cpp::UnrecoverableLossNotice> loss_notice;

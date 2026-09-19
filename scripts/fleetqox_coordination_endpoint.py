@@ -371,6 +371,13 @@ def fleetqox_stream_identity_diagnostics() -> dict[str, Any]:
             "reliable_timeout_retransmissions",
             "rmw_fleetqox_cpp_socket_reliable_timeout_retransmissions", ctypes.c_uint64,
         ),
+        # Added for the "TABLE VI PHASE 1 ACK/NACK LEDGER IDENTITY
+        # COLLISION" RED test (see docs/AUDIT_ACCEPTANCE_TRACKING.md):
+        # confirms FLEETQOX_RMW_DROP_SOURCE_SEQUENCES actually fired
+        # (should_drop_outbound_data_frame_for_test() is a silent drop --
+        # no send trace event is ever recorded for it by design -- so
+        # this counter is the only way to verify it happened at all).
+        ("test_dropped_frames", "rmw_fleetqox_cpp_socket_test_dropped_frames", ctypes.c_uint64),
     ):
         try:
             fn = getattr(library, symbol_name)
