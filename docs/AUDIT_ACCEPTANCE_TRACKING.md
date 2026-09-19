@@ -14651,6 +14651,102 @@ table6_n8_retransmission_feedback_loop.py`'s helpers against the
 existing `permanent_loss_cause` run's raw data). Raw output:
 `results_rmw_socket/table6_n8_permanent_loss_cause/` (gitignored).
 
+## OVERNIGHT AUTONOMOUS N=8 INVESTIGATION -- PHASE 1: ACK/NACK LEDGER IDENTITY COLLISION (FIXED, KEPT)
+
+Autonomous, multi-phase overnight investigation per explicit user
+protocol: measure -> prove/disprove -> RED -> minimal FIX -> GREEN ->
+A/B -> KEEP/REVERT, one proven fix at a time, logged append-only here.
+
+### Hypothesis
+
+`handle_ack_nack_feedback()`'s `g_retransmit_ledger`/`g_publishers`
+lookup matches purely on `(publisher_id, domain_id, topic)`, never
+`robot_id`. `publisher_id` text is NOT unique across robots (every
+robot's Nth locally-created publisher on a shared topic gets identical
+literal text -- the same root cause as the earlier robot_id/stream_key
+collision this project already fixed). Could feedback about robot A's
+stream act on robot B's ledger entry?
+
+### Measurement (existing data, no rerun)
+
+Queried the already-collected N=8 seed=7 `incoming_ack_nack` trace
+(from the "TABLE VI N=8 PERMANENT-LOSS RETRANSMISSION CAUSE" section):
+**625 / 21,455 (2.9%)** incoming events showed `found_in_ledger=true`
+for an `ack_nack.robot_id` (the ORIGINAL PUBLISHER the feedback
+concerns) different from the processing endpoint's own robot_id --
+e.g. `control_station` matching `found_in_ledger=true` for feedback
+whose `robot_id` was `robot_0004`/`robot_0006`. Proven, not
+hypothetical.
+
+### RED (deterministic, N=2)
+
+`scripts/investigate_table6_acknack_ledger_identity_collision.py`: 3
+endpoints (`control_station`, `robot_0000`, `robot_0001`), each
+force-drops its OWN sequence 3 exactly once via the already-existing
+`FLEETQOX_RMW_DROP_SOURCE_SEQUENCES` test hook (dropping sequence 1
+instead hits the already-proven baseline-exclusion rule and never
+generates a NACK at all -- confirmed empirically before settling on
+sequence 3). Result: **5/25 incoming ack_nack events, found_in_ledger=
+true, robot_id != processing endpoint's own robot_id.**
+
+### FIX (minimal)
+
+`handle_ack_nack_feedback()` now returns `true` immediately (correctly
+consumed, not "unrecognized frame type") whenever `ack_nack->robot_id
+!= local_robot_id()`, before touching `g_publishers`/
+`g_retransmit_ledger` at all. `g_retransmit_ledger` only ever contains
+entries this process itself published, so this is exact, not an
+approximation -- there is no legitimate case where a foreign robot's
+feedback should act on it.
+
+### GREEN
+
+Same N=2/seed=1/drop-sequence-3 repro: **0/39** cross-robot matches.
+Full pytest suite unchanged: 835 passed / 8 pre-existing unrelated
+failures (`ngtcp2-public-*` x7 + `test_remote_wait_for_all_acked`),
+same baseline as every prior section in this document.
+
+### N=8 seed=7 before/after (single seed -- mechanism-level fix, kept regardless of outcome)
+
+| Metric | Before | After |
+|---|---:|---:|
+| Permanent loss (never-delivered pairs) | 75.28% (3752/4984) | 65.42% (3072/4696) |
+| Class D (ledger confirmed gone) | 10.9-13.7% (varied by run) | **0.0%** |
+| `nack_retransmissions_sum` | 737 | 5130 |
+| `duplicate_data_frames_deduped_sum` | 905 | 894 |
+| `task_completion_s` | ~120.3s | ~120.3s (unchanged) |
+| crossings_completed / forced_entry | 1 each, all forced | 1 each (one endpoint reached 2), all forced |
+
+Class D dropping to exactly 0% is a clean, mechanism-consistent
+signal: cross-robot ack_nacks are now discarded before ever reaching
+the ledger scan, so they can no longer produce a spurious "ledger
+doesn't have it" reading either. `nack_retransmissions` rising ~7x is
+consistent with removing wasted per-datagram lookup work (looping
+`g_publishers`/`g_retransmit_ledger` for every irrelevant foreign-robot
+ack_nack) freeing up processing time for genuinely useful
+retransmissions within the same fixed scenario window -- not
+independently re-verified against a CPU-time measurement, flagged as
+the most likely explanation rather than fully proven. This is a single
+seed; per this project's own established noise floor (run-to-run
+variance of 7-27 percentage points measured elsewhere), the magnitude
+of the DATA-delivery improvement is not separately statistically
+validated -- KEEP is justified by the proven correctness defect and
+RED/GREEN evidence alone, not by this one seed's aggregate outcome.
+
+### KEEP
+
+Mismatch disappears (GREEN), no regression (full suite unchanged,
+crossings/task_completion/unique-frame-count all comparable), and the
+observed N=8 seed=7 change is directionally consistent with the fix's
+own mechanism. **KEPT.**
+
+**Files changed**: `ros2_ws/src/rmw_fleetqox_cpp/src/rmw_pubsub.cpp`
+(production fix: one early-return guard + one forward declaration),
+`scripts/fleetqox_coordination_endpoint.py` (additive: exposes
+`test_dropped_frames` diagnostic), `scripts/investigate_table6_
+acknack_ledger_identity_collision.py` (new RED/GREEN test, kept as a
+permanent regression check). Commit: `6afe5ee`.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
