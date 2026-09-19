@@ -14802,6 +14802,53 @@ and moving to Phase 3.
 (new, read-only analysis). No production code changed this phase.
 Commit: `666a0ed`.
 
+## OVERNIGHT PHASE 3: REPAIR-TRAFFIC AMPLIFICATION -- MOST RETRIES ARE WASTED ON HOPELESS PAIRS
+
+Read-only re-analysis of the Phase-1-fixed N=8 seed=7 trace (no
+rerun, no new pcap -- reuses the earlier "TABLE VI N=8 TRAFFIC
+COMPOSITION" byte-level capture, DATA 3.5% / NACK 46.6% / ACK 13.5% /
+UNRECOVERABLE 36.3%, as pre-fix context; not re-captured this pass).
+
+### Count-level retransmission-attempt accounting (exact per-pair identity correlation)
+
+4,696 `(identity, target)` pairs total, 41,040 retransmission SEND
+events overall:
+
+| Outcome | Pairs | Retransmit events | % of all retransmission volume | Avg attempts/pair |
+|---|---:|---:|---:|---:|
+| Delivered on original send (no retry needed) | 1,424 | 0 | 0.0% | 0 |
+| Delivered only via retry | 200 | 6,325 | 15.4% | 31.6 |
+| **Never delivered** | **3,072** | **34,715** | **84.6%** | **11.3** |
+
+### Interpretation
+
+**84.6% of all retransmission volume is spent on pairs that never
+benefit from it at all.** Retransmission is not a cheap, targeted
+mechanism here -- it is the dominant channel-load contributor (already
+established: DATA is only ~3.5% of wire bytes, NACK alone is ~46.6%),
+and the overwhelming majority of that effort produces zero delivered
+messages. Pairs that DO eventually succeed via retry are not
+"one-more-try-and-done" either -- they average 31.6 attempts each,
+MORE than the 11.3 average for pairs that give up permanently. This is
+consistent with Phase 76's already-proven finding: never-delivered
+pairs mostly stop retrying because the RECEIVER's own feedback stops
+naming the sequence (98.3% "missing further NACKs"), not because a
+retry budget was exhausted -- so the 11.3-attempt average for
+permanent losses reflects however many attempts happened before the
+receiver's own reporting window closed, not a deliberate cutoff.
+
+Does not infer causality from this volume alone (per instruction) --
+this is a direct, count-based measurement of where retransmission
+effort goes, feeding Phase 4's redundancy-tuning question with a
+concrete question worth carrying forward: if ACK/NACK redundancy
+reduction (Phase 4) disproportionately affects the REDUNDANT-COPY
+mechanism specifically, does it prune wasted retries (the 84.6%) more
+than it prunes eventually-useful ones (the 15.4%)?
+
+**Files changed**: `scripts/analyze_table6_n8_repair_traffic_
+amplification.py` (new, read-only). No production code changed this
+phase. Commit: `db9fda9`.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
