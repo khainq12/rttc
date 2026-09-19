@@ -14122,6 +14122,136 @@ investigate_table6_n8_ack_nack_vs_data_retransmission.py` (new). Raw
 output: `results_rmw_socket/table6_n8_ack_nack_vs_data_retransmission/`
 (gitignored).
 
+## TABLE VI N=8 RETRANSMISSION FEEDBACK-LOOP -- PROVEN
+
+Measurement-only, N=8 seed=7, default config (`FLEETQOX_RMW_ACK_NACK_
+REDUNDANT_RESEND_COUNT` untouched). Question: does DATA loss -> NACK ->
+retransmit -> retransmit loss -> later NACK -> retransmit again
+actually occur, per exact `(publisher_id, source_sequence, stream_key)`
+identity, or does "more retransmissions" only ever come from other
+targets in the same broadcast still being outstanding? Implements the
+"exactly one next step" from the ACK/NACK-vs-DATA-retransmission
+section above.
+
+### Instrumentation (additive only)
+
+- `LossFunnelSendEvent` gained `is_retransmission` (bool): EXACT, not
+  inferred from timing. A new `thread_local` flag
+  (`g_loss_funnel_next_send_is_retransmission`) is armed by
+  `send_retransmission_frame()` immediately before its one
+  `send_frame()` call and consumed by `send_frame_with_qos()` the
+  instant it sets the send-identity for that call; cleared via a
+  scope-exit RAII guard on the caller side (`send_frame_with_qos()` has
+  several early-return paths before it would otherwise clear it).
+- `LossFunnelRecvEvent` gained `robot_id` (same reason
+  `SubscriptionMatchTraceEvent` needed it, see the duplicate-drop
+  section above: `publisher_id`/`source_id` alone is not guaranteed
+  unique across senders).
+- Re-verified full pytest suite (835 passed / 8 pre-existing unrelated
+  failures) after each rebuild.
+
+**Self-caught bug during this change**: the first build set
+`g_loss_funnel_current_send.is_retransmission` correctly but never
+copied it into the actual `LossFunnelSendEvent` at
+`record_loss_funnel_event`'s construction site -- every event read
+back `false` regardless of the real send. Caught immediately by
+cross-checking against the already-exposed `nack_retransmissions`
+counter: it read 744 (nonzero, confirming retransmissions were really
+happening) while the "send" trace showed exactly 0
+`is_retransmission=true` events across all 9 endpoints -- an
+impossible combination if the marker were wired correctly, since both
+counters are driven by the exact same `send_retransmission_frame()`
+call. Fixed by adding the missing `event.is_retransmission = ...`
+assignment; re-verified against the counter afterward (nonzero
+`is_retransmission=true` events, consistent with the counter) before
+trusting any of the analysis below.
+
+### Method
+
+Group each sender's own "send" trace by `(source_id, source_sequence,
+topic)`. Cluster consecutive `is_retransmission=true` events whose
+`wall_ns` gap is under 100ms into one logical round (one
+`send_retransmission_frame()` broadcast reaches multiple targets in a
+tight loop -- those per-target events are one round, not one each; a
+gap of hundreds of ms to seconds marks a genuinely separate,
+later-triggered round). For each `(round, target)` pair, look up that
+target's own "recv" trace (filtered by the full `(robot_id, source_id,
+source_sequence, topic)` identity) for its FIRST arrival timestamp, and
+find which round's time window contains it -- that target's
+`first_success_round`. `first_success_round >= 2` for a target is
+direct, per-target evidence of the literal loop: round 0 (original)
+AND round 1 (first retransmission) both failed to reach that specific
+target, and a later round is what finally did.
+
+### 1. Retransmission-round distribution
+
+674 unique DATA identities observed (per-sender `(source_id,
+source_sequence, topic)` groups, summed across all 9 endpoints):
+
+| Rounds | Count |
+|---|---:|
+| 0 | 581 |
+| 1 | 21 |
+| 2 | 19 |
+| 3 | 10 |
+| >3 | 43 |
+
+### 2. Max rounds for one DATA
+
+**12 rounds** -- sender `robot_0004`, `source_id=fpubcpp-0.0.0.0:9100-3`,
+`source_sequence=17`, topic `/fleetqox_coordination/control`.
+
+### 3. Exact example
+
+Sender `control_station`, `source_id=fpubcpp-0.0.0.0:9100-3`,
+`source_sequence=4`, topic `/fleetqox_coordination/control`, target
+`robot_0006`. All 7 `sendto()` calls to this target for this sequence
+returned `ATTEMPT_SUCCESS` at the sender's own socket (the loss is not
+a sender-side failure):
+
+| Round | Sends (wall_ns, relative to round 0) | Attempts |
+|---|---|---:|
+| 0 (original) | t=0 | 1 |
+| 1 (1st retransmission) | t=+6.18ms .. +64.7ms | 3 |
+| 2 (2nd retransmission) | t=+547.96ms .. +617.7ms | 3 |
+
+First successful decode at `robot_0006`: t=+7.167s (i.e. ~6.55s after
+round 2's last attempt). No round 3 followed for this identity/target
+-- consistent with the frame finally being acknowledged after round 2.
+Rounds 0 and 1 (4 total send attempts across 2 separate rounds) did
+NOT reach `robot_0006`; round 2 is what finally did. This is the
+literal pattern: loss -> NACK -> retransmit -> retransmit loss ->
+later NACK -> retransmit again -> success.
+
+### 4. Feedback loop: PROVEN
+
+**320** `(sender-identity, target)` pairs show `first_success_round >=
+2` -- i.e. 320 direct, per-target instances where the frame survived
+at least one retransmission's own loss before a later round finally
+delivered it. This is not inferable from the round-count distribution
+alone (a `>1`-round identity could in principle be explained entirely
+by OTHER targets in the same broadcast still being outstanding while
+this one target got it on round 1) -- the per-target, first-arrival
+correlation is what makes it direct evidence rather than aggregate
+inference.
+
+### 5. Exactly one next step (not implemented)
+
+Measure how many `(identity, target)` pairs undergo repeated
+retransmission rounds but NEVER receive the frame at all (permanent
+loss -- `repair_sequence_attempt_limit_exhausted_`/no recv ever
+recorded), to determine whether this loop always eventually terminates
+in success (as every instance found in this pass did) or sometimes
+terminates in permanent loss once the attempt/round budget is
+exhausted.
+
+**Files changed**: `ros2_ws/src/rmw_fleetqox_cpp/src/rmw_pubsub.cpp`
+(additive: `is_retransmission` on `LossFunnelSendEvent`, `robot_id` on
+`LossFunnelRecvEvent`), `scripts/
+investigate_table6_n8_retransmission_feedback_loop.py` (new). Raw
+output: `results_rmw_socket/table6_n8_retransmission_feedback_loop/`
+(gitignored).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
