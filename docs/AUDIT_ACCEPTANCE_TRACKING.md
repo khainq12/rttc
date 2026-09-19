@@ -17,7 +17,7 @@ Trạng thái tại thời điểm kiểm tra gốc (07/09/2026): **0/6 nhóm đ
 | 3 | QUIC/PKI và HA/fencing (online rotation, live revocation, ma trận phân vùng không split-brain, failover/failback đa host, durable state) | Đạt phần lớn (thiếu đa host) | ✅ **Đã đóng** | HA multi-host (Raft + etcd/PostgreSQL, failover + failback) làm ở phiên trước (2 VM KVM thật). PKI cert/CA rotation multi-host (CRL revocation + CA rotation thật, không phải chỉ thêm CA) làm phiên này: `scripts/run_multihost_kvm_udp_peer_auth_crl_reload_probe.py`, 4/4 round pass. Commit `65b7100`. Lưu ý nhỏ: "ma trận phân vùng" mới test một số kịch bản tiêu biểu, chưa phải toàn bộ tổ hợp. |
 | 4 | Ngữ nghĩa RMW (full QoS event, full DDS content-filter dialect, deep preallocation) | Đạt một phần | ✅ **Đã đóng** | Dynamic message, nhiều QoS extension (liveliness, deadline, lifespan, destination_order, ownership, partition, presentation) đã xong. **Task #42 (content-filter dialect) đã đóng**: thêm `LIKE ... ESCAPE`, 3/3 pass (`run_rmw_docker_content_filter_sql_probe.py`), và đã ra quyết định phạm vi chính thức — subset hiện tại là ranh giới cuối cùng. **Task #43 (deep_preallocation_claim) đã đóng phần lớn hơn dự kiến**: thay vì redesign wire-format nhị phân (rủi ro cao, ban đầu định hỏi ý kiến), tìm được cách an toàn hơn — verify `snprintf("%.6g",...)` giống hệt định dạng double của `ostringstream` (400k+ giá trị test), rồi build JSON frame body thẳng vào buffer bền vững (`frame_json_scratch`) thay vì `ostringstream` mới mỗi lần, và pool hoá entry trong retransmit ledger (`g_retired_retransmit_entries`) — không đổi 1 byte nào trên wire, không ảnh hưởng 187 probe khác. Verify bằng A/B rebuild (git stash) xác nhận 2 lỗi flaky có sẵn (`rmw_wait_for_all_acked_probe`, `remote_wait_for_all_acked_probe`) tái hiện y hệt ở cả code cũ và mới → không phải regression. `deep_preallocation_claim` vẫn giữ `false` (đúng): phần message deserialization và ledger hash-map node allocation vẫn chưa pool hoá, và binary wire format vẫn là ranh giới scope có chủ đích, không phải việc treo. |
 | 5 | Nav2, Open-RMF, đa host, HIL | Đạt một phần | ❌ **Chưa làm** | Nav2 đã có bằng chứng chạy thực tế (từ trước). Open-RMF chưa phải full upstream stack; chưa có bằng chứng đa host/HIL cho workload tự hành. |
-| 6 | Đối sánh mô phỏng (ns-3/OMNeT++), soak dài hạn, bằng chứng phát hành qua CI | Đạt một phần | 🟡 **Đang làm** | Xem mục "Nhóm 6" bên dưới. Đối sánh ns-3/OMNeT++ Wi-Fi: tìm + sửa 2 bug thật (INET PendingQueue 100 vs ns-3 500 gói; INET Arp retryTimeout 1s bị lộ do đồng bộ start-time) + sửa cách so sánh p99 sang tỷ lệ tương đối. Kết quả 10-seed: **8 trạm = 100% nhóm kịch bản khớp** (trung bình), 16 trạm 56%, 32 trạm 33% (còn khoảng cách thật ở delivery ratio, đã thử 8 giả thuyết không tìm thêm được nguyên nhân). CI: đã xác minh chạy thật pass qua GitHub API. **Baseline LAN N=16 mới (18/09/2026, sau khi sửa 2 bug harness)**: FleetRMW/Fast DDS/CycloneDDS đều 100% ở cả 3 seed (7/13/29); Zenoh 52.8-86.1% (biến động thật do discovery mặc định, không phải lỗi hạ tầng) — xem mục "FRESH CORRECTED-HARNESS LAN N=16 BASELINE". **Mở rộng lên 20 seed ghép cặp (19/09/2026)**: FleetRMW/Fast DDS/CycloneDDS **100% ở TẤT CẢ 20 seed, không ngoại lệ** — xác nhận đây là **ceiling effect** (workload quá dễ để phân biệt 3 hệ thống này), nên gate "superiority" (+15pp so baseline tốt nhất mỗi seed + bootstrap CI > 0) **KHÔNG ĐẠT ĐƯỢC** (và về cấu trúc không thể đạt được trên workload này, vì baseline luôn ở mức trần 100%). Zenoh: biến động rất lớn được định lượng rõ ở n=20 (mean 42.4%, min 4.6%, max 100%, stdev 33.4pp) — nguyên nhân discovery-timing vẫn là giả thuyết, chưa xác nhận. FleetRMW p99 cao hơn ~2x 3 hệ thống kia một cách nhất quán qua cả 20 seed (mô tả thuần, chưa điều tra cơ chế). Xem mục "LAN N=16 — 20-SEED PAIRED CORRECTED-HARNESS EXPERIMENT". Số liệu LAN cũ (trước fix 2 bug harness) đã SUPERSEDED, không dùng để so sánh nữa. **Fix bug "false-ready" cho readiness gate dùng chung (19/09/2026)**: đúng RED→FIX→GREEN, đã sửa và verify (0 regression, 811 test pass). Nhưng khi enforce fix thật (live), phát hiện vấn đề LỚN HƠN dự kiến: gate readiness hiện tại (beacon 16 peer, full-mesh) KHÔNG khớp với workload thực tế (topology hình sao — mỗi robot chỉ nói chuyện với control_station, xác nhận 0 cặp robot-robot trong trace). Kết quả: Fast DDS/CycloneDDS (không chỉ Zenoh) CŨNG bị INVALID_READINESS ở các seed trước đây pass 100% → **Fast DDS sanity: FAIL, CycloneDDS sanity: FAIL, Zenoh 20-seed rerun: 0/20 valid**. FleetRMW không ảnh hưởng (PASS, dùng đường riêng). Kết luận: KHÔNG được nói "Zenoh đã fix" — bug readiness đã đóng đúng, nhưng lộ ra gate cần redesign theo topology thực tế trước khi benchmark LAN N=16 nào (không riêng Zenoh) đáng tin cậy trở lại. Xem mục "ZENOH FALSE-READY HARNESS FIX AND VALIDATION". **Audit kiến trúc Bảng IV/V/VI (19/09/2026)**: xác nhận topology hình sao ở Bảng IV/V là CÓ CHỦ ĐÍCH (từ tận model gốc `_destination_for()`, không phải bug harness) — điều phối robot-robot thật chỉ tồn tại ở Bảng VI (Ricart-Agrawala, full-mesh CHÍNH XÁC theo yêu cầu thuật toán, không phải quá mức). Phát hiện thêm: (1) lệnh robot-specific ở Bảng IV/V ĐÃ đúng target 1 robot (không broadcast); (2) CHƯA có lệnh fleet-wide/emergency-stop nào trong Bảng IV/V; (3) flow tên "coordination" ở Bảng IV/V thực ra vẫn đi qua hub, không phải robot-robot thật; (4) Bảng VI có bug khuếch đại broadcast THẬT — REPLY (đáng lẽ point-to-point) bị gửi chung 1 topic với REQUEST, khuếch đại (N-1)x, là tàn dư diagnostic tạm thời chưa revert; (5) Bảng VI dùng code readiness RIÊNG (`fleetqox_coordination_endpoint.py`), CHƯA được áp fix false-ready. Đề xuất bước tiếp theo: readiness theo "required edge" cho từng endpoint (lấy từ trace CSV cho Bảng IV/V, giữ nguyên full-mesh cho Bảng VI) thay vì 1 hằng số `expected_peer_count` dùng chung — CHƯA triển khai. Xem mục "TABLE IV/V/VI COMMUNICATION-ARCHITECTURE AND READINESS AUDIT". **Fix false-ready riêng cho Bảng VI (19/09/2026)**: đúng RED→FIX→GREEN (819 test pass, 0 regression), dùng identity-based check (không chỉ đếm số) cho đúng full-mesh Bảng VI cần. Chạy lại baseline N=8/16/32×3 seed: **FleetRMW 9/9 valid** (không đổi, vẫn 100% forced_entry — khớp kết luận cũ là do broadcast reliability, không phải readiness); **Fast DDS 1/9 valid** (nhưng lần valid duy nhất cho **0% forced_entry**, đảo ngược hoàn toàn so với số cũ 100% — n=1, chưa thể kết luận chắc); **CycloneDDS 0/9 valid, Zenoh 0/9 valid** — KHÔNG có dữ liệu hiệu năng nào dùng được cho 2 RMW này ở gate đã sửa đúng. Số liệu Bảng VI cũ cho Fast DDS/CycloneDDS/Zenoh giờ nghi ngờ cao là đo dưới điều kiện false-ready (không xoá, giữ làm lịch sử). Bug khuếch đại broadcast REPLY vẫn CHƯA sửa (đúng phạm vi yêu cầu). Xem mục "TABLE VI READINESS CORRECTNESS FIX". Soak dài hạn: chưa làm. |
+| 6 | Đối sánh mô phỏng (ns-3/OMNeT++), soak dài hạn, bằng chứng phát hành qua CI | Đạt một phần | 🟡 **Đang làm** | Xem mục "Nhóm 6" bên dưới. Đối sánh ns-3/OMNeT++ Wi-Fi: tìm + sửa 2 bug thật (INET PendingQueue 100 vs ns-3 500 gói; INET Arp retryTimeout 1s bị lộ do đồng bộ start-time) + sửa cách so sánh p99 sang tỷ lệ tương đối. Kết quả 10-seed: **8 trạm = 100% nhóm kịch bản khớp** (trung bình), 16 trạm 56%, 32 trạm 33% (còn khoảng cách thật ở delivery ratio, đã thử 8 giả thuyết không tìm thêm được nguyên nhân). CI: đã xác minh chạy thật pass qua GitHub API. **Baseline LAN N=16 mới (18/09/2026, sau khi sửa 2 bug harness)**: FleetRMW/Fast DDS/CycloneDDS đều 100% ở cả 3 seed (7/13/29); Zenoh 52.8-86.1% (biến động thật do discovery mặc định, không phải lỗi hạ tầng) — xem mục "FRESH CORRECTED-HARNESS LAN N=16 BASELINE". **Mở rộng lên 20 seed ghép cặp (19/09/2026)**: FleetRMW/Fast DDS/CycloneDDS **100% ở TẤT CẢ 20 seed, không ngoại lệ** — xác nhận đây là **ceiling effect** (workload quá dễ để phân biệt 3 hệ thống này), nên gate "superiority" (+15pp so baseline tốt nhất mỗi seed + bootstrap CI > 0) **KHÔNG ĐẠT ĐƯỢC** (và về cấu trúc không thể đạt được trên workload này, vì baseline luôn ở mức trần 100%). Zenoh: biến động rất lớn được định lượng rõ ở n=20 (mean 42.4%, min 4.6%, max 100%, stdev 33.4pp) — nguyên nhân discovery-timing vẫn là giả thuyết, chưa xác nhận. FleetRMW p99 cao hơn ~2x 3 hệ thống kia một cách nhất quán qua cả 20 seed (mô tả thuần, chưa điều tra cơ chế). Xem mục "LAN N=16 — 20-SEED PAIRED CORRECTED-HARNESS EXPERIMENT". Số liệu LAN cũ (trước fix 2 bug harness) đã SUPERSEDED, không dùng để so sánh nữa. **Fix bug "false-ready" cho readiness gate dùng chung (19/09/2026)**: đúng RED→FIX→GREEN, đã sửa và verify (0 regression, 811 test pass). Nhưng khi enforce fix thật (live), phát hiện vấn đề LỚN HƠN dự kiến: gate readiness hiện tại (beacon 16 peer, full-mesh) KHÔNG khớp với workload thực tế (topology hình sao — mỗi robot chỉ nói chuyện với control_station, xác nhận 0 cặp robot-robot trong trace). Kết quả: Fast DDS/CycloneDDS (không chỉ Zenoh) CŨNG bị INVALID_READINESS ở các seed trước đây pass 100% → **Fast DDS sanity: FAIL, CycloneDDS sanity: FAIL, Zenoh 20-seed rerun: 0/20 valid**. FleetRMW không ảnh hưởng (PASS, dùng đường riêng). Kết luận: KHÔNG được nói "Zenoh đã fix" — bug readiness đã đóng đúng, nhưng lộ ra gate cần redesign theo topology thực tế trước khi benchmark LAN N=16 nào (không riêng Zenoh) đáng tin cậy trở lại. Xem mục "ZENOH FALSE-READY HARNESS FIX AND VALIDATION". **Audit kiến trúc Bảng IV/V/VI (19/09/2026)**: xác nhận topology hình sao ở Bảng IV/V là CÓ CHỦ ĐÍCH (từ tận model gốc `_destination_for()`, không phải bug harness) — điều phối robot-robot thật chỉ tồn tại ở Bảng VI (Ricart-Agrawala, full-mesh CHÍNH XÁC theo yêu cầu thuật toán, không phải quá mức). Phát hiện thêm: (1) lệnh robot-specific ở Bảng IV/V ĐÃ đúng target 1 robot (không broadcast); (2) CHƯA có lệnh fleet-wide/emergency-stop nào trong Bảng IV/V; (3) flow tên "coordination" ở Bảng IV/V thực ra vẫn đi qua hub, không phải robot-robot thật; (4) Bảng VI có bug khuếch đại broadcast THẬT — REPLY (đáng lẽ point-to-point) bị gửi chung 1 topic với REQUEST, khuếch đại (N-1)x, là tàn dư diagnostic tạm thời chưa revert; (5) Bảng VI dùng code readiness RIÊNG (`fleetqox_coordination_endpoint.py`), CHƯA được áp fix false-ready. Đề xuất bước tiếp theo: readiness theo "required edge" cho từng endpoint (lấy từ trace CSV cho Bảng IV/V, giữ nguyên full-mesh cho Bảng VI) thay vì 1 hằng số `expected_peer_count` dùng chung — CHƯA triển khai. Xem mục "TABLE IV/V/VI COMMUNICATION-ARCHITECTURE AND READINESS AUDIT". **Fix false-ready riêng cho Bảng VI (19/09/2026)**: đúng RED→FIX→GREEN (819 test pass, 0 regression), dùng identity-based check (không chỉ đếm số) cho đúng full-mesh Bảng VI cần. Chạy lại baseline N=8/16/32×3 seed: **FleetRMW 9/9 valid** (không đổi, vẫn 100% forced_entry — khớp kết luận cũ là do broadcast reliability, không phải readiness); **Fast DDS 1/9 valid** (nhưng lần valid duy nhất cho **0% forced_entry**, đảo ngược hoàn toàn so với số cũ 100% — n=1, chưa thể kết luận chắc); **CycloneDDS 0/9 valid, Zenoh 0/9 valid** — KHÔNG có dữ liệu hiệu năng nào dùng được cho 2 RMW này ở gate đã sửa đúng. Số liệu Bảng VI cũ cho Fast DDS/CycloneDDS/Zenoh giờ nghi ngờ cao là đo dưới điều kiện false-ready (không xoá, giữ làm lịch sử). Bug khuếch đại broadcast REPLY vẫn CHƯA sửa (đúng phạm vi yêu cầu). Xem mục "TABLE VI READINESS CORRECTNESS FIX". **Điều tra root-cause 2 câu hỏi tách biệt sau khi có readiness gate đúng (19/09/2026)**: thêm instrumentation đo lường thuần (identity-level readiness diagnostic + full REQUEST/REPLY funnel per-message), chạy nhỏ/tái lập được (18 run N=4&N=8 cho Fast DDS/CycloneDDS/Zenoh + 1 run N=4 cho FleetRMW), 0 regression (824 pass). **Câu hỏi A (vì sao Fast DDS/CycloneDDS/Zenoh hay fail readiness)**: Fast DDS/CycloneDDS PASS SẠCH 3/3 ở N=4, FAIL 3/3 ở N=8 (cùng timeout 15s) — lỗi phụ thuộc QUY MÔ, không phải lỗi cố hữu; NHƯNG shape khác nhau: Fast DDS luôn chỉ thiếu đúng 1 peer cụ thể (robot cuối cùng theo thứ tự launch — SYSTEMATIC), CycloneDDS lại có 1 endpoint (control_station, launch đầu tiên) bị cô lập khỏi TẤT CẢ peer còn lại (SYSTEMATIC nhưng khác dạng) — **chứng minh trực tiếp 2 middleware này KHÔNG cùng nguyên nhân**. Zenoh fail cả ở N=4 (quy mô nhỏ nhất đã thử), dạng RANDOM/partial-mesh (cặp nào mất kết nối thay đổi theo seed). `discovery_peers_seen` được xác nhận ĐÁNG TIN CẬY (nhiều endpoint độc lập đồng thuận về peer nào thiếu) — không cần thêm READY_PROBE/READY_ACK mới. Phát hiện phụ: cơ chế "huỷ container ngay khi phát hiện 1 endpoint invalid_readiness" phá huỷ dữ liệu chẩn đoán của các endpoint chưa kịp ghi file (log 0 byte) — hạn chế đo lường, không phải bằng chứng các endpoint đó "cũng fail". **Câu hỏi B (vì sao FleetRMW pass readiness 9/9 nhưng vẫn forced_entry gần 100%)**: xác nhận trực tiếp (N=4, seed=7, và re-xác nhận cấu trúc y hệt ở N=8/16/32 từ dữ liệu baseline cũ) — **crossing đầu tiên một mình "ăn" hết 120 giây scenario_timeout** (retry 24 lần, không endpoint nào bắt đầu được crossing 2-5). Join toàn bộ sent_log/raw_received_log: **không endpoint nào từng nhận đủ REPLY từ cả 4 peer bắt buộc trong suốt 120s** (tốt nhất 3/4); mọi REPLY "thiếu" đều được CHỨNG MINH là đã gửi (nhiều lần, đúng địa chỉ, đúng req_id) nhưng KHÔNG BAO GIỜ đến nơi — LOST thật, không phải LATE. Tổng thể: request 16.0% delivery, reply 27.3% delivery, kết hợp **17.6%** — đây là nguyên nhân chính, KHÔNG PHẢI bug reset `own_claim_yielded_on_timeout` (dù cơ chế này có thật, nó không phải nguyên nhân trực tiếp vì chưa từng có tập hợp "đủ 4" để bị xoá). Khuếch đại broadcast REPLY được ĐỊNH LƯỢNG rõ (59.6% reply nhận được là gửi cho người khác, bị lọc bỏ ngay) nhưng CHƯA đủ bằng chứng để khẳng định đây là nguyên nhân CHÍNH của tỷ lệ mất 82.4% (cần A/B có kiểm soát, ngoài phạm vi lần này). Chứng minh bằng đọc code (không chỉ tương quan): REPLY/REQUEST không thể xảy ra trước cổng start chung, ở bất kỳ middleware nào. Đề xuất bước tiếp theo (CHƯA làm): đo xem message trên topic coordination có thực sự đi vào retransmit ledger riêng của FleetRMW hay không, và nếu có thì bị mất ở giai đoạn nào. Xem mục "TABLE VI POST-READINESS ROOT-CAUSE INVESTIGATION". Soak dài hạn: chưa làm. |
 
 **Tóm lại: 4/6 nhóm đã đóng (1, 2, 3, 4 — nhóm 4 vẫn còn vài ranh giới
 scope có chủ đích, xem bảng, không phải việc treo). Nhóm 6 đang bắt đầu
@@ -12166,6 +12166,332 @@ commit `62cf355`), `scripts/run_table6_corrected_readiness_baseline.py`
 `results_rmw_socket/table6_corrected_readiness_baseline/summary.json`
 and `results_rmw_socket/table6_readiness_sanity/` (gitignored,
 regenerate via the script above).
+
+## TABLE VI POST-READINESS ROOT-CAUSE INVESTIGATION (19/09/2026)
+
+**Scope: ROOT-CAUSE INVESTIGATION ONLY.** No fix to REPLY broadcast, no
+coordination-topic change, no Ricart-Agrawala change, no timeout
+change, no QoS/discovery-config change, no FleetRMW production change,
+no Optimization #2 work, no large seed matrices, no LAN N=16 rerun, no
+Wi-Fi/5G work started. Two separate questions, investigated
+separately, NOT assumed to share a cause.
+
+### 1. New instrumentation added (measurement-only)
+
+`fleetqox_coordination_endpoint.py`:
+- `build_discovery_diagnostic()` (new, pure, unit-tested): computes
+  `missing_peers = required_peers - peers_seen` and packages
+  required/observed/missing PEER IDENTITIES + per-peer first-seen
+  timestamps (`peer_first_seen_s`, relative to `discovery_start`).
+- `--discovery-diag-json` (new, optional): written UNCONDITIONALLY
+  right after the discovery loop exits (converged or not), BEFORE the
+  `--start-file` wait that kills the process on any run this endpoint
+  itself judges not-converged. Without this, an INVALID_READINESS
+  Table VI run left **zero artifacts** for its own endpoints — confirmed
+  true of every INVALID_READINESS run in this project prior to this
+  fix (result_i.json is only ever written at the very end of `main()`,
+  which a readiness failure never reaches).
+- `sent_log` (new): every REQUEST/REPLY THIS endpoint sends, with
+  `req_id`/`wall_ns`/(`to` for replies, `crossing_index`+`retry_index`
+  for requests).
+- `raw_received_log`: cap raised 200->2000; each entry now also carries
+  `wall_ns` (sender's original send time, from the payload) and
+  `recv_wall_ns` (local receipt time) — previously only
+  `type`/`from`/`to`/`req_id`.
+
+`run_ns3_docker_container_fleet_probe.py`: `launch_coordination_endpoints()`
+wires `--discovery-diag-json` per endpoint; new
+`collect_readiness_diagnostics()` reads all endpoints' diag files back
+(best-effort — `None` for any endpoint whose container was torn down
+before writing one, see §14); `run_coordination_probe()`'s return dict
+gained `readiness_diagnostics`, populated on BOTH the `ok` and the
+`invalid_readiness` path.
+
+RED/GREEN: `BuildDiscoveryDiagnosticTest` (5 new tests,
+`tests/test_fleetqox_coordination_endpoint.py`) — missing-peers
+computation, full-convergence case, CASE-G-style
+correct-count-wrong-identity, `peer_first_seen_s` pass-through,
+JSON-serializability. Full suite: **824 passed, 8 failed** (the same 8
+pre-existing ngtcp2-canonical-artifact + remote-ACK failures present in
+every run this entire session) — 0 new regressions.
+
+### 2. QUESTION A — methodology
+
+Small, reproducible: N=4 and N=8, seeds {7, 13, 29}, Fast DDS /
+CycloneDDS / Zenoh only (FleetRMW's own readiness, 9/9 valid, was not
+in question) — 18 runs total, via new
+`scripts/run_table6_readiness_diagnostic_probe.py`. Analyzed by new
+`scripts/analyze_table6_readiness_diagnostics.py`. Raw:
+`results_rmw_socket/table6_readiness_diagnostic/` (gitignored,
+regenerate via the script).
+
+### 3. QUESTION A — headline result: N=4 passes cleanly, N=8 does not
+
+| Middleware | N=4 (3 seeds) | N=8 (3 seeds) |
+|---|---|---|
+| Fast DDS | 3/3 valid | 0/3 valid |
+| CycloneDDS | 3/3 valid | 0/3 valid |
+| Zenoh | 0/3 valid | 0/3 valid |
+
+Fast DDS and CycloneDDS converge perfectly at N=4 under the SAME
+15-second `--discovery-timeout-s` that fails 100% of the time at N=8 —
+readiness failure is **scale-dependent for these two**, not an
+intrinsic per-message defect. Zenoh fails even at the smallest scale
+tested.
+
+### 4. QUESTION A — failure SHAPE differs by middleware (proven, not assumed)
+
+**Fast DDS @ N=8 (3/3 failing seeds): single-peer-isolated, SYSTEMATIC.**
+Every reporting endpoint's `missing_peers` is `["robot_0007"]` and
+NOTHING else, in all 3 seeds (`readiness_diag_0..3.json` for seed=7:
+control_station/robot_0000/robot_0001/robot_0002 all report `seen` =
+every OTHER peer, `missing` = exactly `robot_0007`). `robot_0007` is
+the LAST endpoint in launch order.
+
+**CycloneDDS @ N=8 (3/3 failing seeds): single-endpoint-totally-isolated,
+SYSTEMATIC, but a DIFFERENT shape than Fast DDS.** `control_station`
+(the FIRST endpoint in launch order) reports `seen=["robot_0000"]`,
+`missing` = all 6 remaining peers, `discovery_convergence_s=15.03`
+(ran out the full timeout). This is a different failure signature
+(one endpoint isolated from nearly everyone) than Fast DDS's (nearly
+everyone isolated from exactly one endpoint) — **direct evidence the
+two middlewares do NOT share a cause**, confirming the task's own
+starting hypothesis.
+
+**Zenoh (fails at BOTH N=4 and N=8): RANDOM/PARTIAL-MESH, no single
+culprit.** At N=4 seed=7: `control_station` misses `{robot_0000,
+robot_0003}` while `robot_0001`/`robot_0002` converge FULLY (see all 4
+peers). At N=4 seed=13/29: `control_station` instead misses
+`{robot_0002, robot_0003}`. Which specific pairs fail to connect
+varies seed-to-seed — no fixed single peer or single endpoint explains
+it, unlike Fast DDS/CycloneDDS. `control_station` (which also hosts
+the Zenoh router, per the earlier "ZENOH LAN N=16 VARIANCE ROOT-CAUSE
+INVESTIGATION" section) is disproportionately implicated but not
+exclusively (`robot_0000` also appears as a failing reporter once).
+
+**No LATE-arrival cases were found** (`peer_first_seen_s` values
+`>80%` of `discovery_timeout_s` among ANY successfully-captured
+diagnostic): every peer that was ever going to be seen was seen early
+(typically 0.6s-6.1s into a 15s budget); the failure mode in every
+observed case is a genuine, hard NEVER-SEEN within the window, not a
+narrowly-missed deadline.
+
+### 5. QUESTION A — is `discovery_peers_seen` a trustworthy signal? YES (with one important caveat)
+
+The identity data is internally consistent and externally corroborated:
+independent endpoints (e.g. Fast DDS's control_station, robot_0000,
+robot_0001, robot_0002) agree with each other on exactly which peer
+is missing (robot_0007), and no run showed a peer being "seen" by one
+endpoint that reported bogus/impossible data. **Verdict: trustworthy
+for any run whose diagnostic file was actually captured.** No new
+READY_PROBE/READY_ACK protocol was needed or added — the existing
+beacon identity data, once surfaced (this pass's whole point), was
+sufficient.
+
+**The caveat is a harness limitation, not a signal-trust problem** —
+see §14.
+
+### 6. QUESTION A — same-seed cross-scale comparison
+
+Fast DDS and CycloneDDS: IDENTICAL seeds {7,13,29}, IDENTICAL
+`--discovery-timeout-s=15.0`, only `num_robots` changes (4 -> 8) between
+a 100%-pass column and a 100%-fail column. This is the cleanest single
+piece of evidence in this investigation: the 15-second budget that is
+generous at N=4 is fully consumed (or insufficient) at N=8 for both
+DDS-based middlewares.
+
+### 7. QUESTION B — methodology
+
+Smallest reproducible case: N=4 (5 endpoints total, including
+`control_station`), FleetRMW, one fixed seed (7), default
+`num_crossings=5`/`reply_timeout_s=5.0`/`defer_release_timeout_s=8.0`/
+`scenario_timeout_s=120.0`. Full per-message funnel joined and
+classified by new `scripts/analyze_table6_forced_entry_funnel.py`. Raw:
+`results_rmw_socket/table6_question_b_funnel/` (gitignored, regenerate
+via `run_coordination_probe(num_robots=4, seed=7,
+rmw_implementation="rmw_fleetqox_cpp")` + the analyzer).
+
+### 8. QUESTION B — headline result: crossing 0 alone consumes the ENTIRE scenario
+
+Every one of the 5 endpoints completed exactly **1 of 5** requested
+crossings (`num_crossings_completed=1`), each retried its first
+request **24 times** over the full `scenario_timeout_s=120s`, and each
+hit `task_completion_s≈120.3s` (i.e. ran out the clock) before forcing
+entry. **Crossings 1-4 never even started.** This exact pattern —
+`num_crossings_completed=1`, `task_completion_s≈120.3s`, single forced
+crossing — was independently confirmed, from the EXISTING
+`table6_corrected_readiness_baseline` artifacts (which predate this
+pass's instrumentation but still record `crossings`/
+`num_crossings_completed`), at **N=8, N=16, and N=32 as well** (all
+`seed=7`). This is not an artifact of the small N=4 case — it is the
+same mechanism at every scale tested this project has ever run for
+Table VI's FleetRMW arm.
+
+### 9. QUESTION B — full REQUEST/REPLY funnel: proven, not guessed
+
+For all 20 directed request pairs (5 senders x 4 peers) and all 20
+directed reply pairs, `sent_log`/`raw_received_log` were joined
+directly (peer's own `sent_log` vs. sender's own
+`raw_received_log`, matched on exact `req_id`):
+
+- **No endpoint ever received DISTINCT replies from all 4 required
+  peers, across the full 120s.** Best case (`robot_0000`): 3 of 4
+  distinct repliers ever seen (`control_station`, `robot_0001`,
+  `robot_0003` — `robot_0002` never). Worst case (`control_station`):
+  1 of 4 (`robot_0000` only).
+- **Every single "missing" reply was PROVEN to have been sent,
+  repeatedly, by the peer, and never received** — e.g.
+  `robot_0001`/`robot_0002`/`robot_0003` each show 2 separate,
+  correctly-addressed, correct-`req_id` reply sends to
+  `control_station` in their own `sent_log`; `control_station`'s
+  `raw_received_log` contains zero matching entries for any of them,
+  across the whole run. This is **LOST**, not LATE — the entire 120s
+  window was scanned, not just one retry's attempt deadline.
+- Aggregate message accounting for this run: 480 REQUEST messages sent
+  (24 retries x 4 destinations x 5 senders), 77 received (16.0%
+  delivery); 77 REPLY messages sent (one per request actually
+  received, confirmed 1:1), 21 received (27.3% delivery). **Combined
+  coordination-topic delivery: 98/557 = 17.6%.**
+- `debug_counters["publish_failures"]` was **0 for all 5 endpoints** —
+  every send in `sent_log` was a genuine, successful hand-off to the
+  RMW layer, not an OS-level send failure masquerading as a protocol
+  issue.
+
+### 10. QUESTION B — the `own_claim_yielded_on_timeout` reset mechanism is a REAL but NOT the PROXIMATE cause here
+
+`release_stale_deferrals()` wipes an endpoint's own
+`replies_received` set whenever it yields a deferred reply after
+`--defer-release-timeout-s=8s` while still `requesting` — a real,
+frequently-firing mechanism in this run (`own_claim_yielded_on_timeout`
+= 16/4/0/14/11 across the 5 endpoints). However, since NO endpoint ever
+assembled a complete 4-of-4 distinct-repliers set at ANY point during
+the whole 120s (§9), this reset never actually discarded a
+would-have-succeeded set — there was never a complete set to discard.
+**The dominant, evidenced cause is plain per-message non-delivery on
+the coordination-control topic, not a reset/logic bug in the
+Ricart-Agrawala state machine.** (`robot_0001`, whose
+`own_claim_yielded_on_timeout=0`, still forced entry for the exact
+same reason as everyone else: 2 of 4 required peers' replies were
+never received, full stop.)
+
+### 11. QUESTION B — REPLY broadcast amplification: quantified, not fixed
+
+Of all REPLY messages physically received across the fleet in this
+run, **59.6% (31 of 52) were not even addressed to the receiver** —
+discarded immediately by `on_reply()`'s `if payload["to"] !=
+args.endpoint: return`. This is a real, measured extra burden on the
+shared channel from the still-unreverted "TEMPORARY diagnostic"
+REQUEST+REPLY topic merge (see "TABLE IV/V/VI COMMUNICATION-ARCHITECTURE
+AND READINESS AUDIT"). **This quantifies the amplification's channel
+cost; it does NOT, by itself, prove the amplification is the dominant
+cause of the 17.6% overall delivery rate** (vs. general
+wifi/ns-3-simulated contention from 5 concurrently, continuously
+retrying endpoints) — isolating that would need a controlled A/B
+(splitting the topics), which is explicitly out of scope this pass.
+
+### 12. QUESTION B — does REPLY broadcast traffic occur BEFORE readiness? Proven NO, structurally
+
+Not just correlational: `send_reply()` and the REQUEST-publish call
+inside the crossing loop are the ONLY two call sites that ever publish
+to `/fleetqox_coordination/control`, and both are unreachable until
+AFTER `args.start_file` exists (the crossing loop is the code
+immediately following the `--start-file` wait). The shared
+`start_file` is only ever touched by
+`wait_for_ready_then_start()` after it has observed EVERY endpoint's
+ready-file contain `ready` — i.e. after ALL endpoints, across ALL
+middlewares, have already passed or failed readiness. The
+readiness-beacon phase itself uses a wholly separate topic
+(`/fleetqox_coordination/_discovery_probe`) that neither `send_reply()`
+nor the request-publish site ever touches. **No coordination REQUEST
+or REPLY traffic can physically exist before the shared start gate
+fires, for any middleware, by construction of this harness** — this
+is a code-reachability proof, not a timestamp-correlation argument.
+
+### 13. What was proven vs. suspected vs. insufficient evidence (explicit, per the task's own requirement)
+
+- **PROVEN**: Fast DDS/CycloneDDS readiness failure is scale-dependent
+  (§3, §6). Fast DDS's and CycloneDDS's N=8 failure shapes differ from
+  each other (§4). No endpoint in the Question B run ever received all
+  4 required distinct repliers (§9). Every "missing" Question-B reply
+  was sent but never received — LOST, not LATE (§9). REPLY/REQUEST
+  traffic cannot occur before the shared start gate (§12).
+- **SUSPECTED, not proven**: sequential `docker exec -d` launch order
+  causing multi-second discovery-loop start-time skew across endpoints
+  is a plausible contributor to which specific endpoint(s) appear
+  "isolated" (§4, §14) — no per-container launch timestamp was
+  captured this pass to confirm it directly.
+- **INSUFFICIENT EVIDENCE**: whether the REPLY/REQUEST shared-topic
+  broadcast amplification (§11) is the dominant cause of the 17.6%
+  coordination-topic delivery rate, vs. generic wifi/ns-3-simulated
+  contention from 5 endpoints continuously retrying for 120s — would
+  need a controlled, currently out-of-scope A/B experiment. Whether
+  CycloneDDS's control_station-isolation (§4) is symmetric or
+  one-directional — the other 7 endpoints' own diagnostic files were
+  destroyed by teardown before they could be written (§14).
+
+### 14. Methodological limitation discovered by this pass: immediate-teardown-on-first-invalid destroys other endpoints' evidence
+
+`wait_for_ready_then_start()` raises `ReadinessFailure` (and
+`run_coordination_probe()`'s `finally: probe.teardown()` then
+`docker rm -f`s every container) the instant ANY ONE endpoint's
+ready-file shows `invalid_readiness` — by design, to avoid entering the
+measured workload on a known-bad run. A side effect, discovered via
+this pass's own data: several endpoints in slower/larger runs (e.g.
+Fast DDS N=8 seed=7's `robot_0003`-`robot_0007`, CycloneDDS N=8
+seed=7's `robot_0000`-`robot_0007`) have **0-byte log files and no
+`readiness_diag_i.json` at all** — not because they behaved
+differently, but because they were still executing (their beacons
+WERE independently observed by other endpoints' diagnostics, e.g.
+`robot_0003`-`robot_0006`'s beacons were seen by Fast DDS's
+control_station at 5.7-6.1s) when teardown fired before they reached
+their own 15-second mark and wrote anything. **This is a data-capture
+gap, not evidence those endpoints behaved abnormally** — flagged
+honestly rather than silently treated as "no data = converged" or
+"no data = also failed."
+
+### 15. Explicitly NOT done this pass (per the task's constraints)
+
+No fix to REPLY broadcast amplification. No change to the
+REQUEST/REPLY topic split. No change to Ricart-Agrawala priority/defer
+logic. No increase to `--discovery-timeout-s`, `--reply-timeout-s`, or
+`--defer-release-timeout-s`. No DDS/Zenoh discovery config change. No
+FleetRMW production code change. No large seed matrix (18 + 1 runs
+total, both deliberately small). No LAN N=16 rerun. No Wi-Fi/5G
+experiments started.
+
+### 16. Proposed next experiment (NOT implemented this pass)
+
+Given the strongest, most surprising, and most actionable finding is
+§9-§11 (FleetRMW's own coordination-control topic — which this
+project's architecture already gives a dedicated reliable-retransmit
+path, `ReliableRetransmitEntry`/`g_retransmit_ledger`, per prior work
+this session — loses 82.4% of messages over 120s of sustained
+contention): the recommended next measurement-only step is to
+instrument (not fix) whether REQUEST/REPLY messages on
+`/fleetqox_coordination/control` actually enter FleetRMW's own
+retransmit ledger at all, and if so, at what stage they are being
+dropped (never retried vs. retried-but-still-lost vs. retried
+successfully but the SUBSCRIBER's callback never fires) — this
+directly tests whether the 17.6% delivery rate is a transport-layer
+problem beneath the coordination protocol (fixable independently of
+Ricart-Agrawala/broadcast changes) or something specific to how this
+one topic is used. A secondary, lower-priority candidate (addresses
+§14, not §9-§11): delay `teardown()` briefly after the first
+`INVALID_READINESS` detection so every endpoint's own diagnostic file
+gets a chance to be written, closing the CycloneDDS symmetry gap noted
+in §13.
+
+**Files**: `scripts/fleetqox_coordination_endpoint.py` (instrumentation,
+this pass), `scripts/run_ns3_docker_container_fleet_probe.py`
+(orchestrator wiring, this pass),
+`tests/test_fleetqox_coordination_endpoint.py` (RED/GREEN, this pass),
+`scripts/run_table6_readiness_diagnostic_probe.py` (new, Question A
+driver), `scripts/analyze_table6_readiness_diagnostics.py` (new,
+Question A analysis), `scripts/analyze_table6_forced_entry_funnel.py`
+(new, Question B analysis). Raw output:
+`results_rmw_socket/table6_readiness_diagnostic/` and
+`results_rmw_socket/table6_question_b_funnel/` (gitignored, regenerate
+via the scripts above).
 
 ## Quy ước cập nhật file này
 
