@@ -17,7 +17,7 @@ Trạng thái tại thời điểm kiểm tra gốc (07/09/2026): **0/6 nhóm đ
 | 3 | QUIC/PKI và HA/fencing (online rotation, live revocation, ma trận phân vùng không split-brain, failover/failback đa host, durable state) | Đạt phần lớn (thiếu đa host) | ✅ **Đã đóng** | HA multi-host (Raft + etcd/PostgreSQL, failover + failback) làm ở phiên trước (2 VM KVM thật). PKI cert/CA rotation multi-host (CRL revocation + CA rotation thật, không phải chỉ thêm CA) làm phiên này: `scripts/run_multihost_kvm_udp_peer_auth_crl_reload_probe.py`, 4/4 round pass. Commit `65b7100`. Lưu ý nhỏ: "ma trận phân vùng" mới test một số kịch bản tiêu biểu, chưa phải toàn bộ tổ hợp. |
 | 4 | Ngữ nghĩa RMW (full QoS event, full DDS content-filter dialect, deep preallocation) | Đạt một phần | ✅ **Đã đóng** | Dynamic message, nhiều QoS extension (liveliness, deadline, lifespan, destination_order, ownership, partition, presentation) đã xong. **Task #42 (content-filter dialect) đã đóng**: thêm `LIKE ... ESCAPE`, 3/3 pass (`run_rmw_docker_content_filter_sql_probe.py`), và đã ra quyết định phạm vi chính thức — subset hiện tại là ranh giới cuối cùng. **Task #43 (deep_preallocation_claim) đã đóng phần lớn hơn dự kiến**: thay vì redesign wire-format nhị phân (rủi ro cao, ban đầu định hỏi ý kiến), tìm được cách an toàn hơn — verify `snprintf("%.6g",...)` giống hệt định dạng double của `ostringstream` (400k+ giá trị test), rồi build JSON frame body thẳng vào buffer bền vững (`frame_json_scratch`) thay vì `ostringstream` mới mỗi lần, và pool hoá entry trong retransmit ledger (`g_retired_retransmit_entries`) — không đổi 1 byte nào trên wire, không ảnh hưởng 187 probe khác. Verify bằng A/B rebuild (git stash) xác nhận 2 lỗi flaky có sẵn (`rmw_wait_for_all_acked_probe`, `remote_wait_for_all_acked_probe`) tái hiện y hệt ở cả code cũ và mới → không phải regression. `deep_preallocation_claim` vẫn giữ `false` (đúng): phần message deserialization và ledger hash-map node allocation vẫn chưa pool hoá, và binary wire format vẫn là ranh giới scope có chủ đích, không phải việc treo. |
 | 5 | Nav2, Open-RMF, đa host, HIL | Đạt một phần | ❌ **Chưa làm** | Nav2 đã có bằng chứng chạy thực tế (từ trước). Open-RMF chưa phải full upstream stack; chưa có bằng chứng đa host/HIL cho workload tự hành. |
-| 6 | Đối sánh mô phỏng (ns-3/OMNeT++), soak dài hạn, bằng chứng phát hành qua CI | Đạt một phần | 🟡 **Đang làm** | Xem mục "Nhóm 6" bên dưới. Đối sánh ns-3/OMNeT++ Wi-Fi: tìm + sửa 2 bug thật (INET PendingQueue 100 vs ns-3 500 gói; INET Arp retryTimeout 1s bị lộ do đồng bộ start-time) + sửa cách so sánh p99 sang tỷ lệ tương đối. Kết quả 10-seed: **8 trạm = 100% nhóm kịch bản khớp** (trung bình), 16 trạm 56%, 32 trạm 33% (còn khoảng cách thật ở delivery ratio, đã thử 8 giả thuyết không tìm thêm được nguyên nhân). CI: đã xác minh chạy thật pass qua GitHub API. **Baseline LAN N=16 mới (18/09/2026, sau khi sửa 2 bug harness)**: FleetRMW/Fast DDS/CycloneDDS đều 100% ở cả 3 seed (7/13/29); Zenoh 52.8-86.1% (biến động thật do discovery mặc định, không phải lỗi hạ tầng) — xem mục "FRESH CORRECTED-HARNESS LAN N=16 BASELINE". **Mở rộng lên 20 seed ghép cặp (19/09/2026)**: FleetRMW/Fast DDS/CycloneDDS **100% ở TẤT CẢ 20 seed, không ngoại lệ** — xác nhận đây là **ceiling effect** (workload quá dễ để phân biệt 3 hệ thống này), nên gate "superiority" (+15pp so baseline tốt nhất mỗi seed + bootstrap CI > 0) **KHÔNG ĐẠT ĐƯỢC** (và về cấu trúc không thể đạt được trên workload này, vì baseline luôn ở mức trần 100%). Zenoh: biến động rất lớn được định lượng rõ ở n=20 (mean 42.4%, min 4.6%, max 100%, stdev 33.4pp) — nguyên nhân discovery-timing vẫn là giả thuyết, chưa xác nhận. FleetRMW p99 cao hơn ~2x 3 hệ thống kia một cách nhất quán qua cả 20 seed (mô tả thuần, chưa điều tra cơ chế). Xem mục "LAN N=16 — 20-SEED PAIRED CORRECTED-HARNESS EXPERIMENT". Số liệu LAN cũ (trước fix 2 bug harness) đã SUPERSEDED, không dùng để so sánh nữa. **Fix bug "false-ready" cho readiness gate dùng chung (19/09/2026)**: đúng RED→FIX→GREEN, đã sửa và verify (0 regression, 811 test pass). Nhưng khi enforce fix thật (live), phát hiện vấn đề LỚN HƠN dự kiến: gate readiness hiện tại (beacon 16 peer, full-mesh) KHÔNG khớp với workload thực tế (topology hình sao — mỗi robot chỉ nói chuyện với control_station, xác nhận 0 cặp robot-robot trong trace). Kết quả: Fast DDS/CycloneDDS (không chỉ Zenoh) CŨNG bị INVALID_READINESS ở các seed trước đây pass 100% → **Fast DDS sanity: FAIL, CycloneDDS sanity: FAIL, Zenoh 20-seed rerun: 0/20 valid**. FleetRMW không ảnh hưởng (PASS, dùng đường riêng). Kết luận: KHÔNG được nói "Zenoh đã fix" — bug readiness đã đóng đúng, nhưng lộ ra gate cần redesign theo topology thực tế trước khi benchmark LAN N=16 nào (không riêng Zenoh) đáng tin cậy trở lại. Xem mục "ZENOH FALSE-READY HARNESS FIX AND VALIDATION". Soak dài hạn: chưa làm. |
+| 6 | Đối sánh mô phỏng (ns-3/OMNeT++), soak dài hạn, bằng chứng phát hành qua CI | Đạt một phần | 🟡 **Đang làm** | Xem mục "Nhóm 6" bên dưới. Đối sánh ns-3/OMNeT++ Wi-Fi: tìm + sửa 2 bug thật (INET PendingQueue 100 vs ns-3 500 gói; INET Arp retryTimeout 1s bị lộ do đồng bộ start-time) + sửa cách so sánh p99 sang tỷ lệ tương đối. Kết quả 10-seed: **8 trạm = 100% nhóm kịch bản khớp** (trung bình), 16 trạm 56%, 32 trạm 33% (còn khoảng cách thật ở delivery ratio, đã thử 8 giả thuyết không tìm thêm được nguyên nhân). CI: đã xác minh chạy thật pass qua GitHub API. **Baseline LAN N=16 mới (18/09/2026, sau khi sửa 2 bug harness)**: FleetRMW/Fast DDS/CycloneDDS đều 100% ở cả 3 seed (7/13/29); Zenoh 52.8-86.1% (biến động thật do discovery mặc định, không phải lỗi hạ tầng) — xem mục "FRESH CORRECTED-HARNESS LAN N=16 BASELINE". **Mở rộng lên 20 seed ghép cặp (19/09/2026)**: FleetRMW/Fast DDS/CycloneDDS **100% ở TẤT CẢ 20 seed, không ngoại lệ** — xác nhận đây là **ceiling effect** (workload quá dễ để phân biệt 3 hệ thống này), nên gate "superiority" (+15pp so baseline tốt nhất mỗi seed + bootstrap CI > 0) **KHÔNG ĐẠT ĐƯỢC** (và về cấu trúc không thể đạt được trên workload này, vì baseline luôn ở mức trần 100%). Zenoh: biến động rất lớn được định lượng rõ ở n=20 (mean 42.4%, min 4.6%, max 100%, stdev 33.4pp) — nguyên nhân discovery-timing vẫn là giả thuyết, chưa xác nhận. FleetRMW p99 cao hơn ~2x 3 hệ thống kia một cách nhất quán qua cả 20 seed (mô tả thuần, chưa điều tra cơ chế). Xem mục "LAN N=16 — 20-SEED PAIRED CORRECTED-HARNESS EXPERIMENT". Số liệu LAN cũ (trước fix 2 bug harness) đã SUPERSEDED, không dùng để so sánh nữa. **Fix bug "false-ready" cho readiness gate dùng chung (19/09/2026)**: đúng RED→FIX→GREEN, đã sửa và verify (0 regression, 811 test pass). Nhưng khi enforce fix thật (live), phát hiện vấn đề LỚN HƠN dự kiến: gate readiness hiện tại (beacon 16 peer, full-mesh) KHÔNG khớp với workload thực tế (topology hình sao — mỗi robot chỉ nói chuyện với control_station, xác nhận 0 cặp robot-robot trong trace). Kết quả: Fast DDS/CycloneDDS (không chỉ Zenoh) CŨNG bị INVALID_READINESS ở các seed trước đây pass 100% → **Fast DDS sanity: FAIL, CycloneDDS sanity: FAIL, Zenoh 20-seed rerun: 0/20 valid**. FleetRMW không ảnh hưởng (PASS, dùng đường riêng). Kết luận: KHÔNG được nói "Zenoh đã fix" — bug readiness đã đóng đúng, nhưng lộ ra gate cần redesign theo topology thực tế trước khi benchmark LAN N=16 nào (không riêng Zenoh) đáng tin cậy trở lại. Xem mục "ZENOH FALSE-READY HARNESS FIX AND VALIDATION". **Audit kiến trúc Bảng IV/V/VI (19/09/2026)**: xác nhận topology hình sao ở Bảng IV/V là CÓ CHỦ ĐÍCH (từ tận model gốc `_destination_for()`, không phải bug harness) — điều phối robot-robot thật chỉ tồn tại ở Bảng VI (Ricart-Agrawala, full-mesh CHÍNH XÁC theo yêu cầu thuật toán, không phải quá mức). Phát hiện thêm: (1) lệnh robot-specific ở Bảng IV/V ĐÃ đúng target 1 robot (không broadcast); (2) CHƯA có lệnh fleet-wide/emergency-stop nào trong Bảng IV/V; (3) flow tên "coordination" ở Bảng IV/V thực ra vẫn đi qua hub, không phải robot-robot thật; (4) Bảng VI có bug khuếch đại broadcast THẬT — REPLY (đáng lẽ point-to-point) bị gửi chung 1 topic với REQUEST, khuếch đại (N-1)x, là tàn dư diagnostic tạm thời chưa revert; (5) Bảng VI dùng code readiness RIÊNG (`fleetqox_coordination_endpoint.py`), CHƯA được áp fix false-ready. Đề xuất bước tiếp theo: readiness theo "required edge" cho từng endpoint (lấy từ trace CSV cho Bảng IV/V, giữ nguyên full-mesh cho Bảng VI) thay vì 1 hằng số `expected_peer_count` dùng chung — CHƯA triển khai. Xem mục "TABLE IV/V/VI COMMUNICATION-ARCHITECTURE AND READINESS AUDIT". Soak dài hạn: chưa làm. |
 
 **Tóm lại: 4/6 nhóm đã đóng (1, 2, 3, 4 — nhóm 4 vẫn còn vài ranh giới
 scope có chủ đích, xem bảng, không phải việc treo). Nhóm 6 đang bắt đầu
@@ -11452,6 +11452,449 @@ same commit), `tests/test_fleetqox_rmw_trace_endpoint.py` (RED, commit
 this pass's validation driver). Raw validation output:
 `results_rmw_socket/zenoh_false_ready_fix_validation/` (gitignored,
 regenerate via the script above).
+
+## TABLE IV/V/VI COMMUNICATION-ARCHITECTURE AND READINESS AUDIT (19/09/2026)
+
+**ARCHITECTURE + WORKLOAD AUDIT ONLY.** No benchmark parameters, no
+middleware config, no production code, no coordination protocol
+changed. No 20-seed rerun. No Wi-Fi/5G started. Read-only source/data
+inspection, all conclusions cited to exact files/lines/data.
+
+### 1. SIMPLE ARCHITECTURE
+
+- **Who gives tasks?** `control_station` (a merge of 3 originally
+  separate abstract roles -- see Part 2) issues per-robot commands.
+- **Who executes them?** Each robot, individually, on its own command
+  stream.
+- **Who coordinates conflicts?** Robots themselves, directly with each
+  other -- but ONLY in a completely separate benchmark (Table VI,
+  `fleetqox_coordination_endpoint.py`), not in Table IV/V's trace
+  replay at all (Part 13's central finding).
+- **Who needs to communicate with whom?** Table IV/V: every robot
+  needs `control_station` (nobody needs any other robot). Table VI:
+  every robot potentially needs every OTHER robot, because its
+  scenario is literally "every robot may contend for the SAME one
+  shared zone" -- not sparse pairwise conflicts.
+
+### 2. TABLE IV
+
+**What it measures**: discovery/graph convergence cost itself (not
+delivery) -- convergence time, discovery bytes, CPU/RSS, graph/join
+failure rate -- at N=8/16/32, using the SAME underlying trace-replay
+workload as Table V (`fleetqox/simulator.py::build_fleet_workload()` +
+`fleetqox/trace.py::generate_trace_events()`, replayed by
+`fleetqox_rmw_trace_endpoint.py` over `run_ns3_docker_container_fleet_probe.py`'s
+LAN/wifi profiles). Source: `docs/BANG_V_VI_KET_QUA.md` lines 23-70.
+
+Every flow in this workload traces back to `fleetqox/trace.py`'s
+`_source_for()`/`_destination_for()` (lines 342-353):
+
+```python
+def _source_for(flow):
+    if flow.flow_class is FlowClass.CONTROL:
+        return "fleet_controller"
+    return flow.robot_id
+
+def _destination_for(flow):
+    if flow.flow_class is FlowClass.CONTROL:
+        return flow.robot_id
+    if flow.flow_class is FlowClass.HUMAN_QOE:
+        return "operator_ui"
+    return "fleet_router"
+```
+
+`merge_control_station=True` (opt-in, `fleetqox/trace.py` lines
+160-176, used by the LAN/wifi container-fleet scenario) then
+string-remaps `{fleet_controller, fleet_router, operator_ui}` all to
+one `control_station` name -- a topology simplification (3 roles -> 1
+container), NOT a robot-to-robot merge.
+
+| flow (`FlowSpec`, `fleetqox/simulator.py` lines 76-140+) | sender | logical receiver | physical receiver | rate | payload | purpose |
+|---|---|---|---|---|---|---|
+| CONTROL (`/cmd_vel`) | control_station | **the one specific robot** | same (per-robot topic `/fleetqox_trace/robot_XXXX/control`) | 50 Hz | 96 B | robot-specific command |
+| STATE (`/fleet_state`) | robot | control_station (`fleet_router`) | same | 10 Hz | 320 B | robot -> hub telemetry |
+| COORDINATION (`/coordination_intent`) | robot | control_station (`fleet_router`) | same | 8 Hz | 192 B | **named "coordination" but routed to the hub, never to another robot** -- see Part 13 |
+| PERCEPTION (`/semantic_obstacles`) | robot | control_station (`fleet_router`) | same | -- | -- | robot -> hub |
+| HUMAN_QOE | robot | control_station (`operator_ui`) | same | -- | -- | robot -> operator |
+| DEBUG/BULK/SAFETY | robot | control_station (`fleet_router`) | same | -- | -- | robot -> hub |
+
+Every flow is `control_station<->robot`. **None is `robot->robot`**,
+confirmed independently at the deepest layer (`_destination_for()`
+itself, before any harness-level topology choice) -- this was never a
+harness simplification bug, it is how the trace GENERATOR has always
+worked.
+
+### 3. TABLE V
+
+Same underlying trace/workload as Table IV, replayed across 3 network
+profiles (Wi-Fi/LAN/5G SA emulation) with delivery/latency/jitter/stale
+metrics (`docs/BANG_V_VI_KET_QUA.md` lines 72-138). Direct trace-CSV
+verification (this session, seed=41, `rmw_zenoh_cpp_default_n16_seed41/trace_ref_16robot_seed41.csv`):
+**32 distinct (src,dst) pairs, 0 robot-to-robot pairs** -- every single
+pair is `control_station<->robot_XXXX`.
+
+**Is the current star topology intentional? YES.** Evidence, from
+strongest to weakest:
+1. `_destination_for()` (Part 2) has NEVER had a robot-to-robot case --
+   this is the trace generator's foundational design, not a benchmark
+   harness shortcut.
+2. Table V's own stated purpose (`docs/BANG_V_VI_KET_QUA.md` line 72,
+   "Đầy đủ 3 profile") is comparing middleware DATA-TRANSPORT behavior
+   under a realistic FleetQoX-tagged traffic MIX across network
+   conditions -- a transport benchmark, not a coordination-protocol
+   benchmark.
+3. Genuine robot-to-robot coordination already has its OWN, entirely
+   separate, purpose-built benchmark (Table VI) with a different
+   endpoint script, different traffic model, and different metrics
+   (task completion, forced-entry rate) that would be redundant with
+   Table V if Table V also modeled peer coordination.
+
+**However** (the important nuance, not a contradiction of "intentional"):
+the FlowClass literally named `COORDINATION` (`/coordination_intent`,
+`fleetqox/model.py` line 19) is **also** routed `robot->fleet_router`,
+never `robot->robot` -- so despite its name, Table IV/V's own
+"coordination" traffic has never modeled genuine peer-to-peer
+intent exchange. That gap is real (see Part 13) but it does not make
+the STAR topology itself unintentional -- it means the word
+"coordination" is used for two different things in this project (a
+QoS-tagged traffic class name in Table IV/V, and an actual
+peer-to-peer protocol in Table VI) and the former was never meant to
+imply the latter.
+
+### 4. TABLE VI
+
+**Step-by-step coordination process** (`scripts/fleetqox_coordination_endpoint.py`,
+module docstring lines 1-104, algorithm code lines 260-528): Ricart-Agrawala
+distributed mutual exclusion. Every participant contends for the SAME
+ONE shared "zone" (a stand-in for a shared corridor/intersection) --
+this is a deliberate, textbook-correct protocol chosen specifically
+because "who wins a conflict" needs a precise, provably-fair
+definition.
+
+```
+control_station assigns nothing here (Table VI has no control_station
+role at all -- N peer endpoints only, see launch_coordination_endpoints(),
+run_ns3_docker_container_fleet_probe.py line 1247)
+        |
+        v
+robot wants to cross the shared zone
+        |
+        v
+broadcasts REQUEST(lamport_ts, req_id) to EVERY other participant
+   (by protocol design -- ANY other participant might currently hold
+   or be contending for the same shared resource)
+        |
+        v
+each OTHER participant either replies immediately (requester has
+priority) or defers its reply (this participant has priority / is
+already in the zone)
+        |
+        v
+requester enters the zone once it has collected REPLY from EVERY
+other participant (N-1 replies)
+        |
+        v
+on leaving the zone, sends any deferred replies -- unblocking whoever
+was waiting on this participant
+```
+
+Communication IS logically directed for REQUEST (broadcast-to-all, by
+protocol necessity -- every other participant is a potential
+conflict for the SAME single shared zone) and for REPLY (`payload["to"]`,
+targeted at exactly the one requester it answers, `on_reply()` line
+496: `if payload["to"] != args.endpoint: return`).
+
+### 5. CURRENT COMMUNICATION GRAPHS
+
+```
+TABLE IV / TABLE V (star, verified 0 robot-to-robot pairs):
+
+        control_station
+        /   |   |   \
+       v    v   v    v
+     R0    R1  R2 ... R15
+  (every edge is control_station<->R_i; no R_i<->R_j edge exists)
+
+TABLE VI (full mesh by protocol design, N participants, no control_station):
+
+  R0 --- R1 --- R2 --- ... --- R15
+   \  \  / \    /  \          /
+    \  \/   \  /    \        /
+     \ /\    \/      \      /
+     (every R_i connects to every other R_j: REQUEST broadcast +
+      targeted REPLY, all physically carried on ONE shared topic --
+      see Part 8 for the physical-vs-logical distinction)
+```
+
+### 6. COMMAND DELIVERY
+
+**Robot-specific command (CONTROL/`/cmd_vel`) currently goes to: ONE
+ROBOT.** `_destination_for()` returns `flow.robot_id` specifically for
+`FlowClass.CONTROL` (Part 2) -- each robot's control topic is its own
+per-destination topic (`/fleetqox_trace/robot_XXXX/control`), not a
+shared/duplicated broadcast. This is genuinely targeted delivery, by
+design, matching the research goal's "R3: execute task A->B" example
+exactly.
+
+**Fleet-wide command support: NOT PRESENT in Table IV/V.** There is no
+flow class or code path in `fleetqox/trace.py`/`build_fleet_workload()`
+that sends one message to ALL robots at once (e.g. an emergency stop).
+Every existing flow is either one-specific-robot (CONTROL) or
+robot-to-hub (everything else). This is a genuine gap relative to the
+research goal's own stated example ("a true fleet-wide command, e.g.
+emergency stop, may be delivered to all robots") -- see Part 13.
+
+### 7. ROBOT-TO-ROBOT COORDINATION
+
+**Table IV/V: logically absent.** No flow, at any layer (model,
+simulator, trace, harness), routes robot-to-robot. The FlowClass named
+`COORDINATION` is robot-to-hub only (Part 3).
+
+**Table VI: logically present, physically over-broadcast for REPLY.**
+REQUEST is genuinely meant to reach everyone (correct fan-out by
+protocol design). REPLY is logically point-to-point
+(`payload["to"]==` one specific robot) but **physically published on
+the exact same shared topic as REQUEST** (`fleetqox_coordination_endpoint.py`
+line 320: `reply_pub = request_pub`, both on `/fleetqox_coordination/control`).
+Every REPLY is therefore delivered to, deserialized by, and inspected
+by all N-1 unintended recipients before being discarded
+(`on_reply()`'s `if payload["to"] != args.endpoint: return`, line 496).
+
+### 8. BROADCAST AMPLIFICATION
+
+**PROVEN**, with source evidence and a quantified factor.
+
+`fleetqox_coordination_endpoint.py` lines 313-320's own comment
+labels this explicitly as a **leftover diagnostic**, not an
+intentional design decision:
+> *"DIAGNOSTIC: temporarily using ONE shared topic for both REQUEST and
+> REPLY ... to test whether having 2 independent pub/sub pairs on one
+> process is itself the cause of a real, reproducible bug under
+> investigation ... Moving the actual publish() out to the main loop
+> fixed it."*
+
+The comment itself says the REAL bug (replies essentially never
+received) was fixed by a DIFFERENT change (moving `publish()` calls out
+of the subscription callback into the main loop, `drain_pending_replies()`,
+lines 397-410) -- **not** by merging the two topics. No commit or doc
+entry was found (grep across `docs/AUDIT_ACCEPTANCE_TRACKING.md` for
+"shared topic"/"2 topic riêng"/"revert") reverting the topic merge
+back to two separate topics after that real fix landed. This reads as
+an un-reverted diagnostic artifact, not a deliberate final design.
+
+**Quantified amplification**: every REPLY, which has exactly ONE
+intended recipient, is physically received and processed
+(deserialize + branch check) by all **N-1** unintended recipients too
+-- an **(N-1)x** over-delivery factor for reply traffic specifically
+(N=16 -> 15x; N=32 -> 31x). REQUEST's identical fan-out is NOT
+amplification -- it is the correct, minimum-necessary broadcast this
+specific "single shared zone" protocol requires (Part 9).
+
+### 9. READINESS BUG HISTORY
+
+1. **OLD (all of Table IV/V/VI's shared discovery-beacon code)**: 15s
+   timeout -> READY anyway, regardless of actual convergence
+   (`fleetqox_rmw_trace_endpoint.py`'s old unconditional
+   `ready_file.touch()`, and the STRUCTURALLY IDENTICAL, independently
+   unfixed copy in `fleetqox_coordination_endpoint.py` lines 528-569 --
+   **Table VI was never touched by the false-ready fix pass**, it has
+   its own separate copy of the exact same bug pattern, still present).
+2. **FIX (previous pass, Table IV/V's `fleetqox_rmw_trace_endpoint.py`
+   only)**: timeout no longer means ready; a hard hard gate now
+   requires `peers_seen >= expected_peer_count` (=N-1, i.e. full mesh)
+   for ANY of Fast DDS/CycloneDDS/Zenoh.
+3. **Why full-mesh is wrong for Table IV/V**: the workload is a
+   verified star (Part 2/3) -- a robot only ever exchanges data with
+   `control_station`, never with another robot, so requiring it to
+   also see all 15 OTHER robots on an unrelated diagnostic beacon topic
+   demands connectivity the real workload never uses. This is exactly
+   why Fast DDS/CycloneDDS (whose real per-topic matching only ever
+   needed `robot<->control_station` and always worked) regressed to
+   `INVALID_READINESS` once the irrelevant full-mesh beacon requirement
+   was strictly enforced.
+4. **Why star-only readiness would ALSO be wrong, but specifically for
+   Table VI**: Table VI's own protocol genuinely requires full mesh --
+   every participant may contend with every other one for the SAME
+   single shared zone, so `control_station<->robot`-only readiness
+   (or any check narrower than full mesh) would be insufficient there.
+   Table VI needs the OPPOSITE correction from Table IV/V's, which is
+   exactly why this pass was told not to jump to "each robot only
+   needs control_station" as a universal rule.
+
+### 10. CORRECT READINESS MODEL
+
+Readiness should be defined by **required communication edges**, not a
+single scalar peer count, and not hard-coded to either extreme:
+
+- **STATIC edges** (known before the benchmark starts, from the
+  workload/topology definition itself):
+  - Table IV/V: `control_station <-> robot_i` for every active `i`.
+    No `robot_i <-> robot_j` edge is ever required.
+  - Table VI: `robot_i <-> robot_j` for **every** pair (the scenario's
+    single shared zone means any pair may conflict) -- effectively a
+    full static mesh requirement, but derived from what the SPECIFIC
+    scenario's protocol needs, not a blanket "benchmark default."
+- **DYNAMIC edges** (created by runtime events, e.g. a hypothetical
+  future scenario where only R3 and R7 specifically contend for one of
+  several zones): readiness cannot require these to exist before
+  measurement starts by definition -- what CAN and should be verified
+  in advance is that the underlying transport CAPABILITY to establish
+  such an edge on demand exists (e.g. the RMW's discovery/pub-sub
+  matching machinery is up and the relevant topics are creatable), not
+  that the specific edge has already been used. Table VI's current
+  scenario (one shared zone, not per-zone-scoped conflicts) happens to
+  make every edge effectively static in practice, so this distinction
+  is currently more a matter of principle than an immediate gap -- it
+  would matter for a not-yet-built multi-zone variant of Table VI.
+
+**Concrete implication for a future fix (not implemented in this
+pass)**: readiness should be parameterized by an explicit, workload-supplied
+edge list (or equivalently, a required-peer-set PER ENDPOINT, not one
+shared scalar `expected_peer_count` for everyone) -- `control_station`'s
+required set is "all N robots" in Table IV/V; each robot's required set
+is "just control_station" in Table IV/V, or "all N-1 other robots" in
+Table VI. This single mechanism, driven by different input data,
+correctly serves both tables without hard-coding either shape.
+
+### 11. APPLICATION-LEVEL HANDSHAKE
+
+**NEEDS MORE EVIDENCE**, leaning toward RECOMMENDED for static edges,
+NOT a replacement for anything Table VI-specific.
+
+Evaluated against this pass's own criteria:
+- **Correctness**: strong -- a real send+ack over each REQUIRED
+  relationship proves exactly the capability the real workload needs,
+  no more and no less, whereas the current beacon proves "I heard SOME
+  publisher on an unrelated diagnostic topic" (already documented as
+  an imperfect proxy -- see the pre-existing "CycloneDDS discovery bug
+  bí ẩn" comment in `fleetqox_rmw_trace_endpoint.py`, and this pass's
+  own Fast DDS/CycloneDDS regression evidence).
+- **Middleware neutrality**: strong -- every middleware speaks the same
+  application-level ROS 2 pub/sub API regardless of its own internal
+  discovery mechanism, so a probe-and-ack pattern doesn't privilege any
+  one middleware's internals.
+- **Scalability**: needs more evidence -- for Table VI's full-mesh
+  requirement at N=32, an all-pairs handshake is O(N^2) messages,
+  comparable in shape to the existing beacon's own fan-out, so probably
+  fine, but not measured in this pass.
+- **Discovery-state contamination**: needs more evidence -- an
+  extra probe/ack exchange creates its own pub/sub matches; whether
+  those interact with the SAME topics/QoS the real workload uses (and
+  so could mask or fix real matching issues as a side effect) needs a
+  small dedicated check, not assumed either way here.
+- **Separable from measured traffic**: should be straightforward using
+  the same pattern the existing beacon already uses (a dedicated
+  diagnostic topic, not reused for real data) -- this part is
+  low-risk.
+
+Compared with the current middleware-specific peer-count beacon: the
+handshake is conceptually cleaner (tests the actual required
+relationship, not an unrelated proxy count) but is new machinery that
+would need its own correctness verification before replacing something
+that -- despite this pass's findings -- has been load-bearing
+infrastructure for a long time.
+
+### 12. FAIRNESS
+
+Do not require identical internals. The equivalent, neutral contract
+this pass recommends: **"for every required static edge this
+workload defines, the two endpoints on that edge must demonstrate
+they can exchange an application-level message before measurement
+starts."** This is checked identically (same probe/ack shape, same
+timeout) for FleetRMW/Fast DDS/CycloneDDS/Zenoh -- none of their
+internal discovery mechanisms need to be inspected or compared, only
+the OUTCOME (can these two specific endpoints talk yet). FleetRMW's
+existing `--skip-discovery-wait` exemption would need re-examination
+under this model too (Part 13) -- it currently skips ALL readiness
+checking by asserting static-mode connectivity is instantaneous, which
+was true for Table IV/V's original design intent but has not been
+independently re-verified against an edge-based contract in this pass.
+
+### 13. GAP BETWEEN CURRENT BENCHMARK AND RESEARCH GOAL
+
+- **No fleet-wide/broadcast command exists in Table IV/V** (Part 6) --
+  the research goal explicitly describes an "emergency stop" example
+  reaching all robots; no current flow class or code path implements
+  this.
+- **Table IV/V's "coordination" flow class never models peer-to-peer
+  exchange** (Part 3/7) -- despite the name, `/coordination_intent`
+  traffic is robot-to-hub only, at the deepest model layer
+  (`_destination_for()`), not a benchmark-harness shortcut. Genuine
+  robot-to-robot coordination exists ONLY in the structurally
+  unrelated Table VI (different traffic model: fixed-rate trace replay
+  vs. event-driven mutual exclusion; different metrics; different
+  endpoint script). The two "coordination" concepts in this project's
+  vocabulary refer to genuinely different things and are not
+  currently reconciled or cross-referenced against each other in any
+  single benchmark.
+- **Reply broadcast amplification in Table VI is a real, unreverted
+  diagnostic leftover** (Part 8), not a deliberate design choice --
+  worth fixing (in a SEPARATE pass) purely as a benchmark-fidelity
+  matter, independent of any readiness-gate question.
+- **Table VI has NO `control_station` role at all** -- it is a pure
+  peer benchmark (task assignment plays no part in it), so it cannot
+  by itself validate the research goal's full pipeline ("control
+  station assigns -> robot plans -> conflict -> robots coordinate").
+  There is currently no single benchmark exercising that entire
+  pipeline end-to-end; task assignment (Table IV/V) and conflict
+  resolution (Table VI) are measured in total isolation from each
+  other.
+- **Table VI's own discovery/readiness bug is unfixed** (Part 9) --
+  it shares the exact buggy pattern this project already found and
+  fixed elsewhere, in an independent copy of the code that the
+  previous fix pass did not touch.
+
+### 14. PRODUCTION CODE CHANGES
+
+**NONE.**
+
+### 15. BENCHMARK CODE CHANGES
+
+**NONE.** This pass was read-only source/data inspection; the one
+"probe" performed (inspecting the already-generated seed=41 trace CSV
+for robot-to-robot pairs) used data already on disk from prior passes,
+no new run was executed.
+
+### 16. OPTIMIZATION #2
+
+**NOT IMPLEMENTED.**
+
+### 17. EXACTLY ONE NEXT STEP (NOT executed in this pass)
+
+Implement **per-endpoint required-peer-set readiness**, replacing the
+single shared scalar `expected_peer_count` with an explicit set
+supplied by whichever workload is launching the endpoint:
+- `fleetqox_rmw_trace_endpoint.py` (Table IV/V): derive each endpoint's
+  required set directly from ITS OWN rows in the trace CSV already
+  loaded by `load_rows()` (the same data `compute_receive_capable_deadline_s()`
+  already reads) -- every distinct `src`/`dst` this endpoint appears
+  opposite is a required peer; for a robot that is exactly one entry,
+  `control_station`; for `control_station` that is all active robots.
+  No hard-coded "1" or "N".
+- `fleetqox_coordination_endpoint.py` (Table VI): keep the existing
+  `--peers` list as the required set (already correctly "all N-1
+  others" for this scenario's genuine full-mesh need) -- but fix it to
+  use the SAME `discovery_converged()`-style correct-by-construction
+  gate instead of its own independent, still-buggy copy.
+
+This single mechanism, driven by per-workload data instead of one
+constant, should let Fast DDS/CycloneDDS/Zenoh sanity return to valid
+on Table IV/V (their real per-pair matching was always fine) while
+still correctly enforcing full-mesh readiness where Table VI's
+protocol genuinely needs it. **Not implemented or tested in this
+pass** -- proposed as the next, separately-scoped implementation step.
+
+**Files referenced (no changes)**: `fleetqox/model.py` (FlowClass,
+line 14-23), `fleetqox/simulator.py` (`build_fleet_workload`, lines
+68-140+), `fleetqox/trace.py` (`_source_for`/`_destination_for`, lines
+342-353; `merge_control_station`, lines 160-176),
+`scripts/fleetqox_rmw_trace_endpoint.py` (readiness fix, previous
+pass), `scripts/fleetqox_coordination_endpoint.py` (Table VI endpoint,
+lines 1-104 module docstring, 260-528 protocol/readiness code, 313-320
+shared-topic diagnostic comment, 494-499 `on_reply`),
+`scripts/run_ns3_docker_container_fleet_probe.py` (`launch_coordination_endpoints`
+line 1247, `run_coordination_probe` line 1922, `peers_env` line 1293),
+`docs/BANG_V_VI_KET_QUA.md` (Table IV/V/VI consolidated results).
 
 ## Quy ước cập nhật file này
 
