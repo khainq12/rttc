@@ -158,8 +158,10 @@ def classify(payload: bytes) -> str:
 
 def run_one(
     label: str, redundant_count_env: str | None, output_root: Path, seed: int = SEED,
+    repeat: int | None = None,
 ) -> dict[str, Any]:
-    output_dir = (output_root / f"fleetrmw_n{NUM_ROBOTS}_seed{seed}_{label}").resolve()
+    suffix = f"_{label}" if repeat is None else f"_rep{repeat}_{label}"
+    output_dir = (output_root / f"fleetrmw_n{NUM_ROBOTS}_seed{seed}{suffix}").resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     run_id = output_dir.name.lstrip(".")
     results_dir_container = f"{output_dir.relative_to(ROOT)}/container_results"
@@ -242,6 +244,7 @@ def run_one(
     return {
         "label": label,
         "seed": seed,
+        "repeat": repeat,
         "redundant_count_env": redundant_count_env,
         "status": status,
         "error": error_text,
@@ -307,6 +310,7 @@ def summarize(run: dict[str, Any]) -> dict[str, Any]:
     return {
         "label": run["label"],
         "seed": run["seed"],
+        "repeat": run["repeat"],
         "redundant_count_env": run["redundant_count_env"],
         "status": run["status"],
         "traffic_composition": {
@@ -342,6 +346,13 @@ def main() -> int:
         "--output-root", type=Path,
         default=ROOT / "results_rmw_socket" / "table6_n8_acknack_ab_experiment",
     )
+    parser.add_argument(
+        "--repeats", type=int, default=1,
+        help="run the full A1/B/A2 sequence this many independent times per "
+        "seed (default 1, matching every prior invocation of this script "
+        "exactly -- with --repeats 1, output paths and behavior are "
+        "byte-for-byte identical to before this flag existed).",
+    )
     args = parser.parse_args()
 
     summaries = []
@@ -350,14 +361,20 @@ def main() -> int:
             args.output_root if seed == SEED
             else args.output_root.parent / f"{args.output_root.name}_seed{seed}"
         )
-        for label, redundant_count_env in RUNS:
-            run = run_one(label, redundant_count_env, output_root, seed=seed)
-            summary = summarize(run)
-            summaries.append(summary)
-            print(
-                json.dumps({k: summary[k] for k in ("label", "seed", "status", "total_packets")}),
-                flush=True,
-            )
+        for repeat_index in range(args.repeats):
+            repeat_arg = None if args.repeats == 1 else repeat_index + 1
+            for label, redundant_count_env in RUNS:
+                run = run_one(
+                    label, redundant_count_env, output_root, seed=seed, repeat=repeat_arg,
+                )
+                summary = summarize(run)
+                summaries.append(summary)
+                print(
+                    json.dumps(
+                        {k: summary[k] for k in ("label", "seed", "repeat", "status", "total_packets")}
+                    ),
+                    flush=True,
+                )
 
     summary_path = args.output_root.parent / "table6_n8_acknack_ab_multiseed_summary.json"
     summary_path.parent.mkdir(parents=True, exist_ok=True)
