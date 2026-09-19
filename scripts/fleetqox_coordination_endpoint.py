@@ -203,6 +203,48 @@ def wait_until_deadline_while_spinning(
         drain_fn()
 
 
+def coordination_discovery_converged(
+    *,
+    skip_discovery_wait: bool,
+    beacon_active: bool,
+    required_peers: frozenset[str],
+    peers_seen: frozenset[str],
+) -> bool:
+    """The readiness CONTRACT --ready-file is allowed to promise for
+    Table VI, mirroring fleetqox_rmw_trace_endpoint.py's
+    discovery_converged() (see docs/AUDIT_ACCEPTANCE_TRACKING.md,
+    "TABLE VI READINESS CORRECTNESS FIX") but checking PEER IDENTITY
+    rather than a bare count: this endpoint's Ricart-Agrawala protocol
+    genuinely needs to reach every OTHER participant (a single shared
+    zone means any pair may conflict), so READY must mean "every
+    required peer was actually observed", not merely "N-1 beacons of
+    SOME kind arrived" -- the latter would wrongly pass a run where one
+    required peer never showed up but an unrelated/duplicate one did.
+
+    - skip_discovery_wait=True (FleetRMW's static-mode contract, see
+      --skip-discovery-wait): this endpoint never entered the discovery
+      loop at all by design -- unaffected by this fix, always converged.
+    - beacon_active=True (Fast DDS/CycloneDDS/Zenoh,
+      expected_peer_count>0): converged only if EVERY name in
+      required_peers (this endpoint's own --peers list, which already
+      excludes itself by construction -- see run_ns3_docker_container_
+      fleet_probe.py's peers_env) was actually seen in peers_seen
+      before the deadline. A timeout that never reaches this is NOT
+      convergence, regardless of how many OTHER/unrelated names were
+      seen instead.
+    - beacon_active=False (only reachable when expected_peer_count==0
+      and skip_discovery_wait==False -- not exercised by any current
+      caller, since FleetRMW always sets both together, kept for
+      completeness/symmetry with the trace-endpoint's own contract):
+      there is nothing this endpoint is waiting on, so converged.
+    """
+    if skip_discovery_wait:
+        return True
+    if beacon_active:
+        return required_peers <= peers_seen
+    return True
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--endpoint", required=True)
@@ -563,10 +605,23 @@ def main() -> int:
             if beacon_pub is not None and len(discovery_peers_seen) >= args.expected_peer_count:
                 break
     discovery_convergence_s = time.monotonic() - discovery_start
+    converged = coordination_discovery_converged(
+        skip_discovery_wait=args.skip_discovery_wait,
+        beacon_active=beacon_pub is not None,
+        required_peers=frozenset(peers),
+        peers_seen=frozenset(discovery_peers_seen),
+    )
 
     if args.ready_file:
         args.ready_file.parent.mkdir(parents=True, exist_ok=True)
-        args.ready_file.touch()
+        # Content, not mere existence, is now the readiness signal --
+        # same fix as fleetqox_rmw_trace_endpoint.py's
+        # discovery_converged() (see docs/AUDIT_ACCEPTANCE_TRACKING.md,
+        # "TABLE VI READINESS CORRECTNESS FIX"). A timeout that never
+        # reached convergence (missing one or more required peers by
+        # IDENTITY, not just count) writes "invalid_readiness" instead
+        # of "ready".
+        args.ready_file.write_text("ready\n" if converged else "invalid_readiness\n")
     if args.start_file:
         start_deadline = time.monotonic() + args.start_wait_timeout_s
         while time.monotonic() < start_deadline and not args.start_file.exists():

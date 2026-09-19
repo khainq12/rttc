@@ -2033,6 +2033,18 @@ def run_coordination_probe(
         )
         endpoint_results = probe.collect_results(results_dir_container)
         ns3_log_text = probe.ns3_log()
+    except ReadinessFailure as exc:
+        # A setup/readiness-validity failure, not a coordination-protocol
+        # result -- the start gate was never released, so no
+        # REQUEST/REPLY traffic was ever exchanged. Must not be reported
+        # or aggregated as task-completion/forced-entry/coordination
+        # failure (see ReadinessFailure's docstring).
+        status = "invalid_readiness"
+        error_text = str(exc)
+        try:
+            ns3_log_text = probe.ns3_log()
+        except Exception:  # noqa: BLE001
+            pass
     except Exception as exc:  # noqa: BLE001 -- report to caller, don't hide the traceback
         status = "failed"
         error_text = str(exc)
