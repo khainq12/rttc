@@ -14747,6 +14747,61 @@ own mechanism. **KEPT.**
 acknack_ledger_identity_collision.py` (new RED/GREEN test, kept as a
 permanent regression check). Commit: `6afe5ee`.
 
+## OVERNIGHT PHASE 2: PER-PAIR NETWORK BLACKOUT -- GENUINE CONTENTION, NOT A HARNESS BUG
+
+Read-only re-analysis of the Phase-1-fixed N=8 seed=7 recv trace (no
+rerun). Built the longest continuous gap between two successful DATA
+arrivals for every one of the 72 ordered `(sender, receiver)` pairs.
+
+### Findings
+
+- **Every pair has at least 2 arrivals** -- no pair is EVER completely
+  and permanently cut off for the whole 120s scenario.
+- **Blackouts are severe population-wide**: longest gaps range up to
+  **37.4s** (robot_0005 -> robot_0003) with a typical top-15 range of
+  25-37s -- roughly a QUARTER to a THIRD of the entire scenario spent
+  with zero successful delivery on that specific pair, even for pairs
+  that eventually recover.
+- **Directionality: fully symmetric.** All 36 unordered pairs checked
+  show forward and reverse longest-gap within 3x of each other (0
+  asymmetric pairs found). A directional software/protocol defect
+  would be expected to produce asymmetric patterns (e.g. always
+  breaking sender->receiver while receiver->sender stays fine);
+  uniform bidirectional degradation is the signature of a shared
+  physical-layer cause (contention/path loss affecting the whole link
+  both ways), not a one-way harness bug.
+- **`robot_0007` is NOT unique -- it is a mildly worse example of a
+  general phenomenon.** Mean longest gap for pairs involving
+  `robot_0007`: 22.14s vs 18.53s for pairs not involving it (~20%
+  worse, not qualitatively different). This directly answers this
+  phase's key question: the previously-known `robot_0007` anomaly is
+  one instance of a fleet-wide blackout pattern, not a distinct defect
+  isolated to that one endpoint.
+
+### Correlation with ns-3 state: not performed this pass
+
+No MAC/PHY-level ns-3 drop/queue counters were correlated against
+blackout onset -- the existing run does not persist ns-3's own
+detailed trace output to a location this analysis could read, and
+enabling it would require a NEW instrumented run (explicitly out of
+scope per the overnight time-management priority: reuse existing
+captures first, avoid unnecessary Wi-Fi-matrix reruns). Flagged as an
+open sub-question, not resolved.
+
+### Verdict: genuine modeled wireless contention, not a harness/ns-3 correctness bug
+
+The symmetric, population-wide, substantial-but-not-total blackout
+pattern is consistent with ns-3's own wifi contention/path-loss model
+under N=8's already-established heavy channel load, not a directional
+software defect. Per this phase's explicit instruction ("If it is
+genuine modeled wireless contention... do NOT fix ns-3 to make
+FleetRMW look better"), **no ns-3/harness change was made.** Documented
+and moving to Phase 3.
+
+**Files changed**: `scripts/analyze_table6_n8_per_pair_blackout.py`
+(new, read-only analysis). No production code changed this phase.
+Commit: `666a0ed`.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
