@@ -13996,6 +13996,132 @@ payload), `scripts/investigate_table6_n8_duplicate_drops.py` (new).
 Raw output: `results_rmw_socket/table6_n8_duplicate_drop_investigation/`
 (gitignored).
 
+## TABLE VI N=8 ACK/NACK REDUNDANCY VS DATA RETRANSMISSION -- INDEPENDENCE TEST
+
+Measurement-only, single controlled A/B (not A1/B/A2 -- this pass does
+not test reversion). N=8 seed=7. A = `FLEETQOX_RMW_ACK_NACK_REDUNDANT_
+RESEND_COUNT` unset (default 10). B = `=0`. Question: does reducing
+ACK/NACK redundant resends also reduce FleetRMW's own DATA-frame
+retransmissions, or are these independent mechanisms? Implements the
+"exactly one next step" from the post-recvfrom duplicate-drop section
+above.
+
+### Instrumentation (additive only, no rebuild)
+
+Two counters already existed in `rmw_pubsub.cpp` and were already
+exposed to `fleetqox_rmw_trace_endpoint.py` (Table IV/V) but never to
+`fleetqox_coordination_endpoint.py` (Table VI):
+- `nack_retransmissions` -- `socket_transport().send_retransmission_frame()`
+  call count, triggered when an incoming ACK/NACK's
+  `missing_sequence_ranges` names a sequence this sender still holds in
+  `g_retransmit_ledger`. This is the transport-retry path that is
+  actually active in this scenario.
+- `reliable_timeout_retransmissions` -- the separate periodic
+  `reliable_retransmit_loop()` path, gated by
+  `FLEETQOX_RMW_RELIABLE_ACK_TIMEOUT_MS` (default 0 -- confirmed to
+  make the loop return immediately and never run).
+
+Added both to `fleetqox_stream_identity_diagnostics()`'s existing
+`(key, symbol, restype)` tuple list in `fleetqox_coordination_
+endpoint.py` -- pure Python, reusing already-built, already-exported C
+symbols. No source/retransmission/timeout/QoS/broadcast/ns-3/protocol
+change. Re-verified full pytest suite (835 passed / 8 pre-existing
+unrelated failures, same baseline as every prior section).
+
+"Unique DATA frames" = total application-level `publish()` calls
+(`sent_log` request+reply entries; confirmed the only two publishers
+FleetRMW uses in this scenario -- the discovery beacon publisher is
+never created when `expected_peer_count == 0`, which is always true
+for `rmw_fleetqox_cpp` here). "DATA send attempts" = unique DATA frames
++ both retransmission-counter sums.
+
+### 1. A/B table
+
+| Metric | A (unset, default 10) | B (=0) |
+|---|---:|---:|
+| Unique DATA frames | 583 | 844 |
+| DATA send attempts | 1,753 | 1,593 |
+| DATA retransmissions (nack-driven) | 1,170 | 749 |
+| DATA retransmissions (timeout-driven) | 0 | 0 |
+| Retransmissions per unique DATA | 2.0069 | 0.8874 |
+| ACK count / bytes | 47,254 / 28.73 MB | 11,595 / 7.07 MB |
+| NACK count / bytes | 114,714 / 70.95 MB | 30,029 / 18.77 MB |
+| DATA delivery (all): arrived/left, loss% | 2,378/12,198, 80.5% | 5,789/10,872, 46.8% |
+| DATA delivery (excl. `robot_0007`) | 2,055/8,989, 77.1% | 4,517/8,582, 47.4% |
+| Duplicate DATA received/deduped | 1,450 | 2,239 |
+
+Note: unique DATA frames differ (583 vs 844) because the coordination
+protocol's own dynamics differ between conditions (B's much lower loss
+lets more request/reply cycles complete inside the fixed 120s scenario
+window) -- expected, not a confound for the retransmission comparison
+below. Duplicate-deduped count is HIGHER in B despite fewer
+retransmissions, consistent with B simply having much more total
+delivered traffic (more opportunities for the already-established
+network-level physical duplication, see the section above) -- not
+something this pass explains further (out of scope, not the question
+asked).
+
+### 2. DATA retransmission change
+
+`reliable_timeout_retransmissions` stayed at **0 in both A and B**
+(confirmed empirically, not merely assumed from the env var default):
+this pathway is inactive throughout. `nack_retransmissions` dropped
+**1,170 -> 749 (-36.0%)**; normalized per unique DATA frame, **2.0069
+-> 0.8874 (-55.8%)** -- a larger relative drop than the raw count,
+since B also produced more unique frames.
+
+### 3. ACK/NACK change
+
+NACK count dropped **114,714 -> 30,029 (-73.8%)**, NACK bytes **70.95
+MB -> 18.77 MB (-73.5%)**. ACK count dropped **47,254 -> 11,595
+(-75.5%)**, ACK bytes **28.73 MB -> 7.07 MB (-75.4%)**. Both drop by
+almost exactly the same ~74-76%, consistent with the redundant-copy
+mechanism (11 total sends per ack/nack event down to 1) rather than an
+unrelated shift in the underlying trigger-event count.
+
+### 4. Causal relationship: SUPPORTED
+
+The code-level mechanism is unambiguous, not merely correlational:
+`nack_retransmissions` increments once per `send_retransmission_frame()`
+call, which fires from inside the ACK/NACK-receive handler, once per
+processed ACK/NACK message that names a still-available missing
+sequence. Sending more redundant copies of the same ACK/NACK content
+means that same missing-sequence information reaches (and is acted on
+by) the sender multiple independent times, mechanically inflating this
+counter -- exactly what the traced code does. The measured effect
+(-36% raw, -55.8% normalized) is large and in the direction the
+mechanism predicts. Caveat: this is a **single trial per condition**
+(as scoped -- no repeats requested this pass), and this whole
+investigation chain has repeatedly found substantial single-trial
+variance at this N/seed; the source-level mechanism, not statistical
+replication, is what justifies SUPPORTED here.
+
+### 5. Feedback loop: NOT SUPPORTED BY AVAILABLE EVIDENCE
+
+A feedback loop would mean retransmitted DATA frames themselves get
+lost and re-NACKed, triggering further retransmissions of the *same*
+sequence (a self-reinforcing cycle), not just "more NACK volume causes
+more retransmissions" (the one-directional link established above).
+This pass collected only the AGGREGATE `nack_retransmissions` count,
+not a per-sequence breakdown of how many times each individual missing
+sequence was retransmitted -- so whether any sequence was retried more
+than once cannot be determined from this data. No claim either way
+beyond "not established here."
+
+### 6. Exactly one next step (not implemented)
+
+Measure per-(publisher_id, source_sequence) retransmission-attempt
+counts (e.g. via `repair_attempts_`'s `attempts` field, not currently
+exposed to Python) to directly test whether the feedback-loop question
+above is real: are the same sequences retransmitted multiple rounds,
+or does each missing sequence get at most one retransmission attempt?
+
+**Files changed**: `scripts/fleetqox_coordination_endpoint.py`
+(additive: 2 new diagnostics fields, no new C++), `scripts/
+investigate_table6_n8_ack_nack_vs_data_retransmission.py` (new). Raw
+output: `results_rmw_socket/table6_n8_ack_nack_vs_data_retransmission/`
+(gitignored).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
