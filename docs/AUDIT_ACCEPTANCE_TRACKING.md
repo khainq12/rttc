@@ -10761,6 +10761,348 @@ plus per-run `container_results/` (gitignored, regenerate via
 `python3 scripts/run_lan_n16_paired_20seed_experiment.py` then
 `python3 scripts/analyze_lan_n16_paired_experiment.py --summary-json ...`).
 
+## ZENOH LAN N=16 VARIANCE ROOT-CAUSE INVESTIGATION (19/09/2026)
+
+**READ-ONLY / MEASUREMENT-FIRST pass.** No Zenoh configuration changed.
+No FleetRMW changed. No tuning of any middleware. No Wi-Fi/5G work
+started. All evidence below comes from source code already in the repo
+and raw artifacts already on disk from the 20-seed experiment above --
+no reruns were needed to reach the conclusion.
+
+### 1. SIMPLE ANSWER
+
+**PROVEN**: Zenoh's LAN N=16 delivery variance (4.6% to 100%) is
+explained almost entirely by how many of the 16 robot peers
+`control_station` (the endpoint co-hosting the Zenoh router process
+itself) has actually established two-way communication with by the
+time the measured workload starts. Across all 20 seeds, `delivery_pct`
+correlates with `control_station`'s own beacon peer-convergence
+fraction at **Pearson r = 0.9912** (n=20) -- when `control_station`
+sees 16/16 peers (1 seed), delivery is 100%; when it sees 1/16 (2
+seeds), delivery is ~4.6-7.2%; every value in between tracks
+proportionally.
+
+**LIKELY**: the reason `control_station` specifically is the
+bottleneck (rather than any of the 16 robots) is that it runs BOTH the
+`rmw_zenohd` router process AND its own Zenoh client session in the
+SAME container -- a deliberate harness simplification (see Part 1) that
+may create session-establishment contention or ordering sensitivity
+that a separate-process router would not have. This is architecturally
+plausible and consistent with all observed evidence, but not directly
+proven by a controlled A/B in this pass (that is the proposed next
+experiment).
+
+**UNKNOWN**: the exact internal reason `control_station`'s own Zenoh
+session sometimes takes far longer than 15 seconds (or does not finish
+inside this measurement's window at all) to connect to the router it
+shares a container with. This would need Zenoh-internal or
+router-log-level tracing not available from existing artifacts.
+
+### 2. CURRENT ZENOH ARCHITECTURE
+
+Source: `scripts/run_ns3_docker_container_fleet_probe.py`.
+
+- **Mode**: `control_station` (endpoint 0) runs `rmw_zenohd` -- the
+  Zenoh **router** (`start_zenoh_router()`, line 972). Every other
+  endpoint (`i != 0`) is a Zenoh client/peer node created by ordinary
+  `rmw_zenoh_cpp` rclpy usage, explicitly pointed at that router.
+- **zenohd running?** **YES**, exactly one instance, launched inside
+  `control_station`'s own container via `docker exec -d ... ros2 run
+  rmw_zenoh_cpp rmw_zenohd` (line 1002), listening on
+  `tcp/0.0.0.0:7447` (explicit IPv4 listen config, line 991-993 --
+  deliberately not the default IPv6-wildcard config, since these
+  container network namespaces are IPv4-only).
+- **connect.endpoints**: **YES, explicitly configured** for every
+  non-router endpoint. `zenoh_router_endpoint()` (line 965) returns
+  `tcp/<control_station_ip>:7447`; `launch_endpoints()` (lines
+  1088-1110) writes a per-endpoint `ZENOH_SESSION_CONFIG_URI` file
+  containing `{ connect: { endpoints: ["tcp/<router_ip>:7447"] } }` for
+  every endpoint except the router's own.
+- **Scouting**: the code comment at lines 1090-1096 states plainly:
+  *"Multicast-based scouting for the router did NOT converge reliably
+  in this topology (confirmed: even small-scale runs failed with the
+  default config) -- point every non-router endpoint at the router's
+  known address explicitly instead."* This means the harness **already
+  abandoned default multicast scouting for router discovery** before
+  this investigation began, precisely because it was unreliable. What
+  remains is NOT "no discovery timing issue" -- it is a *different*
+  convergence step: even with the router's address known up front,
+  each client still has to establish a session with it and have its
+  pub/sub declarations propagate through it before real data can flow,
+  and that step is what this investigation finds varies.
+- **Multicast/gossip**: not used for the router-connection path (static
+  `connect.endpoints` instead, per above). Whether Zenoh's own
+  gossip/scouting is still active *underneath* peer-to-peer discovery
+  once connected to the router was not inspected in this pass (would
+  need Zenoh-internal logs, not currently captured).
+- **Docker networking**: all endpoints share the same wired LAN network
+  namespace set up by `wire_network_lan()` (not the wifi/tap-based
+  path) -- a real, additional path is not suspected here specifically
+  because Fast DDS and CycloneDDS run over the identical network setup
+  without the same failure mode (see Part 9).
+
+### 3. CURRENT TOPOLOGY
+
+```
+                 (runs INSIDE the SAME container/process group)
+        +--------------------------------------------+
+        |            control_station                  |
+        |  rmw_zenohd (router, tcp/0.0.0.0:7447)      |
+        |            +                                 |
+        |  Zenoh CLIENT session (control_station's own |
+        |  rclpy node -- publishes "control", receives  |
+        |  state/perception/coordination/debug/human_qoe)|
+        +--------------------+-------------------------+
+                              | tcp/<ip>:7447 (static connect.endpoints)
+        +---------------------+---------------------+---------------------+
+        |                     |                     |                     |
+   robot_0000 <----------> ROUTER <-----------> robot_0001  ... robot_0015
+   (client, connect.endpoints = control_station's tcp/ip:7447, x16 total)
+```
+
+Every non-router endpoint connects ONLY to the router, never directly
+to each other -- a star topology through one hub, and that hub is
+co-located with one of the busiest application endpoints rather than
+run as an independent process.
+
+### 4. READINESS CONTRACT
+
+What "ready" currently means, for the 3 non-FleetRMW middleware
+(`fleetqox_rmw_trace_endpoint.py`, lines 725-804): each endpoint
+publishes its own name on a shared `/fleetqox_trace/_discovery_probe`
+topic and counts DISTINCT senders seen (`discovery_peers_seen`),
+looping until either (a) it has seen all `expected_peer_count` (=16)
+distinct peers, or (b) `discovery_timeout_s` (15s default) elapses --
+**whichever comes first**. Critically (line 805): `args.ready_file.touch()`
+runs **unconditionally** immediately after this loop, regardless of
+which of (a)/(b) ended it. FleetRMW is the ONLY middleware exempted
+from this whole mechanism (`--skip-discovery-wait`, `expected_peer_count=0`,
+lines 1193/1201/1358-1359) -- it is marked ready immediately.
+
+**Does it prove application communication is ready? PARTIALLY.**
+- When convergence succeeds before the timeout (case (a)): yes, a real
+  17-way beacon round-trip through the actual production transport
+  succeeded, a meaningful signal.
+- When the 15-second timeout fires (case (b)): **no** -- the endpoint
+  is marked ready with no proof any peer beacon was ever received. The
+  raw evidence in Part 5/6 below shows this is not a corner case for
+  Zenoh: `control_station` hit exactly this path in most of the 20
+  seeds (`discovery_convergence_s` == 15.0x with `discovery_peers_seen`
+  well under 16 -- see the seed table in Part 6).
+
+### 5. BAD-SEED VS GOOD-SEED TIMELINE
+
+Chosen from the EXISTING 20-seed raw artifacts (no rerun): **A = seed
+41 (4.62% delivery)**, **B = seed 127 (100.0% delivery)** -- both
+already the lowest and the only 100% Zenoh seeds in the paired
+experiment. `control_station`'s own `result_0.json`:
+
+| stage | seed 41 (BAD) | seed 127 (GOOD) |
+|---|---|---|
+| discovery loop duration | 15.02 s (hit timeout) | 4.61 s (converged early) |
+| distinct peers seen / expected | **1 / 16** | **16 / 16** |
+| ready-file touched | yes (unconditional, at 15.02s) | yes (at 4.61s, genuinely converged) |
+| shared start gate -> `start_wall` | t=0 (reference) | t=0 (reference) |
+| first scheduled application send | t=+2.0 s (`scheduled_offset_s`) | t=+2.0 s |
+| first application message actually received | t=+2.28 s | t=+2.01 s |
+| last application message received | t=+4.98 s | t=+4.99 s |
+| total messages received at control_station | **22 / 744 expected** (2.96%) | **744 / 744** (100%) |
+| drain deadline | t=+14.98 s | t=+14.98 s |
+| actual shutdown | t=+19.52 s | t=+22.30 s |
+
+Both runs' *scheduled* application timing is identical (same trace,
+same offsets) -- the only structural difference is what happened
+BEFORE `start_wall`, during the up-to-15-second discovery phase that
+this table's first two rows summarize.
+
+### 6. LOSS PATTERN
+
+For the bad seed, losses are **not** concentrated in an early-then-recovers
+pattern within the measured 3-second/~5-second send window itself --
+`control_station` receives a trickle (22 messages) spread from t=+2.28s
+to t=+4.98s, i.e. throughout the whole active send period, not just at
+the start. This does NOT look like the classic "early messages lost,
+then a clean transition to steady delivery" signature described in
+this pass's own H1 example. Instead, the mechanism is coarser: **an
+entire session (control_station <-> a given robot) is either connected
+by send time or it is not**, and it stays in whichever state it was in
+for the rest of the run (no more mid-run transitions were observed).
+Quantified across all 20 seeds (`control_station`'s own
+`discovery_peers_seen / discovery_expected_peers` vs that seed's overall
+`delivery_pct`):
+
+| seed | cs peers_seen/16 | delivery % |
+|---|---|---|
+| 41 | 1 | 4.62 |
+| 67 | 1 | 7.18 |
+| 13 | 2 | 7.38 |
+| 151 | 2 | 12.37 |
+| 89 | 2 | 15.32 |
+| 103 | 2 | 18.02 |
+| 131 | 3 | 16.58 |
+| 107 | 3 | 20.03 |
+| 79 | 3 | 23.64 |
+| 109 | 4 | 22.22 |
+| 97 | 5 | 22.66 |
+| 53 | 6 | 34.00 |
+| 101 | 9 | 65.64 |
+| 137 | 10 | 68.34 |
+| 7 | 10 | 68.60 |
+| 149 | 13 | 84.72 |
+| 113 | 13 | 81.11 |
+| 29 | 14 | 85.40 |
+| 139 | 15 | 90.37 |
+| 127 | 16 | 100.00 |
+
+**Pearson r = 0.9912** (n=20, computed by a short one-off script over
+the existing raw JSON, not hand-fit). This is close to as strong as
+observational correlation gets, and it is monotonic across the entire
+range, not just at the extremes.
+
+### 7. LOSS FUNNEL
+
+```
+APP SEND -> Zenoh publish accepted -> Zenoh transport/router -> receiver Zenoh -> APP CALLBACK
+```
+
+**Earliest proven divergence: before APP SEND even begins**, at the
+discovery/session-establishment stage. The beacon topic IS a real
+application-level pub/sub round trip over the exact same production
+transport the real workload uses (not an internal middleware flag) --
+`control_station` in the bad seed received essentially none of it
+(`discovery_peers_seen=1`, and its own `beacon_raw_seen_sample` is
+100% its own looped-back name, never another endpoint's), meaning the
+session-level connectivity the real workload will need was never
+established for that peer *before* the real send/receive path was ever
+exercised. This pass did not need to instrument further down the
+funnel (publish-accepted / transport-send / receiver-Zenoh /
+app-callback) because the failure is already fully explained at the
+session-establishment step, upstream of all of those.
+
+### 8. DISCOVERY HYPOTHESIS
+
+**SUPPORTED BY DIRECT EVIDENCE.**
+
+Evidence: r=0.9912 (n=20) between `control_station`'s own beacon-based
+peer-convergence fraction (an existing, already-collected metric,
+`discovery_peers_seen`/`discovery_expected_peers`) and that seed's
+overall delivery percentage. This holds across the *entire* observed
+range (1/16 through 16/16), not just at the extremes, and the one seed
+where `control_station` fully converged (127) is also the one seed
+with 100% delivery.
+
+**Important caveat, per this pass's own instruction not to over-claim**:
+this is about `control_station`'s specific session-establishment state,
+not "Zenoh's discovery/scouting mechanism in general failing" as a
+vague label -- and it is not yet proven to be caused by *scouting*
+specifically, since scouting for router discovery was already replaced
+by a static `connect.endpoints` config before this investigation (Part
+2). The remaining, still-unconfirmed step is TCP session establishment
++ pub/sub declaration propagation between a client and the router,
+which is a different (later) stage than "finding" the router.
+
+### 9. HARNESS AUDIT
+
+One credible, evidence-consistent (but not yet controlled-A/B-proven)
+**Zenoh-specific harness issue found**: **the Zenoh router
+(`rmw_zenohd`) is co-located in the same container as
+`control_station`'s own client session**, unlike Fast DDS (whose
+discovery-server helper is a separate lightweight process the harness
+also starts on `control_station`, but which is not itself a message
+router in the data path the same way) and unlike CycloneDDS (no router
+process at all, static unicast peer list). At the SAME seed (41),
+`control_station`'s discovery **did** fully converge for both Fast DDS
+(16/16 peers, 3.76s) and CycloneDDS (16/16 peers, 4.55s), while Zenoh's
+`control_station` saw only 1/16. This is a same-seed, same-network,
+same-workload contrast that isolates the difference to something about
+Zenoh's control_station-specific session/router relationship, not the
+underlying container network or the trace/workload itself (both of
+which are identical across all three cases). No other Zenoh-specific
+harness bug (wrong address, accidental shared identity, subscription
+created after measurement start, output-parsing bug, premature
+shutdown, stale output reuse) was found in this pass -- `endpoint_results_complete`
+was true and shutdown timestamps were unremarkable for both A and B.
+
+Also confirmed directly relevant to Part 8 of the prior investigation
+(docs "Đã đóng" section for the n=3 baseline): **the discovery-beacon
+counter used elsewhere in this harness is not a general connectivity
+predictor for every middleware** -- Fast DDS and CycloneDDS ALSO
+racked up beacon-timeout endpoints at seed 41 (12/17 and 8/17
+respectively) yet still delivered 100%, meaning "some endpoints timed
+out on the aggregate 16-peer beacon" is common and NOT unique to
+Zenoh's failure mode; what differs for Zenoh is specifically whether
+**`control_station` itself** converges, which correlates near-perfectly
+with delivery, while for the other two middleware `control_station`'s
+own convergence appears robust regardless of other endpoints' beacon
+timeouts.
+
+### 10. THREE-SECOND EFFECT
+
+**LIKELY** (not fully proven from existing artifacts alone). Discovery
+has its own separate, more generous budget (`discovery_timeout_s=15s`),
+which does not itself overlap the measured `seconds=3` workload window
+-- so the short window does not directly truncate discovery. However,
+because "ready" is declared unconditionally at the 15s cap regardless
+of actual convergence (Part 4), and the real workload then runs for
+only ~3-5 wall-clock seconds afterward (`start_offset_ms` + `seconds`),
+any session establishment still in progress in the background at that
+point has only that short remaining window to finish before the
+measurement ends -- this matches **CASE 2** (measurement can begin, and
+in the worst seeds entirely overlaps, a period where required
+communication has not actually converged), not CASE 1. This was not
+tested by rerunning at a longer duration in this pass (explicitly
+disallowed) -- it is inferred from the existing timing fields
+(`discovery_convergence_s`, `start_wall_monotonic_ns`, first-received
+timestamps) already shown in Part 5/6.
+
+### 11. CODE CHANGES
+
+**NONE.** This entire investigation used source code reading and
+existing raw JSON artifacts already produced by the 20-seed experiment
+(`results_rmw_socket/lan_n16_paired_20seed/`). No new instrumentation
+was needed -- `discovery_convergence_s`, `discovery_peers_seen`,
+`discovery_expected_peers`, `beacon_raw_seen_sample`,
+`start_wall_monotonic_ns`, and per-message `recv_monotonic_ns` were all
+already being collected before this pass began.
+
+### 12. PRODUCTION CHANGES
+
+**NONE.**
+
+### 13. OPTIMIZATION #2
+
+**NOT IMPLEMENTED.**
+
+### 14. EXACTLY ONE NEXT EXPERIMENT (NOT executed in this pass)
+
+Discovery/session-convergence is SUPPORTED BY DIRECT EVIDENCE (Part 8),
+so per this pass's own branching rule: propose a controlled A/B to test
+**causality**, not to make Zenoh score higher --
+
+- **A = current configuration**: `rmw_zenohd` router co-located in
+  `control_station`'s own container, exactly as today.
+- **B = router moved to its own separate, independent process/container**,
+  with `control_station` connecting to it via `connect.endpoints` the
+  same way every other endpoint already does (i.e. `control_station`
+  becomes symmetric with the 16 robots instead of a special case),
+  keeping the identical workload, seeds, topology, and every other
+  parameter unchanged.
+
+If B eliminates or greatly reduces the `control_station`-non-convergence
+seeds (and thus the delivery variance), that would directly confirm the
+co-location hypothesis as causal rather than merely correlated. If B
+shows the same variance, the co-location hypothesis is falsified and
+the search continues elsewhere (e.g. router-internal load/timing under
+17 simultaneous connecting clients, independent of where the router
+process happens to run). **Not executed in this pass.**
+
+**Files referenced (no new files needed)**:
+`scripts/run_ns3_docker_container_fleet_probe.py` (lines 965-1010,
+1088-1110, 1193-1226, 1321-1380), `scripts/fleetqox_rmw_trace_endpoint.py`
+(lines 725-830). Raw evidence:
+`results_rmw_socket/lan_n16_paired_20seed/rmw_zenoh_cpp_default_n16_seed{41,127}/.../container_results/result_0.json`
+(and all 20 seeds' `result_0.json` for the Part 6 correlation table).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
