@@ -14936,6 +14936,60 @@ about a change that was not built or tested.
 (new, read-only). No production code changed this phase. Commit:
 `7861567`.
 
+## OVERNIGHT PHASE 4: ACK/NACK REDUNDANCY SWEEP -- NO CONFIG CHANGE (CONFIRMS PRIOR FINDING)
+
+Small pilot sweep of `FLEETQOX_RMW_ACK_NACK_REDUNDANT_RESEND_COUNT` in
+{0, 1, 2, 4, default/10}, N=8, 2 disjoint pilot seeds (11, 17 -- not
+reused from the earlier, much larger pre-Phase-1-fix 5-seed x 3-repeat
+investigation), 1 repeat each = 10 runs, run ON TOP OF the Phase 1
+ledger-identity fix (a fresh baseline, not a re-litigation of the
+earlier study).
+
+### Results
+
+| value | seed | DATA loss% | reply_sent | reply_received | NACK count | forced_entry (all) |
+|---|---:|---:|---:|---:|---:|:---:|
+| 0 | 11 | 47.9 | 584 | 328 | 91,579 | true |
+| 1 | 11 | 67.6 | 438 | 214 | 129,543 | true |
+| 2 | 11 | 71.6 | 381 | 196 | 136,985 | true |
+| 4 | 11 | 47.0 | 509 | 211 | 186,682 | true |
+| default (10) | 11 | **90.2** | 434 | 141 | 190,337 | true |
+| 0 | 17 | 56.1 | 497 | 286 | 37,623 | true |
+| 1 | 17 | 57.9 | 415 | 194 | 98,367 | true |
+| 2 | 17 | 79.0 | 447 | 195 | 165,417 | true |
+| 4 | 17 | 78.0 | 417 | 164 | 284,443 | true |
+| default (10) | 17 | 83.0 | 415 | 100 | 181,022 | true |
+
+### Interpretation
+
+Direction is consistent with the earlier, more rigorous 5-seed x
+3-repeat pre-fix study: `0` (and `1`) beat the default `10` on DATA
+loss% and `reply_received` in BOTH pilot seeds -- default `10` is the
+WORST or tied-worst on every delivery metric in both seeds, confirming
+"default redundancy=10 is harmful on average" continues to hold after
+the Phase 1 fix. Intermediate values (`2`, `4`) show no consistent
+advantage over `0`/`1` and are sometimes worse than the default on
+loss% (seed 17). **`forced_entry` is `true` for every single one of
+the 10 runs, and `task_completion_s` stays within ~1s of 120s in every
+case, regardless of value.**
+
+### Decision: NO CONFIG CHANGE
+
+Per this phase's own explicit rule ("if no value reliably improves the
+END outcome, make NO config change") -- the END outcome for this
+benchmark is whether a robot reaches the critical section via genuine
+mutual exclusion rather than a forced timeout, and how fast the
+scenario completes. Neither improves for ANY tested value: forced
+entry is universal and task completion time is flat across all 10
+runs. Wire-traffic and DATA/REPLY delivery-rate improvements are real
+(confirmed again here) but do not translate into a better end outcome,
+exactly matching the earlier study's own explicit non-adoption
+conclusion. **No default value change made.** This is a genuine
+negative result, reported in full rather than hidden.
+
+**Files changed**: `scripts/run_table6_n8_acknack_redundancy_sweep_
+phase4.py` (new). No production config changed. Commit: `e718630`.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
