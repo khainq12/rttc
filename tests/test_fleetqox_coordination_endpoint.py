@@ -1,8 +1,11 @@
+import os
 import unittest
+from unittest import mock
 
 from scripts.fleetqox_coordination_endpoint import (
     build_discovery_diagnostic,
     coordination_discovery_converged,
+    fleetqox_stream_identity_diagnostics,
     wait_until_deadline_while_spinning,
 )
 
@@ -335,6 +338,55 @@ class BuildDiscoveryDiagnosticTest(unittest.TestCase):
             peer_first_seen_s={},
         )
         json.dumps(diag, sort_keys=True)  # must not raise
+
+
+class FleetqoxStreamIdentityDiagnosticsTest(unittest.TestCase):
+    """RED/GREEN for the "TABLE VI FLEETRMW TRANSPORT LOSS FUNNEL"
+    investigation (see docs/AUDIT_ACCEPTANCE_TRACKING.md): checks
+    whether THIS process's environment reproduces the same
+    identity-collision precondition already found and fixed for Table
+    IV/V (FLEETQOX_RMW_ROBOT_ID unset -> rmw_pubsub.cpp's
+    local_robot_id() falls back to the literal string "local").
+    effective_robot_id must mirror that exact C++ fallback so a mismatch
+    here would mean this diagnostic itself, not the RMW layer, is wrong.
+    """
+
+    def test_unavailable_for_non_fleetrmw_middleware(self):
+        with mock.patch.dict(os.environ, {"RMW_IMPLEMENTATION": "rmw_zenoh_cpp"}, clear=False):
+            diag = fleetqox_stream_identity_diagnostics()
+        self.assertEqual(diag, {"available": False})
+
+    def test_effective_robot_id_falls_back_to_local_when_env_unset(self):
+        env = dict(os.environ)
+        env["RMW_IMPLEMENTATION"] = "rmw_fleetqox_cpp"
+        env.pop("FLEETQOX_RMW_ROBOT_ID", None)
+        with mock.patch.dict(os.environ, env, clear=True):
+            diag = fleetqox_stream_identity_diagnostics()
+        self.assertTrue(diag["available"])
+        self.assertFalse(diag["FLEETQOX_RMW_ROBOT_ID_env_set"])
+        self.assertEqual(diag["effective_robot_id"], "local")
+
+    def test_effective_robot_id_uses_configured_value_when_set(self):
+        env = dict(os.environ)
+        env["RMW_IMPLEMENTATION"] = "rmw_fleetqox_cpp"
+        env["FLEETQOX_RMW_ROBOT_ID"] = "robot_0003"
+        with mock.patch.dict(os.environ, env, clear=True):
+            diag = fleetqox_stream_identity_diagnostics()
+        self.assertTrue(diag["available"])
+        self.assertTrue(diag["FLEETQOX_RMW_ROBOT_ID_env_set"])
+        self.assertEqual(diag["effective_robot_id"], "robot_0003")
+
+    def test_empty_string_robot_id_env_counts_as_unset(self):
+        # os.environ can hold an empty string (distinct from absent) --
+        # local_robot_id() in rmw_pubsub.cpp checks configured[0] != '\0',
+        # i.e. an empty string ALSO falls back to "local". Must match.
+        env = dict(os.environ)
+        env["RMW_IMPLEMENTATION"] = "rmw_fleetqox_cpp"
+        env["FLEETQOX_RMW_ROBOT_ID"] = ""
+        with mock.patch.dict(os.environ, env, clear=True):
+            diag = fleetqox_stream_identity_diagnostics()
+        self.assertFalse(diag["FLEETQOX_RMW_ROBOT_ID_env_set"])
+        self.assertEqual(diag["effective_robot_id"], "local")
 
 
 if __name__ == "__main__":

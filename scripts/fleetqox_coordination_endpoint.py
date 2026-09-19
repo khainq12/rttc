@@ -127,7 +127,9 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable
+import ctypes
 import json
+import os
 import random
 import time
 from pathlib import Path
@@ -294,6 +296,133 @@ def build_discovery_diagnostic(
         "discovery_convergence_s": discovery_convergence_s,
         "peer_first_seen_s": dict(peer_first_seen_s),
     }
+
+
+def fleetqox_stream_identity_diagnostics() -> dict[str, Any]:
+    """Measurement-only, for the "TABLE VI FLEETRMW TRANSPORT LOSS
+    FUNNEL" investigation (see docs/AUDIT_ACCEPTANCE_TRACKING.md).
+
+    Checks the SAME identity-collision contract that was already found
+    and fixed for Table IV/V's launcher (see
+    run_ns3_docker_container_fleet_probe.py's fleetqox_rmw_env_prefix()
+    docstring, "ROOT CAUSE TÌM RA: publisher_id/robot_id COLLISION"):
+    rmw_pubsub.cpp's local_robot_id() falls back to the literal string
+    "local" whenever FLEETQOX_RMW_ROBOT_ID is unset, and stream_key() =
+    robot_id + "|" + topic + "|" + publisher_id. That fix was applied
+    to fleetqox_rmw_env_prefix() (Table IV/V's launcher only) --
+    launch_coordination_endpoints() (Table VI) builds its own,
+    independent env_prefix and has never called that function, so this
+    reads back, at runtime, from INSIDE this exact process, whether the
+    same collision precondition holds here too.
+
+    effective_robot_id: read directly from this process's own
+    environment (the same env var rmw_pubsub.cpp's local_robot_id()
+    reads at C++ static-init time, inherited from the same OS process)
+    -- not a guess, the literal value the RMW layer is using RIGHT NOW.
+
+    duplicate_data_frames_deduped / out_of_order_data_frames_observed /
+    socket_bound_endpoint: plain always-on atomics/accessors already
+    exported by rmw_pubsub.cpp for other callers (see
+    rmw_fleetqox_cpp_duplicate_data_frames_deduped()/
+    _out_of_order_data_frames_observed()/_socket_bound_endpoint()) --
+    reading them adds no new tracking, no new overhead, and changes no
+    behavior. Returns {"available": False} for any non-FleetRMW
+    middleware or if the shared library can't be loaded (e.g. this
+    process never initialized rclpy with rmw_fleetqox_cpp).
+    """
+    if os.environ.get("RMW_IMPLEMENTATION") != "rmw_fleetqox_cpp":
+        return {"available": False}
+    configured_robot_id = os.environ.get("FLEETQOX_RMW_ROBOT_ID") or ""
+    result: dict[str, Any] = {
+        "available": True,
+        "FLEETQOX_RMW_ROBOT_ID_env_set": bool(configured_robot_id),
+        # Mirrors local_robot_id()'s own fallback exactly -- see that
+        # function's doc comment in rmw_pubsub.cpp.
+        "effective_robot_id": configured_robot_id or "local",
+    }
+    try:
+        library = ctypes.CDLL("librmw_fleetqox_cpp.so")
+    except OSError as exc:
+        result["library_load_error"] = str(exc)
+        return result
+    for key, symbol_name, restype in (
+        ("duplicate_data_frames_deduped", "rmw_fleetqox_cpp_duplicate_data_frames_deduped", ctypes.c_uint64),
+        ("out_of_order_data_frames_observed", "rmw_fleetqox_cpp_out_of_order_data_frames_observed", ctypes.c_uint64),
+        ("socket_bound_endpoint", "rmw_fleetqox_cpp_socket_bound_endpoint", ctypes.c_char_p),
+    ):
+        try:
+            fn = getattr(library, symbol_name)
+        except AttributeError:
+            continue
+        fn.restype = restype
+        value = fn()
+        if restype is ctypes.c_char_p:
+            result[key] = value.decode("utf-8") if value else ""
+        else:
+            result[key] = int(value)
+    return result
+
+
+def fleetqox_loss_funnel_trace() -> dict[str, list[dict[str, Any]]]:
+    """Same mechanism, same opt-in gating
+    (FLEETQOX_RMW_LOSS_FUNNEL_TRACE_PROFILING), same accessor symbols as
+    scripts/fleetqox_rmw_trace_endpoint.py's function of the same name
+    (see that file's docstring for the full rationale) -- reused
+    verbatim here for the Table VI investigation rather than
+    reinventing a second tracing scheme. Returns {"send": [...],
+    "recv": [...], "raw_recvfrom": [...], "subscription_match": [...]}.
+    """
+    empty: dict[str, list[dict[str, Any]]] = {
+        "send": [], "recv": [], "raw_recvfrom": [], "subscription_match": [],
+    }
+    if os.environ.get("RMW_IMPLEMENTATION") != "rmw_fleetqox_cpp":
+        return empty
+    if not os.environ.get("FLEETQOX_RMW_LOSS_FUNNEL_TRACE_PROFILING"):
+        return empty
+    try:
+        library = ctypes.CDLL("librmw_fleetqox_cpp.so")
+    except OSError:
+        return empty
+    result: dict[str, list[dict[str, Any]]] = {}
+    for key, symbol_name in (
+        ("send", "rmw_fleetqox_cpp_loss_funnel_send_trace_json"),
+        ("recv", "rmw_fleetqox_cpp_loss_funnel_recv_trace_json"),
+        ("raw_recvfrom", "rmw_fleetqox_cpp_loss_funnel_raw_recvfrom_trace_json"),
+        ("subscription_match", "rmw_fleetqox_cpp_subscription_match_trace_json"),
+    ):
+        fn = getattr(library, symbol_name)
+        fn.restype = ctypes.c_char_p
+        raw = fn()
+        if not raw:
+            result[key] = []
+            continue
+        try:
+            result[key] = json.loads(raw.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            result[key] = []
+    return result
+
+
+def fleetqox_subscriptions_snapshot() -> list[dict[str, Any]]:
+    """Same mechanism as fleetqox_rmw_trace_endpoint.py's function of the
+    same name -- see that file's docstring."""
+    if os.environ.get("RMW_IMPLEMENTATION") != "rmw_fleetqox_cpp":
+        return []
+    if not os.environ.get("FLEETQOX_RMW_LOSS_FUNNEL_TRACE_PROFILING"):
+        return []
+    try:
+        library = ctypes.CDLL("librmw_fleetqox_cpp.so")
+    except OSError:
+        return []
+    fn = library.rmw_fleetqox_cpp_subscriptions_snapshot_json
+    fn.restype = ctypes.c_char_p
+    raw = fn()
+    if not raw:
+        return []
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return []
 
 
 def main() -> int:
@@ -968,6 +1097,9 @@ def main() -> int:
         "debug_counters": debug_counters,
         "raw_received_log": raw_received_log,
         "sent_log": sent_log,
+        "fleetqox_stream_identity_diagnostics": fleetqox_stream_identity_diagnostics(),
+        "fleetqox_loss_funnel_trace": fleetqox_loss_funnel_trace(),
+        "fleetqox_subscriptions_snapshot": fleetqox_subscriptions_snapshot(),
     }
     args.summary_json.parent.mkdir(parents=True, exist_ok=True)
     args.summary_json.write_text(json.dumps(result, sort_keys=True), encoding="utf-8")
