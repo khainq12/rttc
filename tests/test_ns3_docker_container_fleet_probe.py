@@ -14,6 +14,7 @@ from scripts.run_ns3_docker_container_fleet_probe import (
     compute_jitter_stale_repair_stats,
     compute_latency_stats_ms,
     endpoint_list,
+    fleetqox_coordination_rmw_env_prefix,
     fleetqox_rmw_env_prefix,
     parse_docker_mem_usage_mb,
     station_mac,
@@ -195,6 +196,72 @@ class FleetqoxRmwEnvPrefixTest(unittest.TestCase):
             identity_robot_a, identity_robot_b,
             "GREEN: a distinct robot_id per endpoint must break the collision",
         )
+
+
+class FleetqoxCoordinationRmwEnvPrefixTest(unittest.TestCase):
+    """RED/GREEN for the Table VI robot-identity-collision fix (see
+    docs/AUDIT_ACCEPTANCE_TRACKING.md "TABLE VI FLEETRMW TRANSPORT LOSS
+    FUNNEL"): launch_coordination_endpoints() built its own, separate,
+    inline env_prefix and never called fleetqox_rmw_env_prefix() (the
+    function that already carries this exact fix for Table IV/V's
+    launch_endpoints()) -- so every Table VI endpoint's
+    local_robot_id() fell back to "local", proven at runtime (N=4
+    seed=7) to cause 363/488 (74.4%) of physically-arrived coordination
+    messages to be misclassified as duplicates and silently dropped.
+
+    fleetqox_coordination_rmw_env_prefix() must set
+    FLEETQOX_RMW_ROBOT_ID={endpoint} (fixing the collision) while
+    preserving Table VI's own deliberate choice of NOT setting
+    FLEETQOX_RMW_PEER_POLICY/FLEETQOX_RMW_STATIC_SUBSCRIPTIONS (Table
+    VI's Ricart-Agrawala traffic is broadcast-to-everyone by design,
+    unlike Table IV/V's subscription_aware star topology) -- i.e. fix
+    ONLY the identity bug, change nothing else about the wire
+    behavior.
+    """
+
+    def test_red_sets_robot_id(self):
+        env = fleetqox_coordination_rmw_env_prefix("robot_0000", "peer:9100", None)
+        self.assertIn("FLEETQOX_RMW_ROBOT_ID=robot_0000 ", env)
+
+    def test_control_station_gets_its_own_id_too(self):
+        env = fleetqox_coordination_rmw_env_prefix("control_station", "peer:9100", None)
+        self.assertIn("FLEETQOX_RMW_ROBOT_ID=control_station ", env)
+
+    def test_every_endpoint_gets_a_unique_id(self):
+        endpoints = endpoint_list(4)
+        ids = []
+        for endpoint in endpoints:
+            env = fleetqox_coordination_rmw_env_prefix(endpoint, "peer:9100", None)
+            tokens = [tok for tok in env.split() if tok.startswith("FLEETQOX_RMW_ROBOT_ID=")]
+            self.assertEqual(len(tokens), 1, f"exactly one ROBOT_ID entry for {endpoint}")
+            self.assertEqual(tokens[0].split("=", 1)[1], endpoint)
+            ids.append(tokens[0])
+        self.assertEqual(len(ids), len(set(ids)), "every endpoint must get a UNIQUE id")
+
+    def test_preserves_broadcast_to_everyone_peer_policy_untouched(self):
+        # Table VI deliberately leaves FLEETQOX_RMW_PEER_POLICY at its
+        # own RMW-side default ("all") -- see
+        # launch_coordination_endpoints()'s own comment on why
+        # subscription_aware mode/a static subscriptions map is wrong
+        # for this scenario's broadcast-to-everyone shape. The identity
+        # fix must not change this.
+        env = fleetqox_coordination_rmw_env_prefix("robot_0000", "peer:9100", None)
+        self.assertNotIn("FLEETQOX_RMW_PEER_POLICY", env)
+        self.assertNotIn("FLEETQOX_RMW_STATIC_SUBSCRIPTIONS", env)
+
+    def test_still_sets_static_mode(self):
+        env = fleetqox_coordination_rmw_env_prefix("robot_0000", "peer:9100", None)
+        self.assertIn("FLEETQOX_RMW_STATIC_MODE=1", env)
+
+    def test_extra_rmw_env_still_passed_through(self):
+        env = fleetqox_coordination_rmw_env_prefix(
+            "robot_0000", "peer:9100", {"FLEETQOX_RMW_LOSS_FUNNEL_TRACE_PROFILING": "1"}
+        )
+        self.assertIn("FLEETQOX_RMW_LOSS_FUNNEL_TRACE_PROFILING=1", env)
+
+    def test_peers_are_wired_through(self):
+        env = fleetqox_coordination_rmw_env_prefix("robot_0000", "10.60.0.5:9100", None)
+        self.assertIn("FLEETQOX_RMW_PEERS=10.60.0.5:9100 ", env)
 
 
 class BuildStaticSubscriptionsTest(unittest.TestCase):

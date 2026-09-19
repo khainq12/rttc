@@ -151,6 +151,8 @@ def fleetqox_rmw_env_prefix(
     static_mode: bool,
     static_subscription_entries: list[str],
     extra_rmw_env: dict[str, str] | None,
+    *,
+    include_static_subscriptions: bool = True,
 ) -> str:
     """Builds the `KEY=value ` env string launch_endpoints() exports
     before sourcing rmw_fleetqox_cpp's install/setup.bash for one
@@ -177,6 +179,19 @@ def fleetqox_rmw_env_prefix(
     generates and every other part of this harness already keys off of
     (no second identity system) -- makes stream_key() unique per robot
     again, independent of this fix's other env vars.
+
+    include_static_subscriptions (default True, preserving every
+    existing caller's behavior byte-for-byte): whether the static_mode
+    branch also sets FLEETQOX_RMW_PEER_POLICY=subscription_aware and
+    FLEETQOX_RMW_STATIC_SUBSCRIPTIONS. Added so
+    fleetqox_coordination_rmw_env_prefix() (Table VI, see
+    docs/AUDIT_ACCEPTANCE_TRACKING.md "TABLE VI FLEETRMW TRANSPORT LOSS
+    FUNNEL") can reuse this SAME ROBOT_ID-setting contract while still
+    getting Table VI's own deliberately different choice (STATIC_MODE=1
+    with peer_policy left at its own "broadcast to everyone" default)
+    instead of Table IV/V's subscription_aware star-topology config --
+    two genuinely different, both-correct wire configurations sharing
+    one identity fix, not a behavior change to either.
     """
     env_prefix = (
         f"RMW_IMPLEMENTATION=rmw_fleetqox_cpp FLEETQOX_RMW_BIND=0.0.0.0:{RMW_PORT} "
@@ -184,15 +199,51 @@ def fleetqox_rmw_env_prefix(
         f"FLEETQOX_RMW_ROBOT_ID={endpoint} "
     )
     if static_mode:
-        env_prefix += (
-            "FLEETQOX_RMW_PEER_POLICY=subscription_aware FLEETQOX_RMW_STATIC_MODE=1 "
-            f"FLEETQOX_RMW_STATIC_SUBSCRIPTIONS="
-            f"{shlex.quote(','.join(static_subscription_entries))} "
-        )
+        env_prefix += "FLEETQOX_RMW_STATIC_MODE=1 "
+        if include_static_subscriptions:
+            env_prefix += (
+                "FLEETQOX_RMW_PEER_POLICY=subscription_aware "
+                f"FLEETQOX_RMW_STATIC_SUBSCRIPTIONS="
+                f"{shlex.quote(','.join(static_subscription_entries))} "
+            )
     env_prefix += "".join(
         f"{key}={value} " for key, value in (extra_rmw_env or {}).items()
     )
     return env_prefix
+
+
+def fleetqox_coordination_rmw_env_prefix(
+    endpoint: str,
+    peers: str,
+    extra_rmw_env: dict[str, str] | None,
+) -> str:
+    """Table VI's own env_prefix (launch_coordination_endpoints()) --
+    thin wrapper over fleetqox_rmw_env_prefix() so this shares that
+    function's FLEETQOX_RMW_ROBOT_ID fix (see docs/
+    AUDIT_ACCEPTANCE_TRACKING.md "TABLE VI FLEETRMW TRANSPORT LOSS
+    FUNNEL") instead of duplicating a second, unfixed copy of the same
+    env-construction logic -- which is exactly how this bug happened
+    the first time: launch_coordination_endpoints() built its own
+    inline env_prefix, never called fleetqox_rmw_env_prefix(), and so
+    never got the ROBOT_ID fix already applied to launch_endpoints()
+    (Table IV/V). Proven at runtime (N=4 seed=7) to cause 363/488
+    (74.4%) of physically-arrived coordination messages to be
+    misclassified as duplicates and silently dropped before reaching
+    the application.
+
+    static_mode is always True and static_subscription_entries is
+    always empty here -- Table VI's Ricart-Agrawala traffic is
+    broadcast-to-everyone by design (see
+    launch_coordination_endpoints()'s own comment), so
+    include_static_subscriptions=False keeps FLEETQOX_RMW_PEER_POLICY
+    at the RMW's own default and never sets
+    FLEETQOX_RMW_STATIC_SUBSCRIPTIONS at all -- identical wire
+    configuration to before this fix, plus the one corrected identity
+    variable.
+    """
+    return fleetqox_rmw_env_prefix(
+        endpoint, peers, True, [], extra_rmw_env, include_static_subscriptions=False,
+    )
 
 
 def build_static_subscriptions(
@@ -1333,12 +1384,22 @@ class ReferenceTopologyProbe:
                 # broadcast-to-everyone shape this scenario wants, so
                 # subscription_aware mode/a static subscriptions map isn't
                 # needed here the way it is for the trace-replay endpoint.
-                env_prefix = (
-                    f"RMW_IMPLEMENTATION=rmw_fleetqox_cpp FLEETQOX_RMW_BIND=0.0.0.0:{RMW_PORT} "
-                    f"FLEETQOX_RMW_PEERS={rmw_peers} FLEETQOX_RMW_STATIC_MODE=1 "
-                )
-                env_prefix += "".join(
-                    f"{key}={value} " for key, value in (extra_rmw_env or {}).items()
+                #
+                # FLEETQOX_RMW_ROBOT_ID (19/09/2026, see
+                # docs/AUDIT_ACCEPTANCE_TRACKING.md "TABLE VI FLEETRMW
+                # TRANSPORT LOSS FUNNEL"): this env_prefix previously never
+                # set it, for ANY endpoint -- proven at runtime to cause
+                # 74.4% of physically-arrived coordination messages to be
+                # misclassified as duplicates (all 5 endpoints shared
+                # local_robot_id()'s "local" fallback) and silently
+                # dropped. fleetqox_coordination_rmw_env_prefix() reuses
+                # fleetqox_rmw_env_prefix()'s already-fixed ROBOT_ID
+                # contract (Table IV/V's launch_endpoints() already had
+                # this) instead of a second, independently-unfixed copy of
+                # the same construction -- exactly how this bug happened
+                # the first time.
+                env_prefix = fleetqox_coordination_rmw_env_prefix(
+                    endpoint, rmw_peers, extra_rmw_env,
                 )
                 rmw_setup = f"source /work/{FLEETQOX_RMW_INSTALL}/setup.bash && export {env_prefix}"
             else:
