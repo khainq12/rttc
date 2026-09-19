@@ -17,7 +17,7 @@ Trạng thái tại thời điểm kiểm tra gốc (07/09/2026): **0/6 nhóm đ
 | 3 | QUIC/PKI và HA/fencing (online rotation, live revocation, ma trận phân vùng không split-brain, failover/failback đa host, durable state) | Đạt phần lớn (thiếu đa host) | ✅ **Đã đóng** | HA multi-host (Raft + etcd/PostgreSQL, failover + failback) làm ở phiên trước (2 VM KVM thật). PKI cert/CA rotation multi-host (CRL revocation + CA rotation thật, không phải chỉ thêm CA) làm phiên này: `scripts/run_multihost_kvm_udp_peer_auth_crl_reload_probe.py`, 4/4 round pass. Commit `65b7100`. Lưu ý nhỏ: "ma trận phân vùng" mới test một số kịch bản tiêu biểu, chưa phải toàn bộ tổ hợp. |
 | 4 | Ngữ nghĩa RMW (full QoS event, full DDS content-filter dialect, deep preallocation) | Đạt một phần | ✅ **Đã đóng** | Dynamic message, nhiều QoS extension (liveliness, deadline, lifespan, destination_order, ownership, partition, presentation) đã xong. **Task #42 (content-filter dialect) đã đóng**: thêm `LIKE ... ESCAPE`, 3/3 pass (`run_rmw_docker_content_filter_sql_probe.py`), và đã ra quyết định phạm vi chính thức — subset hiện tại là ranh giới cuối cùng. **Task #43 (deep_preallocation_claim) đã đóng phần lớn hơn dự kiến**: thay vì redesign wire-format nhị phân (rủi ro cao, ban đầu định hỏi ý kiến), tìm được cách an toàn hơn — verify `snprintf("%.6g",...)` giống hệt định dạng double của `ostringstream` (400k+ giá trị test), rồi build JSON frame body thẳng vào buffer bền vững (`frame_json_scratch`) thay vì `ostringstream` mới mỗi lần, và pool hoá entry trong retransmit ledger (`g_retired_retransmit_entries`) — không đổi 1 byte nào trên wire, không ảnh hưởng 187 probe khác. Verify bằng A/B rebuild (git stash) xác nhận 2 lỗi flaky có sẵn (`rmw_wait_for_all_acked_probe`, `remote_wait_for_all_acked_probe`) tái hiện y hệt ở cả code cũ và mới → không phải regression. `deep_preallocation_claim` vẫn giữ `false` (đúng): phần message deserialization và ledger hash-map node allocation vẫn chưa pool hoá, và binary wire format vẫn là ranh giới scope có chủ đích, không phải việc treo. |
 | 5 | Nav2, Open-RMF, đa host, HIL | Đạt một phần | ❌ **Chưa làm** | Nav2 đã có bằng chứng chạy thực tế (từ trước). Open-RMF chưa phải full upstream stack; chưa có bằng chứng đa host/HIL cho workload tự hành. |
-| 6 | Đối sánh mô phỏng (ns-3/OMNeT++), soak dài hạn, bằng chứng phát hành qua CI | Đạt một phần | 🟡 **Đang làm** | Xem mục "Nhóm 6" bên dưới. Đối sánh ns-3/OMNeT++ Wi-Fi: tìm + sửa 2 bug thật (INET PendingQueue 100 vs ns-3 500 gói; INET Arp retryTimeout 1s bị lộ do đồng bộ start-time) + sửa cách so sánh p99 sang tỷ lệ tương đối. Kết quả 10-seed: **8 trạm = 100% nhóm kịch bản khớp** (trung bình), 16 trạm 56%, 32 trạm 33% (còn khoảng cách thật ở delivery ratio, đã thử 8 giả thuyết không tìm thêm được nguyên nhân). CI: đã xác minh chạy thật pass qua GitHub API. **Baseline LAN N=16 mới (18/09/2026, sau khi sửa 2 bug harness)**: FleetRMW/Fast DDS/CycloneDDS đều 100% ở cả 3 seed (7/13/29); Zenoh 52.8-86.1% (biến động thật do discovery mặc định, không phải lỗi hạ tầng) — xem mục "FRESH CORRECTED-HARNESS LAN N=16 BASELINE". Số liệu LAN cũ (trước fix) đã SUPERSEDED, không dùng để so sánh nữa. Soak dài hạn: chưa làm. |
+| 6 | Đối sánh mô phỏng (ns-3/OMNeT++), soak dài hạn, bằng chứng phát hành qua CI | Đạt một phần | 🟡 **Đang làm** | Xem mục "Nhóm 6" bên dưới. Đối sánh ns-3/OMNeT++ Wi-Fi: tìm + sửa 2 bug thật (INET PendingQueue 100 vs ns-3 500 gói; INET Arp retryTimeout 1s bị lộ do đồng bộ start-time) + sửa cách so sánh p99 sang tỷ lệ tương đối. Kết quả 10-seed: **8 trạm = 100% nhóm kịch bản khớp** (trung bình), 16 trạm 56%, 32 trạm 33% (còn khoảng cách thật ở delivery ratio, đã thử 8 giả thuyết không tìm thêm được nguyên nhân). CI: đã xác minh chạy thật pass qua GitHub API. **Baseline LAN N=16 mới (18/09/2026, sau khi sửa 2 bug harness)**: FleetRMW/Fast DDS/CycloneDDS đều 100% ở cả 3 seed (7/13/29); Zenoh 52.8-86.1% (biến động thật do discovery mặc định, không phải lỗi hạ tầng) — xem mục "FRESH CORRECTED-HARNESS LAN N=16 BASELINE". **Mở rộng lên 20 seed ghép cặp (19/09/2026)**: FleetRMW/Fast DDS/CycloneDDS **100% ở TẤT CẢ 20 seed, không ngoại lệ** — xác nhận đây là **ceiling effect** (workload quá dễ để phân biệt 3 hệ thống này), nên gate "superiority" (+15pp so baseline tốt nhất mỗi seed + bootstrap CI > 0) **KHÔNG ĐẠT ĐƯỢC** (và về cấu trúc không thể đạt được trên workload này, vì baseline luôn ở mức trần 100%). Zenoh: biến động rất lớn được định lượng rõ ở n=20 (mean 42.4%, min 4.6%, max 100%, stdev 33.4pp) — nguyên nhân discovery-timing vẫn là giả thuyết, chưa xác nhận. FleetRMW p99 cao hơn ~2x 3 hệ thống kia một cách nhất quán qua cả 20 seed (mô tả thuần, chưa điều tra cơ chế). Xem mục "LAN N=16 — 20-SEED PAIRED CORRECTED-HARNESS EXPERIMENT". Số liệu LAN cũ (trước fix 2 bug harness) đã SUPERSEDED, không dùng để so sánh nữa. Soak dài hạn: chưa làm. |
 
 **Tóm lại: 4/6 nhóm đã đóng (1, 2, 3, 4 — nhóm 4 vẫn còn vài ranh giới
 scope có chủ đích, xem bảng, không phải việc treo). Nhóm 6 đang bắt đầu
@@ -10452,6 +10452,314 @@ driver, this pass). Raw per-run output:
 (trace CSV + per-endpoint `container_results/result_*.json`, kept as
 raw evidence, not committed to git due to size -- regenerate via
 `python3 scripts/run_lan_n16_fresh_baseline_comparison.py`).
+
+## LAN N=16 — 20-SEED PAIRED CORRECTED-HARNESS EXPERIMENT (19/09/2026)
+
+Continuation of the n=3 fresh baseline above (does NOT overwrite it).
+**MEASUREMENT ONLY**: no optimization, no parameter tuning, no
+production middleware code changes, no result-driven changes of any
+kind during this pass. New files: `scripts/run_lan_n16_paired_20seed_experiment.py`
+(experiment driver, reuses `run_one()` from the n=3 baseline script
+unmodified except for the addition of `fresh_deadline_success_pct`),
+`scripts/analyze_lan_n16_paired_experiment.py` (deterministic analysis:
+aggregates, per-seed best-baseline reselection, paired bootstrap --
+no hand-copied numbers).
+
+### 1. SIMPLE ANSWER
+
+After 20 paired seeds: **FleetRMW, Fast DDS, and CycloneDDS remain tied
+at exactly 100.0% delivery on every single one of the 20 seeds** (80/80
+cells) -- this LAN N=16/3s/fifo workload is a **ceiling effect**, too
+easy to discriminate among these three. Because the registered primary
+metric compares FleetRMW against the *best* of the three baselines
+per seed, and Fast DDS/CycloneDDS are always at the ceiling, the
+primary paired difference is **exactly 0.0 percentage points on every
+seed** -- **the superiority gate is not met, and cannot be met on this
+workload**, regardless of how poorly Zenoh performs (Zenoh is never the
+best baseline, so its own variance never enters the primary metric).
+Zenoh itself shows large, genuine, seed-dependent delivery variance
+(4.6% to 100.0%, mean 42.4%) under its default discovery configuration
+at 17 endpoints -- confirmed, not a hypothesis, now that n=20. FleetRMW
+also shows a consistently higher p99 latency (~4.1 ms vs ~2.0 ms for the
+other three) across all 20 seeds -- reported descriptively only, no
+mechanism investigated in this pass.
+
+### 2. EXPERIMENT FREEZE
+
+- **git commit**: `7082683263c6940db44595c071592587f70f5ec6` at freeze
+  time (working tree clean apart from this pass's own new files, which
+  were committed before any run started: `a03c107`).
+- **Topology**: LAN. **N**: 16 robots + 1 control_station = 17
+  endpoints. **seconds**: 3. **mode/policy**: fifo.
+- **20 seeds** (chosen and frozen before running anything in this
+  pass): `7, 13, 29, 41, 53, 67, 79, 89, 97, 101, 103, 107, 109, 113,
+  127, 131, 137, 139, 149, 151` -- the first 10 are this project's
+  pre-existing 10-seed list (already used for an earlier wifi-parity
+  variance check); the next 10 are the next 10 primes after 101,
+  mechanically extending that list's own prime-sequence convention
+  rather than inventing an arbitrary new set.
+- **Middleware versions** (unchanged since the n=3 baseline, reverified
+  at freeze time): `ros-jazzy-rmw-fastrtps-cpp` 8.4.4,
+  `ros-jazzy-rmw-cyclonedds-cpp` 2.2.4, `ros-jazzy-rmw-zenoh-cpp`
+  0.2.10. Docker server 29.7.2, container kernel `6.12.76-linuxkit`.
+- **Discovery mode per middleware**: unchanged from the n=3 baseline
+  (FleetRMW `default`, Fast DDS `discovery_server`, CycloneDDS
+  `static_peers`, Zenoh `default`) -- not touched in this pass.
+- **Counterbalanced order**: cyclic rotation of the 4 middleware,
+  shifted by one position per seed index, exactly the pattern given in
+  this pass's own instructions; the full frozen 80-entry execution plan
+  was printed before any run started (see raw output).
+
+### 3. VALIDITY
+
+| middleware | valid runs | invalid first attempts | replacement runs |
+|---|---|---|---|
+| FleetRMW | 20/20 | 0 | 0 |
+| Fast DDS | 20/20 | 0 | 0 |
+| CycloneDDS | 20/20 | 0 | 0 |
+| Zenoh | 20/20 | 0 | 0 |
+
+All 80 runs (20 seeds x 4 middleware) passed validity on the first
+attempt (`status=ok`, `endpoint_results_complete=true`, `intended>0`).
+**Zero retries were needed** -- Zenoh's low-delivery runs were all
+independently valid (containers launched, became ready, ran the full
+workload, shut down cleanly, fresh output every time); low delivery is
+not the same as an invalid run, and none of Zenoh's poor results were
+infrastructure failures.
+
+### 4. RAW DELIVERY RESULTS
+
+| seed | FleetRMW | Fast DDS | CycloneDDS | Zenoh |
+|---|---|---|---|---|
+| 7 | 100.0 | 100.0 | 100.0 | 68.60 |
+| 13 | 100.0 | 100.0 | 100.0 | 7.38 |
+| 29 | 100.0 | 100.0 | 100.0 | 85.40 |
+| 41 | 100.0 | 100.0 | 100.0 | 4.62 |
+| 53 | 100.0 | 100.0 | 100.0 | 34.00 |
+| 67 | 100.0 | 100.0 | 100.0 | 7.18 |
+| 79 | 100.0 | 100.0 | 100.0 | 23.64 |
+| 89 | 100.0 | 100.0 | 100.0 | 15.32 |
+| 97 | 100.0 | 100.0 | 100.0 | 22.66 |
+| 101 | 100.0 | 100.0 | 100.0 | 65.64 |
+| 103 | 100.0 | 100.0 | 100.0 | 18.02 |
+| 107 | 100.0 | 100.0 | 100.0 | 20.03 |
+| 109 | 100.0 | 100.0 | 100.0 | 22.22 |
+| 113 | 100.0 | 100.0 | 100.0 | 81.11 |
+| 127 | 100.0 | 100.0 | 100.0 | 100.00 |
+| 131 | 100.0 | 100.0 | 100.0 | 16.58 |
+| 137 | 100.0 | 100.0 | 100.0 | 68.34 |
+| 139 | 100.0 | 100.0 | 100.0 | 90.37 |
+| 149 | 100.0 | 100.0 | 100.0 | 84.72 |
+| 151 | 100.0 | 100.0 | 100.0 | 12.37 |
+
+### 5. FRESH-DEADLINE RESULTS
+
+**Identical to Section 4 above, for all 80 runs.** `stale_pct` (fraction
+of delivered messages exceeding their own deadline) was measured as
+exactly `0.0` for every one of the 80 runs -- every message that
+arrived, arrived within its deadline at this LAN/N=16/3s scale, so
+`fresh_deadline_success_pct = delivery_pct` exactly throughout this
+experiment. Not hand-copied: verified by direct comparison of both
+fields across all 80 raw result records before writing this section.
+
+### 6. DELIVERY SUMMARY
+
+| middleware | mean | median | min | max |
+|---|---|---|---|---|
+| FleetRMW | 100.0 | 100.0 | 100.0 | 100.0 |
+| Fast DDS | 100.0 | 100.0 | 100.0 | 100.0 |
+| CycloneDDS | 100.0 | 100.0 | 100.0 | 100.0 |
+| Zenoh | 42.41 | 23.15 | 4.62 | 100.0 |
+
+FleetRMW, Fast DDS, and CycloneDDS: **exactly 100.0% on all 20 valid
+seeds, no exceptions** -- stated exactly as measured, no ranking
+manufactured among three fully tied systems.
+
+### 7. FRESH-DEADLINE SUMMARY
+
+Identical to Section 6 (see Section 5).
+
+### 8. PRIMARY PAIRED ANALYSIS
+
+Per-seed best baseline is reselected independently for every seed from
+{Fast DDS, CycloneDDS, Zenoh} (not chosen once globally). Because Fast
+DDS and CycloneDDS are always at 100.0%, `best_baseline(S) = 100.0` for
+every single seed, regardless of Zenoh's value that seed.
+
+- **FleetRMW(S) - best_baseline(S) = 0.0 for all 20 seeds** (FleetRMW
+  is also always 100.0%).
+- **mean difference**: 0.0 pp.
+- **median difference**: 0.0 pp.
+- **Paired bootstrap** (10,000 resamples over complete seed-rows, fixed
+  analysis seed `20260919`): 95% CI = **[0.0, 0.0]** pp.
+
+### 9. SUPERIORITY GATE
+
+**SUPERIORITY GATE NOT MET.**
+
+- Condition 1 (mean diff >= +15.0 pp): **FAILED** -- mean diff is 0.0 pp.
+- Condition 2 (bootstrap 95% CI lower bound > 0): **FAILED** -- CI
+  lower bound is 0.0.
+
+This is not a failure of FleetRMW -- see Section 10. The gate is
+structurally unreachable on this workload because the *baseline* side
+of the comparison (Fast DDS / CycloneDDS) is itself already saturated
+at 100%, leaving no headroom for any system, including FleetRMW, to
+show a positive gap against "the best baseline."
+
+### 10. CEILING EFFECT
+
+**YES.** FleetRMW, Fast DDS, and CycloneDDS all have mean fresh-deadline
+success >= 99.5% (in fact exactly 100.0%) across all 20 complete seeds.
+The LAN N=16/3s/fifo workload cannot discriminate among these three
+systems -- their tie is a direct consequence of the workload being
+easy enough for all of them to saturate, not evidence that FleetRMW and
+the baselines perform identically under harder conditions (higher N,
+higher payload, lossy links, etc. — all outside this pass's scope).
+
+### 11. LATENCY
+
+Per-middleware summary across the 20 seeds (mean of per-seed
+percentile values; individual per-seed p50/p95/p99 preserved in
+`results_rmw_socket/lan_n16_paired_20seed/analysis.json`):
+
+| middleware | p50 mean (median) | p95 mean (median) | p99 mean (median) |
+|---|---|---|---|
+| FleetRMW | 0.991 ms (0.992) | 1.953 ms (1.927) | **4.102 ms (4.100)** |
+| Fast DDS | 0.730 ms (0.727) | 1.422 ms (1.453) | 2.031 ms (2.039) |
+| CycloneDDS | 0.692 ms (0.691) | 1.448 ms (1.426) | 2.053 ms (1.982) |
+| Zenoh | 0.964 ms (0.960) | 1.562 ms (1.557) | 1.956 ms (1.913) |
+
+FleetRMW's p99 is consistently roughly double the other three's across
+all 20 seeds (not just the earlier n=3 sample) -- this is now a
+well-supported descriptive finding, not a 3-sample anecdote. **No
+mechanism is claimed or investigated here** -- see Section 20 for a
+proposed follow-up measurement.
+
+### 12. ZENOH VARIANCE
+
+Quantified over the 20 valid seeds: **mean 42.41%, median 23.15%, min
+4.62%, max 100.0%, standard deviation 33.38 pp** (n=20). This is large,
+genuine variance under Zenoh's default discovery configuration at 17
+endpoints -- reproducible across a 20-seed sample, not a small-sample
+artifact (the earlier n=3 sample, 52.8/64.5/86.1%, undersampled the low
+end that n=20 reveals: 6 of 20 seeds are below 20% delivery). **No
+causal explanation is claimed** -- the earlier "discovery-convergence
+timing" hypothesis remains a hypothesis, not confirmed here (this pass
+did not instrument Zenoh's discovery internals).
+
+### 13. PER-FLOW RESULTS
+
+FleetRMW, Fast DDS, and CycloneDDS: 100.0% on every flow, every seed
+(no loss to distribute). Zenoh's mean delivery by flow, across the 20
+seeds:
+
+| flow | Zenoh mean delivery % |
+|---|---|
+| control | 42.45 |
+| state | 42.60 |
+| perception | 42.33 |
+| coordination | 42.48 |
+| debug | 39.64 |
+| human_qoe | 38.31 |
+
+Loss is spread nearly evenly across all 6 flows (38-42%), confirming
+the n=3 finding at n=20: Zenoh's loss is not concentrated in one flow,
+consistent with (but not proof of) a startup/discovery-timing effect
+that indiscriminately affects whatever is in flight before convergence
+completes, rather than a flow-specific mechanism.
+
+### 14. FLEETRMW REGRESSION CHECK
+
+- **Premature shutdown bug (a6dffd1)**: **ABSENT.** All 20 FleetRMW
+  seeds delivered 100.0% with `endpoint_results_complete=true` -- no
+  sign of any endpoint exiting before peers finished sending.
+- **Cross-robot stream/identity collision (1544008/010ca96)**:
+  **ABSENT.** All 20 FleetRMW seeds: `delivery_pct == 100.0` exactly,
+  with zero exceptions (`fleet_regression_check.all_100pct = true`,
+  `min_delivery_pct = 100.0`, `seeds_below_100pct = []`). Had the old
+  collision returned, this would show up as sporadic sub-100% FleetRMW
+  seeds, exactly like the pre-fix numbers this experiment's baseline
+  superseded -- it does not.
+
+### 15. RETRY OBSERVATION
+
+Not investigated in this pass, per instruction. No new measurement was
+added beyond what the n=3 baseline already recorded (`repair_amp` = 0.0
+for FleetRMW at LAN/N=16/3s scale, via existing
+`fleetqox_transport_metrics` NACK/fragment/timeout-retransmission
+counters -- unchanged mechanism, not rerun as its own analysis this
+pass since nothing about the retry path was touched or was in scope
+here).
+
+### 16. PRODUCTION CHANGES
+
+**NONE.** `ros2_ws/src/rmw_fleetqox_cpp/` was not touched in this pass.
+
+### 17. OPTIMIZATION #2
+
+**NOT IMPLEMENTED.**
+
+### 18. LIMITATIONS
+
+- LAN only -- no Wi-Fi/5G generalization.
+- N=16 only -- no claim about other fleet sizes.
+- seconds=3, fifo policy only -- this exact workload only.
+- 20 paired seeds -- a solid variance characterization, especially for
+  Zenoh, but still one fixed workload shape; not a claim that
+  generalizes beyond it.
+- No superiority claim is made or supported (gate not met; see Section
+  9-10 for exactly why).
+- Zenoh's discovery-timing hypothesis remains unconfirmed (Section 12).
+- FleetRMW's p99 gap is descriptive only; no causal experiment was run
+  (Section 11, Section 20).
+
+### 19. VERDICT
+
+Based on evidence only: **FleetRMW, Fast DDS, and CycloneDDS are
+delivery-indistinguishable on this LAN N=16/3s/fifo workload across 20
+seeds (100.0% every seed, no exceptions) -- a ceiling effect, not a
+demonstrated tie under harder conditions.** The pre-registered
+superiority gate is **NOT MET**, and structurally cannot be met on this
+workload regardless of how much worse Zenoh performs, because Zenoh is
+never the per-seed best baseline. Zenoh's default-discovery delivery
+variance (4.6-100%, mean 42.4%) is now a well-quantified, reproducible
+characteristic at n=20, with its cause still unconfirmed. FleetRMW's
+higher p99 latency (~2x the other three) is now well-supported
+descriptively across 20 seeds, with its cause not investigated.
+
+### 20. EXACTLY ONE NEXT STEP (NOT executed in this pass)
+
+Two candidate follow-ups are supported by this pass's own findings
+(10.A applies because of the confirmed ceiling effect; 10.B applies
+because of the confirmed, consistent latency gap) -- per this pass's
+instruction to choose based on results, the ceiling effect is the more
+fundamental blocker to any further LAN-based superiority claim, so:
+
+**(A) Propose ONE pre-registered harder, still-VALID workload** for the
+next paired experiment, chosen to avoid the current ceiling without
+manufacturing failure: increase `num_robots` beyond 16 (e.g. N=32,
+already a supported harness parameter) and/or shorten `seconds`/raise
+message rate, keeping LAN topology (no wifi/5G confound) so the harder
+condition is purely load, not a different transport. This would be
+run as its own separate, explicitly-authorized pass -- **not executed
+here.**
+
+(B, noted but secondary this pass): a measurement-only latency
+localization experiment for FleetRMW's ~2x p99 gap (e.g. splitting
+end-to-end latency into publish-side, wire, and receive-side segments
+using existing `fleetqox_transport_metrics.publish_stages` timing,
+already collected but not yet analyzed) remains available as a
+follow-up but is not the higher-priority next step given the ceiling
+effect blocks the primary comparison entirely regardless of latency.
+
+**Files**: `scripts/run_lan_n16_paired_20seed_experiment.py` (driver),
+`scripts/analyze_lan_n16_paired_experiment.py` (deterministic
+analysis, no hand-copied numbers). Raw + analysis output:
+`results_rmw_socket/lan_n16_paired_20seed/{raw_report.json,analysis.json}`
+plus per-run `container_results/` (gitignored, regenerate via
+`python3 scripts/run_lan_n16_paired_20seed_experiment.py` then
+`python3 scripts/analyze_lan_n16_paired_experiment.py --summary-json ...`).
 
 ## Quy ước cập nhật file này
 
