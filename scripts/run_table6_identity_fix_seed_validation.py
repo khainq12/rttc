@@ -121,34 +121,50 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--image", default=DEFAULT_IMAGE)
     parser.add_argument(
+        "--num-robots",
+        type=int,
+        default=NUM_ROBOTS,
+        help="scale knob only for THIS measurement script -- does not touch the "
+        "harness/production code being validated. Default (4) matches the "
+        "original single-scale validation this script was written for.",
+    )
+    parser.add_argument(
         "--output-root",
         type=Path,
-        default=ROOT / "results_rmw_socket" / "table6_identity_fix_seed_validation",
+        default=None,
+        help="defaults to results_rmw_socket/table6_identity_fix_seed_validation "
+        "for N=4 (unchanged path, for exact backward compatibility) or "
+        "..._n{N} for any other --num-robots.",
     )
     parser.add_argument("--summary-json", type=Path, default=None)
     args = parser.parse_args()
 
-    args.output_root.mkdir(parents=True, exist_ok=True)
+    num_robots = args.num_robots
+    output_root = args.output_root
+    if output_root is None:
+        suffix = "" if num_robots == NUM_ROBOTS else f"_n{num_robots}"
+        output_root = ROOT / "results_rmw_socket" / f"table6_identity_fix_seed_validation{suffix}"
+    output_root.mkdir(parents=True, exist_ok=True)
     results: list[dict[str, Any]] = []
 
     for seed in SEEDS:
-        print(f"=== FleetRMW N={NUM_ROBOTS} seed={seed} ===", flush=True)
-        output_dir = args.output_root / f"fleetrmw_n{NUM_ROBOTS}_seed{seed}"
+        print(f"=== FleetRMW N={num_robots} seed={seed} ===", flush=True)
+        output_dir = output_root / f"fleetrmw_n{num_robots}_seed{seed}"
         result = run_coordination_probe(
             image=args.image,
             output_dir=output_dir,
-            num_robots=NUM_ROBOTS,
+            num_robots=num_robots,
             seed=seed,
             rmw_implementation="rmw_fleetqox_cpp",
             discovery_mode="default",
             extra_rmw_env={"FLEETQOX_RMW_LOSS_FUNNEL_TRACE_PROFILING": "1"},
         )
-        analysis = analyze_run(output_dir, NUM_ROBOTS, result["status"], result["error"])
+        analysis = analyze_run(output_dir, num_robots, result["status"], result["error"])
         analysis["seed"] = seed
         results.append(analysis)
         print(json.dumps({k: analysis[k] for k in ("seed", "valid", "status")}), flush=True)
 
-    report = {"seeds": SEEDS, "results": results}
+    report = {"seeds": SEEDS, "num_robots": num_robots, "results": results}
     if args.summary_json:
         args.summary_json.parent.mkdir(parents=True, exist_ok=True)
         args.summary_json.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
