@@ -14849,6 +14849,93 @@ than it prunes eventually-useful ones (the 15.4%)?
 amplification.py` (new, read-only). No production code changed this
 phase. Commit: `db9fda9`.
 
+## OVERNIGHT PHASE 5: REPLY BROADCAST FAN-OUT -- MEASURED AND ARCHITECTURALLY VALIDATED, NOT IMPLEMENTED THIS PASS
+
+Read-only re-analysis of the Phase-1-fixed N=8 seed=7 data (no rerun)
+plus a source-level feasibility assessment. No production code
+changed this phase -- see "decision" below for why.
+
+### Measurement
+
+`fleetqox_coordination_endpoint.py` publishes REQUEST and REPLY on
+ONE shared broadcast topic (`reply_pub = request_pub`); REPLY carries
+a logical `"to"` field but is physically delivered to every peer, and
+`on_reply()` discards it at the APPLICATION layer
+(`if payload["to"] != args.endpoint: return`) -- AFTER the full wire
+cost (sendto -> network -> recvfrom -> decode) is already paid. Using
+`raw_received_log` (every RMW-level successful decode, already
+recorded): **1,089 / 1,236 (88.1%)** of all successfully-decoded REPLY
+messages fleet-wide were addressed to someone other than the receiver
+-- matching the theoretical fan-out waste for broadcast-to-N-1-peers
+almost exactly (7/8 = 87.5% for N=8). REQUEST traffic (388 received)
+is excluded from this waste calculation -- it genuinely needs full
+broadcast for Ricart-Agrawala correctness (every peer must see every
+REQUEST to compute Lamport-ordering).
+
+Every one of those wasted REPLY deliveries ALSO independently
+regenerates a fresh ACK/NACK feedback computation at the receiver
+(RELIABLE QoS: `observe_frame()` runs on every decoded frame,
+regardless of whether the app finds it useful) -- so this waste is not
+confined to the DATA channel alone, it also inflates the
+already-dominant ACK/NACK channel (Phase 3) proportionally.
+
+### Architectural feasibility (source-verified, not just theorized)
+
+Confirmed via direct source read that a genuinely minimal,
+RMW-C++-free directed-REPLY path is possible: `subscription_aware_
+targets()` (`rmw_pubsub.cpp:4577`) already computes send targets
+PER-TOPIC (`subscription_topic_key(domain_id, topic, type_name)`),
+sending only to peers with a currently-known live subscription for
+that EXACT topic. Combined with `seed_static_subscriptions()`
+(`FLEETQOX_RMW_STATIC_SUBSCRIPTIONS`, already used by Table IV/V), this
+targeting can be seeded STATICALLY at startup -- it does NOT require
+the dynamic graph-advertisement thread that `STATIC_MODE=1` disables
+(already proven required for Table VI: disabling `STATIC_MODE`
+entirely was tested earlier this project and caused ~100% forced-entry).
+This resolves the one real risk this phase specifically checked for:
+Table VI's `STATIC_MODE=1` requirement does NOT conflict with using
+`subscription_aware` peer_policy, PROVIDED the subscription map is
+seeded statically rather than learned dynamically.
+
+The minimal design: split REPLY off the shared topic into N-1
+per-target topics (`/fleetqox_coordination/reply_to/{target}`, each
+subscribed to by exactly one peer), keep REQUEST unchanged on the
+existing shared broadcast topic, and switch Table VI's harness-side
+`fleetqox_coordination_rmw_env_prefix()` call from
+`include_static_subscriptions=False` to `True` with a computed map:
+the shared request topic -> all peers (unchanged, still full
+broadcast), each `reply_to/{X}` topic -> peer X only. Ricart-Agrawala
+semantics are unaffected: REQUEST still reaches everyone; REPLY still
+reaches its one intended recipient, just without touching every other
+peer's wire/decode/ACK-NACK pipeline on the way.
+
+### Decision: measured and validated, NOT implemented this pass
+
+This change touches the benchmark's own Ricart-Agrawala coordination
+script (`fleetqox_coordination_endpoint.py`), not just RMW transport
+internals -- a fundamentally more delicate correctness surface than
+this session's other (purely additive-instrumentation or single-guard
+RMW) fixes. A careful implementation needs: new per-target
+publisher/topic plumbing, a new static-subscriptions-string builder in
+the harness, and validation at BOTH small scale (N=2 sanity: no missed
+replies, no protocol deadlock) AND N=8 (the actual scale this
+investigation cares about) before it could be trusted. Given the
+remaining scope for this overnight session (completing the ACK/NACK
+sweep already in flight, and the mandatory final N=8 reassessment +
+consolidated report), rushing this implementation risks either
+shipping a subtly-broken mutex protocol or leaving no time for the
+mandatory Phase 6 deliverable. Per this session's own standing rule
+("never keep a change merely because it sounds reasonable" applies
+equally to "never rush a plausible-sounding change without room to
+validate it") -- **deferred as a well-specified follow-up, not
+implemented.** The measurement and architecture above are the
+deliverable for this phase; no wire-load or delivery claim is made
+about a change that was not built or tested.
+
+**Files changed**: `scripts/measure_table6_n8_reply_fanout_waste.py`
+(new, read-only). No production code changed this phase. Commit:
+`7861567`.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
