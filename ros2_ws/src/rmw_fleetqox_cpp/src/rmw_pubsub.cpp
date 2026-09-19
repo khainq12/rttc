@@ -634,8 +634,18 @@ struct SubscriptionMatchTraceEvent
   // byte-identical content without any new decode step -- purely
   // observational, gated by the same loss_funnel_trace_profiling_enabled()
   // flag as every other field here, adds no cost when disabled.
+  //
+  // payload_hex is hex-encoded, NOT raw bytes: an application payload is
+  // arbitrary binary and is not guaranteed to be valid UTF-8, but this
+  // struct's JSON accessor embeds every field as a JSON string, and the
+  // Python side decodes the whole returned buffer as UTF-8 before
+  // json.loads() -- one invalid byte anywhere in a raw payload silently
+  // discarded the ENTIRE subscription_match trace (caught as
+  // UnicodeDecodeError, defaulted to []), while every OTHER trace type
+  // stayed fine since none of them embed raw payload bytes. Hex keeps
+  // this field always-valid ASCII regardless of payload content.
   std::string robot_id;
-  std::string payload_text;
+  std::string payload_hex;
 };
 std::vector<SubscriptionMatchTraceEvent> g_subscription_match_trace_events;
 
@@ -14905,7 +14915,7 @@ void enqueue_received_frame(const std::string & encoded_frame)
     // alone) cannot: every sender in a benchmark run shares the same
     // publisher_id text (see allocate_publisher_id()), so without this
     // two frames from different robots with the same sequence number
-    // would be indistinguishable here. payload_text is capped well
+    // would be indistinguishable here. payload_hex is capped well
     // below any real message size purely so a pathological future
     // payload can't bloat this trace buffer; it is not a correctness
     // boundary for this decode.
@@ -14913,9 +14923,8 @@ void enqueue_received_frame(const std::string & encoded_frame)
     {
       const std::size_t payload_cap =
         std::min<std::size_t>(decoded_frame->serialized_payload.size(), 512);
-      match_event.payload_text = std::string(
-        decoded_frame->serialized_payload.begin(),
-        decoded_frame->serialized_payload.begin() + payload_cap);
+      match_event.payload_hex = hex_encode_bytes(
+        decoded_frame->serialized_payload.data(), payload_cap);
     }
     std::lock_guard<std::mutex> trace_lock(g_loss_funnel_trace_mutex);
     g_subscription_match_trace_events.push_back(std::move(match_event));
@@ -15524,7 +15533,7 @@ const char * rmw_fleetqox_cpp_subscription_match_trace_json()
     built += "\"matched_subscriptions\":" + std::to_string(event.matched_subscriptions) + ",";
     built += "\"wall_ns\":" + std::to_string(event.wall_ns) + ",";
     built += "\"robot_id\":\"" + loss_funnel_json_escape(event.robot_id) + "\",";
-    built += "\"payload\":\"" + loss_funnel_json_escape(event.payload_text) + "\"}";
+    built += "\"payload_hex\":\"" + event.payload_hex + "\"}";
   }
   built += "]";
   json = std::move(built);
