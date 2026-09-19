@@ -17,7 +17,7 @@ Trạng thái tại thời điểm kiểm tra gốc (07/09/2026): **0/6 nhóm đ
 | 3 | QUIC/PKI và HA/fencing (online rotation, live revocation, ma trận phân vùng không split-brain, failover/failback đa host, durable state) | Đạt phần lớn (thiếu đa host) | ✅ **Đã đóng** | HA multi-host (Raft + etcd/PostgreSQL, failover + failback) làm ở phiên trước (2 VM KVM thật). PKI cert/CA rotation multi-host (CRL revocation + CA rotation thật, không phải chỉ thêm CA) làm phiên này: `scripts/run_multihost_kvm_udp_peer_auth_crl_reload_probe.py`, 4/4 round pass. Commit `65b7100`. Lưu ý nhỏ: "ma trận phân vùng" mới test một số kịch bản tiêu biểu, chưa phải toàn bộ tổ hợp. |
 | 4 | Ngữ nghĩa RMW (full QoS event, full DDS content-filter dialect, deep preallocation) | Đạt một phần | ✅ **Đã đóng** | Dynamic message, nhiều QoS extension (liveliness, deadline, lifespan, destination_order, ownership, partition, presentation) đã xong. **Task #42 (content-filter dialect) đã đóng**: thêm `LIKE ... ESCAPE`, 3/3 pass (`run_rmw_docker_content_filter_sql_probe.py`), và đã ra quyết định phạm vi chính thức — subset hiện tại là ranh giới cuối cùng. **Task #43 (deep_preallocation_claim) đã đóng phần lớn hơn dự kiến**: thay vì redesign wire-format nhị phân (rủi ro cao, ban đầu định hỏi ý kiến), tìm được cách an toàn hơn — verify `snprintf("%.6g",...)` giống hệt định dạng double của `ostringstream` (400k+ giá trị test), rồi build JSON frame body thẳng vào buffer bền vững (`frame_json_scratch`) thay vì `ostringstream` mới mỗi lần, và pool hoá entry trong retransmit ledger (`g_retired_retransmit_entries`) — không đổi 1 byte nào trên wire, không ảnh hưởng 187 probe khác. Verify bằng A/B rebuild (git stash) xác nhận 2 lỗi flaky có sẵn (`rmw_wait_for_all_acked_probe`, `remote_wait_for_all_acked_probe`) tái hiện y hệt ở cả code cũ và mới → không phải regression. `deep_preallocation_claim` vẫn giữ `false` (đúng): phần message deserialization và ledger hash-map node allocation vẫn chưa pool hoá, và binary wire format vẫn là ranh giới scope có chủ đích, không phải việc treo. |
 | 5 | Nav2, Open-RMF, đa host, HIL | Đạt một phần | ❌ **Chưa làm** | Nav2 đã có bằng chứng chạy thực tế (từ trước). Open-RMF chưa phải full upstream stack; chưa có bằng chứng đa host/HIL cho workload tự hành. |
-| 6 | Đối sánh mô phỏng (ns-3/OMNeT++), soak dài hạn, bằng chứng phát hành qua CI | Đạt một phần | 🟡 **Đang làm** | Xem mục "Nhóm 6" bên dưới. Đối sánh ns-3/OMNeT++ Wi-Fi: tìm + sửa 2 bug thật (INET PendingQueue 100 vs ns-3 500 gói; INET Arp retryTimeout 1s bị lộ do đồng bộ start-time) + sửa cách so sánh p99 sang tỷ lệ tương đối. Kết quả 10-seed: **8 trạm = 100% nhóm kịch bản khớp** (trung bình), 16 trạm 56%, 32 trạm 33% (còn khoảng cách thật ở delivery ratio, đã thử 8 giả thuyết không tìm thêm được nguyên nhân). CI: đã xác minh chạy thật pass qua GitHub API. **Baseline LAN N=16 mới (18/09/2026, sau khi sửa 2 bug harness)**: FleetRMW/Fast DDS/CycloneDDS đều 100% ở cả 3 seed (7/13/29); Zenoh 52.8-86.1% (biến động thật do discovery mặc định, không phải lỗi hạ tầng) — xem mục "FRESH CORRECTED-HARNESS LAN N=16 BASELINE". **Mở rộng lên 20 seed ghép cặp (19/09/2026)**: FleetRMW/Fast DDS/CycloneDDS **100% ở TẤT CẢ 20 seed, không ngoại lệ** — xác nhận đây là **ceiling effect** (workload quá dễ để phân biệt 3 hệ thống này), nên gate "superiority" (+15pp so baseline tốt nhất mỗi seed + bootstrap CI > 0) **KHÔNG ĐẠT ĐƯỢC** (và về cấu trúc không thể đạt được trên workload này, vì baseline luôn ở mức trần 100%). Zenoh: biến động rất lớn được định lượng rõ ở n=20 (mean 42.4%, min 4.6%, max 100%, stdev 33.4pp) — nguyên nhân discovery-timing vẫn là giả thuyết, chưa xác nhận. FleetRMW p99 cao hơn ~2x 3 hệ thống kia một cách nhất quán qua cả 20 seed (mô tả thuần, chưa điều tra cơ chế). Xem mục "LAN N=16 — 20-SEED PAIRED CORRECTED-HARNESS EXPERIMENT". Số liệu LAN cũ (trước fix 2 bug harness) đã SUPERSEDED, không dùng để so sánh nữa. Soak dài hạn: chưa làm. |
+| 6 | Đối sánh mô phỏng (ns-3/OMNeT++), soak dài hạn, bằng chứng phát hành qua CI | Đạt một phần | 🟡 **Đang làm** | Xem mục "Nhóm 6" bên dưới. Đối sánh ns-3/OMNeT++ Wi-Fi: tìm + sửa 2 bug thật (INET PendingQueue 100 vs ns-3 500 gói; INET Arp retryTimeout 1s bị lộ do đồng bộ start-time) + sửa cách so sánh p99 sang tỷ lệ tương đối. Kết quả 10-seed: **8 trạm = 100% nhóm kịch bản khớp** (trung bình), 16 trạm 56%, 32 trạm 33% (còn khoảng cách thật ở delivery ratio, đã thử 8 giả thuyết không tìm thêm được nguyên nhân). CI: đã xác minh chạy thật pass qua GitHub API. **Baseline LAN N=16 mới (18/09/2026, sau khi sửa 2 bug harness)**: FleetRMW/Fast DDS/CycloneDDS đều 100% ở cả 3 seed (7/13/29); Zenoh 52.8-86.1% (biến động thật do discovery mặc định, không phải lỗi hạ tầng) — xem mục "FRESH CORRECTED-HARNESS LAN N=16 BASELINE". **Mở rộng lên 20 seed ghép cặp (19/09/2026)**: FleetRMW/Fast DDS/CycloneDDS **100% ở TẤT CẢ 20 seed, không ngoại lệ** — xác nhận đây là **ceiling effect** (workload quá dễ để phân biệt 3 hệ thống này), nên gate "superiority" (+15pp so baseline tốt nhất mỗi seed + bootstrap CI > 0) **KHÔNG ĐẠT ĐƯỢC** (và về cấu trúc không thể đạt được trên workload này, vì baseline luôn ở mức trần 100%). Zenoh: biến động rất lớn được định lượng rõ ở n=20 (mean 42.4%, min 4.6%, max 100%, stdev 33.4pp) — nguyên nhân discovery-timing vẫn là giả thuyết, chưa xác nhận. FleetRMW p99 cao hơn ~2x 3 hệ thống kia một cách nhất quán qua cả 20 seed (mô tả thuần, chưa điều tra cơ chế). Xem mục "LAN N=16 — 20-SEED PAIRED CORRECTED-HARNESS EXPERIMENT". Số liệu LAN cũ (trước fix 2 bug harness) đã SUPERSEDED, không dùng để so sánh nữa. **Fix bug "false-ready" cho readiness gate dùng chung (19/09/2026)**: đúng RED→FIX→GREEN, đã sửa và verify (0 regression, 811 test pass). Nhưng khi enforce fix thật (live), phát hiện vấn đề LỚN HƠN dự kiến: gate readiness hiện tại (beacon 16 peer, full-mesh) KHÔNG khớp với workload thực tế (topology hình sao — mỗi robot chỉ nói chuyện với control_station, xác nhận 0 cặp robot-robot trong trace). Kết quả: Fast DDS/CycloneDDS (không chỉ Zenoh) CŨNG bị INVALID_READINESS ở các seed trước đây pass 100% → **Fast DDS sanity: FAIL, CycloneDDS sanity: FAIL, Zenoh 20-seed rerun: 0/20 valid**. FleetRMW không ảnh hưởng (PASS, dùng đường riêng). Kết luận: KHÔNG được nói "Zenoh đã fix" — bug readiness đã đóng đúng, nhưng lộ ra gate cần redesign theo topology thực tế trước khi benchmark LAN N=16 nào (không riêng Zenoh) đáng tin cậy trở lại. Xem mục "ZENOH FALSE-READY HARNESS FIX AND VALIDATION". Soak dài hạn: chưa làm. |
 
 **Tóm lại: 4/6 nhóm đã đóng (1, 2, 3, 4 — nhóm 4 vẫn còn vài ranh giới
 scope có chủ đích, xem bảng, không phải việc treo). Nhóm 6 đang bắt đầu
@@ -11102,6 +11102,356 @@ process happens to run). **Not executed in this pass.**
 (lines 725-830). Raw evidence:
 `results_rmw_socket/lan_n16_paired_20seed/rmw_zenoh_cpp_default_n16_seed{41,127}/.../container_results/result_0.json`
 (and all 20 seeds' `result_0.json` for the Part 6 correlation table).
+
+## ZENOH FALSE-READY HARNESS FIX AND VALIDATION (19/09/2026)
+
+**HARNESS CORRECTNESS ONLY pass.** No Zenoh configuration changed. No
+FleetRMW production code changed. No Fast DDS/CycloneDDS tuning. No
+Wi-Fi/5G work. Strict RED -> FIX -> GREEN -> VALIDATION.
+
+**Headline finding, stated up front so it is not missed**: the fix
+itself is correct and verified (RED/GREEN unit tests, live sanity). But
+applying it live revealed something bigger than the original Zenoh-only
+finding: **the shared 16-peer aggregate discovery-beacon check is not
+an accurate readiness signal for ANY of the three non-FleetRMW
+middleware at N=16** -- enforcing it as a hard gate (as this pass's
+own goal required) now also flags Fast DDS and CycloneDDS runs as
+`INVALID_READINESS` at seeds that previously delivered 100%. Do not
+read this as "the fix is broken" -- read it as "the fix correctly
+stopped hiding a pre-existing measurement-validity problem that also
+affected Fast DDS/CycloneDDS, not only Zenoh." See sections 9/13/19/21.
+
+### 1. SIMPLE ANSWER
+
+What was wrong: the discovery-readiness loop touched `--ready-file`
+unconditionally after exiting, whether it exited because convergence
+was reached or because the 15-second timeout fired first -- so an
+endpoint that saw 1 of 16 expected peers was marked exactly as ready as
+one that saw all 16. What changed: readiness is now a content-based
+signal (`"ready"` vs `"invalid_readiness"`) computed by a new pure,
+unit-tested function (`discovery_converged()`), and the orchestrator
+now enforces that content instead of merely checking file existence.
+**A timeout without convergence no longer becomes READY, for any
+middleware sharing this gate.**
+
+What this pass additionally discovered (not originally in scope, but
+directly caused by correctly enforcing the fix): the aggregate
+16-peer-beacon check itself demands full-mesh awareness (every
+endpoint must see every other endpoint), while the actual benchmark
+workload is a **pure star topology** (verified directly from the trace
+CSV: 32 distinct (src,dst) pairs, **0 of them robot-to-robot** -- every
+pair is `control_station<->robot_XXXX`). Fast DDS and CycloneDDS could
+previously tolerate individual robots timing out on this irrelevant
+mesh-wide beacon because their REAL per-topic matching (which only ever
+needs `robot<->control_station`, never `robot<->robot`) still
+succeeded. Now that the beacon timeout is correctly enforced as a hard
+gate, those previously-harmless stragglers make the whole run invalid
+too.
+
+### 2. PROVEN OLD BUG
+
+Source: `scripts/fleetqox_rmw_trace_endpoint.py`, discovery loop (prior
+to this pass, lines ~799-830):
+
+```python
+discovery_start = time.monotonic()
+discovery_deadline = discovery_start + args.discovery_timeout_s
+if not args.skip_discovery_wait:
+    while time.monotonic() < discovery_deadline:
+        ...
+        if beacon_pub is not None:
+            if len(discovery_peers_seen) >= args.expected_peer_count:
+                break
+        elif ...:
+            break
+discovery_convergence_s = time.monotonic() - discovery_start
+...
+if args.ready_file:
+    args.ready_file.parent.mkdir(parents=True, exist_ok=True)
+    args.ready_file.touch()          # <-- unconditional, regardless of why the loop exited
+```
+
+`args.ready_file.touch()` ran after the loop **no matter which way the
+loop exited** -- via the `break` (genuine convergence) or via the
+`while` condition going false (timeout). The only place the
+distinction was even computed was a debug-print condition just above
+it, never used to gate the file write. Confirmed live (previous
+investigation pass) at seed=41: `control_station` saw exactly 1/16
+peers at the 15.02s timeout and was still marked ready, then measured
+4.62% delivery -- reported as if it were a real application-performance
+number.
+
+Which middleware use this shared path: **Fast DDS, CycloneDDS, and
+Zenoh** all call with `expected_peer_count = len(self.endpoints) - 1`
+(dynamically derived from topology, not hard-coded -- 16 for N=16, per
+`run_ns3_docker_container_fleet_probe.py` lines 1193/1358). **FleetRMW**
+passes `--skip-discovery-wait` and `expected_peer_count=0`
+(lines 1201/1359), so it never entered this loop at all and is
+completely unaffected by both the bug and the fix.
+
+### 3. READINESS CONTRACT
+
+**OLD**: `timeout -> READY` (unconditionally, regardless of convergence state).
+
+**NEW** (`discovery_converged()`, `scripts/fleetqox_rmw_trace_endpoint.py`):
+```
+skip_discovery_wait=True         -> READY   (FleetRMW's contract, unaffected)
+beacon_active, peers_seen>=expected -> READY   (genuine convergence)
+beacon_active, peers_seen<expected -> INVALID  (timeout without convergence)
+```
+`--ready-file` now contains `"ready\n"` or `"invalid_readiness\n"`
+instead of being empty. `wait_for_ready_then_start()`
+(`run_ns3_docker_container_fleet_probe.py`) polls that CONTENT and
+raises a new `ReadinessFailure` immediately the moment any endpoint
+reports `invalid_readiness`, instead of waiting out the full deadline.
+`run_lan_probe()` catches `ReadinessFailure` separately and sets
+`status="invalid_readiness"` -- distinct from both `"ok"` and
+`"failed"`.
+
+### 4. RED
+
+Added `tests/test_fleetqox_rmw_trace_endpoint.py::DiscoveryConvergedReadinessContractTest`
+(7 cases: A-E from this pass's spec, plus the skip-discovery-wait and
+fallback-path cases) BEFORE `discovery_converged()` existed. Result:
+```
+ImportError: cannot import name 'discovery_converged' from 'scripts.fleetqox_rmw_trace_endpoint'
+```
+Committed as `df4ee7c` (RED, deliberately fails at that commit).
+
+### 5. FIX
+
+- `scripts/fleetqox_rmw_trace_endpoint.py`: added `discovery_converged()`
+  (pure function, no clock/rclpy dependency); tracks
+  `subscription_fallback_converged` through the existing loop; computes
+  `converged` once after the loop; `--ready-file` now
+  `write_text("ready\n" | "invalid_readiness\n")` instead of `.touch()`.
+- `scripts/run_ns3_docker_container_fleet_probe.py`: new `ReadinessFailure`
+  exception; `wait_for_ready_then_start()` polls ready-file content
+  (not existence) and raises `ReadinessFailure` immediately on any
+  `invalid_readiness`; `run_lan_probe()` catches it separately, setting
+  `status="invalid_readiness"`.
+- No timeout changed. No Zenoh config changed. No FleetRMW behavior
+  changed (still exempt via `--skip-discovery-wait`). Orchestrators
+  that only check ready-file EXISTENCE
+  (`run_ns3_docker_wifi_tap_rmw_probe.py`, not touched) see zero
+  behavior change -- the file still exists exactly when it always did.
+  Committed as `c313b69`.
+
+### 6. GREEN
+
+```
+811 passed, 8 failed
+```
+The 8 failures are the SAME pre-existing, unrelated ones from every
+prior pass in this project (7 ngtcp2-canonical-artifact tests +
+`test_remote_wait_for_all_acked`, all skip/fail based on checked-in
+artifact staleness, nothing to do with this change). 811 = 804
+(previous baseline) + 7 new tests, all passing. **0 new regressions**
+at the unit-test level.
+
+### 7. LIVE SANITY
+
+Ran the exact historically-worst case (Zenoh, seed=41, previously
+4.62% delivery) under the fixed harness:
+```json
+{"valid": false, "status": "invalid_readiness", "intended": 2337,
+ "delivered": 0, "delivery_pct": 0.0,
+ "error": "one or more endpoints reported invalid_readiness ..."}
+```
+Confirmed directly: this run no longer silently entered the measured
+workload with 1/16 peer convergence -- it is now correctly rejected as
+invalid before any application message was ever sent. `delivered`/
+`delivery_pct` are reported here only because `run_one()`'s generic
+computation runs regardless of status; per Part 8 below, these two
+fields are NOT meaningful for `invalid_readiness` rows and must never
+be read as "0% delivery" -- they are placeholders from an empty
+`endpoint_results` dict, not a measured outcome.
+
+### 8. ZENOH 20-SEED VALIDITY
+
+**valid: 0/20. invalid_readiness: 20/20.**
+
+Rerunning the EXACT same 20 seeds (7,13,29,41,53,67,79,89,97,101,103,
+107,109,113,127,131,137,139,149,151 -- frozen, none swapped) under the
+fixed harness: every single seed now hits `INVALID_READINESS`,
+including seed=127 (previously the ONE 100%-delivery seed, where
+`control_station` had converged 16/16 in 4.61s). In this rerun,
+`control_station` itself timed out at seed=127
+(`ready_0: invalid_readiness`, `DISCOVERY_TIMEOUT_DEBUG: control_station`).
+This is an important, sobering methodological finding on its own: **a
+seed controls the deterministic TRAFFIC pattern, not the real
+wall-clock timing of container startup / TCP session establishment /
+OS scheduling** -- so the SAME seed does not guarantee the same
+convergence outcome run to run. This does not weaken the original
+control_station-convergence correlation (r=0.9912, Part 6/8 of the
+prior investigation) -- it explains why a strict re-run of "the same
+seeds" cannot be read as a literal per-seed before/after pair for
+convergence outcome, only for the deterministic traffic pattern itself.
+
+### 9. ZENOH BEFORE VS AFTER
+
+| seed | OLD control_station peers/16 | OLD delivery % | NEW readiness | NEW control_station peers/16 (this attempt) | NEW delivery % |
+|---|---|---|---|---|---|
+| 41 | 1 | 4.62 | INVALID_READINESS | n/a (endpoint-level detail not re-extracted for all 20; seed 41 reconfirmed invalid in the live-sanity run above) | N/A |
+| 127 | 16 | 100.00 | INVALID_READINESS | timed out this attempt (see Part 8) | N/A |
+| (all other 18 seeds) | 1-15 | 4.6-90.4 | INVALID_READINESS (all 20/20) | not individually re-extracted | N/A |
+
+Neither outcome **A** (full convergence -> valid -> high delivery) nor
+outcome **B** (fails 15s readiness -> INVALID_READINESS, cleanly) is
+what a simple "Zenoh's problem is fixed" story would predict alone --
+what actually happened is closer to B for every seed **in this specific
+rerun attempt**, for reasons now understood to go beyond
+Zenoh/`control_station` specifically (see Part 13). What is confirmed
+NOT happening anymore, in every one of these 20 seeds: partial
+convergence silently becoming READY and being counted as if it were
+real application delivery -- that specific bug is closed.
+
+### 10. VALID-RUN DELIVERY
+
+**N/A -- 0 valid Zenoh runs in this rerun to aggregate.** Mean/median/
+min/max cannot be computed from zero valid samples. This is itself the
+headline result of Part 8/9, not a gap in the analysis.
+
+### 11. LATENCY
+
+**N/A for the same reason** -- no valid Zenoh run produced any
+delivered messages to compute p50/p95/p99 from in this rerun.
+
+### 12. CAUSAL PREDICTION
+
+**INSUFFICIENT EVIDENCE — cannot be tested with this rerun's data.**
+The prediction ("if the workload starts only after genuine full
+convergence, delivery variance should disappear or greatly reduce")
+requires at least some VALID runs to check delivery against. This
+specific 20-seed rerun produced zero valid Zenoh runs, so there is
+nothing to correlate. This is not evidence against the original
+causal explanation (which used 20 valid, non-gated measurements and
+found r=0.9912) -- it simply cannot be re-tested by this particular
+validation attempt, which enforces a stricter gate that happens to
+reject all 20 attempts outright before any of them could reach
+steady-state measurement.
+
+### 13. FAST DDS SANITY
+
+**FAIL.** Seeds 7, 41, 13 (predetermined subset, not cherry-picked
+after seeing results): **0/3 valid**, all three now
+`INVALID_READINESS`. At seed=41, endpoints `robot_0006`, `robot_0007`,
+`robot_0008` specifically timed out on the aggregate beacon (8 of 17
+endpoints wrote `ready`, the run aborted the instant the first of these
+three wrote `invalid_readiness`). These same three seeds' Fast DDS runs
+delivered 100% under the OLD (buggy) harness in the 20-seed paired
+experiment -- this is a genuine regression introduced by correctly
+enforcing the existing (already known to be approximate, see the
+"CycloneDDS discovery bug bi an" comment already in the source before
+this pass) beacon threshold as a hard gate. Root cause: see Part 1/9's
+headline finding -- the beacon demands mesh-wide awareness (16 peers)
+the star-topology workload never uses (Fast DDS's REAL per-topic
+matching, `robot<->control_station` only, evidently still succeeds
+even when 3 robots never see each other or every other robot on the
+unrelated diagnostic topic).
+
+### 14. CYCLONEDDS SANITY
+
+**FAIL**, same pattern. Seeds 7, 41, 13: **0/3 valid**, all
+`INVALID_READINESS`. At seed=41, exactly one endpoint failed to
+converge before the run was aborted. These same three seeds delivered
+100% under the OLD harness. Same root-cause hypothesis as Fast DDS
+(Part 13) applies -- not independently re-verified endpoint-by-endpoint
+for CycloneDDS in this pass, since the pattern and conclusion are
+identical.
+
+### 15. FLEETRMW REGRESSION
+
+**PASS / NOT AFFECTED.** Seeds 7, 41, 13: **3/3 valid**, 100.0%
+delivery on every one, exactly as before. FleetRMW's
+`--skip-discovery-wait` contract means `discovery_converged()` always
+returns `True` for it immediately (Part 3) -- it never entered the
+loop this fix touches, so it cannot regress from this change by
+construction, and the live evidence confirms that. The two previously
+proven harness bugs (premature receiver shutdown, cross-robot stream
+identity collision) were not reintroduced -- delivery remained exactly
+100.0% with no exceptions, matching the earlier 20-seed FleetRMW
+baseline.
+
+### 16. PRODUCTION CODE CHANGES
+
+**NONE.** `ros2_ws/src/rmw_fleetqox_cpp/` untouched.
+
+### 17. ZENOH CONFIGURATION CHANGES
+
+**NONE.** `connect.endpoints`, router architecture, TCP settings, QoS,
+and scouting configuration are byte-for-byte unchanged from the prior
+investigation pass.
+
+### 18. OPTIMIZATION #2
+
+**NOT IMPLEMENTED.**
+
+### 19. WHAT THE OLD 42.4% MEANS NOW
+
+**Explicitly does NOT remain a valid steady-state performance number.**
+The old 42.4% mean (and the full 4.6%-100% range) was computed entirely
+from runs that this pass has now proven could include partial,
+never-actually-converged setups silently counted as valid measurements
+-- the false-ready bug was real and (per Part 8's live evidence)
+affects a very large fraction, quite possibly all, of the low-delivery
+seeds in that dataset. It cannot be salvaged by reinterpretation; it
+must be treated as measured under confirmed-invalid setup conditions
+and set aside. Whether Zenoh's TRUE steady-state delivery (once a
+correctly-scoped readiness check exists) is closer to 100%, to the old
+42.4%, or something else entirely is now explicitly **UNKNOWN** --
+this pass produced zero valid Zenoh measurements to answer that
+question with.
+
+### 20. VERDICT
+
+The proven false-ready benchmark bug is **fixed and verified**
+(RED/GREEN unit tests; live sanity directly confirms seed=41 no longer
+silently enters measurement). This required no Zenoh configuration
+change, no FleetRMW change, and no tuning, exactly as scoped. However,
+enforcing the fix live has surfaced a **larger, previously-undiscovered
+measurement-validity problem**: the shared 16-peer aggregate discovery
+beacon is not an accurate readiness proxy for the star-topology
+workload this harness actually runs, for ANY of Fast DDS, CycloneDDS,
+or Zenoh -- not only Zenoh. Until that broader problem is addressed,
+this harness **cannot currently produce a reliable LAN N=16 comparison
+for any of the three non-FleetRMW middleware** (observed 0/20 Zenoh,
+0/3 Fast DDS, 0/3 CycloneDDS valid in this pass's live attempts).
+**Do not describe Zenoh as "fixed"** -- describe it precisely as: *"the
+benchmark no longer counts partial-convergence startup as valid
+application delivery, for any middleware sharing this gate; separately,
+that same enforcement has revealed the gate itself needs to be
+redesigned around the workload's actual star topology before any of
+the three non-FleetRMW middleware can reliably pass it at N=16."*
+
+### 21. EXACTLY ONE NEXT STEP (NOT executed in this pass)
+
+Many runs across MULTIPLE middleware are `INVALID_READINESS`, and the
+evidence points to a specific, well-scoped design flaw rather than
+"study why TCP/declaration convergence sometimes exceeds 15s" in the
+abstract: **the readiness check should be topology-aware**. Proposed
+next experiment (separate pass, not executed here): redefine each
+endpoint's required convergence set from "all N-1 other endpoints" to
+"only the specific peer(s) this endpoint's own trace rows require" --
+for this star-topology workload, that means `control_station` must see
+all 16 robots, but each robot only needs to see `control_station`
+(never the other 15 robots). Re-run the same frozen 20-seed set under
+that corrected contract and check whether Fast DDS/CycloneDDS sanity
+returns to 100% valid (expected, since their real per-pair matching
+already works) while Zenoh's `control_station`-specific convergence
+failures (the one relationship the star topology actually depends on
+everywhere) remain correctly caught. **Do not increase the 15-second
+timeout as part of this next step** unless a further, separately
+pre-registered experiment specifically studies that question -- this
+proposal is about the SHAPE of the requirement, not its duration.
+
+**Files**: `scripts/fleetqox_rmw_trace_endpoint.py` (fix, commit
+`c313b69`), `scripts/run_ns3_docker_container_fleet_probe.py` (fix,
+same commit), `tests/test_fleetqox_rmw_trace_endpoint.py` (RED, commit
+`df4ee7c`), `scripts/run_zenoh_false_ready_fix_validation.py` (new,
+this pass's validation driver). Raw validation output:
+`results_rmw_socket/zenoh_false_ready_fix_validation/` (gitignored,
+regenerate via the script above).
 
 ## Quy ước cập nhật file này
 
