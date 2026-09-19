@@ -154,8 +154,21 @@ def run_one(
     delivery_pct = (100.0 * delivered / intended) if intended else None
     fresh_pct = fresh_success_pct(endpoints, result["endpoint_results"])
     jitter_stats = result["jitter_stale_repair_stats"]
+    stale_ratio = jitter_stats.get("stale_ratio")
     latency = result["latency_stats_ms"] or {}
     per_flow = per_flow_breakdown(trace_path, result["endpoint_results"])
+    # "fresh-deadline success": the existing benchmark already computes
+    # stale_ratio (fraction of DELIVERED messages whose latency exceeded
+    # their own deadline_ms) and delivery_pct (delivered/intended) --
+    # combining them (delivered messages that were NOT stale, as a
+    # fraction of everything intended) is the natural existing-metric
+    # composition for "did this message actually arrive usefully", not a
+    # new measurement or redefinition of either underlying quantity.
+    fresh_deadline_success_pct = (
+        delivery_pct * (1.0 - stale_ratio)
+        if delivery_pct is not None and stale_ratio is not None
+        else delivery_pct  # stale_ratio is None only when nothing was delivered
+    )
     valid = result["status"] == "ok" and result["endpoint_results_complete"] and intended > 0
     invalid_reason = None
     if not valid:
@@ -182,6 +195,7 @@ def run_one(
         "lost": lost,
         "delivery_pct": delivery_pct,
         "fresh_success_pct": fresh_pct,
+        "fresh_deadline_success_pct": fresh_deadline_success_pct,
         "stale_pct": (
             jitter_stats["stale_ratio"] * 100.0
             if jitter_stats.get("stale_ratio") is not None
