@@ -15410,6 +15410,133 @@ running) Table VI measurement can be trusted, and it must land before
 attempting to replicate the exciting `redundancy=0` result across
 multiple seeds.
 
+## TABLE VI HARNESS DURATION MISMATCH FIX + CLEAN N=8 5-SEED A/B -- REDUNDANCY=0 REPRODUCIBLY HEALS N=8
+
+Closes the "N=8 REALTIME-LAG VALIDATION" section's own next step. Full
+RED->FIX->GREEN->validity-sanity->clean-A/B cycle.
+
+### PHASE 1-3: RED/FIX/GREEN
+
+**RED** (`EffectiveNs3SimDurationSTest`,
+`tests/test_ns3_docker_container_fleet_probe.py`): proved
+`run_coordination_probe()`'s old hardcoded `sim_duration_s=60.0` could
+be shorter than `scenario_timeout_s` for ANY `scenario_timeout_s` value
+(10/30/60/90/120/300s tested), not just the one default combination --
+fails at import (the fix function didn't exist yet).
+
+**FIX** (`scripts/run_ns3_docker_container_fleet_probe.py`):
+`sim_duration_s` now defaults to `None` and is derived by the new
+`effective_ns3_sim_duration_s()` as `start_offset_ms/1000 +
+scenario_timeout_s + NS3_SIM_DURATION_DRAIN_MARGIN_S` (60.0s -- the
+SAME slack constant `wait_for_completion()`'s own timeout already used,
+now a single shared constant instead of a duplicated literal: "one
+clear duration contract"). Explicit callers (smoke tests wanting a
+short-lived network) still override it. Zero radio/QoS/workload/
+production-code/Ricart-Agrawala change.
+
+**GREEN**: 48/48 focused tests; full suite 840 passed (835 + 5 new),
+same 8 pre-existing unrelated failures, 0 regressions.
+
+### PHASE 4: validity sanity (N=2, N=4, post-fix)
+
+| N | wall_elapsed_s | sim_time_s | sim_lag_s | valid | crossings | forced_entry | task_completion_s |
+|---|---|---|---|---|---|---|---|
+| 2 | 15.02 | 15.00 | 0.023 | YES | 5/5 all | none | 4.48 |
+| 4 | 15.04 | 15.00 | 0.037 | YES | 5/5 all | none | 7.23 |
+
+Both remain clean and valid after the fix, as expected (neither ever
+approached either the old 60s cutoff or the lag gate).
+
+### PHASE 5: clean N=8 5-seed A/B (directed-reply ON, harness fix applied)
+
+A = `ACK_NACK_REDUNDANT_RESEND_COUNT=10` (production default), B = `=0`.
+Counterbalanced run order by seed parity. Everything else frozen.
+
+| seed | A sim_lag_s | A valid | A data delivery | A 5/5 crossings | A task_s | B sim_lag_s | B valid | B data delivery | B 5/5 crossings | B task_s |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 7 | 32.80 | NO | 60.74% | NO | 120.33 | 0.026 | YES | **100.00%** | **YES** | 13.86 |
+| 13 | 39.17 | NO | 58.29% | NO | 120.35 | 0.025 | YES | **100.00%** | **YES** | 14.07 |
+| 29 | 32.20 | NO | 66.67% | NO | 120.33 | 0.028 | YES | **100.00%** | **YES** | 13.70 |
+| 41 | 35.93 | NO | 66.12% | NO | 120.33 | 0.028 | YES | **100.00%** | **YES** | 13.44 |
+| 53 | 40.85 | NO | 57.85% | NO | 120.33 | 0.024 | YES | **100.00%** | **YES** | 13.41 |
+| **mean** | **36.19** | **0/5 valid** | **61.93%** | **0/5** | **120.33** | **0.026** | **5/5 valid** | **100.00%** | **5/5** | **13.70** |
+
+`forced_entry`: universal (every endpoint, every seed) under A; **zero**
+(every endpoint, every seed) under B. MAC-tx packet rate: A averages
+944.7 pkt/s, B averages 271.6 pkt/s (**3.48x lower**) -- consistent
+with, not contradicted by, A's much higher absolute totals (A simply
+keeps running far longer before hitting its own now-correct 182s
+`sim_duration_s` ceiling, since it never finishes). `ack_nack_events`
+(RMW-level gap-driven reports): A 2502-3431 per run; B **0** every run
+-- consistent, not a bug: with zero loss there is nothing to report
+missing.
+
+With the harness fix applied, A's `sim_lag_s` is actually WORSE than
+what the (bugged) pre-fix measurement showed (36.19s mean vs 14.26s at
+the old artificial 60s cutoff) -- because the fix now lets ns-3 keep
+running long enough for the CPU backlog to keep accumulating instead of
+being silently cut off. This is direct, additional confirmation that
+A's degradation is a real, growing phenomenon, not a fixed one-time
+cost.
+
+### PHASE 6: decision
+
+1. **Did the harness duration fix work?** YES -- confirmed both by the
+   unit tests and by every one of the 10 live runs in Phase 5
+   completing with `status=ok` and self-consistent
+   `wall_elapsed_s`/`sim_time_s`/`sim_lag_s` telemetry throughout.
+2. **Is redundancy=10 too expensive for realtime ns-3 at N=8?** YES --
+   5/5 seeds INVALID (`sim_lag_s` 32.2-40.9s, all far past the 10s
+   gate), reproducibly, with the harness fix in place (so this is not
+   the old duration-mismatch artifact reappearing).
+3. **Is redundancy=0 reproducibly healthy at N=8?** YES -- 5/5 seeds
+   VALID, 5/5 seeds 100% DATA delivery, 5/5 seeds 5/5 crossings, 0%
+   forced_entry in every endpoint of every seed.
+4. **Does redundancy=0 preserve coordination correctness?** YES --
+   identical Ricart-Agrawala semantics (no protocol code touched), 5/5
+   crossings completed cleanly every seed, no forced entry (i.e. no
+   mutual-exclusion violation forced by timeout) in any run.
+
+**Harness fix: KEEP.** Pure configuration correction, zero behavior
+change for any run that was already valid, unit-tested, live-validated
+across 12 runs (2 sanity + 10 A/B) with zero failures.
+
+**redundancy=0: NOT-YET adopted as a default**, but evidence now
+STRONGLY supports it as a genuine, reproducible, multi-seed-confirmed
+mitigation for N=8 -- 5/5 valid, 5/5 fully healthy, vs 0/5 valid for
+the current default. No claim of superiority over other middleware is
+made (this is a FleetRMW-internal configuration comparison only, on one
+scenario, at one scale).
+
+### Results this closes/invalidates
+
+**All ABSOLUTE default-config N=8 performance numbers in this
+investigation's history are confirmed INVALID** (not merely suspected,
+per the prior section's hedge) -- every one was measured either (a)
+before this fix, under the old `sim_duration_s`=60 cutoff, or (b) is
+now directly superseded by this section's own clean, harness-fixed
+measurement, which shows redundancy=10 is invalid (`sim_lag_s`>>10s)
+regardless of the duration-mismatch bug. This includes: the directed-
+REPLY A/B's N=8 permanent-loss percentages and `task_completion_s`; the
+"N=8 REMAINING WI-FI LOSS" pass's entire per-packet/aggregate
+accounting (delivered=47.07%, `mac_rx_drop_total`=769,849, PHY
+collision-reason breakdown, etc.); every earlier N=8 ACK/NACK A1/B/A2
+causal-replication percentage. **What REMAINS valid**: directed-REPLY's
+own fan-out-elimination proof (measured at N=2/N=4, both valid scales,
+architecturally scale-independent); the QUALITATIVE direction that
+ACK/NACK redundancy causally contributes to N=8 degradation (now
+CONFIRMED, not just suggested, by this section's clean 5/5-seed
+result); this section's own numbers (harness-fixed, validity-gated).
+
+**Next step**: bring the adoption decision to the user -- the evidence
+bar this section's own Phase 6 set ("only adopt redundancy=0 as a
+FleetRMW configuration/default change if multi-seed valid evidence
+supports it") is now met (5/5 seeds valid and fully healthy vs 0/5 for
+the current default), so the next action is deciding WHERE to apply
+`ACK_NACK_REDUNDANT_RESEND_COUNT=0` (Table VI only vs a broader
+default) and getting explicit sign-off before changing any production
+default, not running further ad-hoc experiments.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
