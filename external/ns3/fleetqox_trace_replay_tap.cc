@@ -143,15 +143,25 @@ SelfCpuSeconds()
     return -1.0;
   }
   std::string skip;
-  // Fields 1-13 are pid,(comm),state,ppid,...,cutime -- utime/stime are
-  // fields 14/15 (1-indexed). comm can contain spaces inside parens, so
-  // skip past the closing ')' first rather than counting whitespace-
-  // delimited tokens naively.
+  // Fields 1-2 are pid,(comm) -- comm can contain spaces inside parens,
+  // so skip past the closing ')' first rather than counting whitespace-
+  // delimited tokens naively. After that, field 3 (state) is the very
+  // next whitespace-delimited token; utime/stime are fields 14/15
+  // (1-indexed), so 11 more reads (fields 3..13: state, ppid, pgrp,
+  // session, tty_nr, tpgid, flags, minflt, cminflt, majflt, cmajflt)
+  // land exactly before utime. BUG FIXED (see "N=16 SCALE VALIDATION"
+  // in docs/AUDIT_ACCEPTANCE_TRACKING.md): this loop previously ran 13
+  // times, consuming 2 fields too many -- it silently swallowed utime
+  // AND stime themselves, so the actual read below captured fields
+  // 16/17 (cutime/cstime, the process's REAPED CHILDREN's CPU time --
+  // 0 for this single-process program) instead, producing a
+  // plausible-looking but wrong near-zero self_cpu_s on every prior
+  // measurement that used it.
   std::getline(stat, skip, ')');
   long utimeTicks = 0;
   long stimeTicks = 0;
   std::string field;
-  for (int i = 0; i < 13; ++i)
+  for (int i = 0; i < 11; ++i)
   {
     stat >> field;
   }
