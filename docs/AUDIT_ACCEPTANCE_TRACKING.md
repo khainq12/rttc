@@ -15634,6 +15634,129 @@ the same key/value).
 No radio/QoS/workload/timeout/Ricart-Agrawala/global-default change at
 any point in this adoption.
 
+## N=16 SCALE VALIDATION -- SIMULATOR INVALID, CPU-SATURATED, NO PERFORMANCE CLAIM MADE
+
+Follow-up to "TABLE VI ACK/NACK REDUNDANCY=0 ADOPTION". Same frozen
+config that made N=8 healthy -- harness duration-contract fix, directed-
+REPLY ON, Table-VI-specific `ACK_NACK_REDUNDANT_RESEND_COUNT=0` (the new
+default, no override passed) -- with ONLY `num_robots` changed 8->16.
+No radio/QoS/workload/Ricart-Agrawala/global-default change.
+
+### Bug found and fixed while instrumenting: `self_cpu_s` was wrong
+
+`SelfCpuSeconds()` (`external/ns3/fleetqox_trace_replay_tap.cc`)
+parses `/proc/self/stat` by skipping past `)` then reading N more
+whitespace-delimited fields before treating the next two as utime/stime.
+The skip count was 13, but only 11 fields (state through cmajflt) sit
+between `)` and utime -- the loop consumed utime and stime THEMSELVES,
+so the actual read captured fields 16/17 (`cutime`/`cstime`, a single-
+process program's reaped-children CPU time -- always ~0) instead.
+Fixed to 11. Confirmed with a smoke run (N=8, redundancy=10, heavy
+load): `self_cpu_s` now grows from 0.41s at wall=5s to 29.34s at
+wall=36.3s (a believable, load-correlated curve) instead of the old
+flat near-zero value every prior measurement in this investigation
+silently reported. Full suite: 846 passed, same 8 pre-existing
+failures, 0 regressions (measurement-only, no behavior change).
+
+### PHASE 1: N=16 seed=7 validity sanity -- INVALID
+
+| metric | value |
+|---|---|
+| wall_elapsed_s | 132.04 |
+| sim_time_s (last capture) | 95.0 |
+| **sim_lag_s** | **37.03s** (gate: <=10s) |
+| self_cpu_s (corrected) | 125.32s |
+| **CPU utilization (self_cpu_s / wall_elapsed_s)** | **94.9%** |
+| self_rss_kb | 246,960 (~247MB) |
+| mac_tx_total / rate | 77,899 / 590 pkt/s |
+| DATA delivery (uninterpreted) | 53.01% |
+| REQUEST delivery (uninterpreted) | 55.76% |
+| REPLY delivery (uninterpreted) | 48.09% |
+| crossings_completed | 1/5 (14 of 17 endpoints), 2/5 (1), 3/5 (1) |
+| forced_entry | universal |
+| task_completion_s | 120.33 (full timeout) |
+
+**Validity gate: FAILED (sim_lag_s=37.03s >> 10s). Per this
+investigation's own rule, none of the delivery/crossings/forced_entry
+numbers above are interpreted as a FleetRMW result** -- they are
+recorded only as "what the harness measured," explicitly not as
+evidence of a FleetRMW scalability defect.
+
+**Root mechanism, directly measured, not inferred: CPU saturation.**
+The ns-3 process's own CPU utilization jumped from a comfortable **38.9%**
+at N=8 (same config, same seed, healthy: `self_cpu_s`=9.74s /
+`wall_elapsed_s`=25.03s, corrected measurement) to **94.9%** at N=16 --
+essentially pegged at one core for the entire run. `mac_tx_total`
+climbed from 6,790 (N=8, completed cleanly) to 77,899 (N=16, still
+stuck after 120s) -- an 11.5x increase against only a 2x growth in
+`num_robots` (3.78x growth in REQUEST fan-out pairs, `17*16` vs `9*8`,
+the O(N^2) quantity intrinsic to Ricart-Agrawala's REQUEST broadcast --
+unchanged, required, not a bug). The gap between 3.78x (expected from
+fan-out alone) and 11.5x (observed) is consistent with additional
+collision/retry amplification on the shared channel as more stations
+contend for it, compounding on top of the base fan-out growth -- this
+investigation does not have enough data points (only N=8 and N=16) to
+fit a precise growth law, and does not attempt to.
+
+Because seed=7 was unambiguously invalid, **the other 4 seeds
+(13/29/41/53) were NOT run** -- per this investigation's own explicit
+instruction not to spend further runs before understanding validity.
+**Phase 3 (loss-funnel root-causing) was NOT performed** -- it is
+explicitly scoped to "simulator-valid but unhealthy," which does not
+apply here. **No RED/FIX/GREEN/A-B was performed on any FleetRMW or
+radio/QoS/workload parameter** -- the only fix in this pass was the
+unrelated, pre-existing `self_cpu_s` measurement bug above.
+
+### PHASE 4: scale accounting (what CAN be said from 2 data points)
+
+| | N=8 (valid, healthy) | N=16 (invalid) | ratio |
+|---|---|---|---|
+| num_robots | 8 | 16 | 2.0x |
+| total endpoints | 9 | 17 | 1.89x |
+| REQUEST fan-out pairs (endpoints x (endpoints-1)) | 72 | 272 | 3.78x |
+| mac_tx_total (raw count, NOT rate-normalized -- N=16 never finished) | 6,790 | 77,899 | 11.5x |
+| mac_tx rate (pkt/s, a LOWER BOUND for N=16 since the lagging simulator can only report what it managed to model) | 271.6 | 590.0 | 2.17x |
+| self_cpu_s / wall_elapsed_s | 38.9% | 94.9% | 2.44x |
+| sim_lag_s | 0.025s | 37.03s | n/a (0 vs saturating) |
+| DATA delivery | 100% | 53.01% (uninterpreted) | n/a |
+
+**What grows approximately with N**: the per-second MAC-tx rate the
+simulator manages to process (2.17x for a 2x growth in N) -- roughly
+linear to slightly super-linear, though this is a lower bound, not the
+true demand rate, since the lagging simulator cannot report events it
+hasn't gotten to yet. **What grows faster than N**: CPU utilization
+ratio (2.44x, and already saturating at N=16, meaning the NEXT
+doubling has nowhere left to go without falling further behind);
+raw event/packet volume in a still-incomplete run (11.5x, though this
+number conflates "more required fan-out" with "N=16 never finished and
+kept retrying," so it should not be read as a clean per-unit-of-work
+rate). No extrapolation to N=32 or any other untested scale is made.
+
+### Verdicts
+
+1. **N=16 seed=7 simulator validity: INVALID** (`sim_lag_s`=37.03s).
+2. **Harness/simulator problem: YES** -- direct, measured CPU
+   saturation (94.9%) of the realtime ns-3 process, not a configuration
+   mismatch this time (the duration-contract fix from the prior section
+   is confirmed working -- `sim_time_s` genuinely advanced this far
+   before the process was killed at its own correctly-derived
+   `sim_duration_s`, it just couldn't keep pace with real time doing
+   so).
+3. **FleetRMW problem: NOT-YET-KNOWN** -- cannot be assessed from an
+   invalid run, by this investigation's own explicit rule.
+4. **N=16 healthy: INVALID** (not YES, not NO -- the measurement itself
+   is not trustworthy enough to answer healthy/unhealthy).
+5. **Evidence supports moving to N=32: NO** -- N=16 itself is not yet
+   simulator-valid; N=32 would only be more CPU-constrained.
+
+**Next step**: profile WHERE the ns-3 process's CPU time is actually
+being spent at N=16 (e.g. which trace/callback/queue operation dominates
+under this event volume) to find a genuine ns-3-side or harness-side
+throughput defect if one exists -- before considering any workload-
+level mitigation, since this problem is now proven to be about the
+SIMULATOR's own realtime throughput ceiling, not (yet) about anything
+FleetRMW does with the traffic.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
