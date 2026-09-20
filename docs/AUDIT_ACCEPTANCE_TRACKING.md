@@ -15054,6 +15054,101 @@ detail; it does not change the scenario-level outcome.
   N=16 until N=8 is understood and reasonably stable"), N=16 is not
   warranted yet.
 
+## TABLE VI DIRECTED REPLY -- IMPLEMENTED, VALIDATED, KEPT
+
+Implements the deferred design from "OVERNIGHT PHASE 5: REPLY BROADCAST
+FAN-OUT" above (that pass measured 88.1% unintended REPLY fan-out at N=8
+and confirmed the mechanism architecturally viable but deliberately did
+not implement it). This pass implements and experimentally validates it
+as its own dedicated RED/FIX/GREEN/sanity/A-B/causal-verification task.
+
+**PROVEN going in**: REQUEST broadcast is required; REPLY is logically
+point-to-point; 88.1% of decoded REPLY deliveries at N=8 are received by
+unintended robots and discarded; N=8 remains unhealthy; removing REPLY
+fan-out was explicitly NOT assumed to fix N=8.
+
+**1. RED** (N=2, 3 endpoints, seed=3, `scripts/investigate_table6_directed_reply_fanout.py`):
+old shared-broadcast-topic REPLY delivers **30 intended / 30 unintended**
+(exactly 50% waste at N=2, matching theory: 1 unintended target out of 2
+total non-sender endpoints).
+
+**2. FIX** (`scripts/fleetqox_coordination_endpoint.py`,
+`scripts/run_ns3_docker_container_fleet_probe.py`, pure Python/harness,
+zero C++ change): opt-in `--directed-reply` flag, default off (byte-for-
+byte unchanged broadcast behavior). When enabled: REPLY moves off the
+shared `/fleetqox_coordination/control` topic onto per-target topics
+`/fleetqox_coordination/reply_to/{robot}` (one publisher per peer, one
+subscription to the endpoint's own topic); REQUEST is untouched, still
+broadcast on the shared topic. Reuses only already-existing mechanisms:
+`subscription_aware` peer policy + `seed_static_subscriptions()` (static,
+so it works under Table VI's required `STATIC_MODE=1`) -- confirmed via
+source read that `send_control_payload()` (ACK/NACK's own targeting) is
+untouched by this policy switch, satisfying "do not change ACK/NACK
+redundancy" architecturally, not just by intent.
+
+**3. GREEN**: same N=2 run with `--directed-reply`: **30 intended / 0
+unintended**, identical 5/5 crossings and forced_entry=false in both
+conditions. Full suite: 835 passed, same 8 pre-existing unrelated
+failures (test_ngtcp2_public_*, test_remote_wait_for_all_acked) --
+0 regressions.
+
+**4. Sanity** (`scripts/investigate_table6_directed_reply_n4_sanity.py`,
+N=4, seeds 7 and 13, the known-healthy scale from the identity-collision
+fix's own multi-seed validation): OLD and NEW produce **identical** 5/5
+crossings and forced_entry=false on both seeds; unintended REPLY fan-out
+300->0 both seeds. Coordination correctness is unchanged.
+
+**5. N=8 A/B** (`scripts/run_table6_n8_directed_reply_ab_experiment.py`,
+seeds 7 and 13, counterbalanced run order, `FLEETQOX_RMW_LOSS_FUNNEL_TRACE_PROFILING=1`):
+
+| Metric | seed=7 OLD | seed=7 NEW | seed=13 OLD | seed=13 NEW |
+|---|---|---|---|---|
+| REPLY unintended | 646 | **0** | 691 | **0** |
+| ACK/NACK trace events (out+in) | 6562 | **729** (-89%) | 20465 | **803** (-96%) |
+| Permanent DATA loss | 61.11% | **38.03%** | 58.68% | **43.30%** |
+| forced_entry (any endpoint) | true | true | true | true |
+| task_completion_s (mean) | 120.54 | 120.33 | 120.33 | 120.33 |
+| crossings 5/5 (any endpoint) | false | false | false | false |
+
+**6. Causal chain**:
+- directed REPLY -> removes unintended REPLY fan-out: **PROVEN** (N=2:
+  30->0; N=8: 646->0 and 691->0, both seeds, exactly as designed).
+- -> ACK/NACK load falls: **PROVEN** (89% and 96% reduction in traced
+  ACK/NACK events, both seeds, large and consistent).
+- -> DATA delivery improves: **PROVEN, but partial** (permanent loss
+  fell 23.1pp and 15.4pp, both seeds, same direction -- a real,
+  reproducible improvement, not a full fix: 38-43% permanent loss
+  remains).
+- -> coordination outcome improves: **NOT PROVEN**. forced_entry stayed
+  universal and task_completion_s stayed pinned at the ~120s
+  scenario_timeout in all 4 N=8 runs, OLD and NEW alike -- exactly the
+  outcome the task's own instruction warned not to assume away.
+  Consistent with the already-established Phase 2 finding (genuine,
+  symmetric ns-3 wireless contention causing per-pair blackouts up to
+  37s) as the deeper, still-unaddressed bottleneck at N=8.
+
+**KEEP.** Coordination semantics are unchanged (N=2/N=4 identical
+correctness, REQUEST/Ricart-Agrawala/ACK-NACK/QoS/timeouts untouched, 0
+regressions), unintended REPLY fan-out is eliminated exactly as designed,
+and two real, reproducible, zero-cost-of-adoption improvements are
+measured (ACK/NACK load, permanent DATA loss) with no downside on any
+measured axis. It does not resolve N=8's underlying unhealthiness --
+that remains a separate, already-identified, out-of-scope network-
+contention problem -- but "does not fix everything" is not a REVERT
+criterion here; "makes something worse" is, and nothing does.
+
+Byte-level DATA/ACK/NACK/UNRECOVERABLE wire composition (as opposed to
+traced-event counts) was not recaptured via pcap for this A/B --
+that was already measured once for the OLD/default condition in
+"TABLE VI N=8 TRAFFIC COMPOSITION AND ACK/NACK CORRELATION" above, and a
+full capture matrix for both conditions was judged disproportionate to
+"start small, expand only if signal is useful" given the traced-event
+counts already show a large, consistent, unambiguous reduction.
+
+**Next step**: investigate the N=8 per-pair ns-3 wireless blackout
+mechanism itself (Phase 2's finding) as the next candidate root cause,
+now that REPLY fan-out is no longer a confound.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
