@@ -266,6 +266,64 @@ class FleetqoxCoordinationRmwEnvPrefixTest(unittest.TestCase):
         self.assertIn("FLEETQOX_RMW_PEERS=10.60.0.5:9100 ", env)
 
 
+class AckNackRedundancyZeroTableViScopeTest(unittest.TestCase):
+    """Proves the "TABLE VI ACK/NACK REDUNDANCY=0 ADOPTION" config change
+    (see docs/AUDIT_ACCEPTANCE_TRACKING.md) is scoped EXACTLY to Table
+    VI's coordination benchmark: a clean, harness-fixed, 5-seed N=8 A/B
+    showed FLEETQOX_RMW_ACK_NACK_REDUNDANT_RESEND_COUNT=10 (the
+    production default) was simulator-INVALID on 5/5 seeds while =0 was
+    VALID and fully healthy on 5/5 -- but this must NOT become a new
+    global/production default. fleetqox_coordination_rmw_env_prefix()
+    (Table VI only) must default to "0"; fleetqox_rmw_env_prefix()
+    (Table IV/V, and the function every other FleetRMW workload's env
+    construction is built from) must NEVER set this variable at all,
+    leaving rmw_pubsub.cpp's own compiled-in default (10) untouched for
+    every other workload."""
+
+    def test_table_vi_defaults_to_redundancy_zero(self):
+        env = fleetqox_coordination_rmw_env_prefix("robot_0000", "peer:9100", None)
+        self.assertIn("FLEETQOX_RMW_ACK_NACK_REDUNDANT_RESEND_COUNT=0", env)
+
+    def test_table_vi_default_applies_to_every_endpoint(self):
+        for endpoint in endpoint_list(8):
+            env = fleetqox_coordination_rmw_env_prefix(endpoint, "peer:9100", None)
+            self.assertIn("FLEETQOX_RMW_ACK_NACK_REDUNDANT_RESEND_COUNT=0", env)
+
+    def test_explicit_caller_override_still_wins(self):
+        # This investigation's own A/B experiment scripts must still be
+        # able to explicitly request "10" to reproduce/compare against
+        # the unhealthy production-default case.
+        env = fleetqox_coordination_rmw_env_prefix(
+            "robot_0000", "peer:9100", {"FLEETQOX_RMW_ACK_NACK_REDUNDANT_RESEND_COUNT": "10"}
+        )
+        self.assertIn("FLEETQOX_RMW_ACK_NACK_REDUNDANT_RESEND_COUNT=10", env)
+        self.assertNotIn("FLEETQOX_RMW_ACK_NACK_REDUNDANT_RESEND_COUNT=0", env)
+
+    def test_other_extra_rmw_env_keys_unaffected(self):
+        env = fleetqox_coordination_rmw_env_prefix(
+            "robot_0000", "peer:9100", {"FLEETQOX_RMW_LOSS_FUNNEL_TRACE_PROFILING": "1"}
+        )
+        self.assertIn("FLEETQOX_RMW_ACK_NACK_REDUNDANT_RESEND_COUNT=0", env)
+        self.assertIn("FLEETQOX_RMW_LOSS_FUNNEL_TRACE_PROFILING=1", env)
+
+    def test_other_fleetrmw_workloads_do_not_inherit_this_setting(self):
+        # fleetqox_rmw_env_prefix() backs Table IV/V's launch_endpoints()
+        # -- and, transitively (per fleetqox_coordination_rmw_env_prefix's
+        # own "thin wrapper" design), is the ONLY place any RMW env
+        # actually gets constructed. Calling it DIRECTLY (as every non-
+        # Table-VI workload does) must never see this key: the global/
+        # production default is unchanged.
+        env = fleetqox_rmw_env_prefix("robot_0000", "peer:9100", False, [], None)
+        self.assertNotIn("FLEETQOX_RMW_ACK_NACK_REDUNDANT_RESEND_COUNT", env)
+
+    def test_other_fleetrmw_workloads_do_not_inherit_even_with_extra_env(self):
+        env = fleetqox_rmw_env_prefix(
+            "robot_0000", "peer:9100", True, [], {"FOO": "bar"}
+        )
+        self.assertNotIn("FLEETQOX_RMW_ACK_NACK_REDUNDANT_RESEND_COUNT", env)
+        self.assertIn("FOO=bar", env)
+
+
 class BuildStaticSubscriptionsTest(unittest.TestCase):
     def test_maps_publisher_to_dst_flow_class_pairs(self):
         endpoints = ["control_station", "robot_0000", "robot_0001"]

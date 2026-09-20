@@ -15537,6 +15537,103 @@ the current default), so the next action is deciding WHERE to apply
 default) and getting explicit sign-off before changing any production
 default, not running further ad-hoc experiments.
 
+## TABLE VI ACK/NACK REDUNDANCY=0 ADOPTION -- TABLE-VI-SPECIFIC ONLY, PRODUCTION DEFAULT UNCHANGED
+
+Closes the prior section's own next step ("bring the adoption decision
+to the user") -- adopted, scoped exactly as requested.
+
+### The corrected 60s/120s harness bug, summarized
+
+`run_coordination_probe()` used to pass a hardcoded `sim_duration_s=60.0`
+straight to ns-3's own `Simulator::Stop()`, completely independent of
+`scenario_timeout_s` (default 120.0, the coordination workload's own
+real-time deadline) -- ns-3's simulated Wi-Fi network could legitimately
+shut itself down while the workload was still running for up to another
+60 real seconds. Fixed (see "TABLE VI HARNESS DURATION MISMATCH FIX"
+above) by deriving `sim_duration_s` from `scenario_timeout_s` plus a
+shared drain-margin constant whenever the caller doesn't explicitly
+override it. Every N=8 measurement made before that fix landed used the
+mismatched config.
+
+### Config change (Table VI only)
+
+`fleetqox_coordination_rmw_env_prefix()`
+(`scripts/run_ns3_docker_container_fleet_probe.py`) -- Table VI's OWN
+env-prefix builder, never shared with any other workload -- now
+defaults `FLEETQOX_RMW_ACK_NACK_REDUNDANT_RESEND_COUNT` to `"0"` via
+`dict.setdefault()`, so:
+- any Table VI run that doesn't explicitly request a different value
+  gets `0` automatically (proven end-to-end, not just in the unit
+  tests -- see the live sanity run below, launched with NO
+  `extra_rmw_env` override at all);
+- an explicit caller override (e.g. this investigation's own A/B
+  scripts requesting `"10"` to reproduce the unhealthy case for
+  comparison) still wins;
+- `fleetqox_rmw_env_prefix()` (Table IV/V's own function, and the only
+  place ANY FleetRMW RMW environment is actually constructed) is
+  completely untouched -- it never sets this key, under any
+  circumstance, for any other workload;
+- `rmw_pubsub.cpp`'s own compiled-in default (10) is unmodified --
+  **no production/global FleetRMW default was changed**.
+
+### Test proof of scope
+
+`AckNackRedundancyZeroTableViScopeTest`
+(`tests/test_ns3_docker_container_fleet_probe.py`): 6 new tests proving
+(1) Table VI defaults to `0` for every endpoint, (2) an explicit
+override still wins, (3) other `extra_rmw_env` keys are unaffected, and
+(4)/(5) `fleetqox_rmw_env_prefix()` (what every OTHER FleetRMW workload
+is built from) never sets this key, with or without other
+`extra_rmw_env` present -- i.e. explicit, direct proof of isolation,
+not just absence of a change in that function's diff.
+
+**GREEN**: 54/54 focused tests (48 prior + 6 new); full suite 846
+passed (840 + 6 new), same 8 pre-existing unrelated failures, 0
+regressions.
+
+### Post-adoption N=8 sanity (seed=7, no manual override)
+
+`scripts/validate_table6_n8_redundancy_zero_adoption.py` -- N=8, seed=7,
+directed-reply ON, `run_coordination_probe()` called with **no
+`extra_rmw_env` at all**, proving the new default takes effect through
+the real launcher end to end:
+
+| metric | result |
+|---|---|
+| `sim_lag_s` | 0.025s (gate: <=10s) |
+| valid | **YES** |
+| DATA delivery | **100.00%** |
+| crossings | **5/5, all 9 endpoints** |
+| forced_entry | **none, any endpoint** |
+| `task_completion_s` (mean) | 14.06s |
+
+Matches the explicit-override "B" condition from the 5-seed A/B exactly
+(same seed, same result) -- confirms the automatic default and the
+manual override are wire-identical, as they must be (`setdefault` on
+the same key/value).
+
+### Final status record
+
+- **Directed REPLY: KEPT** (per-target REPLY topics + subscription_aware
+  + static subscriptions; see "TABLE VI DIRECTED REPLY" above).
+- **`ACK_NACK_REDUNDANT_RESEND_COUNT=0`: ADOPTED, Table-VI-specific
+  benchmark configuration only** -- set inside
+  `fleetqox_coordination_rmw_env_prefix()`, does not touch
+  `fleetqox_rmw_env_prefix()` or `rmw_pubsub.cpp`'s own default.
+- **Production/global FleetRMW default: UNCHANGED** (still 10 for
+  every workload that doesn't go through Table VI's coordination
+  launcher).
+- **Historical N=8 absolute performance numbers**: remain INVALID as
+  recorded in the prior section (measured under the pre-fix duration
+  mismatch and/or the now-superseded default redundancy config).
+- **Current Table VI N=8 status, with both fixes/adoptions in place**:
+  simulator-valid, 100% DATA delivery, 5/5 crossings, zero forced_entry
+  -- confirmed on this sanity seed and consistent with 5/5 seeds in the
+  prior section's clean A/B.
+
+No radio/QoS/workload/timeout/Ricart-Agrawala/global-default change at
+any point in this adoption.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và

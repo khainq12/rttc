@@ -256,9 +256,29 @@ def fleetqox_coordination_rmw_env_prefix(
     subscription_aware_targets()'s own per-topic targeting in
     rmw_pubsub.cpp. Default parameters preserve this function's exact
     prior behavior byte-for-byte when directed-reply is not requested.
+    FLEETQOX_RMW_ACK_NACK_REDUNDANT_RESEND_COUNT=0 -- TABLE-VI-SPECIFIC
+    benchmark configuration (see docs/AUDIT_ACCEPTANCE_TRACKING.md,
+    "TABLE VI ACK/NACK REDUNDANCY=0 ADOPTION"): set as the default HERE
+    ONLY -- fleetqox_rmw_env_prefix() (Table IV/V's own function,
+    called below but never given this default) and rmw_pubsub.cpp's
+    own compiled-in default (still 10 for every other FleetRMW
+    workload, unchanged) are both untouched, so this applies to Table
+    VI's coordination benchmark exclusively. Proven necessary by a
+    clean, harness-fixed, 5-seed N=8 A/B: the production default (10)
+    was simulator-INVALID on 5/5 seeds (sim_lag_s 32-41s) with 61.93%
+    mean DATA delivery and universal forced_entry; 0 was VALID on 5/5
+    seeds with 100% DATA delivery, 5/5 crossings, and zero forced_entry
+    every seed. A caller-supplied extra_rmw_env value always wins (e.g.
+    this investigation's own A/B experiment scripts explicitly request
+    "10" to reproduce/compare against the unhealthy case) -- this only
+    fills in a default for callers that don't ask for anything
+    specific, i.e. no rmw_pubsub.cpp/production/global-default change
+    at all.
     """
+    merged_extra_rmw_env = dict(extra_rmw_env or {})
+    merged_extra_rmw_env.setdefault("FLEETQOX_RMW_ACK_NACK_REDUNDANT_RESEND_COUNT", "0")
     return fleetqox_rmw_env_prefix(
-        endpoint, peers, True, static_subscription_entries or [], extra_rmw_env,
+        endpoint, peers, True, static_subscription_entries or [], merged_extra_rmw_env,
         include_static_subscriptions=include_static_subscriptions,
     )
 
