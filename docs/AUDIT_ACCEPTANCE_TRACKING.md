@@ -15757,6 +15757,195 @@ level mitigation, since this problem is now proven to be about the
 SIMULATOR's own realtime throughput ceiling, not (yet) about anything
 FleetRMW does with the traffic.
 
+## N=16 CPU PROFILE -- FUNDAMENTAL WI-FI MODEL + EVENT-SCHEDULER COST, NOT A HARNESS BUG
+
+Follow-up to "N=16 SCALE VALIDATION" -- profiles WHERE the ns-3 process
+spends its (94-95% saturated) CPU at N=16, using `perf`
+(`linux-tools-generic`, installed into a dedicated
+`localhost/fleetrmw/rmw-netem:jazzy-perf-fixed` image built via an
+ephemeral, network-enabled `docker commit` -- otherwise byte-identical
+to the standard image; confirmed the ns-3 binary still compiles
+identically). No radio/QoS/workload/ACK-NACK/directed-REPLY/production
+change at any point.
+
+### Getting `perf` working needed 3 real fixes along the way
+
+1. `docker commit` on a container started with `--entrypoint bash`
+   baked that override into the new image's metadata, breaking the
+   harness's `sleep infinity` container-keepalive convention (`bash
+   "sleep infinity"` treats the string as a script path, exits
+   immediately). Fixed with `docker commit --change='ENTRYPOINT
+   ["/bin/bash","-lc"]'` to restore the original contract.
+2. `pgrep -f fleetqox_tap_bridge` (used to find the running simulator's
+   PID) also matches `build_ns3_binary()`'s own `g++ ... -o /tmp/
+   fleetqox_tap_bridge` compile command -- caught profiling `find`/
+   `bash` (the tap-creator-symlink-fix shell step) instead of the
+   simulator on the first live attempt. Fixed by matching `/tmp/
+   fleetqox_tap_bridge --numRobots` (the actual runtime invocation only).
+3. `perf record -p <pid>` (process-scoped) captured ZERO samples for
+   the real ns-3 process with BOTH the default hardware `cycles:P`
+   event and the software `task-clock` event, while isolated busy-loop
+   and syscall-heavy (`dd if=/dev/zero`) test processes in the
+   identical container/capability setup sampled perfectly with either
+   event every time -- cause still unexplained. System-wide (`perf
+   record -a`) sampling works reliably; a first attempt at 60s with
+   `--call-graph dwarf` captured real data (689,490 samples) but at
+   4.6GB, triggering "IO/CPU overload" and crashing the container
+   before `perf report` could run. A lighter configuration (flat, no
+   call-graph, 199Hz, 15s window) succeeded cleanly: 15,592 samples,
+   1.4MB.
+
+### Cross-check: profiler overhead
+
+`sim_lag_s` with profiling attached: 35.48s (`self_cpu_s`=117.7,
+`wall_elapsed_s`=125.48, CPU ratio 93.8%). Without profiling (prior
+section's own measurement, same seed, same config): 37.03s (CPU ratio
+94.9%). **No material difference** -- consistent with every ablation in
+this and the prior section (heavyTracing=false; loss_funnel_trace
+ablation) all pointing the same direction: **instrumentation overhead
+is not the cause.**
+
+### Flat profile, aggregated by module (system-wide sample, N=16 mid-run steady state)
+
+| bucket | % of samples |
+|---|---|
+| Unresolved userspace (no symbol match -- see caveat below) | 59.56% |
+| Unresolved kernel-mode (blocked by container `kptr_restrict`) | 19.78% |
+| **Wi-Fi module total** (`libns3.41-wifi.so`) | **8.19%** |
+| &nbsp;&nbsp;-- Wi-Fi PHY/interference (noise/interference calc, preamble/duration/data-rate calc) | 4.57% |
+| &nbsp;&nbsp;-- Wi-Fi MAC (channel access, backoff, frame exchange) | 1.55% |
+| &nbsp;&nbsp;-- Wi-Fi module, other | 2.07% |
+| Other processes (the 17 concurrent Python coordination endpoints -- system-wide sampling artifact, not the ns-3 process itself) | 3.30% |
+| ns-3 core / simulator scheduler (`Simulator::Now`, `MapScheduler::Insert`, `RealtimeSimulatorImpl::{Now,ProcessOneEvent}`) | 1.96% |
+| `libc` allocation (`malloc`/`cfree`) | ~0.89% |
+| C++ stdlib containers (red-black tree insert/erase -- event-queue and interference-multimap bookkeeping) | 0.88% |
+| locking (`pthread_mutex_{lock,unlock}`) | 0.55% |
+| `fleetqox_tap_bridge` (this investigation's own driver binary) | 0.40% |
+| **TapBridge module** (`libns3.41-tap-bridge.so`) | **0.03%** |
+
+Top individual resolved symbols: `malloc` (0.57%, the single hottest
+NAMED symbol), `ns3::MapScheduler::Insert` (0.47%, the hottest ns-3-
+specific symbol), `ns3::InterferenceHelper::CalculateNoiseInterferenceW`
+(0.32%), `cfree` (0.32%), `pthread_mutex_lock` (0.31%),
+`ns3::Simulator::Now()` (0.23%), `std::_Rb_tree_rebalance_for_erase`
+(0.22%, red-black tree erase -- backs both the event scheduler's
+`std::multimap` and the PHY interference helper's own `std::multimap`),
+`ns3::RealtimeSimulatorImpl::Now()` (0.18%),
+`ns3::ChannelAccessManager::{GetAccessGrantStart,UpdateBackoff}`
+(0.14%+0.11%), `ns3::PhyEntity::{CalculatePhyPreambleAndHeaderDuration,
+EndPreambleDetectionPeriod,GetDuration}` (0.15%+0.14%+0.13%).
+
+**Symbol-resolution caveat**: the 59.56% "unresolved userspace" bucket
+is real CPU time, not noise -- `perf` could not attach a name to it
+(likely INLINED ns-3 template/header machinery -- `Ptr<T>`,
+`Callback<>`, `EventImpl` -- which gets compiled directly into
+whichever translation unit uses it, i.e. into `fleetqox_tap_bridge`
+itself, without DWARF debug info to unwind through inlining, since
+neither ns-3 nor this driver were built with `-g`). This means the
+TRUE cost of "simulator scheduler/event dispatch" (which owns most of
+that smart-pointer/callback glue) is almost certainly LARGER than the
+1.96% directly attributed to `libns3.41-core.so` -- likely the single
+largest bucket overall once the inlined portion is accounted for.
+Likewise the 19.78% unresolved kernel-mode time is consistent with
+`RealtimeSimulatorImpl`'s own high-resolution-timer-based real-time
+pacing (repeated fine-grained sleep/wake syscalls) plus genuine socket
+I/O for the now much higher Wi-Fi traffic volume -- not attributable to
+a specific function, but not mysterious either.
+
+### N=8 vs N=16 event-growth table (from the already-existing, zero-overhead atomic counters -- see prior section for the raw numbers)
+
+| metric | N=8 (valid) | N=16 (invalid) | ratio | vs num_robots (2.0x) |
+|---|---|---|---|---|
+| `phy_rx_drop` rate (mostly collision-pattern reasons) | 659.2/s | 3832.4/s | **5.81x** | super-linear |
+| `mac_rx_drop` rate (MAC-level duplicate/dedup rejection) | 3743.7/s | 14435.8/s | 3.86x | slightly super-linear, tracks REQUEST fan-out (3.78x) closely |
+| `mac_tx` rate | 271.3/s | 590.0/s | 2.17x | near-linear |
+| CPU utilization (`self_cpu_s`/`wall_elapsed_s`) | 38.9% | ~94-95% | 2.44x, now saturating | -- |
+
+`phy_rx_drop`'s super-linear growth (5.81x for 2x stations) is the
+clearest, cheapest, zero-overhead signal that PHY-layer collision
+processing -- confirmed by the perf profile to be a real, named,
+non-trivial CPU consumer (`InterferenceHelper::CalculateNoiseInterferenceW`,
+preamble/duration calculations) -- grows disproportionately as more
+stations contend for the one shared channel, compounding with the
+generic event-scheduling overhead every additional event (successful
+or dropped) also carries.
+
+### Classification
+
+**FUNDAMENTAL COST OF THIS DETAILED WI-FI MODEL** (not a harness bug,
+not avoidable ns-3 config/implementation overhead in any way this
+investigation could act on):
+- TapBridge: ruled out directly (0.03% of samples -- negligible).
+- This investigation's own instrumentation: ruled out directly (two
+  independent ablations, one profiled cross-check, all showing no
+  material difference).
+- avoidable ns-3 config: no evidence found -- nothing in the resolved
+  profile points to a misconfiguration (e.g. no excessive `NS_LOG`
+  overhead, no unexpected pcap/tracing left enabled).
+- What IS hot -- Wi-Fi PHY/interference computation, Wi-Fi MAC channel-
+  access/backoff, and (very likely, per the unresolved-symbol caveat)
+  the generic event-scheduler/smart-pointer dispatch machinery -- are
+  all genuine, architecturally-necessary parts of ns-3's detailed
+  802.11 model, doing MORE of the SAME work as traffic/contention grows
+  with N, not doing wasted/duplicate work.
+
+**No optimization attempted.** ns-3 itself is an apt-installed
+precompiled library in this environment (no vendored source in this
+repository to patch), so any fix at the PHY/MAC/scheduler level named
+above would require rebuilding ns-3 from source -- a fundamentally
+different, much larger undertaking than this investigation's own scope,
+and not justified without first proving the cost is EXCESS rather than
+inherent (this profile shows the latter). This investigation's OWN
+driver code (`fleetqox_trace_replay_tap.cc`/`fleetqox_tap_bridge`)
+contributes a negligible 0.40% of samples -- nothing there is worth
+optimizing either. Per this task's own instruction, no semantics-
+preserving optimization target was identified, so none was attempted.
+
+### Verdicts
+
+1. **Top CPU buckets**: Wi-Fi module 8.19% (PHY/interference 4.57%,
+   MAC 1.55%, other 2.07%); ns-3 core/scheduler 1.96% (understated, see
+   caveat); allocation+locking+containers ~2.3%; TapBridge 0.03%;
+   unresolved (likely inlined scheduler/callback glue + real-time
+   pacing/socket kernel time) ~79%.
+2. **Top hot functions**: `malloc`, `ns3::MapScheduler::Insert`,
+   `ns3::InterferenceHelper::CalculateNoiseInterferenceW`, `cfree`,
+   `pthread_mutex_lock`, `ns3::Simulator::Now()`,
+   `std::_Rb_tree_rebalance_for_erase`, `ns3::RealtimeSimulatorImpl::Now()`,
+   `ns3::ChannelAccessManager::{GetAccessGrantStart,UpdateBackoff}`,
+   `ns3::PhyEntity::{CalculatePhyPreambleAndHeaderDuration,
+   EndPreambleDetectionPeriod}`.
+3. **N=8 vs N=16 event growth**: `phy_rx_drop` rate 5.81x (super-
+   linear), `mac_rx_drop` rate 3.86x (tracks fan-out), `mac_tx` rate
+   2.17x (near-linear), CPU utilization 2.44x (now saturating).
+4. **Instrumentation overhead: NO** (confirmed 3 independent ways: 2
+   ablations + 1 profiled cross-check, all consistent).
+5. **Dominant CPU mechanism**: genuine Wi-Fi PHY/MAC computation
+   compounding with ns-3's own generic event-scheduling/real-time-
+   pacing overhead as event volume grows super-linearly with station
+   count -- not one single hot spot, a broad, structural cost.
+6. **Classification: FUNDAMENTAL COST OF THIS DETAILED WI-FI MODEL.**
+7. **No optimization attempted** -- no semantics-preserving target
+   identified within this investigation's scope (ns-3 itself is not
+   vendored/patchable here; this driver's own code is a negligible
+   0.40% of the cost).
+8. **`sim_lag_s` before -> after profiling attempt: unchanged** (37.03s
+   without profiling vs 35.48s with -- both deeply invalid, no
+   optimization was applied to change this number).
+9. **N=16 scientifically usable now: NO** (unchanged from the prior
+   section -- this pass explains WHY, it does not fix it).
+
+**Next step**: STOP further N=16 CPU-bottleneck investigation -- the
+cost has been traced to genuine, structural Wi-Fi-model + scheduler
+overhead with no in-scope, semantics-preserving fix available (per this
+task's own "do not hack ns-3 merely to obtain a valid N=16 result"
+rule). Table VI's validated, reproducible result remains N=8 with
+`ACK_NACK_REDUNDANT_RESEND_COUNT=0` (5/5 seeds valid and healthy); any
+further scale work should wait for either a genuine ns-3-upstream
+performance improvement or a decision to accept N=16 measurements only
+under a relaxed/adjusted validity gate (an explicit trade-off decision
+for the user, not an engineering fix).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
