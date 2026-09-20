@@ -16183,6 +16183,79 @@ that feature -> A/B -> measure -> KEEP/REVERT") is satisfied by the
 "prove" step failing for every candidate considered -- there is nothing
 downstream of that to do.
 
+## Phase 5: RealtimeSimulatorImpl hard-limit safety gate -- IMPLEMENTED, TESTED, FOUND AND FIXED A HARNESS GAP
+
+Measurement-safety change, not a performance optimization, per this
+task's own framing. `--realtimeHardLimitS` (already added alongside
+the scheduler flag, see the Phase 1-3 section above) wires
+`RealtimeSimulatorImpl::SetSynchronizationMode(SYNC_HARD_LIMIT)` +
+`SetHardLimit(Seconds(x))`. Default `0` keeps ns-3's own default
+(`SYNC_BEST_EFFORT` -- silently fall behind, this program's prior,
+unchanged behavior).
+
+### Live verification
+
+- **N=8 seed=7, `--realtimeHardLimitS=10`**: ran to completion cleanly,
+  `sim_lag_s` stayed <=0.1s throughout (well under the 10s limit) --
+  **no spurious trip** on a healthy run.
+- **N=16 seed=7, `--realtimeHardLimitS=10`**: ns-3 itself printed
+  `RealtimeSimulatorImpl::ProcessOneEvent (): Hard real-time limit
+  exceeded (jitter = 10000000745)` at simulated time ~35.79s and
+  aborted (`NS_FATAL, terminating` / `terminate called without an
+  active exception`) -- **the C++-level gate works exactly as
+  designed.**
+
+### Gap found and fixed: the Python harness did not notice the crash
+
+Live-testing the trip case surfaced a real problem this task's own
+Phase 5 exists to catch: `run_coordination_probe()`'s
+`wait_for_completion()` polls for each endpoint's OWN
+`result_N.json` file, which the coordination endpoints still write on
+their own independent wall-clock `scenario_timeout_s`, REGARDLESS of
+whether ns-3 is still alive. Confirmed live: with ns-3 dead from
+~35.79s onward (out of a ~100-120s run), the probe still returned
+`status: "ok"` with no indication anything had gone wrong -- exactly
+the "silently produce performance results after falling unacceptably
+behind wall time" failure mode this phase was supposed to prevent. A
+naive downstream script reading only the last `FLEETQOX_WIFI_STATS`
+line before the crash (`sim_lag_s`=8.59s, i.e. UNDER the 10s validity
+gate) would have judged this run "valid" while the simulator had in
+fact catastrophically failed moments later.
+
+**Fix** (`scripts/run_ns3_docker_container_fleet_probe.py`,
+`run_coordination_probe()`): after reading `ns3_log_text` back, check
+for the literal `"NS_FATAL"` marker ns-3 itself emits on any fatal
+error (hard-limit trip or otherwise) and, if found while `status` was
+still `"ok"`, override it to `"ns3_realtime_hard_limit_exceeded"` with
+an explanatory `error` message. Only overrides an otherwise-`"ok"`
+status -- a run that already failed for a more specific reason
+(`ReadinessFailure`, a raised exception) keeps that classification.
+Re-verified live: N=16/hard-limit-10s trip now correctly reports
+`status: "ns3_realtime_hard_limit_exceeded"`; N=8/hard-limit-10s
+healthy run still reports `status: "ok"` (no false positive). Full
+pytest suite unchanged (846 passed / 8 pre-existing unrelated
+failures) -- this change only adds a new status value on an
+`NS_FATAL` marker that could never appear in any existing passing
+test's `ns3_log`.
+
+### Verdicts
+
+1. Hard-limit C++ mechanism: **works correctly** -- fires at the
+   configured threshold, aborts the process, does not fire on a
+   healthy run.
+2. Harness-level detection: **was missing, now fixed** -- this is the
+   single most direct hit on this task's own Phase 5 goal ("a run
+   cannot silently produce performance results after falling
+   unacceptably behind wall time").
+3. Default behavior: **unchanged** (`realtimeHardLimitS=0`/disabled by
+   default at every call site) -- this is an opt-in safety mode, not
+   yet the production default for every run in this investigation.
+4. **KEEP.** Phase 6 will decide whether to turn the hard limit ON
+   (at the 10s validity-gate threshold) for its combined-optimization
+   N=8/N=16 runs, so that any run in that final pass which would have
+   silently exceeded the gate instead fails fast and is visibly
+   excluded rather than needing after-the-fact `sim_lag_s` inspection.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và

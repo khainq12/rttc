@@ -2276,6 +2276,31 @@ def run_coordination_probe(
         endpoint_results = probe.collect_results(results_dir_container)
         ns3_log_text = probe.ns3_log()
         readiness_diagnostics = probe.collect_readiness_diagnostics(results_dir_container)
+        # Phase 5 measurement-safety gate (see --realtimeHardLimitS's own
+        # doc comment in fleetqox_trace_replay_tap.cc and
+        # docs/AUDIT_ACCEPTANCE_TRACKING.md, "N=16 SERIOUS PERFORMANCE
+        # PASS"): a SYNC_HARD_LIMIT trip makes ns-3 itself call
+        # NS_FATAL_ERROR and abort mid-run -- confirmed live that this
+        # does NOT by itself stop wait_for_completion() above from
+        # succeeding (the coordination endpoints run to their own
+        # wall-clock scenario_timeout_s independently and still write
+        # result_N.json even with a dead/silent network), so without this
+        # check a hard-limit trip would silently return status="ok" with
+        # a truncated ns3_log -- exactly the "silently produce
+        # performance results after falling unacceptably behind wall
+        # time" failure mode Phase 5 exists to prevent. Only overrides an
+        # otherwise-"ok" status; a run that already failed for another
+        # reason keeps that more specific error.
+        if status == "ok" and "NS_FATAL" in ns3_log_text:
+            status = "ns3_realtime_hard_limit_exceeded"
+            error_text = (
+                "ns-3 process aborted mid-run (NS_FATAL, most likely "
+                "RealtimeSimulatorImpl's SYNC_HARD_LIMIT) -- see ns3_log "
+                "for the exact message; any coordination-endpoint results "
+                "collected after this point reflect a dead/degraded "
+                "network, not genuine measurement, and must not be used "
+                "for a performance claim."
+            )
     except ReadinessFailure as exc:
         # A setup/readiness-validity failure, not a coordination-protocol
         # result -- the start gate was never released, so no
