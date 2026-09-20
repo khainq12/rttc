@@ -216,6 +216,9 @@ def fleetqox_coordination_rmw_env_prefix(
     endpoint: str,
     peers: str,
     extra_rmw_env: dict[str, str] | None,
+    *,
+    static_subscription_entries: list[str] | None = None,
+    include_static_subscriptions: bool = False,
 ) -> str:
     """Table VI's own env_prefix (launch_coordination_endpoints()) --
     thin wrapper over fleetqox_rmw_env_prefix() so this shares that
@@ -231,8 +234,9 @@ def fleetqox_coordination_rmw_env_prefix(
     misclassified as duplicates and silently dropped before reaching
     the application.
 
-    static_mode is always True and static_subscription_entries is
-    always empty here -- Table VI's Ricart-Agrawala traffic is
+    static_mode is always True. By default (include_static_subscriptions
+    =False, static_subscription_entries=None) static_subscription_entries
+    is empty -- Table VI's Ricart-Agrawala REQUEST traffic is
     broadcast-to-everyone by design (see
     launch_coordination_endpoints()'s own comment), so
     include_static_subscriptions=False keeps FLEETQOX_RMW_PEER_POLICY
@@ -240,9 +244,22 @@ def fleetqox_coordination_rmw_env_prefix(
     FLEETQOX_RMW_STATIC_SUBSCRIPTIONS at all -- identical wire
     configuration to before this fix, plus the one corrected identity
     variable.
+
+    The caller may opt into include_static_subscriptions=True with an
+    explicit entries list instead (added for the "TABLE VI DIRECTED
+    REPLY" causal experiment, see docs/AUDIT_ACCEPTANCE_TRACKING.md) --
+    used ONLY when --directed-reply is active, to make
+    FLEETQOX_RMW_PEER_POLICY=subscription_aware route each per-target
+    REPLY topic to exactly its one subscriber while the shared REQUEST
+    topic (declared as subscribed-to by every peer in the entries list
+    the caller builds) still reaches everyone, unaffected -- see
+    subscription_aware_targets()'s own per-topic targeting in
+    rmw_pubsub.cpp. Default parameters preserve this function's exact
+    prior behavior byte-for-byte when directed-reply is not requested.
     """
     return fleetqox_rmw_env_prefix(
-        endpoint, peers, True, [], extra_rmw_env, include_static_subscriptions=False,
+        endpoint, peers, True, static_subscription_entries or [], extra_rmw_env,
+        include_static_subscriptions=include_static_subscriptions,
     )
 
 
@@ -1313,6 +1330,7 @@ class ReferenceTopologyProbe:
         discovery_mode: str = "default",
         extra_rmw_env: dict[str, str] | None = None,
         launch_order: list[int] | None = None,
+        directed_reply: bool = False,
     ) -> None:
         """Bảng VI ("Chỉ số điều phối và hoàn thành nhiệm vụ") launcher --
         runs fleetqox_coordination_endpoint.py (the Ricart-Agrawala zone-
@@ -1334,6 +1352,21 @@ class ReferenceTopologyProbe:
         regardless of this launch order -- only the wall-clock SEQUENCE
         of the docker exec calls themselves changes. None (default)
         launches in the normal 0..N-1 order.
+
+        directed_reply (default False, preserving prior behavior byte-
+        for-byte): opt-in for the "TABLE VI DIRECTED REPLY" causal
+        experiment (see docs/AUDIT_ACCEPTANCE_TRACKING.md). Passes
+        --directed-reply to fleetqox_coordination_endpoint.py (REPLY
+        moves to a dedicated per-target topic instead of the shared
+        REQUEST/REPLY topic) AND switches this endpoint's RMW env to
+        FLEETQOX_RMW_PEER_POLICY=subscription_aware with a static
+        subscriptions map declaring: every peer subscribes to the
+        shared REQUEST topic (unchanged, still full broadcast) and
+        exactly one peer (the topic's own name suffix) subscribes to
+        each per-target REPLY topic. REQUEST's own wire behavior is
+        provably unaffected: subscription_aware_targets() computes
+        targets PER TOPIC (rmw_pubsub.cpp), and every peer is declared
+        subscribed to the request topic here exactly as before.
         """
         docker("exec", self.rigger_name, "mkdir", "-p", f"/work/{results_dir_container}")
         self._ready_files = [f"{results_dir_container}/ready_{i}" for i in range(len(self.endpoints))]
@@ -1398,8 +1431,30 @@ class ReferenceTopologyProbe:
                 # this) instead of a second, independently-unfixed copy of
                 # the same construction -- exactly how this bug happened
                 # the first time.
+                coordination_static_entries: list[str] = []
+                if directed_reply:
+                    # Every OTHER peer subscribes to the shared REQUEST
+                    # topic -- unchanged broadcast behavior, just now
+                    # declared explicitly instead of relying on
+                    # peer_policy's own "all" default.
+                    for other in self.endpoints:
+                        if other == endpoint:
+                            continue
+                        coordination_static_entries.append(
+                            f"{self.ips[other]}:{RMW_PORT}|0|/fleetqox_coordination/control|"
+                            f"{STATIC_SUBSCRIPTION_TYPE_NAME}"
+                        )
+                        # Exactly ONE peer (the topic's own target) is
+                        # ever subscribed to each per-target REPLY topic.
+                        coordination_static_entries.append(
+                            f"{self.ips[other]}:{RMW_PORT}|0|"
+                            f"/fleetqox_coordination/reply_to/{other}|"
+                            f"{STATIC_SUBSCRIPTION_TYPE_NAME}"
+                        )
                 env_prefix = fleetqox_coordination_rmw_env_prefix(
                     endpoint, rmw_peers, extra_rmw_env,
+                    static_subscription_entries=coordination_static_entries,
+                    include_static_subscriptions=directed_reply,
                 )
                 rmw_setup = f"source /work/{FLEETQOX_RMW_INSTALL}/setup.bash && export {env_prefix}"
             else:
@@ -1468,6 +1523,7 @@ class ReferenceTopologyProbe:
                 f"--discovery-diag-json=/work/{self._readiness_diag_files[i]} "
                 f"--ready-file=/work/{self._ready_files[i]} "
                 f"--start-file=/work/{self._start_file}"
+                f"{' --directed-reply' if directed_reply else ''}"
             )
             cmd = f"{inner} > /work/{log_file} 2>&1"
             docker("exec", "-d", self.endpoint_container_names[i], "bash", "-lc", cmd)
@@ -2044,6 +2100,7 @@ def run_coordination_probe(
     discovery_mode: str = "default",
     extra_rmw_env: dict[str, str] | None = None,
     launch_order: list[int] | None = None,
+    directed_reply: bool = False,
 ) -> dict[str, Any]:
     """Bảng VI ("Chỉ số điều phối và hoàn thành nhiệm vụ") -- see
     fleetqox_coordination_endpoint.py's module docstring for the
@@ -2123,6 +2180,7 @@ def run_coordination_probe(
             discovery_mode=discovery_mode,
             extra_rmw_env=extra_rmw_env,
             launch_order=launch_order,
+            directed_reply=directed_reply,
         )
         probe.wait_for_ready_then_start(ready_deadline_s=ready_deadline_s)
         probe.wait_for_completion(

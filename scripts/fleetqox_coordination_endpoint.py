@@ -517,6 +517,19 @@ def main() -> int:
     parser.add_argument("--expected-peer-count", type=int, default=0)
     parser.add_argument("--skip-discovery-wait", action="store_true")
     parser.add_argument(
+        "--directed-reply",
+        action="store_true",
+        help="Opt-in (default off, preserving the original shared-broadcast-"
+        "topic behavior byte-for-byte): publish REPLY on a dedicated "
+        "per-target topic (/fleetqox_coordination/reply_to/{target}) "
+        "instead of the shared REQUEST/REPLY topic, so the harness can "
+        "route it directly to its one intended recipient at the wire "
+        "level (FLEETQOX_RMW_PEER_POLICY=subscription_aware + static "
+        "subscriptions) instead of broadcasting it to every peer. REQUEST "
+        "is unaffected either way -- see docs/AUDIT_ACCEPTANCE_TRACKING.md, "
+        "'TABLE VI DIRECTED REPLY'.",
+    )
+    parser.add_argument(
         "--priority-mode",
         choices=("lamport", "fleetqox"),
         default="lamport",
@@ -587,8 +600,34 @@ def main() -> int:
     # 11 sent, across repeated real runs) while requests got through at a
     # much more ordinary ~46% rate, with NO difference in QoS or pattern
     # between the two topics -- see docs/AUDIT_ACCEPTANCE_TRACKING.md.
+    # That earlier failure was actually the "reply_pub.publish() called
+    # synchronously from inside on_request" bug fixed below (see
+    # pending_immediate_replies/drain_pending_replies) -- not something
+    # inherent to having 2 topics -- so --directed-reply's own separate
+    # per-target topics (added for the "TABLE VI DIRECTED REPLY" causal
+    # experiment, see docs/AUDIT_ACCEPTANCE_TRACKING.md) do not reopen
+    # that historical failure mode, since they go through the exact same
+    # queue-then-drain-from-the-main-loop path.
     request_pub = node.create_publisher(String, "/fleetqox_coordination/control", qos)
-    reply_pub = request_pub
+    if args.directed_reply:
+        # REQUEST stays fully broadcast (Ricart-Agrawala needs every peer
+        # to see every REQUEST for Lamport-ordering) -- only REPLY, which
+        # is already logically addressed to exactly one robot via its own
+        # "to" field, gets a dedicated per-target topic so the RMW layer
+        # can (with FLEETQOX_RMW_PEER_POLICY=subscription_aware + static
+        # subscriptions, set by the harness when --directed-reply is
+        # used) deliver it ONLY to that one robot at the wire level,
+        # instead of broadcasting it to every peer and relying on
+        # on_reply()'s own "to" check to discard it after the full
+        # sendto/network/recvfrom/decode cost is already paid.
+        reply_pubs = {
+            peer: node.create_publisher(String, f"/fleetqox_coordination/reply_to/{peer}", qos)
+            for peer in peers
+        }
+        reply_pub = None
+    else:
+        reply_pubs = {}
+        reply_pub = request_pub
 
     # ---- Ricart-Agrawala mutual-exclusion state ----
     lamport_clock = 0
@@ -687,7 +726,7 @@ def main() -> int:
             sent_log.append(
                 {"type": "reply", "to": to, "req_id": req_id, "wall_ns": reply_wall_ns}
             )
-        safe_publish(reply_pub, msg)
+        safe_publish(reply_pubs[to] if args.directed_reply else reply_pub, msg)
 
     def drain_pending_replies() -> None:
         pending = pending_immediate_replies[:]
@@ -818,6 +857,34 @@ def main() -> int:
             on_request(msg)
 
     node.create_subscription(String, "/fleetqox_coordination/control", on_control_message, qos)
+
+    if args.directed_reply:
+        # Same raw_received_log recording as on_control_message (so
+        # existing measurement/analysis that reads raw_received_log needs
+        # no changes), just arriving on this endpoint's own dedicated
+        # reply-target topic instead of the shared one -- REPLY never
+        # arrives via on_control_message at all in this mode, since
+        # send_reply() no longer publishes on the shared topic when
+        # --directed-reply is set.
+        def on_directed_reply(msg: String) -> None:
+            payload = json.loads(msg.data)
+            recv_wall_ns = time.time_ns()
+            if len(raw_received_log) < 2000:
+                raw_received_log.append(
+                    {
+                        "type": payload.get("type"),
+                        "from": payload.get("from"),
+                        "to": payload.get("to"),
+                        "req_id": payload.get("req_id"),
+                        "wall_ns": payload.get("wall_ns"),
+                        "recv_wall_ns": recv_wall_ns,
+                    }
+                )
+            on_reply(msg)
+
+        node.create_subscription(
+            String, f"/fleetqox_coordination/reply_to/{args.endpoint}", on_directed_reply, qos
+        )
 
     # ---- Same RMW-agnostic beacon discovery-convergence measurement as
     # fleetqox_rmw_trace_endpoint.py, kept for methodological consistency
