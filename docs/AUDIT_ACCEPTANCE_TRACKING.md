@@ -16346,6 +16346,213 @@ plausibly close a gap of this size.
    asked to be investigated (PHY choice, event scheduler, avoidable
    event sources).
 
+## LAN READINESS GATE: TOPOLOGY-AWARE FIX -- PROVEN SAFE, BUT EXPOSES A SEPARATE, PRE-EXISTING DISCOVERY-CONVERGENCE PROBLEM
+
+Follow-up to "ZENOH FALSE-READY HARNESS FIX AND VALIDATION" (19/09/2026),
+which left LAN Table V's cross-middleware N=16 comparison unusable: the
+shared readiness gate required every endpoint to see a FULL MESH of
+N-1 other endpoints' discovery beacons, but Table V's actual workload
+is a star (control_station<->robot_i only) -- so a robot could
+legitimately never see another robot's beacon and still be correctly
+"ready" for its own workload, and the old gate had no way to tell that
+apart from a genuine readiness failure.
+
+### Phase 1: topology proven, not assumed
+
+Generated a real Table V trace via `fleetqox.trace.generate_trace_events()`
+(N=4, seed=7, policy=fifo) and inspected its own src/dst columns
+directly: the only edges present are control_station<->robot_0000/1/2/3
+-- zero robot<->robot edges. Confirms `_source_for()`/`_destination_for()`
+in fleetqox/trace.py already only ever route CONTROL flows
+control_station->robot_i and everything else robot_i->control_station,
+by construction. Added `required_peers_from_trace()`
+(scripts/run_ns3_docker_container_fleet_probe.py) to derive this
+programmatically from any trace's own src/dst columns for a given
+--policy -- makes no topology assumption of its own (a future workload
+with genuine robot<->robot flows would just produce different edges,
+no code change needed).
+
+### Phase 2 (RED) / Phase 3 (FIX)
+
+Added `TopologyAwareReadinessContractTest` (4 required cases: valid
+star->READY, robot missing control_station->INVALID, control_station
+missing a robot->INVALID, irrelevant robot<->robot gap->must NOT fail)
+-- all 4 failed with `TypeError` against the unmodified
+`discovery_converged()` (no identity-aware path existed at all),
+confirming RED. Fix: `discovery_converged()` gained an opt-in
+`required_peer_ids`/`peers_seen_ids` identity-SUBSET check
+(`required_peer_ids <= peers_seen_ids`) that takes priority over the
+old scalar `peers_seen >= expected_peer_count` comparison when passed
+-- a strict generalization (equivalent to the old contract when
+required_peer_ids is every other endpoint, since peers_seen_ids can
+only ever contain identities from that same closed set).
+`fleetqox_rmw_trace_endpoint.py` gained `--required-peer-ids` (flag
+omitted entirely = old behavior, byte-for-byte -- distinguished from an
+explicitly-empty value via Python `None`, not string truthiness).
+`launch_endpoints()` gained an opt-in `required_peer_ids_by_endpoint`
+parameter (default `None` = unchanged for every existing caller);
+`run_lan_probe()` computes it from its own already-generated trace and
+always passes it through -- **Wi-Fi's `run_probe()` and Table VI's
+`launch_coordination_endpoints()` are untouched, byte-for-byte,
+confirmed by reading both call sites directly (neither passes the new
+parameter).** FleetRMW (`--skip-discovery-wait`, static mode)
+deliberately does NOT receive `--required-peer-ids`: it has no
+discovery loop for that flag to gate in the first place (documented
+explicitly in code rather than silently implying a check that cannot
+happen). Commit `d8cad68`.
+
+### Phase 4 (GREEN + live sanity)
+
+Full pytest suite: 846 -> 853 passed (the +7 are this change's own new
+tests), same 8 pre-existing unrelated failures, 0 regressions.
+
+Live N=2/N=4 sanity (all 4 middlewares, `scripts/run_lan_topology_aware_sanity_n2_n4.py`,
+commit `e9de2e1`): **FleetRMW READY / 100% delivery at both N=2 and
+N=4** (unaffected, bypasses this gate by design, exactly as intended).
+**Fast DDS / CycloneDDS / Zenoh all reported INVALID_READINESS at both
+N=2 and N=4.** The new `required_peer_ids`/`missing_required_peer_ids`
+diagnostic fields (added to the DISCOVERY_TIMEOUT_DEBUG print and
+summary JSON in the same commit as the fix) prove the gate computed
+the CORRECT required set in every case (e.g. robot_0001 at N=2 correctly
+required only `["control_station"]`, not a full mesh) and correctly
+detected it was genuinely missing -- not a gate-logic bug.
+Re-tested CycloneDDS N=2 in total isolation with `discovery_timeout_s`
+raised to 30s (double the default, diagnostic-only, not adopted as a
+config change): still failed identically -- robot_0001 received 265 of
+its OWN beacon loopbacks and ZERO from control_station. **The exact
+same missing edge would have failed under the OLD full-mesh gate too**
+(peers_seen=0 satisfies neither `>=1` nor `>=2`) -- this is not a
+regression the topology-aware fix introduced.
+
+### Phase 5: fresh LAN N=16 3-seed baseline -- SAME PATTERN, AT FULL SCALE
+
+Ran the EXISTING, unmodified `run_lan_n16_fresh_baseline_comparison.py
+--main-only` (seeds 7/13/29, counterbalanced order) -- no script changes
+needed, since `run_lan_probe()` itself now always applies the
+topology-aware gate, so every existing caller inherits it automatically.
+
+| middleware | seed=7 | seed=13 | seed=29 | valid (n=3) |
+|---|---|---|---|---|
+| FleetRMW | 100.0% | 100.0% | 100.0% | **3/3** |
+| Fast DDS | invalid_readiness | invalid_readiness | invalid_readiness | **0/3** |
+| CycloneDDS | invalid_readiness | invalid_readiness | invalid_readiness | **0/3** |
+| Zenoh | invalid_readiness | invalid_readiness | invalid_readiness | **0/3** |
+
+FleetRMW p50/p95/p99 (ms), all 3 seeds: 1.01/2.11/4.45 (seed 7),
+1.00/1.98/3.98 (seed 13), 0.97/1.78/3.38 (seed 29); stale_pct=0.0%,
+jitter 0.56-0.70ms every seed. `fresh_deadline_success_pct` = 100.0%
+every seed (stale_pct=0, so identical to delivery_pct here).
+
+**The exact same endpoint fails, every single seed, for each
+middleware (fully deterministic, not random noise):**
+
+| middleware | failing endpoint (all 3 seeds) | missing peers |
+|---|---|---|
+| Fast DDS | endpoint 0 (control_station) | 5 of 16 required robots (e.g. seed 7: robot_0000/0001/0007/0011/0014) |
+| CycloneDDS | endpoint 16 (robot_0015, LAST launched) | 1 of 1 required (control_station) -- total isolation for this one endpoint |
+| Zenoh | endpoint 0 (control_station) | 7 of 16 required robots (seed 7: robot_0000/0001/0003/0005/0012/0013/0015), plus "Unable to connect to a Zenoh router" warnings logged before the beacon phase even starts |
+
+**Root-cause characterization (not a topology-shape problem):** Fast
+DDS and Zenoh both show control_station missing a PARTIAL, seed-
+consistent subset of its required robots (11/16 and 9/16 succeed
+respectively) -- consistent with control_station's discovery window
+being effectively shortened because it ALSO hosts an extra process
+(the Fast DDS discovery-server / Zenoh router) before its own endpoint
+script even starts, so marginal peers that would complete discovery
+near the end of the 15s window miss the cutoff specifically for
+control_station. CycloneDDS shows the opposite shape (one specific
+robot, not control_station, totally isolated) -- consistent with this
+being a DIFFERENT root cause per middleware (matches this codebase's
+own prior finding for a different script, "TABLE VI POST-READINESS
+ROOT-CAUSE INVESTIGATION": "Fast DDS/CycloneDDS KHÔNG cùng nguyên
+nhân"). This is a genuine, pre-existing, deterministic discovery-
+convergence limitation of the underlying beacon mechanism within the
+default 15s window at N=16 -- INDEPENDENT of full-mesh vs. star
+readiness semantics, since the SAME specific peers are the ones never
+observed regardless of how many total peers are required.
+
+**Per this task's own explicit rule ("if any middleware repeatedly
+fails readiness: STOP only that middleware's performance interpretation
+and investigate the exact missing required edge. Do not turn timeout
+back into READY"): STOPPING here for Fast DDS/CycloneDDS/Zenoh's
+performance interpretation.** The gate is NOT weakened, NOT tuned per
+middleware, and `--discovery-timeout-s` was NOT changed for the
+recorded baseline (the 30s retest above was diagnostic-only, run in
+isolation, and not adopted).
+
+### Phase 6: 20-seed final validation -- NOT REACHED (blocked)
+
+Phase 6 only applies "after the 3-seed baseline is clean" for a
+cross-middleware comparison. It is not: only 1 of 4 middlewares
+(FleetRMW) achieved valid readiness. Running the frozen 20-seed set
+would reproduce the identical 0/20 outcome for Fast DDS/CycloneDDS/
+Zenoh (the failure is deterministic per seed already, not a
+seed-sensitivity question) at real compute cost, so it was not run.
+**No superiority-gate computation is possible** -- FleetRMW has no
+valid baseline to compare against in this pass.
+
+### Verdicts
+
+1. Topology-aware readiness fix: **KEEP**, proven correct via unit
+   tests + live diagnostic identity output, zero regressions, Wi-Fi/
+   Table VI untouched.
+2. FleetRMW LAN N=16: **VALID**, 3/3 seeds, 100% delivery, p50~1.0ms/
+   p99~3.4-4.5ms, unchanged in character from the prior "FRESH
+   CORRECTED-HARNESS LAN N=16 BASELINE" finding.
+3. Fast DDS / CycloneDDS / Zenoh LAN N=16: **STILL NO VALID DATA** --
+   not because of the topology-mesh shape (now fixed), but because of a
+   separate, deterministic, per-middleware discovery-convergence
+   problem within the existing 15s timeout, fully characterized above
+   (exact missing peers identified) but NOT fixed (out of this task's
+   explicit scope: no middleware tuning, no discovery-setting changes).
+4. 20-seed final validation: **NOT REACHED**, correctly blocked by the
+   3-seed gate per this task's own rule.
+5. Ceiling effect: **N/A** -- there is no valid multi-middleware data
+   to show a ceiling in.
+
+## LAN TABLE V -- FINAL PAPER-READY STATUS (20/09/2026)
+
+### INVALID/SUPERSEDED -- must NOT be used in the paper
+
+1. Any LAN numbers from before commit `a6dffd1` (premature-receiver-
+   shutdown fix) -- e.g. the original Bảng V row (FastDDS/CycloneDDS
+   86.3%, Zenoh 52.0%, FleetRMW 65.8%, p50=698.7ms).
+2. Any LAN FleetRMW numbers from before commit `1544008`
+   (FLEETQOX_RMW_ROBOT_ID collision fix) -- e.g. the ~55% FleetRMW
+   delivery figures between the two fixes.
+3. The 20-seed paired LAN N=16 comparison from "LAN N=16 -- 20-SEED
+   PAIRED CORRECTED-HARNESS EXPERIMENT" (commit `7082683`,
+   FleetRMW/FastDDS/CycloneDDS 100%, Zenoh mean 42.4%) -- measured under
+   the false-ready bug (unconditional timeout->ready), later proven
+   (same day) to invalidate FastDDS/CycloneDDS/Zenoh's readiness for
+   that entire run.
+4. The Zenoh control_station-convergence correlation analysis in
+   "ZENOH LAN N=16 VARIANCE ROOT-CAUSE INVESTIGATION" -- computed from
+   data collected under the false-ready bug.
+
+### VALID -- fresh, topology-aware-readiness-gated results only
+
+**Table V, LAN profile, N=16, fifo policy, 3s trace duration, 3 seeds
+(7/13/29), topology-aware readiness gate (this pass):**
+
+| Middleware | Valid runs | Delivery % | Fresh-deadline success % | p50 (ms) | p99 (ms) | Stale % |
+|---|---|---|---|---|---|---|
+| **FleetRMW** | 3/3 | 100.0 (all seeds) | 100.0 (all seeds) | 0.97-1.01 | 3.38-4.45 | 0.0 |
+| Fast DDS | 0/3 | no valid data | no valid data | no valid data | no valid data | no valid data |
+| CycloneDDS | 0/3 | no valid data | no valid data | no valid data | no valid data | no valid data |
+| Zenoh | 0/3 | no valid data | no valid data | no valid data | no valid data | no valid data |
+
+No cross-middleware superiority claim can be made from this table (no
+valid baseline to compare FleetRMW against). FleetRMW's own result is
+internally valid and consistent with its own prior post-identity-fix
+baseline.
+
+### Final LAN status: **NOT paper-ready for a cross-middleware Table V
+claim.** FleetRMW's own LAN N=16 numbers ARE paper-ready. Fast DDS/
+CycloneDDS/Zenoh require a genuine fix to the underlying discovery-
+convergence-within-timeout problem characterized above (out of this
+task's scope) before any comparison can be reported.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
