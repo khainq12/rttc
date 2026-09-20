@@ -15149,6 +15149,142 @@ counts already show a large, consistent, unambiguous reduction.
 mechanism itself (Phase 2's finding) as the next candidate root cause,
 now that REPLY fan-out is no longer a confound.
 
+## N=8 REMAINING WI-FI LOSS AFTER DIRECTED-REPLY -- MAJOR FINDING: SIMULATOR REALTIME LAG, NOT PURELY RADIO CONTENTION
+
+Follow-up to "TABLE VI DIRECTED REPLY" above, per its own "investigate the
+N=8 per-pair ns-3 wireless blackout mechanism" next step. Frozen config
+throughout: `--directed-reply` ON, N=8, seed=7, default network profile
+(circle/7.5m/2.7 exponent/15dBm/-82dBm), default `scenario_timeout_s=120`
+-- no radio/QoS/timeout/workload/Ricart-Agrawala/forced-entry change at
+any point in this investigation.
+
+**New instrumentation** (`external/ns3/fleetqox_trace_replay_tap.cc`,
+measurement-only, additive, no C++ production/`rmw_pubsub.cpp` change):
+per-station ("who") labels on every existing MacTx/MacTxDrop/MacRx/
+MacRxDrop/PhyTxBegin/PhyRxDrop trace connection (previously anonymous,
+mixing all 9 stations together); new hooks on `WifiMac::DroppedMpdu`
+(exact `WifiMacDropReason`: FAILED_ENQUEUE/EXPIRED_LIFETIME/
+REACHED_RETRY_LIMIT/QOS_OLD_PACKET), `WifiRemoteStationManager::
+MacTxFinalDataFailed` (retry-limit cross-check), `Txop::BackoffTrace`/
+`CwTrace` (channel-access contention proxy), `WifiMacQueue::Expired`,
+and periodic (2s) per-station queue-depth sampling. Two bugs found and
+fixed in the pre-existing `ExtractEventId()` diagnostic-payload-marker
+extractor while validating this (both diagnostic-tool-only, zero
+production/behavior impact): (1) it only recognized Table IV/V's
+`fleetqox_rmw_trace_endpoint.py` `"e":"<id>"` marker -- Table VI's
+`fleetqox_coordination_endpoint.py` uses a different JSON schema with
+no such field at all, so extraction silently returned 0% for every
+Table VI run ever measured with it; added a `"wall_ns":<digits>`
+fallback (present in every Table VI request/reply payload, unique
+enough per run) to fix this. (2) the digit scan didn't skip the space
+Python's default `json.dumps()` separator inserts after `:` (`"wall_ns":
+123` not `"wall_ns":123`), which silently defeated even the new marker
+until fixed. RED/GREEN: a smoke test (N=2, `--directed-reply`) went
+from `mac_event_extracted=0/3775` to `240/3775` after both fixes. Full
+suite: 835 passed, same 8 pre-existing unrelated failures, 0 regressions.
+
+### The major finding
+
+Cross-referencing RMW-level ground truth (`sent_log`/`raw_received_log`,
+the SAME mechanism every prior permanent-loss number in this
+investigation was built from) against the new ns-3 MAC-event timeline
+by real send time reveals a sharp, clean cliff:
+
+| messages sent in real-time window | ns-3-level Wi-Fi trace visibility |
+|---|---|
+| 0-7s | 100% |
+| 7-30s | 91-100% |
+| 30-54s | 54-81% (declining) |
+| **54-120s (the remaining ~65s -- more than half the run)** | **exactly 0%, no exceptions** |
+
+Independently confirmed via `FLEETQOX_WIFI_STATS`: **all 9 endpoints
+report `task_completion_s` ≈ 120.3s (real elapsed, matching the
+configured 120s timeout exactly), but ns-3's OWN `Simulator::Now()`
+never advanced past `sim_time_s=60`** at last capture -- a precise 2x
+realtime lag. **ns-3's RealtimeSimulatorImpl fell behind real time and,
+from roughly the halfway point onward, never modeled the rest of the
+run's traffic at all** before the orchestrator killed the process --
+not "lost in the Wi-Fi channel", literally never simulated.
+
+This means a large fraction of every N=8 "permanent DATA loss" number
+measured in THIS ENTIRE INVESTIGATION to date (including this task's
+own directed-REPLY A/B experiment, and every earlier ACK/NACK causal
+experiment) is confounded by simulator throughput, not purely by the
+configured radio model's own capacity -- a materially different
+finding than "N=8 is genuinely over Wi-Fi capacity" as previously
+framed. Not yet determined whether this pass's own (heavier) new
+instrumentation partly caused/worsened the lag versus it being inherent
+to N=8's unmodified traffic volume (see next step).
+
+### What IS genuine (within the ~half of the run ns-3 did model)
+
+`WifiPhyRxfailureReason` breakdown for phy_rx_drop_total=131,596: RXING
+9, TXING 21,653, BUSY_DECODING_PREAMBLE 44,482, PREAMBLE_DETECT_FAILURE
+56,856, L_SIG_FAILURE 62, PREAMBLE_DETECTION_PACKET_SWITCH 8,534 --
+**99.95% are collision-pattern reasons** (simultaneous-transmission
+preamble corruption/capture-effect), not weak-signal/distance failures.
+`cw_value_max=1023` -- 802.11's DCF contention window hit its ABSOLUTE
+ceiling at least once (only reachable via real, repeated, modeled
+collisions). `mac_rx_drop_total=769,849` vs `mac_rx_total=60,546`
+successfully received (~93% MAC-level rejection) -- consistent with
+pervasive 802.11 ACK loss forcing repeated link-layer retransmission,
+independent of and on top of FleetRMW's own NACK-driven retransmission.
+Explicit permanent MAC-level drops are comparatively small:
+`dropped_mpdu_reached_retry_limit`=4, `mac_tx_final_data_failed_total`=4,
+`dropped_mpdu_expired_lifetime`=`wifi_mac_queue_expired_total`=51.
+AP's own downlink queue backlog peaked at 499 packets (vs 5-32 for
+individual stations) -- the single shared AP relaying all 9 stations'
+traffic is a clear structural bottleneck, though its magnitude is also
+confounded by the realtime lag (a lagging simulator drains its own
+queues slower than real packets arrive, inflating apparent backlog).
+
+**Exact example** (full MAC/PHY timeline captured): robot_0001's
+REQUEST broadcast (`wall_ns=1789875061485590434`, `sim_time≈57.446s`,
+within the still-modeled first half) fans out as 7 near-simultaneous
+unicast MacTx copies; within a ~4ms simulated window, EVERY other
+station registers repeated `mac_rx_drop` events, robot_0001's own PHY
+registers a TXING failure (`phy_rx_drop:4`, i.e. busy transmitting when
+another copy's signal arrived), and most (but not confirmed all)
+recipients eventually get a clean `rx` after several rejected attempts
+-- a textbook real 802.11 collision-and-retry signature, not corrupted
+or garbage data.
+
+### Verdicts
+
+- **Harness/simulator bug: not a logic defect**, but **yes, a genuine,
+  newly-discovered ns-3 RealtimeSimulatorImpl throughput ceiling at N=8
+  scale** (~2x behind real time) that invalidates roughly half of every
+  N=8 run's data and confounds this whole investigation's prior
+  "genuine Wi-Fi contention" framing.
+- **Genuine modeled contention: yes, partially** -- within the portion
+  ns-3 did simulate, the PHY/MAC evidence is unambiguous real collision
+  behavior, not a bug. But its MEASURED MAGNITUDE across this whole
+  investigation is now suspect until the realtime-lag confound is
+  isolated.
+- **Causal FleetRMW traffic source (if the lag proves load-driven)**:
+  the pre-existing ACK/NACK redundant-resend factor (already proven a
+  partial causal contributor to N=8 DATA loss, see "TABLE VI N=8
+  ACK/NACK CAUSAL REPLICATION" above) plus REQUEST's inherent
+  (N-1)-way unicast fan-out (unchanged, required) are the most likely
+  drivers of both the collision volume and the simulator's own
+  event-processing load.
+- **No FIX applied** -- per this task's own "do not optimize yet"
+  instruction, and because fixing/mitigating "genuine collision" would
+  be premature before the realtime-lag confound is isolated and
+  quantified. New scripts: `scripts/investigate_table6_n8_wifi_mac_phy_loss.py`,
+  `scripts/smoke_test_wifi_mac_phy_instrumentation.py`.
+
+**Next step**: measure ns-3's realtime lag in isolation (periodic
+`Simulator::Now()` vs. wall-clock stamp only, none of this pass's
+heavier per-packet extraction/drop logging) at the same frozen N=8
+config, to (a) rule out this pass's own added instrumentation overhead
+as the cause/amplifier of the lag, and (b) if the lag is confirmed
+inherent, sweep `FLEETQOX_RMW_ACK_NACK_REDUNDANT_RESEND_COUNT` (already
+proven safe to vary, see the earlier A1/B/A2 experiments) to see
+whether it's load-driven (actionable) or a fixed CPU ceiling
+(meaning N=8 ns-3-based measurements are unreliable regardless of any
+FleetRMW-side change).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
