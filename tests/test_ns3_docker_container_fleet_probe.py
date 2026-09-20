@@ -19,6 +19,7 @@ from scripts.run_ns3_docker_container_fleet_probe import (
     fleetqox_coordination_rmw_env_prefix,
     fleetqox_rmw_env_prefix,
     parse_docker_mem_usage_mb,
+    required_peers_from_trace,
     station_mac,
     topic_for,
 )
@@ -359,6 +360,87 @@ class BuildStaticSubscriptionsTest(unittest.TestCase):
                 "control_station": [("robot_0000", "control")],
                 "robot_0000": [("control_station", "state")],
                 "robot_0001": [],
+            },
+        )
+
+
+class RequiredPeersFromTraceTest(unittest.TestCase):
+    """Phase 1 of the LAN topology-aware readiness fix (see
+    docs/AUDIT_ACCEPTANCE_TRACKING.md, "LAN READINESS GATE: TOPOLOGY-
+    AWARE FIX"): required_peers_from_trace() must derive each
+    endpoint's required discovery peers from the trace's OWN src/dst
+    edges, not assume any particular topology shape."""
+
+    def test_star_workload_yields_star_peer_sets(self):
+        # Exactly Table V's actual shape (empirically confirmed against
+        # a real generate_trace_events() output): every flow is
+        # control_station<->robot_i, never robot<->robot.
+        endpoints = ["control_station", "robot_0000", "robot_0001", "robot_0002"]
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.csv"
+            with trace_path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(
+                    handle, fieldnames=["policy", "src", "dst", "flow_class", "event_id"]
+                )
+                writer.writeheader()
+                writer.writerow(
+                    {"policy": "fifo", "src": "control_station", "dst": "robot_0000",
+                     "flow_class": "control", "event_id": 0}
+                )
+                writer.writerow(
+                    {"policy": "fifo", "src": "robot_0000", "dst": "control_station",
+                     "flow_class": "state", "event_id": 1}
+                )
+                writer.writerow(
+                    {"policy": "fifo", "src": "control_station", "dst": "robot_0001",
+                     "flow_class": "control", "event_id": 2}
+                )
+                # robot_0002 never appears at all in the "fifo" policy's
+                # rows -- must end up with an EMPTY required-peer set,
+                # not a full-mesh assumption.
+                writer.writerow(
+                    {"policy": "static_priority", "src": "robot_0002", "dst": "control_station",
+                     "flow_class": "state", "event_id": 3}
+                )
+            result = required_peers_from_trace(trace_path, "fifo", endpoints)
+        self.assertEqual(
+            result,
+            {
+                "control_station": frozenset({"robot_0000", "robot_0001"}),
+                "robot_0000": frozenset({"control_station"}),
+                "robot_0001": frozenset({"control_station"}),
+                "robot_0002": frozenset(),
+            },
+        )
+        # The defining property of a star: no robot requires any other
+        # robot.
+        for robot in ("robot_0000", "robot_0001", "robot_0002"):
+            self.assertNotIn("robot_0000", result[robot] - {robot})
+            self.assertTrue(result[robot] <= {"control_station"})
+
+    def test_non_star_workload_derives_its_own_edges(self):
+        # If a future workload ever schedules a genuine robot<->robot
+        # flow, this function must reflect THAT edge too -- it makes no
+        # topology assumption of its own, it only reads the trace.
+        endpoints = ["control_station", "robot_0000", "robot_0001"]
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.csv"
+            with trace_path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(
+                    handle, fieldnames=["policy", "src", "dst", "flow_class", "event_id"]
+                )
+                writer.writeheader()
+                writer.writerow(
+                    {"policy": "fifo", "src": "robot_0000", "dst": "robot_0001",
+                     "flow_class": "state", "event_id": 0}
+                )
+            result = required_peers_from_trace(trace_path, "fifo", endpoints)
+        self.assertEqual(
+            result,
+            {
+                "control_station": frozenset(),
+                "robot_0000": frozenset({"robot_0001"}),
+                "robot_0001": frozenset({"robot_0000"}),
             },
         )
 

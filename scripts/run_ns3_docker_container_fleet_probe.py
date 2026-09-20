@@ -300,6 +300,42 @@ def build_static_subscriptions(
     return {endpoint: sorted(pairs) for endpoint, pairs in by_publisher.items()}
 
 
+def required_peers_from_trace(
+    trace_path: Path, policy: str, endpoints: list[str]
+) -> dict[str, frozenset[str]]:
+    """LAN Table V topology-aware readiness (see
+    docs/AUDIT_ACCEPTANCE_TRACKING.md, "LAN READINESS GATE: TOPOLOGY-
+    AWARE FIX"): derives each endpoint's REQUIRED discovery peers
+    directly from the actual trace CSV's own src/dst columns, for the
+    given --policy, instead of assuming every endpoint must see every
+    other endpoint (full mesh). An endpoint appears in another's
+    required-peer set iff at least one trace row has them as the
+    (src, dst) pair (in either direction) -- i.e. iff the workload
+    actually schedules a message between them. This makes no
+    topology assumption of its own: for a star workload (every flow is
+    control_station<->robot_i, confirmed via `_source_for()`/
+    `_destination_for()` in fleetqox/trace.py and empirically verified
+    against a real generated trace -- see the tracking doc) it produces
+    exactly the star's required-peer sets (control_station -> every
+    robot it exchanges a flow with, robot_i -> {control_station} only);
+    for any other workload shape (e.g. one with genuine robot<->robot
+    flows) it would derive that shape's edges instead, with no code
+    change needed here.
+    """
+    peers: dict[str, set[str]] = {endpoint: set() for endpoint in endpoints}
+    endpoint_set = set(endpoints)
+    with trace_path.open(newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            if row["policy"] != policy:
+                continue
+            src, dst = row["src"], row["dst"]
+            if src == dst or src not in endpoint_set or dst not in endpoint_set:
+                continue
+            peers[src].add(dst)
+            peers[dst].add(src)
+    return {endpoint: frozenset(found) for endpoint, found in peers.items()}
+
+
 def compute_latency_stats_ms(endpoint_results: dict[str, Any]) -> dict[str, Any] | None:
     """End-to-end latency percentiles (p50/p95/p99) across every delivered
     message, aggregated over ALL endpoints. Needs no new instrumentation --
@@ -1163,7 +1199,14 @@ class ReferenceTopologyProbe:
         start_wait_timeout_s: float,
         rmw_implementation: str = "rmw_fleetqox_cpp",
         discovery_mode: str = "default",
+        required_peer_ids_by_endpoint: dict[str, frozenset[str]] | None = None,
     ) -> None:
+        # required_peer_ids_by_endpoint: opt-in (default None), LAN's own
+        # topology-aware readiness gate (see required_peers_from_trace()
+        # and docs/AUDIT_ACCEPTANCE_TRACKING.md, "LAN READINESS GATE:
+        # TOPOLOGY-AWARE FIX") -- None preserves this method's exact
+        # prior full-mesh-readiness behavior for every OTHER caller
+        # (Wi-Fi's run_probe() never passes this).
         docker("exec", self.rigger_name, "mkdir", "-p", f"/work/{results_dir_container}")
         self._ready_files = [f"{results_dir_container}/ready_{i}" for i in range(len(self.endpoints))]
         self._start_file = f"{results_dir_container}/start"
@@ -1308,6 +1351,20 @@ class ReferenceTopologyProbe:
             # docs/AUDIT_ACCEPTANCE_TRACKING.md "FleetRMW N/A" for the
             # ~15.1s artifact this replaces with a real near-zero number).
             skip_discovery_wait_flag = " --skip-discovery-wait" if static_mode else ""
+            # LAN topology-aware readiness (opt-in, see this method's own
+            # docstring param note): only applies to the standard,
+            # beacon-based RMWs -- FleetRMW's static mode has no
+            # discovery loop for --required-peer-ids to gate in the
+            # first place (skip_discovery_wait_flag above short-circuits
+            # discovery_converged() before required_peer_ids is ever
+            # consulted -- see that function's own docstring), so passing
+            # this to FleetRMW would be a silent no-op, not a real check;
+            # left absent for it rather than implying a check that
+            # cannot happen.
+            required_peer_ids_flag = ""
+            if required_peer_ids_by_endpoint is not None and rmw_implementation != "rmw_fleetqox_cpp":
+                required = required_peer_ids_by_endpoint.get(endpoint, frozenset())
+                required_peer_ids_flag = f" --required-peer-ids={shlex.quote(','.join(sorted(required)))}"
             inner = (
                 "source /opt/ros/jazzy/setup.bash && "
                 f"{rmw_setup}&& "
@@ -1332,6 +1389,7 @@ class ReferenceTopologyProbe:
                 f"--discovery-timeout-s={discovery_timeout_s:.12g} "
                 f"--start-wait-timeout-s={start_wait_timeout_s} "
                 f"--expected-peer-count={expected_peer_count}"
+                f"{required_peer_ids_flag}"
                 f"{skip_discovery_wait_flag} "
                 f"--summary-json=/work/{result_json} "
                 f"--ready-file=/work/{self._ready_files[i]} "
@@ -2418,6 +2476,13 @@ def run_lan_probe(
     static_subscriptions = (
         build_static_subscriptions(trace_path, policy, endpoints) if effective_static_mode else None
     )
+    # LAN topology-aware readiness (see docs/AUDIT_ACCEPTANCE_TRACKING.md,
+    # "LAN READINESS GATE: TOPOLOGY-AWARE FIX"): derived from this SAME
+    # trace_path/policy/endpoints this run already generated above --
+    # not a separate assumption, the actual per-endpoint edges this
+    # run's own workload will exercise. LAN-only: run_probe() (Wi-Fi)
+    # does not compute or pass this, so its behavior is unaffected.
+    required_peer_ids_by_endpoint = required_peers_from_trace(trace_path, policy, endpoints)
     results_dir_container = f"{output_dir.relative_to(ROOT)}/container_results"
     # Clear any stale ready/result/log files from a PRIOR run at this same
     # output_dir before creating fresh -- confirmed live (17/09/2026, see
@@ -2461,6 +2526,7 @@ def run_lan_probe(
             start_wait_timeout_s=start_wait_timeout_s,
             rmw_implementation=rmw_implementation,
             discovery_mode=discovery_mode,
+            required_peer_ids_by_endpoint=required_peer_ids_by_endpoint,
         )
         probe.wait_for_ready_then_start(ready_deadline_s=ready_deadline_s)
         # No sim_duration_s to time a mid-run sample against here (no

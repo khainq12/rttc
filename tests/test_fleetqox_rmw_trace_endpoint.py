@@ -731,5 +731,139 @@ class DiscoveryConvergedReadinessContractTest(unittest.TestCase):
         )
 
 
+class TopologyAwareReadinessContractTest(unittest.TestCase):
+    """RED/GREEN for the LAN full-mesh-readiness-gate bug (see
+    docs/AUDIT_ACCEPTANCE_TRACKING.md, "LAN READINESS GATE: TOPOLOGY-
+    AWARE FIX"): Table V's actual workload is a STAR
+    (control_station<->robot_i, no robot<->robot flow ever scheduled --
+    see fleetqox/trace.py's _source_for()/_destination_for() and
+    required_peers_from_trace()'s own tests). The OLD gate required
+    every endpoint to see ALL other endpoints' beacons (a full mesh)
+    before declaring READY -- correct for control_station (which does
+    need every robot) but wrong for a robot (which only ever needs
+    control_station), and wrong in the other direction too: a robot
+    must never be marked ready merely because it happens to see other
+    robots' beacons while missing the one peer (control_station) its
+    own workload actually requires.
+
+    These 4 cases exercise discovery_converged()'s NEW identity-based
+    path (required_peer_ids/peers_seen_ids) directly, no wall clock,
+    rclpy, or subprocess dependency -- same style as
+    DiscoveryConvergedReadinessContractTest above."""
+
+    def test_case_1_valid_star_is_ready(self):
+        # control_station sees all 3 robots it actually needs.
+        self.assertTrue(
+            discovery_converged(
+                skip_discovery_wait=False,
+                beacon_active=True,
+                peers_seen=0,
+                expected_peer_count=0,
+                subscription_fallback_ok=False,
+                required_peer_ids=frozenset({"robot_0000", "robot_0001", "robot_0002"}),
+                peers_seen_ids=frozenset({"robot_0000", "robot_0001", "robot_0002"}),
+            )
+        )
+        # Each robot sees only control_station -- NOT the other robots
+        # -- and must STILL be ready, because control_station is the
+        # only peer this robot's own workload requires.
+        self.assertTrue(
+            discovery_converged(
+                skip_discovery_wait=False,
+                beacon_active=True,
+                peers_seen=0,
+                expected_peer_count=0,
+                subscription_fallback_ok=False,
+                required_peer_ids=frozenset({"control_station"}),
+                peers_seen_ids=frozenset({"control_station"}),
+            )
+        )
+
+    def test_case_2_robot_missing_control_station_is_invalid(self):
+        # robot_3 sees other robots' beacons (irrelevant to it) but NOT
+        # control_station -- the one peer it actually requires.
+        self.assertFalse(
+            discovery_converged(
+                skip_discovery_wait=False,
+                beacon_active=True,
+                peers_seen=0,
+                expected_peer_count=0,
+                subscription_fallback_ok=False,
+                required_peer_ids=frozenset({"control_station"}),
+                peers_seen_ids=frozenset({"robot_0001", "robot_0002"}),
+            )
+        )
+
+    def test_case_3_control_station_missing_a_required_robot_is_invalid(self):
+        # control_station saw every robot EXCEPT robot_7, which it does
+        # need (it has a real flow with every robot).
+        self.assertFalse(
+            discovery_converged(
+                skip_discovery_wait=False,
+                beacon_active=True,
+                peers_seen=0,
+                expected_peer_count=0,
+                subscription_fallback_ok=False,
+                required_peer_ids=frozenset({f"robot_{i:04d}" for i in range(8)}),
+                peers_seen_ids=frozenset({f"robot_{i:04d}" for i in range(8) if i != 7}),
+            )
+        )
+
+    def test_case_4_irrelevant_robot_to_robot_missing_edge_does_not_fail(self):
+        # robot_0000 never needs robot_0001 (no flow between them in
+        # this workload) -- never seeing robot_0001's beacon at all
+        # must NOT prevent readiness, as long as the one REQUIRED peer
+        # (control_station) was seen.
+        self.assertTrue(
+            discovery_converged(
+                skip_discovery_wait=False,
+                beacon_active=True,
+                peers_seen=0,
+                expected_peer_count=0,
+                subscription_fallback_ok=False,
+                required_peer_ids=frozenset({"control_station"}),
+                peers_seen_ids=frozenset({"control_station"}),
+            )
+        )
+        # Even if robot_0001's beacon is ALSO seen (harmless extra
+        # information), still ready -- required_peer_ids is a floor,
+        # not an exact-match requirement.
+        self.assertTrue(
+            discovery_converged(
+                skip_discovery_wait=False,
+                beacon_active=True,
+                peers_seen=0,
+                expected_peer_count=0,
+                subscription_fallback_ok=False,
+                required_peer_ids=frozenset({"control_station"}),
+                peers_seen_ids=frozenset({"control_station", "robot_0001"}),
+            )
+        )
+
+    def test_omitting_required_peer_ids_preserves_old_count_based_behavior(self):
+        # Backward compatibility: a caller that does NOT pass
+        # required_peer_ids/peers_seen_ids (every existing caller,
+        # including Wi-Fi's run_probe()) must see EXACTLY the old
+        # count-based decision, unchanged.
+        self.assertFalse(
+            discovery_converged(
+                skip_discovery_wait=False,
+                beacon_active=True,
+                peers_seen=15,
+                expected_peer_count=16,
+                subscription_fallback_ok=False,
+            )
+        )
+        self.assertTrue(
+            discovery_converged(
+                skip_discovery_wait=False,
+                beacon_active=True,
+                peers_seen=16,
+                expected_peer_count=16,
+                subscription_fallback_ok=False,
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -377,6 +377,8 @@ def discovery_converged(
     peers_seen: int,
     expected_peer_count: int,
     subscription_fallback_ok: bool,
+    required_peer_ids: frozenset[str] | None = None,
+    peers_seen_ids: frozenset[str] = frozenset(),
 ) -> bool:
     """The readiness CONTRACT --ready-file is allowed to promise: READY
     only if the required convergence condition has actually been
@@ -397,10 +399,27 @@ def discovery_converged(
     - skip_discovery_wait=True (FleetRMW's static-mode contract, see
       --skip-discovery-wait): this endpoint never entered the discovery
       loop at all by design -- unaffected by this fix, always converged.
-    - beacon_active=True (Fast DDS/CycloneDDS/Zenoh, expected_peer_count>0):
-      converged only if this endpoint's beacon actually observed
-      peers_seen >= expected_peer_count distinct senders before the
-      deadline. A timeout that never reaches this is NOT convergence.
+    - beacon_active=True, required_peer_ids is not None (LAN Table V's
+      topology-aware gate, see docs/AUDIT_ACCEPTANCE_TRACKING.md, "LAN
+      READINESS GATE: TOPOLOGY-AWARE FIX"): converged only if EVERY
+      identity in required_peer_ids (this endpoint's own workload-
+      derived required peers -- see required_peers_from_trace() in
+      run_ns3_docker_container_fleet_probe.py) was actually observed in
+      peers_seen_ids before the deadline. A peer this endpoint's
+      workload never talks to may be absent from peers_seen_ids with no
+      effect -- required_peer_ids is a FLOOR (subset check), not an
+      exact-match requirement, so extra/irrelevant peers seen are
+      harmless. Strictly generalizes the count-based check below: for a
+      full-mesh required_peer_ids (every other endpoint), this is
+      exactly equivalent to peers_seen >= expected_peer_count, since
+      peers_seen_ids can only ever contain identities from that same
+      closed set of endpoints.
+    - beacon_active=True, required_peer_ids is None (every OTHER
+      existing caller, including Wi-Fi's run_probe() -- UNCHANGED
+      behavior, this is the original full-mesh contract): converged
+      only if this endpoint's beacon actually observed peers_seen >=
+      expected_peer_count distinct senders before the deadline. A
+      timeout that never reaches this is NOT convergence.
     - beacon_active=False (the pub.get_subscription_count() fallback,
       only reachable when expected_peer_count==0 and
       skip_discovery_wait==False -- not exercised by any current caller,
@@ -410,6 +429,8 @@ def discovery_converged(
     if skip_discovery_wait:
         return True
     if beacon_active:
+        if required_peer_ids is not None:
+            return required_peer_ids <= peers_seen_ids
         return peers_seen >= expected_peer_count
     return subscription_fallback_ok
 
@@ -627,6 +648,30 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--required-peer-ids",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated list of OTHER endpoint names this endpoint's "
+            "own workload actually requires discovery convergence with "
+            "(e.g. a robot in Table V's star topology only needs "
+            "'control_station', not every other robot) -- see "
+            "required_peers_from_trace() in "
+            "run_ns3_docker_container_fleet_probe.py and "
+            "docs/AUDIT_ACCEPTANCE_TRACKING.md, 'LAN READINESS GATE: "
+            "TOPOLOGY-AWARE FIX'. Default (flag omitted entirely, i.e. "
+            "Python None, DISTINCT from an explicitly empty string) "
+            "preserves the OLD full-mesh --expected-peer-count contract "
+            "unchanged -- this flag is opt-in per caller, not a behavior "
+            "change for any existing invocation (e.g. Wi-Fi's run_probe() "
+            "never passes it). When passed (even as an empty string, "
+            "meaning this endpoint requires zero peers), it takes "
+            "priority over --expected-peer-count: convergence requires "
+            "every listed identity to have been seen, regardless of how "
+            "many OTHER (irrelevant) peers were or weren't seen."
+        ),
+    )
+    parser.add_argument(
         "--skip-discovery-wait",
         action="store_true",
         help=(
@@ -776,9 +821,18 @@ def main() -> int:
     # trusting it here would have made "discovery convergence time" either
     # always equal --discovery-timeout-s (if it never fires) or wrong (if
     # it fires late/early), not a real measurement.
+    # required_peer_ids: parsed once here, empty/None means "not
+    # specified" -- see --required-peer-ids's own help text and
+    # discovery_converged()'s docstring for the full topology-aware
+    # readiness contract this enables.
+    required_peer_ids: frozenset[str] | None = (
+        frozenset(p for p in args.required_peer_ids.split(",") if p)
+        if args.required_peer_ids is not None
+        else None
+    )
     discovery_peers_seen: set[str] = set()
     beacon_pub = None
-    if args.expected_peer_count > 0:
+    if args.expected_peer_count > 0 or required_peer_ids is not None:
         beacon_topic = "/fleetqox_trace/_discovery_probe"
         beacon_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST, depth=1, reliability=ReliabilityPolicy.RELIABLE
@@ -822,7 +876,10 @@ def main() -> int:
                 rclpy.spin_once(node, timeout_sec=0.0)
             rclpy.spin_once(node, timeout_sec=0.1)
             if beacon_pub is not None:
-                if len(discovery_peers_seen) >= args.expected_peer_count:
+                if required_peer_ids is not None:
+                    if required_peer_ids <= discovery_peers_seen:
+                        break
+                elif len(discovery_peers_seen) >= args.expected_peer_count:
                     break
             elif not publishers or all(
                 pub.get_subscription_count() > 0 for pub in publishers.values()
@@ -836,8 +893,10 @@ def main() -> int:
         peers_seen=len(discovery_peers_seen),
         expected_peer_count=args.expected_peer_count,
         subscription_fallback_ok=subscription_fallback_converged,
+        required_peer_ids=required_peer_ids,
+        peers_seen_ids=frozenset(discovery_peers_seen),
     )
-    if beacon_pub is not None and len(discovery_peers_seen) < args.expected_peer_count:
+    if beacon_pub is not None and not converged:
         # TEMPORARY diagnostic for the "last-launched endpoint never sees
         # any beacon" investigation (docs/AUDIT_ACCEPTANCE_TRACKING.md) --
         # tells apart "writer never matched" from "matched but callback
@@ -849,6 +908,11 @@ def main() -> int:
                     "beacon_pub_subscription_count": beacon_pub.get_subscription_count(),
                     "beacon_raw_seen_count": len(beacon_raw_seen),
                     "beacon_raw_seen_sample": beacon_raw_seen[:10],
+                    "required_peer_ids": sorted(required_peer_ids) if required_peer_ids is not None else None,
+                    "missing_required_peer_ids": (
+                        sorted(required_peer_ids - discovery_peers_seen)
+                        if required_peer_ids is not None else None
+                    ),
                     "topic_names_and_types": node.get_topic_names_and_types(),
                 }
             ),
@@ -1034,6 +1098,9 @@ def main() -> int:
         "discovery_convergence_s": discovery_convergence_s,
         "discovery_peers_seen": len(discovery_peers_seen),
         "discovery_expected_peers": args.expected_peer_count,
+        "discovery_required_peer_ids": sorted(required_peer_ids) if required_peer_ids is not None else None,
+        "discovery_peers_seen_ids": sorted(discovery_peers_seen),
+        "discovery_ready": converged,
         "start_wall_monotonic_ns": start_wall_ns,
         "drain_deadline_monotonic_ns": drain_deadline_ns,
         "final_drain_deadline_monotonic_ns": final_drain_deadline_ns,
