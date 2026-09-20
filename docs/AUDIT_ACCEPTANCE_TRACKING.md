@@ -15285,6 +15285,131 @@ whether it's load-driven (actionable) or a fixed CPU ceiling
 (meaning N=8 ns-3-based measurements are unreliable regardless of any
 FleetRMW-side change).
 
+## N=8 REALTIME-LAG VALIDATION -- MAJOR FINDING: sim_duration_s/scenario_timeout_s DEFAULT MISMATCH, PLUS CONFIRMED LOAD-DRIVEN PACING LAG
+
+Follow-up to "N=8 REMAINING WI-FI LOSS AFTER DIRECTED-REPLY" above, per
+its own next step (isolate whether that pass's own instrumentation
+overhead caused the measured realtime lag). Adds `--heavyTracing`
+(default **false**) to `external/ns3/fleetqox_trace_replay_tap.cc`,
+gating every expensive per-packet trace/extraction hook added by that
+pass behind one flag -- with it off, the program's trace connections
+and per-event work are IDENTICAL to what this investigation used
+BEFORE that pass. Also adds `wall_elapsed_s`/`sim_lag_s`/`self_cpu_s`/
+`self_rss_kb`/`mac_tx_bytes`/`mac_rx_bytes` to the existing 5s
+`FLEETQOX_WIFI_STATS` print -- all O(1) per print (one clock read + two
+`/proc` file reads + plain arithmetic), so these cannot themselves be
+the confound. 835 passed, same 8 pre-existing failures, 0 regressions.
+No radio/QoS/timeout/workload/production change.
+
+### STEP 1 (isolate instrumentation): NOT the cause
+
+N=8 seed=7, directed-reply ON, default `FLEETQOX_RMW_ACK_NACK_REDUNDANT_RESEND_COUNT`
+(unset = 10), `--heavyTracing=false`: `sim_lag_s` still grows from
+0.02s (sim=5s) to **14.26s (sim=60s, wall=74.26s)** -- the SAME growing-
+lag pattern the heavy-tracing pass observed. **Instrumentation
+overhead is not the (sole) cause.**
+
+### A bigger, independent discovery: `sim_duration_s` defaults to 60s, `scenario_timeout_s` defaults to 120s
+
+While instrumenting this, found that `run_coordination_probe()`
+(`scripts/run_ns3_docker_container_fleet_probe.py`) has an **unrelated
+default parameter mismatch**: `sim_duration_s: float = 60.0` (passed
+straight to the ns-3 driver's `Simulator::Stop(Seconds(simDuration))`)
+is completely independent of `scenario_timeout_s: float = 120.0` (the
+coordination workload's own real-time deadline) -- and NO script in
+this entire investigation ever overrode `sim_duration_s` for an N=8
+run. This means **ns-3's own simulated network has been deliberately
+told to shut itself down at simulated-time 60s in EVERY N=8 measurement
+this investigation has ever made, while the coordination workload kept
+running for up to 120 real seconds** -- the back half of every default-
+duration N=8 run has been proceeding over an ALREADY-EXITED ns-3
+process (no TapBridge, no Wi-Fi model, nothing). This is a distinct
+mechanism from realtime pacing lag, and it alone would produce
+"traffic sent after ~60-75s never gets a chance to arrive" regardless
+of any lag or radio-contention question. Not fixed in this pass --
+flagged as the highest-priority next step below.
+
+### STEP 2 (load A/B): lag is load-driven within the window ns-3 is alive
+
+| | seed=7 default (redundancy=10) | seed=7 redundancy=0 |
+|---|---|---|
+| sim_lag_s @ sim=15s | 1.33s | 0.06s |
+| sim_lag_s @ sim=25s | 3.28s | 0.02s |
+| sim_lag_s @ last capture | **14.26s** (sim=60, wall=74.26) | **0.02s** (sim=25, wall=25.02) |
+| mac_tx_total @ sim=15s | 8,088 | 3,658 (-55%) |
+| mac_tx_bytes @ sim=15s | 4,778,660 | 2,100,874 (-56%) |
+| task_completion_s (all 9 endpoints) | ~120.3s (from prior A/B) | **12.6-15.0s** |
+| crossings_completed | stuck (prior A/B: 1-4/5) | **5/5, all 9 endpoints** |
+| forced_entry | universal (prior A/B) | **0%, all 9 endpoints** |
+| sim_lag_s <= 10s gate | **INVALID** | **VALID** |
+
+Reducing `FLEETQOX_RMW_ACK_NACK_REDUNDANT_RESEND_COUNT` from the
+default 10 to 0 (directed-reply held ON, nothing else changed)
+eliminated the pacing lag almost entirely (stayed under 0.1s for the
+whole observed window) AND produced the **first fully-healthy, validly-
+measured N=8 result in this entire investigation**: all 9 endpoints
+completed 5/5 crossings with 0% forced_entry in 12.6-15.0 real seconds
+-- well inside the window ns-3's network was genuinely alive, so this
+result is NOT confounded by the `sim_duration_s` issue either. Single
+seed only -- not yet replicated.
+
+### Verdicts
+
+1. **Instrumentation responsible: NO.**
+2. **N=8 default**: wall=74.26s / sim=60.0s / **lag=14.26s** (growing,
+   captured before the sim_duration_s=60 cutoff would have fired
+   anyway).
+3. **N=8 redundancy=0**: wall=25.02s / sim=25.0s / **lag=0.02s**
+   (workload itself finished at real 12.6-15.0s).
+4. **Packet/byte reduction**: ~55% fewer MAC-tx events, ~56% fewer
+   MAC-tx bytes by the sim=15s mark (redundancy=0 vs default).
+5. **Validity table**: N=2 valid (lag~0.02-0.06s, measured, multiple
+   smoke tests); N=4 valid (inferred -- every N=4 measurement in this
+   investigation's history completes in single-digit-to-low-double-
+   digit real seconds, never approaching either the lag gate or the
+   60s `sim_duration_s` ceiling; not directly re-measured with lag
+   telemetry in this pass); N=8 default INVALID; N=8 redundancy=0
+   VALID.
+6. **Load-driven lag: PARTIAL.** The within-window PACING lag is
+   genuinely load-driven (redundancy=0 removes it almost entirely).
+   But there is ALSO a separate, load-INDEPENDENT `sim_duration_s`(60)
+   vs `scenario_timeout_s`(120) parameter mismatch that would starve
+   the network partway through ANY run lasting longer than ~60-75 real
+   seconds, regardless of load.
+7. **Previous N=8 conclusions that remain valid**: directed-REPLY's
+   fan-out elimination (measured/confirmed at N=2/N=4, both genuinely
+   valid scales, and architecturally identical regardless of runtime);
+   the QUALITATIVE direction that ACK/NACK redundancy causally
+   contributes to N=8 DATA loss (now dramatically reconfirmed, in the
+   right direction, by this pass's own A/B).
+8. **Previous N=8 numbers that must be marked INVALID**: essentially
+   every default-config N=8 ABSOLUTE performance number in this
+   investigation's history -- `task_completion_s`≈120.3s,
+   `forced_entry`≈100%, and every permanent-loss/traffic-composition
+   percentage from the directed-REPLY A/B (task/section above) and the
+   "N=8 REMAINING WI-FI LOSS" pass (delivered=47.07%,
+   `mac_rx_drop_total`=769,849, etc.) -- all measured under the same
+   `sim_duration_s`=60 default, meaning a large, unquantified fraction
+   of every one of those numbers reflects "sent into a dead network",
+   not genuine 120-real-second radio contention. The RELATIVE/
+   directional comparisons within each of those experiments (old vs
+   new, A vs B) likely still point the right way since both arms of
+   each comparison shared the same confound, but their absolute
+   magnitudes do not.
+9. **N=8 benchmark scientifically usable under default config: NO.**
+   A valid, fully-successful CONFIGURATION now exists (directed-reply +
+   `ACK_NACK_REDUNDANT_RESEND_COUNT=0`) but is single-seed and
+   unreplicated.
+
+**Next step**: fix the `sim_duration_s`(60.0 default)/`scenario_timeout_s`
+(120.0 default) mismatch in `run_coordination_probe()` (pure harness
+configuration, zero radio/QoS/workload/production-code change) so
+ns-3's own network never exits before the coordination workload's own
+deadline -- this is required before any future N=8 (or any longer-
+running) Table VI measurement can be trusted, and it must land before
+attempting to replicate the exciting `redundancy=0` result across
+multiple seeds.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
