@@ -77,12 +77,14 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
 #include <iostream>
 #include <map>
 #include <mutex>
 #include <set>
 #include <sstream>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 using namespace ns3;
@@ -106,11 +108,86 @@ namespace
 constexpr std::size_t kSmallFrameThresholdBytes = 100;
 constexpr std::size_t kMaxRxDropReasons = 32;
 
+// Added for the "N=8 REALTIME-LAG VALIDATION" investigation (see
+// docs/AUDIT_ACCEPTANCE_TRACKING.md): the "N=8 REMAINING WI-FI LOSS
+// AFTER DIRECTED-REPLY" pass found ns-3's own Simulator::Now() reaching
+// only ~60s of simulated time across a 120s real-wall-clock run, but
+// could not tell apart three explanations -- (A) that same pass's OWN
+// heavy per-packet instrumentation (LogMacEvent's CopyData + base64
+// decode + byte-search, called from MacTx/MacRx/MacTxDrop/MacRxDrop/
+// PhyRxDrop/DroppedMpdu/WifiMacQueueExpired -- up to 769,849 times in
+// one run per that pass's own mac_rx_drop_total) slowing the simulator
+// down enough to CAUSE the lag itself; (B) genuine FleetRMW/network
+// event LOAD (independent of this program's own tracing) simply being
+// more than a real-time simulator can keep up with at N=8; or (C) a
+// more fundamental CPU ceiling. --heavyTracing (default FALSE) gates
+// every one of those expensive per-packet LogMacEvent calls and the
+// DroppedMpdu/MacTxFinalDataFailed/BackoffTrace/CwTrace/queue-backlog
+// hooks entirely -- with it off, this program touches nothing this
+// investigation didn't already touch BEFORE that pass (the original,
+// pre-existing MacTx/MacTxDrop/MacRx/MacRxDrop/PhyTxBegin/PhyRxDrop
+// atomic-only counters), isolating hypothesis A. wall_elapsed_s/
+// self_cpu_s/self_rss_kb below are the ONLY new measurement this pass
+// adds when --heavyTracing=false -- all three are O(1) per print (a
+// wall-clock read plus two small /proc file reads every 5s), not
+// per-packet, so enabling them cannot itself be the confound.
+bool g_heavyTracing = false;
+std::chrono::steady_clock::time_point g_wallClockStart;
+
+double
+SelfCpuSeconds()
+{
+  std::ifstream stat("/proc/self/stat");
+  if (!stat.is_open())
+  {
+    return -1.0;
+  }
+  std::string skip;
+  // Fields 1-13 are pid,(comm),state,ppid,...,cutime -- utime/stime are
+  // fields 14/15 (1-indexed). comm can contain spaces inside parens, so
+  // skip past the closing ')' first rather than counting whitespace-
+  // delimited tokens naively.
+  std::getline(stat, skip, ')');
+  long utimeTicks = 0;
+  long stimeTicks = 0;
+  std::string field;
+  for (int i = 0; i < 13; ++i)
+  {
+    stat >> field;
+  }
+  stat >> utimeTicks >> stimeTicks;
+  long ticksPerSec = sysconf(_SC_CLK_TCK);
+  if (ticksPerSec <= 0)
+  {
+    return -1.0;
+  }
+  return static_cast<double>(utimeTicks + stimeTicks) / static_cast<double>(ticksPerSec);
+}
+
+long
+SelfRssKb()
+{
+  std::ifstream status("/proc/self/status");
+  std::string line;
+  while (std::getline(status, line))
+  {
+    if (line.rfind("VmRSS:", 0) == 0)
+    {
+      long kb = 0;
+      std::sscanf(line.c_str(), "VmRSS: %ld kB", &kb);
+      return kb;
+    }
+  }
+  return -1;
+}
+
 std::atomic<uint64_t> g_macTxTotal{0};
+std::atomic<uint64_t> g_macTxBytes{0};
 std::atomic<uint64_t> g_macTxSmall{0};
 std::atomic<uint64_t> g_macTxLarge{0};
 std::atomic<uint64_t> g_macTxDropTotal{0};
 std::atomic<uint64_t> g_macRxTotal{0};
+std::atomic<uint64_t> g_macRxBytes{0};
 std::atomic<uint64_t> g_macRxDropTotal{0};
 std::atomic<uint64_t> g_phyTxBeginTotal{0};
 std::atomic<uint64_t> g_phyRxDropTotal{0};
@@ -393,6 +470,15 @@ ExtractEventId(Ptr<const Packet> packet, std::string& eventId)
 void
 LogMacEvent(const std::string& kind, const std::string& who, Ptr<const Packet> packet)
 {
+  // Single gating point for ALL per-packet extraction/logging overhead
+  // (see g_heavyTracing's doc comment) -- every call site below still
+  // calls this unconditionally; skipping here (before the CopyData +
+  // base64-decode + byte-search ExtractEventId() does) is what makes
+  // --heavyTracing=false actually cheap, not just "logs fewer lines".
+  if (!g_heavyTracing)
+  {
+    return;
+  }
   g_macEventAttempts.fetch_add(1, std::memory_order_relaxed);
   std::string eventId;
   if (!ExtractEventId(packet, eventId))
@@ -436,6 +522,11 @@ void
 MacTxTrace(std::string who, Ptr<const Packet> packet)
 {
   g_macTxTotal.fetch_add(1, std::memory_order_relaxed);
+  // Cheap (O(1) arithmetic, no string/extraction work) byte counter --
+  // unconditional, for the "N=8 REALTIME-LAG VALIDATION" investigation's
+  // "total packets/bytes if cheaply available" measurement without
+  // needing --heavyTracing.
+  g_macTxBytes.fetch_add(packet->GetSize(), std::memory_order_relaxed);
   if (packet->GetSize() <= kSmallFrameThresholdBytes)
   {
     g_macTxSmall.fetch_add(1, std::memory_order_relaxed);
@@ -458,6 +549,7 @@ void
 MacRxTrace(std::string who, Ptr<const Packet> packet)
 {
   g_macRxTotal.fetch_add(1, std::memory_order_relaxed);
+  g_macRxBytes.fetch_add(packet->GetSize(), std::memory_order_relaxed);
   LogMacEvent("rx", who, packet);
 }
 
@@ -661,16 +753,31 @@ PrintWifiStats(uint32_t totalStations, uint32_t numAps)
   // from real wall-clock scheduling jitter around when the orchestrator
   // notices completion (see docs/AUDIT_ACCEPTANCE_TRACKING.md 15/09/2026
   // "XÁC ĐỊNH ĐƯỢC NGUỒN GỐC nhiễu nền").
+  // Added for the "N=8 REALTIME-LAG VALIDATION" investigation (see
+  // g_heavyTracing's doc comment): O(1) per print (one steady_clock
+  // read plus two small /proc file reads) regardless of --heavyTracing,
+  // so these fields alone cannot be the confound they're measuring.
+  double wallElapsedS = std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - g_wallClockStart)
+                            .count();
+  double simTimeS = Simulator::Now().GetSeconds();
   std::cout << "FLEETQOX_WIFI_STATS {"
-            << "\"sim_time_s\":" << Simulator::Now().GetSeconds() << ","
+            << "\"sim_time_s\":" << simTimeS << ","
+            << "\"wall_elapsed_s\":" << wallElapsedS << ","
+            << "\"sim_lag_s\":" << (wallElapsedS - simTimeS) << ","
+            << "\"self_cpu_s\":" << SelfCpuSeconds() << ","
+            << "\"self_rss_kb\":" << SelfRssKb() << ","
+            << "\"heavy_tracing\":" << (g_heavyTracing ? "true" : "false") << ","
             << "\"total_stations\":" << totalStations << ","
             << "\"num_aps\":" << numAps << ","
             << "\"associated_stations\":" << g_associatedStaCount.load() << ","
             << "\"mac_tx_total\":" << g_macTxTotal.load() << ","
+            << "\"mac_tx_bytes\":" << g_macTxBytes.load() << ","
             << "\"mac_tx_small\":" << g_macTxSmall.load() << ","
             << "\"mac_tx_large\":" << g_macTxLarge.load() << ","
             << "\"mac_tx_drop_total\":" << g_macTxDropTotal.load() << ","
             << "\"mac_rx_total\":" << g_macRxTotal.load() << ","
+            << "\"mac_rx_bytes\":" << g_macRxBytes.load() << ","
             << "\"mac_rx_drop_total\":" << g_macRxDropTotal.load() << ","
             << "\"phy_tx_begin_total\":" << g_phyTxBeginTotal.load() << ","
             << "\"phy_rx_drop_total\":" << g_phyRxDropTotal.load() << ","
@@ -704,6 +811,7 @@ PrintWifiStats(uint32_t totalStations, uint32_t numAps)
 int
 main(int argc, char* argv[])
 {
+  g_wallClockStart = std::chrono::steady_clock::now();
   uint32_t numRobots = 8;
   std::string wifiMode = "ErpOfdmRate54Mbps";
   double mobilitySpeed = 0.0;
@@ -830,6 +938,18 @@ main(int argc, char* argv[])
       "rxSensitivityDbm",
       "WifiPhy RxSensitivity in dBm (reference diagram: -82 dBm).",
       rxSensitivityDbm);
+  cmd.AddValue(
+      "heavyTracing",
+      "Enable the 'N=8 REMAINING WI-FI LOSS AFTER DIRECTED-REPLY' pass's "
+      "expensive per-packet MAC-event extraction/logging and "
+      "DroppedMpdu/MacTxFinalDataFailed/BackoffTrace/CwTrace/queue-"
+      "backlog hooks. Default false: with this off, the program's trace "
+      "connections and per-event work are identical to what this "
+      "investigation used BEFORE that pass -- see g_heavyTracing's own "
+      "doc comment for why (isolating whether that pass's OWN "
+      "instrumentation overhead, not FleetRMW/network load, caused the "
+      "measured ns-3 realtime lag).",
+      g_heavyTracing);
   cmd.Parse(argc, argv);
   if (layout != "grid" && layout != "circle")
   {
@@ -1225,21 +1345,35 @@ main(int argc, char* argv[])
     Ptr<WifiNetDevice> dev = DynamicCast<WifiNetDevice>(stationDevices.Get(i));
     const std::string& who = stationEndpointLabels[i];
     Ptr<WifiMac> wmac = dev->GetMac();
+    // These 6 are the ORIGINAL, pre-"N=8 REMAINING WI-FI LOSS" hooks --
+    // cheap atomic-only counters even before this pass, connected
+    // unconditionally (matches this program's behavior for every prior
+    // investigation that used it).
     wmac->TraceConnectWithoutContext("MacTx", MakeBoundCallback(&MacTxTrace, who));
     wmac->TraceConnectWithoutContext("MacTxDrop", MakeBoundCallback(&MacTxDropTrace, who));
     wmac->TraceConnectWithoutContext("MacRx", MakeBoundCallback(&MacRxTrace, who));
     wmac->TraceConnectWithoutContext("MacRxDrop", MakeBoundCallback(&MacRxDropTrace, who));
-    wmac->TraceConnectWithoutContext("DroppedMpdu", MakeBoundCallback(&DroppedMpduTrace, who));
     dev->GetPhy()->TraceConnectWithoutContext("PhyTxBegin", MakeBoundCallback(&PhyTxBeginTrace, who));
     dev->GetPhy()->TraceConnectWithoutContext("PhyRxDrop", MakeBoundCallback(&PhyRxDropTrace, who));
-    wmac->GetWifiRemoteStationManager()->TraceConnectWithoutContext(
-        "MacTxFinalDataFailed", MakeBoundCallback(&MacTxFinalDataFailedTrace, who));
-    Ptr<Txop> txop = wmac->GetTxop();
-    txop->TraceConnectWithoutContext("BackoffTrace", MakeBoundCallback(&BackoffValueTrace, who));
-    txop->TraceConnectWithoutContext("CwTrace", MakeBoundCallback(&CwValueTrace, who));
-    txop->GetWifiMacQueue()->TraceConnectWithoutContext(
-        "Expired", MakeBoundCallback(&WifiMacQueueExpiredTrace, who));
-    g_queueBacklogTargets.emplace_back(who, txop->GetWifiMacQueue());
+    // Everything below is new in the "N=8 REMAINING WI-FI LOSS AFTER
+    // DIRECTED-REPLY" pass -- gated behind --heavyTracing (default
+    // false) for the "N=8 REALTIME-LAG VALIDATION" investigation (see
+    // g_heavyTracing's doc comment): not connecting these trace sources
+    // at all when false, not just skipping their callback bodies, so
+    // --heavyTracing=false reproduces exactly this program's PRE-that-
+    // pass behavior.
+    if (g_heavyTracing)
+    {
+      wmac->TraceConnectWithoutContext("DroppedMpdu", MakeBoundCallback(&DroppedMpduTrace, who));
+      wmac->GetWifiRemoteStationManager()->TraceConnectWithoutContext(
+          "MacTxFinalDataFailed", MakeBoundCallback(&MacTxFinalDataFailedTrace, who));
+      Ptr<Txop> txop = wmac->GetTxop();
+      txop->TraceConnectWithoutContext("BackoffTrace", MakeBoundCallback(&BackoffValueTrace, who));
+      txop->TraceConnectWithoutContext("CwTrace", MakeBoundCallback(&CwValueTrace, who));
+      txop->GetWifiMacQueue()->TraceConnectWithoutContext(
+          "Expired", MakeBoundCallback(&WifiMacQueueExpiredTrace, who));
+      g_queueBacklogTargets.emplace_back(who, txop->GetWifiMacQueue());
+    }
   }
   for (uint32_t i = 0; i < apDevices.GetN(); ++i)
   {
@@ -1250,23 +1384,29 @@ main(int argc, char* argv[])
     wmac->TraceConnectWithoutContext("MacTxDrop", MakeBoundCallback(&MacTxDropTrace, who));
     wmac->TraceConnectWithoutContext("MacRx", MakeBoundCallback(&MacRxTrace, who));
     wmac->TraceConnectWithoutContext("MacRxDrop", MakeBoundCallback(&MacRxDropTrace, who));
-    wmac->TraceConnectWithoutContext("DroppedMpdu", MakeBoundCallback(&DroppedMpduTrace, who));
     dev->GetPhy()->TraceConnectWithoutContext("PhyTxBegin", MakeBoundCallback(&PhyTxBeginTrace, who));
     dev->GetPhy()->TraceConnectWithoutContext("PhyRxDrop", MakeBoundCallback(&PhyRxDropTrace, who));
-    wmac->GetWifiRemoteStationManager()->TraceConnectWithoutContext(
-        "MacTxFinalDataFailed", MakeBoundCallback(&MacTxFinalDataFailedTrace, who));
-    Ptr<Txop> txop = wmac->GetTxop();
-    txop->TraceConnectWithoutContext("BackoffTrace", MakeBoundCallback(&BackoffValueTrace, who));
-    txop->TraceConnectWithoutContext("CwTrace", MakeBoundCallback(&CwValueTrace, who));
-    txop->GetWifiMacQueue()->TraceConnectWithoutContext(
-        "Expired", MakeBoundCallback(&WifiMacQueueExpiredTrace, who));
-    g_queueBacklogTargets.emplace_back(who, txop->GetWifiMacQueue());
+    if (g_heavyTracing)
+    {
+      wmac->TraceConnectWithoutContext("DroppedMpdu", MakeBoundCallback(&DroppedMpduTrace, who));
+      wmac->GetWifiRemoteStationManager()->TraceConnectWithoutContext(
+          "MacTxFinalDataFailed", MakeBoundCallback(&MacTxFinalDataFailedTrace, who));
+      Ptr<Txop> txop = wmac->GetTxop();
+      txop->TraceConnectWithoutContext("BackoffTrace", MakeBoundCallback(&BackoffValueTrace, who));
+      txop->TraceConnectWithoutContext("CwTrace", MakeBoundCallback(&CwValueTrace, who));
+      txop->GetWifiMacQueue()->TraceConnectWithoutContext(
+          "Expired", MakeBoundCallback(&WifiMacQueueExpiredTrace, who));
+      g_queueBacklogTargets.emplace_back(who, txop->GetWifiMacQueue());
+    }
     Ptr<ApWifiMac> apMac = DynamicCast<ApWifiMac>(wmac);
     apMac->TraceConnectWithoutContext("AssociatedSta", MakeCallback(&AssociatedStaTrace));
   }
 
   Simulator::Schedule(Seconds(5.0), &PrintWifiStats, totalStations, numAps);
-  Simulator::Schedule(Seconds(2.0), &PrintQueueBacklog);
+  if (g_heavyTracing)
+  {
+    Simulator::Schedule(Seconds(2.0), &PrintQueueBacklog);
+  }
 
   Simulator::Stop(Seconds(simDuration));
   Simulator::Run();
