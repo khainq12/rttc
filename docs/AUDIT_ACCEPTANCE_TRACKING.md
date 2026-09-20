@@ -16256,6 +16256,96 @@ test's `ns3_log`.
    silently exceeded the gate instead fails fast and is visibly
    excluded rather than needing after-the-fact `sim_lag_s` inspection.
 
+## Phase 6: combine proven-safe optimizations, N=8/N=16 revalidation -- N=16 CEILING CONFIRMED, STOP
+
+Combines every optimization that individually survived Phases 2-5 with
+a KEEP verdict. That set is exactly **one item**: the `heap` event
+scheduler (Phase 3). Phase 2 (PHY) was not applicable (Yans already
+exclusive, nothing to change). Phase 4 found zero avoidable event
+sources (nothing disabled). Phase 5 (realtime hard-limit) is a
+measurement-safety mode, not a performance change, and is left at its
+default-disabled state for these data-collection runs specifically so
+the FULL `sim_lag_s` trajectory remains observable for documenting the
+ceiling (rather than aborting early at whatever threshold a hard limit
+would be set to) -- it remains available and tested (see Phase 5) for
+future runs where fail-fast is preferred over full-trajectory
+visibility.
+
+### N=8, combined config (`scheduler=heap`), seeds 7, 13, 29
+
+| seed | sim_lag_s | valid | data_delivery_pct | forced_entry | 5/5 crossings | task_completion_s_mean |
+|---|---|---|---|---|---|---|
+| 7 | 0.026 | true | 100.0 | false | true | 13.57 |
+| 13 | 0.018 | true | 100.0 | false | true | 13.32 |
+| 29 | 0.024 | true | 100.0 | false | true | 14.18 |
+
+**N=8 remains valid and healthy under the combined config, 3/3 seeds**
+-- identical conclusion to the pre-existing N=8 baseline. The `heap`
+scheduler introduces no regression at N=8.
+
+### N=16, combined config (`scheduler=heap`), seed 7 (first, per this task's own escalation order)
+
+Already measured in the Phase 3 section above (that test WAS the
+combined config, since `heap` is the only ingredient in this
+combination): `sim_lag_s`=27.02s, `self_cpu_s`=120.46s, `valid`=**false**
+(27.02s is far above the 10s gate -- not a borderline case).
+
+Per this task's own explicit stop rule ("If N=16 remains invalid after
+all defensible optimizations: STOP and document the demonstrated
+realtime scalability ceiling"): **N=16 seed=7 is invalid under the
+combined config, so seeds 13/29/41/53 are NOT run** -- there is no
+scientific reason to burn 4 more ~130s runs confirming invalidity when
+the mechanism (genuine Wi-Fi PHY/MAC computation, per "N=16 CPU
+PROFILE") is structural, not seed-dependent noise, and the single
+proven-safe optimization available closes only ~18% of an enormous
+gap. **STOP is the correct action here, not a shortfall.**
+
+### Why the gap could not plausibly be closed by any further defensible optimization
+
+The "N=16 CPU PROFILE" section's own flat profile attributes only
+~1.96% of CPU samples directly to `ns3::MapScheduler`/core-scheduler
+machinery (understated per that section's own inlining caveat, but
+even a generous 3-4x correction for inlined glue tops out around 6-8%
+of total CPU). `heap` measurably improved `sim_lag_s` by ~18% -- a
+reasonable result for optimizing that slice. Reaching the 10s gate from
+27.02s requires eliminating **~63% more** of the total wall-clock lag.
+The dominant, PROVEN cost (Wi-Fi PHY/MAC computation: interference
+calculation, preamble/backoff/channel-access, growing SUPER-linearly
+with station count -- `phy_rx_drop` rate at 5.81x for a 2x station
+increase) is exactly the real 802.11 contention/interference behavior
+this task's own STRICT SCIENTIFIC RULE forbids weakening. There is no
+remaining semantics-preserving lever in this investigation's scope
+(ns-3 itself is apt-installed, not vendored/patchable here) that could
+plausibly close a gap of this size.
+
+### Verdicts
+
+1. Each optimization, final KEEP/REVERT:
+   - **PHY (Yans vs Spectrum)**: N/A, no change (already Yans).
+   - **Event scheduler (`heap`)**: **KEEP** -- opt-in via
+     `--scheduler=heap`, not yet made the harness's own default.
+   - **Avoidable event-source removal**: N/A, nothing found to remove.
+   - **Realtime hard-limit safety gate**: **KEEP** as an opt-in
+     measurement-safety mode (default disabled) -- proven to work
+     correctly and to have caught a real harness silent-continuation
+     gap (now fixed) during its own verification.
+2. N=8 before -> after (combined config): valid before, **valid after**
+   (3/3 seeds 7/13/29), 100% delivery / 5/5 crossings / no forced_entry
+   unchanged in both cases -- **no regression**.
+3. N=16 before -> after (combined config, seed=7): `sim_lag_s` 32.83s
+   (map, matched baseline) -> 27.02s (heap) -- improved but **still far
+   above the 10s validity gate**.
+4. **N=16 scientifically valid now: NO.**
+5. Per this task's own explicit rule: **STOP**. No N=16 performance
+   table is produced (would require validity first). The demonstrated
+   realtime scalability ceiling for this Table VI Ricart-Agrawala
+   Wi-Fi benchmark, under this ns-3 model and this validity gate,
+   remains **N=8** -- unchanged from before this entire pass, now
+   additionally confirmed to be the ceiling even after exhausting every
+   semantics-preserving optimization avenue this task specifically
+   asked to be investigated (PHY choice, event scheduler, avoidable
+   event sources).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
