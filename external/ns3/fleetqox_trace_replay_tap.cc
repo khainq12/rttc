@@ -960,6 +960,35 @@ main(int argc, char* argv[])
       "instrumentation overhead, not FleetRMW/network load, caused the "
       "measured ns-3 realtime lag).",
       g_heavyTracing);
+  std::string schedulerType = "map";
+  cmd.AddValue(
+      "scheduler",
+      "ns-3 Simulator event-scheduler implementation: 'map' (ns3::MapScheduler, "
+      "std::map/red-black-tree based -- this program's ORIGINAL, still-default "
+      "behavior, byte-for-byte unchanged if this flag is never passed), 'heap' "
+      "(ns3::HeapScheduler, binary heap), 'list' (ns3::ListScheduler, O(n) "
+      "insert -- reference/slow baseline only), 'calendar' "
+      "(ns3::CalendarScheduler), or 'priority' (ns3::PriorityQueueScheduler). "
+      "Added for the \"N=16 SERIOUS PERFORMANCE PASS\" investigation (see "
+      "docs/AUDIT_ACCEPTANCE_TRACKING.md) after profiling found "
+      "ns3::MapScheduler::Insert as a hot function at N=16 -- purely an "
+      "internal event-ordering data structure, does not change WHICH events "
+      "fire or in what simulated-time order, so switching it can never alter "
+      "simulated network semantics/results, only wall-clock speed.",
+      schedulerType);
+  double realtimeHardLimitS = 0.0;
+  cmd.AddValue(
+      "realtimeHardLimitS",
+      "RealtimeSimulatorImpl SynchronizationMode: 0 (default, unchanged "
+      "behavior) keeps SYNC_BEST_EFFORT (silently fall behind and keep "
+      "going, this program's original behavior). A positive value switches "
+      "to SYNC_HARD_LIMIT with that many seconds of tolerance -- ns-3 itself "
+      "raises a fatal error (hard stop, not a silent bad measurement) if "
+      "wall-clock lag ever exceeds this threshold. Added for the \"N=16 "
+      "SERIOUS PERFORMANCE PASS\" investigation's Phase 5 (measurement "
+      "safety, not a performance change) -- see "
+      "docs/AUDIT_ACCEPTANCE_TRACKING.md.",
+      realtimeHardLimitS);
   cmd.Parse(argc, argv);
   if (layout != "grid" && layout != "circle")
   {
@@ -968,6 +997,24 @@ main(int argc, char* argv[])
   if (layout == "circle" && circleRadius <= 0.0)
   {
     NS_FATAL_ERROR("--circleRadius must be positive when --layout=circle");
+  }
+  static const std::map<std::string, std::string> kSchedulerTypeIds = {
+      {"map", "ns3::MapScheduler"},
+      {"heap", "ns3::HeapScheduler"},
+      {"list", "ns3::ListScheduler"},
+      {"calendar", "ns3::CalendarScheduler"},
+      {"priority", "ns3::PriorityQueueScheduler"},
+  };
+  auto schedulerTypeIdIt = kSchedulerTypeIds.find(schedulerType);
+  if (schedulerTypeIdIt == kSchedulerTypeIds.end())
+  {
+    NS_FATAL_ERROR(
+        "--scheduler must be one of map/heap/list/calendar/priority, got '" << schedulerType
+                                                                             << "'");
+  }
+  if (realtimeHardLimitS < 0.0)
+  {
+    NS_FATAL_ERROR("--realtimeHardLimitS must be non-negative");
   }
 
   // Must happen before ANY ns-3 random variable is constructed (every
@@ -1001,6 +1048,38 @@ main(int argc, char* argv[])
   // and real checksums (the simulation normally skips them for speed).
   GlobalValue::Bind("SimulatorImplementationType", StringValue("ns3::RealtimeSimulatorImpl"));
   GlobalValue::Bind("ChecksumEnabled", BooleanValue(true));
+
+  // Event-scheduler choice: a pure internal event-ordering data-structure
+  // swap, never changes which events fire or their simulated-time order,
+  // so this cannot alter simulated network semantics/results (see
+  // --scheduler's own doc comment above and docs/AUDIT_ACCEPTANCE_TRACKING.md,
+  // "N=16 SERIOUS PERFORMANCE PASS"). Must be called before Simulator::Run()
+  // -- doing it here, right after the SimulatorImplementationType bind and
+  // before any topology/device/application object is built (hence before
+  // any event is scheduled), satisfies that ordering requirement.
+  {
+    ObjectFactory schedulerFactory;
+    schedulerFactory.SetTypeId(schedulerTypeIdIt->second);
+    Simulator::SetScheduler(schedulerFactory);
+  }
+
+  // Realtime hard-limit safety gate (measurement safety, not a performance
+  // change -- see --realtimeHardLimitS's own doc comment above). Left at
+  // ns-3's default SYNC_BEST_EFFORT when the flag is 0 (unset), matching
+  // this program's original, always-silently-falls-behind behavior.
+  if (realtimeHardLimitS > 0.0)
+  {
+    Ptr<RealtimeSimulatorImpl> realtimeImpl =
+        DynamicCast<RealtimeSimulatorImpl>(Simulator::GetImplementation());
+    if (!realtimeImpl)
+    {
+      NS_FATAL_ERROR(
+          "--realtimeHardLimitS requires ns3::RealtimeSimulatorImpl, but "
+          "Simulator::GetImplementation() did not return one");
+    }
+    realtimeImpl->SetHardLimit(Seconds(realtimeHardLimitS));
+    realtimeImpl->SetSynchronizationMode(RealtimeSimulatorImpl::SYNC_HARD_LIMIT);
+  }
 
   // Reference-topology endpoint set: ONE control_station (merges the old
   // fleet_controller/operator_ui roles -- see docs/AUDIT_ACCEPTANCE_TRACKING.md

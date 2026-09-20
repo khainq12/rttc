@@ -921,14 +921,22 @@ class ReferenceTopologyProbe:
         ns3_seed: int = 1,
         ns3_run: int = 1,
         log_path: str = "/tmp/ns3.log",
+        scheduler: str = "map",
+        realtime_hard_limit_s: float = 0.0,
     ) -> None:
+        # scheduler/realtime_hard_limit_s: see fleetqox_trace_replay_tap.cc's
+        # --scheduler/--realtimeHardLimitS doc comments -- defaults ("map",
+        # 0.0) reproduce this harness's original, unchanged behavior byte
+        # for byte (added for the "N=16 SERIOUS PERFORMANCE PASS"
+        # investigation, docs/AUDIT_ACCEPTANCE_TRACKING.md).
         cmd = (
             f"/tmp/fleetqox_tap_bridge --numRobots={self.num_robots} --tapPrefix=ftap "
             f"--simDuration={sim_duration_s:.12g} --numAps={num_aps} "
             f"--layout={shlex.quote(layout)} --circleRadius={circle_radius:.12g} "
             f"--pathLossExponent={path_loss_exponent:.12g} --txPowerDbm={tx_power_dbm:.12g} "
             f"--rxSensitivityDbm={rx_sensitivity_dbm:.12g} --mobilitySpeed={mobility_speed:.12g} "
-            f"--seed={ns3_seed} --run={ns3_run} > {log_path} 2>&1"
+            f"--seed={ns3_seed} --run={ns3_run} --scheduler={shlex.quote(scheduler)} "
+            f"--realtimeHardLimitS={realtime_hard_limit_s:.12g} > {log_path} 2>&1"
         )
         docker("exec", "-d", self.ns3sim_name, "bash", "-lc", cmd)
         time.sleep(NS3_ATTACH_WAIT_S)
@@ -2156,6 +2164,8 @@ def run_coordination_probe(
     extra_rmw_env: dict[str, str] | None = None,
     launch_order: list[int] | None = None,
     directed_reply: bool = False,
+    ns3_scheduler: str = "map",
+    ns3_realtime_hard_limit_s: float = 0.0,
 ) -> dict[str, Any]:
     """Bảng VI ("Chỉ số điều phối và hoàn thành nhiệm vụ") -- see
     fleetqox_coordination_endpoint.py's module docstring for the
@@ -2177,7 +2187,14 @@ def run_coordination_probe(
     ns-3's own simulated network always outlives the coordination
     workload's own full possible runtime -- pass an explicit value only
     to deliberately request a shorter-lived network (e.g. a smoke
-    test)."""
+    test).
+
+    ns3_scheduler/ns3_realtime_hard_limit_s: passed straight through to
+    ReferenceTopologyProbe.start_ns3()'s same-named args -- see
+    fleetqox_trace_replay_tap.cc's --scheduler/--realtimeHardLimitS doc
+    comments. Defaults reproduce this harness's original behavior
+    unchanged; added for the "N=16 SERIOUS PERFORMANCE PASS"
+    investigation (docs/AUDIT_ACCEPTANCE_TRACKING.md)."""
     sim_duration_s = effective_ns3_sim_duration_s(
         sim_duration_s=sim_duration_s,
         scenario_timeout_s=scenario_timeout_s,
@@ -2226,6 +2243,8 @@ def run_coordination_probe(
             mobility_speed=mobility_speed,
             ns3_seed=ns3_seed,
             ns3_run=ns3_run,
+            scheduler=ns3_scheduler,
+            realtime_hard_limit_s=ns3_realtime_hard_limit_s,
         )
         if rmw_implementation == "rmw_zenoh_cpp":
             probe.start_zenoh_router()
