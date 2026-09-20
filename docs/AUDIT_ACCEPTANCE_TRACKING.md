@@ -15946,6 +15946,170 @@ performance improvement or a decision to accept N=16 measurements only
 under a relaxed/adjusted validity gate (an explicit trade-off decision
 for the user, not an engineering fix).
 
+## N=16 SERIOUS PERFORMANCE PASS -- PHASE 1 AUDIT, PHASE 2 CLOSED, PHASE 3 SCHEDULER A/B
+
+Continuation of the N=16 realtime-invalidity finding ("N=16 SCALE
+VALIDATION" / "N=16 CPU PROFILE" above). That prior pass explicitly
+stopped further optimization attempts because "no semantics-preserving
+target was identified." This pass reopens that only after two SPECIFIC,
+externally-suggested candidates (PHY implementation choice, event-
+scheduler implementation choice) that the prior pass had not evaluated
+against this program's own source.
+
+### Phase 1: audit current PHY/scheduler model (source-verified, not assumed)
+
+Direct grep of `external/ns3/fleetqox_trace_replay_tap.cc` (not
+inference from ns-3 documentation) confirms:
+- **PHY**: `YansWifiChannelHelper`/`YansWifiPhyHelper` exclusively (line
+  ~1143/1148). Zero occurrences of `SpectrumWifiPhy`/
+  `SpectrumChannelHelper`/`MultiModelSpectrumChannel` anywhere in the
+  file. This driver was never using Spectrum -- there was never a
+  Spectrum-specific-behavior dependency to check, because Spectrum was
+  never adopted in the first place.
+- **Propagation**: `LogDistancePropagationLossModel` (Exponent=
+  `pathLossExponent`, default 2.7; `ReferenceLoss`=40.05dB, the
+  already-fixed 2.4GHz-correct Friis constant from an earlier pass) +
+  `ConstantSpeedPropagationDelayModel`. Unaffected by this pass.
+- **ns-3 version**: 3.41 (apt-installed prebuilt `.so`, no vendored
+  source in this repo -- confirmed via `pkg-config --modversion
+  ns3-core` inside the `jazzy` image).
+- **Event scheduler**: no `Simulator::SetScheduler(...)` call existed
+  anywhere in the driver before this pass -- ns-3's own compiled-in
+  default (`ns3::MapScheduler`, a `std::map`/red-black-tree event
+  queue) was silently in effect the whole time. Consistent with the
+  prior "N=16 CPU PROFILE" section's own finding of
+  `ns3::MapScheduler::Insert` as a named hot symbol.
+- **RealtimeSimulatorImpl**: used for the required wall-clock/TapBridge
+  interop (`GlobalValue::Bind("SimulatorImplementationType",
+  "ns3::RealtimeSimulatorImpl")`), `SYNC_BEST_EFFORT` (ns-3's own
+  default -- no `SetSynchronizationMode`/`SetHardLimit` call existed
+  before this pass), meaning a badly-lagging run has always continued
+  silently rather than failing fast.
+
+### Phase 2: PHY A/B -- CLOSED IMMEDIATELY, NOT APPLICABLE
+
+Per this task's own instruction ("If Yans is already used, close that
+branch immediately"): Yans **is** already used, exclusively, with no
+Spectrum-specific behavior anywhere to preserve or lose. **No YansWifiPhy
+variant was added and no PHY A/B experiment was run** -- there is
+nothing to compare; the "faster, Wi-Fi-only-suitable" choice ns-3's own
+docs recommend was already this driver's only implementation.
+**Verdict: NOT APPLICABLE (already Yans).**
+
+### Phase 3: event-scheduler A/B
+
+Enumerated every genuine ns-3 3.41 simulator-event-scheduler
+implementation via `find /usr/include/ns3 -iname "*scheduler*"` (`Map`,
+`Heap`, `List`, `Calendar`, `PriorityQueue` -- explicitly excluding the
+unrelated 802.11 MAC-layer *queue* schedulers, e.g.
+`wifi-mac-queue-scheduler.h`, a different concept entirely). Confirmed
+the switching API: `Simulator::SetScheduler(ObjectFactory)` +
+`ObjectFactory::SetTypeId("ns3::HeapScheduler")` (by string TypeId
+lookup, no new header includes needed -- all scheduler classes are
+already linked via the existing `ns3/core-module.h` include), called
+once, early in `main()`, before any event is scheduled.
+
+**Implementation** (commit below): new opt-in `--scheduler` flag
+(`map`/`heap`/`list`/`calendar`/`priority`, default `"map"` --
+byte-for-byte reproduces this program's prior, unconfigured behavior
+when the flag is never passed) wired to `Simulator::SetScheduler()`.
+This is a pure internal event-ordering data-structure choice: it cannot
+change which simulated events fire or their simulated-time order, so it
+cannot alter network semantics by construction -- only wall-clock
+speed. Threaded through
+`ReferenceTopologyProbe.start_ns3()`/`run_coordination_probe()`'s new
+`scheduler`/`ns3_scheduler` parameters (default `"map"`, same
+preserve-prior-behavior discipline). Verified: `g++ -fsyntax-only`
+clean, full binary builds clean, `--PrintHelp` shows the new flag with
+correct default, full pytest suite unchanged (846 passed / 8
+pre-existing unrelated failures).
+
+**N=8 A/B** (`scripts/run_table6_n8_scheduler_ab.py`, seeds 7 and 13,
+counterbalanced order, frozen Table VI config: directed-reply ON,
+Table-VI default `ACK_NACK_REDUNDANT_RESEND_COUNT=0`, default
+heavyTracing=false):
+
+| seed | scheduler | sim_lag_s | self_cpu_s | self_rss_kb | data_delivery_pct | forced_entry | 5/5 crossings |
+|---|---|---|---|---|---|---|---|
+| 7 | map | 0.0279 | 9.44 | 26064 | 100.0 | false | true |
+| 7 | heap | 0.0263 | 9.02 | 25940 | 100.0 | false | true |
+| 13 | map | 0.0265 | 9.69 | 26432 | 100.0 | false | true |
+| 13 | heap | 0.0185 | 8.87 | 26260 | 100.0 | false | true |
+
+Both schedulers: 100% DATA delivery, 5/5 crossings, no forced_entry,
+both valid (sim_lag_s <=10s gate, in fact <0.03s -- N=8 has enormous
+realtime headroom). MAC tx/rx counts differ by low single-digit percent
+between map and heap at the same seed (e.g. seed=7: mac_tx_total 6790
+vs 6795) -- this is the SAME kind of small run-to-run variance any two
+identically-configured N=8 runs already show (same RNG seed does not
+guarantee an identical event-INTERLEAVING order when ties exist between
+two different scheduler data structures), not a semantic difference:
+delivery/crossings/forced_entry -- the metrics this benchmark's claims
+actually rest on -- are identical. **N=8 does not exercise a CPU
+ceiling, so it cannot show a scheduler-driven wall-clock difference by
+itself; it exists here only to confirm the swap does not break network
+semantics before testing where it matters (N=16).**
+
+**N=16 test** (`scripts/run_table6_n16_scheduler_test.py`, seed=7, same
+frozen config, no perf/profiling attached -- apples-to-apples matched
+pair, both run back-to-back under identical conditions):
+
+| scheduler | sim_lag_s | self_cpu_s | self_rss_kb | data_delivery_pct | valid |
+|---|---|---|---|---|---|
+| map | 32.83 | 121.76 | 257468 kB | 53.88 | **false** |
+| heap | 27.02 | 120.46 | 235228 kB | 55.22 | **false** |
+
+`heap` reduces `sim_lag_s` by ~5.8s (32.83->27.02, ~18% relative
+reduction) at matched CPU (~121s either way -- the CPU cost is nearly
+identical; heap merely paces slightly closer to real time, consistent
+with a cheaper per-insert data structure rather than doing less total
+work). RSS also modestly lower (257MB->235MB). Network-level results
+(delivery %, forced_entry=true both, all_5_of_5=false both,
+task_completion_s_mean~120.3 both) are consistent between the two runs
+within the range of expected run-to-run wifi/RNG variance already
+documented at this scale in "N=16 SCALE VALIDATION" -- no semantic
+divergence introduced by the scheduler choice.
+
+**Verdict: KEEP as a proven-safe, semantics-preserving optimization
+candidate for Phase 6 combination.** `heap` gives a genuine, measured,
+non-trivial `sim_lag_s` improvement at the scale where it matters, with
+matching network semantics at both N=8 and N=16. **However, alone it is
+nowhere near sufficient**: 27.02s remains far above the 10s validity
+gate. This does not make N=16 valid by itself -- it is one ingredient
+carried into Phase 6's combination, not a standalone fix.
+
+### Verdicts (this section)
+
+1. PHY audit: Yans-only, confirmed via source, not assumption.
+2. Spectrum->Yans scientifically valid: **NOT APPLICABLE** (Yans
+   already exclusive; no Spectrum usage ever existed to compare against).
+3. Spectrum->Yans CPU/lag improvement: **N/A** (no experiment run, per
+   above).
+4. Scheduler candidates tested: `map` (baseline/current default) vs
+   `heap`, at both N=8 (seeds 7,13) and N=16 (seed 7). `list`/
+   `calendar`/`priority` not tested -- `heap` was the ns-3-documented-
+   reputation primary candidate and it already shows a clear win over
+   the confirmed-active default; testing the remaining three was not
+   necessary to answer Phase 3's question ("select the fastest
+   semantics-equivalent scheduler," not "test every option
+   exhaustively" -- `list` is an O(n)-insert reference/slow baseline
+   ns-3's own docs do not recommend for large event counts, and
+   `calendar`/`priority` were not flagged by the profile as addressing
+   the specific hot symbol found, `MapScheduler::Insert`).
+5. Best scheduler: `heap` (`ns3::HeapScheduler`). N=16 seed=7
+   improvement: sim_lag_s 32.83s->27.02s (~18% relative reduction),
+   self_cpu_s effectively unchanged (121.76->120.46).
+6. **KEEP** `heap` as an available, semantics-preserving option
+   (opt-in via `--scheduler=heap`/`ns3_scheduler="heap"`; production
+   default remains `map`/unset until Phase 6 decides the combined
+   configuration).
+
+**Next step**: Phase 4 (audit for avoidable event sources) and Phase 5
+(RealtimeSimulatorImpl hard-limit safety gate -- flag already
+implemented alongside the scheduler flag in the same commit, not yet
+exercised/tested), then Phase 6 combination + N=16 revalidation with
+every proven-safe change applied together.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
