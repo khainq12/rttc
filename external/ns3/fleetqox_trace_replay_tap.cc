@@ -117,6 +117,71 @@ std::atomic<uint64_t> g_phyRxDropTotal{0};
 std::array<std::atomic<uint64_t>, kMaxRxDropReasons> g_phyRxDropByReason{};
 std::atomic<uint64_t> g_associatedStaCount{0};
 
+// Added for the "N=8 REMAINING WI-FI LOSS AFTER DIRECTED-REPLY"
+// investigation (see docs/AUDIT_ACCEPTANCE_TRACKING.md): the counters
+// above cannot distinguish WHY a packet never reached MacRx -- an
+// explicit MAC-layer drop, a channel-access/PHY failure, or a packet
+// still legitimately in flight when the process was killed. These add
+// the exact ns-3 trace sources that answer that, all purely additive
+// (no change to any radio/QoS/timing parameter):
+//   WifiMac::DroppedMpdu -- fires with the EXACT WifiMacDropReason
+//     (FAILED_ENQUEUE = queue was full at enqueue time, i.e. an
+//     immediate explicit drop; EXPIRED_LIFETIME = sat in the MAC queue
+//     past its lifetime, i.e. classification B "stuck past useful
+//     time"; REACHED_RETRY_LIMIT = the 802.11 MAC itself gave up after
+//     exhausting its retry budget, i.e. classification C; QOS_OLD_PACKET
+//     = superseded by a newer packet under block-ack, not expected here
+//     since wifiQos is never enabled for Table VI).
+//   WifiRemoteStationManager::MacTxFinalDataFailed -- an independent
+//     confirmation of retry-limit exhaustion from the rate-control
+//     side, for a same-mechanism cross-check against DroppedMpdu's own
+//     REACHED_RETRY_LIMIT count.
+//   WifiMacQueue::Expired -- fires exactly when EXPIRED_LIFETIME above
+//     is about to happen (the queue's own lifetime-check firing),
+//     kept as a second, independent confirmation of the same
+//     mechanism from the queue's side rather than the MAC's side.
+//   Txop::BackoffTrace / CwTrace -- the DCF's own backoff counter and
+//     contention window value every time either changes; a CW that
+//     keeps growing past its minimum is ns-3's own signal that this
+//     station is experiencing real channel-access contention/collision
+//     (CW doubles on every collision in the standard 802.11 DCF model),
+//     independent of anything RMW-level.
+// All hooks are labeled per-station ("who") unlike the pre-existing
+// aggregate-only counters above, which mix every station together and
+// cannot show "per sender->receiver differences".
+enum : std::size_t
+{
+  kDropReasonFailedEnqueue = 0,
+  kDropReasonExpiredLifetime = 1,
+  kDropReasonReachedRetryLimit = 2,
+  kDropReasonQosOldPacket = 3,
+  kNumDropReasons = 4,
+};
+std::array<std::atomic<uint64_t>, kNumDropReasons> g_droppedMpduByReason{};
+std::atomic<uint64_t> g_macTxFinalDataFailedTotal{0};
+std::atomic<uint64_t> g_wifiMacQueueExpiredTotal{0};
+std::atomic<uint64_t> g_backoffValueSum{0};
+std::atomic<uint64_t> g_backoffValueCount{0};
+std::atomic<uint64_t> g_backoffValueMax{0};
+std::atomic<uint64_t> g_cwValueSum{0};
+std::atomic<uint64_t> g_cwValueCount{0};
+std::atomic<uint64_t> g_cwValueMax{0};
+
+// Per-station WifiMacQueue backlog snapshot, sampled on its own faster
+// cadence (2s) than PrintWifiStats' 5s -- a queue can fill/drain much
+// faster than 5s, and "how deep did the backlog get, not just whether
+// it eventually expired" is what the investigation's "queue delay/
+// backlog" measurement needs. Populated once at setup time (before
+// Simulator::Run()), read-only from then on from the single simulation
+// event thread -- no mutex needed (matches how g_macToApGroup/
+// g_apDeviceByGroup above are already used read-only after setup).
+std::vector<std::pair<std::string, Ptr<WifiMacQueue>>> g_queueBacklogTargets;
+
+// Per-station identity for the existing aggregate atomics' NEW
+// per-packet-with-"who" logging below -- reuses g_macEventLogLines'
+// existing buffered-line mechanism, just adding a "who" field to every
+// line instead of leaving it implicit/mixed.
+
 // Per-packet MAC-layer timeline for the "black-box" decomposition
 // investigation (16-17/09/2026, see docs/AUDIT_ACCEPTANCE_TRACKING.md
 // "Optimization #2: tách network black box"). Existing counters above are
@@ -261,30 +326,72 @@ ExtractEventId(Ptr<const Packet> packet, std::string& eventId)
   }
   std::vector<uint8_t> decoded = Base64Decode(b64Start, b64End);
 
+  // Table IV/V's fleetqox_rmw_trace_endpoint.py marker (unchanged).
   static const std::string kMarker = "\"e\":\"";
   auto it = std::search(decoded.begin(), decoded.end(), kMarker.begin(), kMarker.end());
-  if (it == decoded.end())
+  if (it != decoded.end())
   {
-    DumpDebugPayload(size, buf);
-    return false;
+    auto digitsStart = it + static_cast<std::ptrdiff_t>(kMarker.size());
+    auto digitsEnd = digitsStart;
+    while (digitsEnd != decoded.end() && std::isdigit(*digitsEnd))
+    {
+      ++digitsEnd;
+    }
+    if (digitsEnd != digitsStart && digitsEnd != decoded.end() && *digitsEnd == '"')
+    {
+      eventId.assign(digitsStart, digitsEnd);
+      return true;
+    }
   }
-  auto digitsStart = it + static_cast<std::ptrdiff_t>(kMarker.size());
-  auto digitsEnd = digitsStart;
-  while (digitsEnd != decoded.end() && std::isdigit(*digitsEnd))
+
+  // Added for the "N=8 REMAINING WI-FI LOSS AFTER DIRECTED-REPLY"
+  // investigation (see docs/AUDIT_ACCEPTANCE_TRACKING.md): confirmed by
+  // source read that scripts/fleetqox_coordination_endpoint.py (Table
+  // VI's own endpoint script, a DIFFERENT script from
+  // fleetqox_rmw_trace_endpoint.py above) never emits an "e" field at
+  // all -- its JSON schema is {"type","from"/"to","req_id","wall_ns",
+  // ...} instead, meaning the "e" marker above ALWAYS fails to extract
+  // for every Table VI run and ExtractEventId() silently returned false
+  // for 100% of packets (confirmed empirically: a smoke-test run showed
+  // mac_event_attempts=3763, mac_event_extracted=0). Every Table VI
+  // message (request AND reply) DOES carry "wall_ns": a plain JSON
+  // integer nanosecond send timestamp, unique enough within one run to
+  // serve the exact same correlation purpose. Prefixed "wallns:" so it
+  // is visually distinct from an "e"-derived numeric id (the two
+  // schemas are mutually exclusive per run in practice, but this keeps
+  // the two id spaces unambiguous regardless).
+  static const std::string kWallNsMarker = "\"wall_ns\":";
+  auto wallIt = std::search(decoded.begin(), decoded.end(), kWallNsMarker.begin(), kWallNsMarker.end());
+  if (wallIt != decoded.end())
   {
-    ++digitsEnd;
+    auto digitsStart = wallIt + static_cast<std::ptrdiff_t>(kWallNsMarker.size());
+    // fleetqox_coordination_endpoint.py's json.dumps() uses Python's
+    // default separators, which insert a space after every ':' --
+    // "\"wall_ns\": 123..." not "\"wall_ns\":123...". Skip it (and any
+    // other incidental whitespace) before scanning for digits.
+    while (digitsStart != decoded.end() && std::isspace(*digitsStart))
+    {
+      ++digitsStart;
+    }
+    auto digitsEnd = digitsStart;
+    while (digitsEnd != decoded.end() && std::isdigit(*digitsEnd))
+    {
+      ++digitsEnd;
+    }
+    if (digitsEnd != digitsStart)
+    {
+      eventId.assign("wallns:");
+      eventId.append(digitsStart, digitsEnd);
+      return true;
+    }
   }
-  if (digitsEnd == digitsStart || digitsEnd == decoded.end() || *digitsEnd != '"')
-  {
-    DumpDebugPayload(size, buf);
-    return false;
-  }
-  eventId.assign(digitsStart, digitsEnd);
-  return true;
+
+  DumpDebugPayload(size, buf);
+  return false;
 }
 
 void
-LogMacEvent(const char* kind, Ptr<const Packet> packet)
+LogMacEvent(const std::string& kind, const std::string& who, Ptr<const Packet> packet)
 {
   g_macEventAttempts.fetch_add(1, std::memory_order_relaxed);
   std::string eventId;
@@ -299,7 +406,8 @@ LogMacEvent(const char* kind, Ptr<const Packet> packet)
                        std::chrono::system_clock::now().time_since_epoch())
                        .count();
   std::ostringstream line;
-  line << "FLEETQOX_MAC_EVENT {\"kind\":\"" << kind << "\",\"event_id\":\"" << eventId << "\","
+  line << "FLEETQOX_MAC_EVENT {\"kind\":\"" << kind << "\",\"who\":\"" << who << "\","
+       << "\"event_id\":\"" << eventId << "\","
        << "\"sim_time_s\":" << Simulator::Now().GetSeconds() << ","
        << "\"wall_ns\":" << wallNs << "}";
   std::lock_guard<std::mutex> lock(g_macEventLogMutex);
@@ -325,7 +433,7 @@ FlushMacEventLog()
 }
 
 void
-MacTxTrace(Ptr<const Packet> packet)
+MacTxTrace(std::string who, Ptr<const Packet> packet)
 {
   g_macTxTotal.fetch_add(1, std::memory_order_relaxed);
   if (packet->GetSize() <= kSmallFrameThresholdBytes)
@@ -336,36 +444,38 @@ MacTxTrace(Ptr<const Packet> packet)
   {
     g_macTxLarge.fetch_add(1, std::memory_order_relaxed);
   }
-  LogMacEvent("tx", packet);
+  LogMacEvent("tx", who, packet);
 }
 
 void
-MacTxDropTrace(Ptr<const Packet> /* packet */)
+MacTxDropTrace(std::string who, Ptr<const Packet> packet)
 {
   g_macTxDropTotal.fetch_add(1, std::memory_order_relaxed);
+  LogMacEvent("mac_tx_drop", who, packet);
 }
 
 void
-MacRxTrace(Ptr<const Packet> packet)
+MacRxTrace(std::string who, Ptr<const Packet> packet)
 {
   g_macRxTotal.fetch_add(1, std::memory_order_relaxed);
-  LogMacEvent("rx", packet);
+  LogMacEvent("rx", who, packet);
 }
 
 void
-MacRxDropTrace(Ptr<const Packet> /* packet */)
+MacRxDropTrace(std::string who, Ptr<const Packet> packet)
 {
   g_macRxDropTotal.fetch_add(1, std::memory_order_relaxed);
+  LogMacEvent("mac_rx_drop", who, packet);
 }
 
 void
-PhyTxBeginTrace(Ptr<const Packet> /* packet */, double /* txPowerW */)
+PhyTxBeginTrace(std::string /* who */, Ptr<const Packet> /* packet */, double /* txPowerW */)
 {
   g_phyTxBeginTotal.fetch_add(1, std::memory_order_relaxed);
 }
 
 void
-PhyRxDropTrace(Ptr<const Packet> /* packet */, WifiPhyRxfailureReason reason)
+PhyRxDropTrace(std::string who, Ptr<const Packet> packet, WifiPhyRxfailureReason reason)
 {
   g_phyRxDropTotal.fetch_add(1, std::memory_order_relaxed);
   auto idx = static_cast<std::size_t>(reason);
@@ -373,12 +483,86 @@ PhyRxDropTrace(Ptr<const Packet> /* packet */, WifiPhyRxfailureReason reason)
   {
     g_phyRxDropByReason[idx].fetch_add(1, std::memory_order_relaxed);
   }
+  LogMacEvent("phy_rx_drop:" + std::to_string(idx), who, packet);
 }
 
 void
 AssociatedStaTrace(uint16_t /* aid */, Mac48Address /* address */)
 {
   g_associatedStaCount.fetch_add(1, std::memory_order_relaxed);
+}
+
+// New MAC/PHY-adjacent trace callbacks (see the "N=8 REMAINING WI-FI
+// LOSS AFTER DIRECTED-REPLY" doc comment above g_droppedMpduByReason
+// for what each measures and why).
+void
+DroppedMpduTrace(std::string who, WifiMacDropReason reason, Ptr<const WifiMpdu> mpdu)
+{
+  auto idx = static_cast<std::size_t>(reason);
+  if (idx < kNumDropReasons)
+  {
+    g_droppedMpduByReason[idx].fetch_add(1, std::memory_order_relaxed);
+  }
+  static const char* kReasonNames[kNumDropReasons] = {
+      "failed_enqueue", "expired_lifetime", "reached_retry_limit", "qos_old_packet"};
+  const char* reasonName = (idx < kNumDropReasons) ? kReasonNames[idx] : "unknown";
+  LogMacEvent(std::string("dropped_mpdu:") + reasonName, who, mpdu->GetPacket());
+}
+
+void
+MacTxFinalDataFailedTrace(std::string /* who */, Mac48Address /* address */)
+{
+  g_macTxFinalDataFailedTotal.fetch_add(1, std::memory_order_relaxed);
+}
+
+void
+WifiMacQueueExpiredTrace(std::string who, Ptr<const WifiMpdu> mpdu)
+{
+  g_wifiMacQueueExpiredTotal.fetch_add(1, std::memory_order_relaxed);
+  LogMacEvent("queue_expired", who, mpdu->GetPacket());
+}
+
+void
+BackoffValueTrace(std::string /* who */, uint32_t value, uint8_t /* linkId */)
+{
+  g_backoffValueSum.fetch_add(value, std::memory_order_relaxed);
+  g_backoffValueCount.fetch_add(1, std::memory_order_relaxed);
+  uint64_t prevMax = g_backoffValueMax.load(std::memory_order_relaxed);
+  while (value > prevMax && !g_backoffValueMax.compare_exchange_weak(prevMax, value))
+  {
+  }
+}
+
+void
+CwValueTrace(std::string /* who */, uint32_t value, uint8_t /* linkId */)
+{
+  g_cwValueSum.fetch_add(value, std::memory_order_relaxed);
+  g_cwValueCount.fetch_add(1, std::memory_order_relaxed);
+  uint64_t prevMax = g_cwValueMax.load(std::memory_order_relaxed);
+  while (value > prevMax && !g_cwValueMax.compare_exchange_weak(prevMax, value))
+  {
+  }
+}
+
+void
+PrintQueueBacklog()
+{
+  Simulator::Schedule(Seconds(2.0), &PrintQueueBacklog);
+  std::ostringstream line;
+  line << "FLEETQOX_QUEUE_BACKLOG {\"sim_time_s\":" << Simulator::Now().GetSeconds()
+       << ",\"depths\":[";
+  bool first = true;
+  for (const auto& target : g_queueBacklogTargets)
+  {
+    if (!first)
+    {
+      line << ",";
+    }
+    first = false;
+    line << "[\"" << target.first << "\"," << target.second->GetNPackets() << "]";
+  }
+  line << "]}";
+  std::cout << line.str() << std::endl;
 }
 
 // STATIC cross-AP-group relay (11/09/2026, see docs/AUDIT_ACCEPTANCE_TRACKING.md
@@ -492,6 +676,18 @@ PrintWifiStats(uint32_t totalStations, uint32_t numAps)
             << "\"phy_rx_drop_total\":" << g_phyRxDropTotal.load() << ","
             << "\"mac_event_attempts\":" << g_macEventAttempts.load() << ","
             << "\"mac_event_extracted\":" << g_macEventExtracted.load() << ","
+            << "\"dropped_mpdu_failed_enqueue\":" << g_droppedMpduByReason[kDropReasonFailedEnqueue].load() << ","
+            << "\"dropped_mpdu_expired_lifetime\":" << g_droppedMpduByReason[kDropReasonExpiredLifetime].load() << ","
+            << "\"dropped_mpdu_reached_retry_limit\":" << g_droppedMpduByReason[kDropReasonReachedRetryLimit].load() << ","
+            << "\"dropped_mpdu_qos_old_packet\":" << g_droppedMpduByReason[kDropReasonQosOldPacket].load() << ","
+            << "\"mac_tx_final_data_failed_total\":" << g_macTxFinalDataFailedTotal.load() << ","
+            << "\"wifi_mac_queue_expired_total\":" << g_wifiMacQueueExpiredTotal.load() << ","
+            << "\"backoff_value_count\":" << g_backoffValueCount.load() << ","
+            << "\"backoff_value_sum\":" << g_backoffValueSum.load() << ","
+            << "\"backoff_value_max\":" << g_backoffValueMax.load() << ","
+            << "\"cw_value_count\":" << g_cwValueCount.load() << ","
+            << "\"cw_value_sum\":" << g_cwValueSum.load() << ","
+            << "\"cw_value_max\":" << g_cwValueMax.load() << ","
             << "\"phy_rx_drop_by_reason\":[";
   for (std::size_t i = 0; i < kMaxRxDropReasons; ++i)
   {
@@ -1018,31 +1214,59 @@ main(int argc, char* argv[])
   // Hook every station's + the AP's Phy/Mac trace sources -- see the
   // WIFI-LEVEL DIAGNOSTIC COUNTERS block above for why (distinguishing a
   // genuine 802.11 capacity/collision ceiling at scale from the RMW
-  // retry loop's own ARP broadcasts adding to the contention).
+  // retry loop's own ARP broadcasts adding to the contention). Every
+  // hook is now bound to that device's own label ("who") -- see the
+  // "N=8 REMAINING WI-FI LOSS AFTER DIRECTED-REPLY" doc comment above
+  // g_droppedMpduByReason for why per-station identity is needed here
+  // (it wasn't before: every station shared the same unlabeled global
+  // callback).
   for (uint32_t i = 0; i < stationDevices.GetN(); ++i)
   {
     Ptr<WifiNetDevice> dev = DynamicCast<WifiNetDevice>(stationDevices.Get(i));
-    dev->GetMac()->TraceConnectWithoutContext("MacTx", MakeCallback(&MacTxTrace));
-    dev->GetMac()->TraceConnectWithoutContext("MacTxDrop", MakeCallback(&MacTxDropTrace));
-    dev->GetMac()->TraceConnectWithoutContext("MacRx", MakeCallback(&MacRxTrace));
-    dev->GetMac()->TraceConnectWithoutContext("MacRxDrop", MakeCallback(&MacRxDropTrace));
-    dev->GetPhy()->TraceConnectWithoutContext("PhyTxBegin", MakeCallback(&PhyTxBeginTrace));
-    dev->GetPhy()->TraceConnectWithoutContext("PhyRxDrop", MakeCallback(&PhyRxDropTrace));
+    const std::string& who = stationEndpointLabels[i];
+    Ptr<WifiMac> wmac = dev->GetMac();
+    wmac->TraceConnectWithoutContext("MacTx", MakeBoundCallback(&MacTxTrace, who));
+    wmac->TraceConnectWithoutContext("MacTxDrop", MakeBoundCallback(&MacTxDropTrace, who));
+    wmac->TraceConnectWithoutContext("MacRx", MakeBoundCallback(&MacRxTrace, who));
+    wmac->TraceConnectWithoutContext("MacRxDrop", MakeBoundCallback(&MacRxDropTrace, who));
+    wmac->TraceConnectWithoutContext("DroppedMpdu", MakeBoundCallback(&DroppedMpduTrace, who));
+    dev->GetPhy()->TraceConnectWithoutContext("PhyTxBegin", MakeBoundCallback(&PhyTxBeginTrace, who));
+    dev->GetPhy()->TraceConnectWithoutContext("PhyRxDrop", MakeBoundCallback(&PhyRxDropTrace, who));
+    wmac->GetWifiRemoteStationManager()->TraceConnectWithoutContext(
+        "MacTxFinalDataFailed", MakeBoundCallback(&MacTxFinalDataFailedTrace, who));
+    Ptr<Txop> txop = wmac->GetTxop();
+    txop->TraceConnectWithoutContext("BackoffTrace", MakeBoundCallback(&BackoffValueTrace, who));
+    txop->TraceConnectWithoutContext("CwTrace", MakeBoundCallback(&CwValueTrace, who));
+    txop->GetWifiMacQueue()->TraceConnectWithoutContext(
+        "Expired", MakeBoundCallback(&WifiMacQueueExpiredTrace, who));
+    g_queueBacklogTargets.emplace_back(who, txop->GetWifiMacQueue());
   }
   for (uint32_t i = 0; i < apDevices.GetN(); ++i)
   {
     Ptr<WifiNetDevice> dev = DynamicCast<WifiNetDevice>(apDevices.Get(i));
-    dev->GetMac()->TraceConnectWithoutContext("MacTx", MakeCallback(&MacTxTrace));
-    dev->GetMac()->TraceConnectWithoutContext("MacTxDrop", MakeCallback(&MacTxDropTrace));
-    dev->GetMac()->TraceConnectWithoutContext("MacRx", MakeCallback(&MacRxTrace));
-    dev->GetMac()->TraceConnectWithoutContext("MacRxDrop", MakeCallback(&MacRxDropTrace));
-    dev->GetPhy()->TraceConnectWithoutContext("PhyTxBegin", MakeCallback(&PhyTxBeginTrace));
-    dev->GetPhy()->TraceConnectWithoutContext("PhyRxDrop", MakeCallback(&PhyRxDropTrace));
-    Ptr<ApWifiMac> apMac = DynamicCast<ApWifiMac>(dev->GetMac());
+    const std::string who = "AP" + std::to_string(i);
+    Ptr<WifiMac> wmac = dev->GetMac();
+    wmac->TraceConnectWithoutContext("MacTx", MakeBoundCallback(&MacTxTrace, who));
+    wmac->TraceConnectWithoutContext("MacTxDrop", MakeBoundCallback(&MacTxDropTrace, who));
+    wmac->TraceConnectWithoutContext("MacRx", MakeBoundCallback(&MacRxTrace, who));
+    wmac->TraceConnectWithoutContext("MacRxDrop", MakeBoundCallback(&MacRxDropTrace, who));
+    wmac->TraceConnectWithoutContext("DroppedMpdu", MakeBoundCallback(&DroppedMpduTrace, who));
+    dev->GetPhy()->TraceConnectWithoutContext("PhyTxBegin", MakeBoundCallback(&PhyTxBeginTrace, who));
+    dev->GetPhy()->TraceConnectWithoutContext("PhyRxDrop", MakeBoundCallback(&PhyRxDropTrace, who));
+    wmac->GetWifiRemoteStationManager()->TraceConnectWithoutContext(
+        "MacTxFinalDataFailed", MakeBoundCallback(&MacTxFinalDataFailedTrace, who));
+    Ptr<Txop> txop = wmac->GetTxop();
+    txop->TraceConnectWithoutContext("BackoffTrace", MakeBoundCallback(&BackoffValueTrace, who));
+    txop->TraceConnectWithoutContext("CwTrace", MakeBoundCallback(&CwValueTrace, who));
+    txop->GetWifiMacQueue()->TraceConnectWithoutContext(
+        "Expired", MakeBoundCallback(&WifiMacQueueExpiredTrace, who));
+    g_queueBacklogTargets.emplace_back(who, txop->GetWifiMacQueue());
+    Ptr<ApWifiMac> apMac = DynamicCast<ApWifiMac>(wmac);
     apMac->TraceConnectWithoutContext("AssociatedSta", MakeCallback(&AssociatedStaTrace));
   }
 
   Simulator::Schedule(Seconds(5.0), &PrintWifiStats, totalStations, numAps);
+  Simulator::Schedule(Seconds(2.0), &PrintQueueBacklog);
 
   Simulator::Stop(Seconds(simDuration));
   Simulator::Run();
