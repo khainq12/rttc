@@ -2072,13 +2072,48 @@ def run_probe(
     }
 
 
+# Fixes the "TABLE VI HARNESS DURATION MISMATCH" bug (see
+# docs/AUDIT_ACCEPTANCE_TRACKING.md, "N=8 REALTIME-LAG VALIDATION"):
+# run_coordination_probe() used to pass a hardcoded sim_duration_s=60.0
+# straight to ns-3's own Simulator::Stop(), completely independent of
+# scenario_timeout_s (default 120.0) -- the coordination workload's own
+# real-time deadline. ns-3's simulated Wi-Fi network could legitimately
+# shut itself down while the workload was still running for up to
+# another 60 real seconds, and every N=8 measurement in this
+# investigation's history was made under that mismatch (see
+# EffectiveNs3SimDurationSTest in
+# tests/test_ns3_docker_container_fleet_probe.py for the RED/GREEN
+# proof). Reuses the EXACT SAME slack constant wait_for_completion()
+# already grants the workload to finish below -- one clear duration
+# contract, not two independently-guessed numbers that can drift apart
+# again.
+NS3_SIM_DURATION_DRAIN_MARGIN_S = 60.0
+
+
+def effective_ns3_sim_duration_s(
+    *, sim_duration_s: float | None, scenario_timeout_s: float, start_offset_ms: float
+) -> float:
+    """Returns sim_duration_s unchanged if the caller explicitly gave one
+    (e.g. this investigation's own short smoke tests deliberately want a
+    short-lived network) -- otherwise derives it so ns-3's own network
+    always outlives the coordination workload's own full possible
+    runtime (from container start, through start_offset_ms's initial
+    wait, through the entire scenario_timeout_s window the workload is
+    allowed to keep retrying in) plus NS3_SIM_DURATION_DRAIN_MARGIN_S of
+    slack for in-flight repair/ACK traffic to resolve after the
+    workload's own last legitimate send."""
+    if sim_duration_s is not None:
+        return sim_duration_s
+    return start_offset_ms / 1000.0 + scenario_timeout_s + NS3_SIM_DURATION_DRAIN_MARGIN_S
+
+
 def run_coordination_probe(
     *,
     image: str = DEFAULT_IMAGE,
     output_dir: Path,
     num_robots: int,
     seed: int,
-    sim_duration_s: float = 60.0,
+    sim_duration_s: float | None = None,
     num_crossings: int = 5,
     crossing_duration_ms: float = 300.0,
     reply_timeout_s: float = 5.0,
@@ -2115,7 +2150,19 @@ def run_coordination_probe(
     No trace CSV here (unlike run_probe()) -- this scenario's workload
     is fully self-contained inside fleetqox_coordination_endpoint.py,
     parameterized only by --num-crossings/--crossing-duration-ms/
-    --reply-timeout-s, not by a pre-generated event schedule."""
+    --reply-timeout-s, not by a pre-generated event schedule.
+
+    sim_duration_s: defaults to None, meaning it is DERIVED from
+    scenario_timeout_s (see effective_ns3_sim_duration_s() above) so
+    ns-3's own simulated network always outlives the coordination
+    workload's own full possible runtime -- pass an explicit value only
+    to deliberately request a shorter-lived network (e.g. a smoke
+    test)."""
+    sim_duration_s = effective_ns3_sim_duration_s(
+        sim_duration_s=sim_duration_s,
+        scenario_timeout_s=scenario_timeout_s,
+        start_offset_ms=start_offset_ms,
+    )
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     run_id = output_dir.name.lstrip(".")
@@ -2184,7 +2231,7 @@ def run_coordination_probe(
         )
         probe.wait_for_ready_then_start(ready_deadline_s=ready_deadline_s)
         probe.wait_for_completion(
-            timeout_s=start_offset_ms / 1000.0 + scenario_timeout_s + 60.0,
+            timeout_s=start_offset_ms / 1000.0 + scenario_timeout_s + NS3_SIM_DURATION_DRAIN_MARGIN_S,
             results_dir_container=results_dir_container,
         )
         endpoint_results = probe.collect_results(results_dir_container)

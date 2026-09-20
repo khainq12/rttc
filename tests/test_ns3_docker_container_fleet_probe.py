@@ -5,6 +5,7 @@ from pathlib import Path
 
 from scripts.run_ns3_docker_container_fleet_probe import (
     BASE_IP_PREFIX,
+    NS3_SIM_DURATION_DRAIN_MARGIN_S,
     RMW_PORT,
     STATIC_SUBSCRIPTION_TYPE_NAME,
     ReferenceTopologyProbe,
@@ -13,6 +14,7 @@ from scripts.run_ns3_docker_container_fleet_probe import (
     compute_graph_join_failures,
     compute_jitter_stale_repair_stats,
     compute_latency_stats_ms,
+    effective_ns3_sim_duration_s,
     endpoint_list,
     fleetqox_coordination_rmw_env_prefix,
     fleetqox_rmw_env_prefix,
@@ -553,6 +555,69 @@ class ConstantsTest(unittest.TestCase):
     def test_rmw_port_and_type_name_are_sane(self):
         self.assertEqual(RMW_PORT, 9100)
         self.assertEqual(STATIC_SUBSCRIPTION_TYPE_NAME, "std_msgs/msg/String")
+
+
+class EffectiveNs3SimDurationSTest(unittest.TestCase):
+    """PROVEN BUG (see docs/AUDIT_ACCEPTANCE_TRACKING.md, "N=8 REALTIME-LAG
+    VALIDATION" / "TABLE VI HARNESS DURATION MISMATCH FIX"):
+    run_coordination_probe() used to hardcode sim_duration_s=60.0,
+    completely independent of scenario_timeout_s (default 120.0) --
+    ns-3's own Simulator::Stop() could fire, silently killing the
+    simulated Wi-Fi network, while the coordination workload (Python
+    side, a totally separate clock) was still legitimately running for
+    up to another 60 real seconds. Every N=8 measurement in this
+    investigation's history was made under that mismatch. This test
+    proves the derived default always covers the workload's own full
+    possible runtime (start_offset_ms + scenario_timeout_s) plus a
+    drain margin, for any scenario_timeout_s -- not just the default."""
+
+    def test_default_covers_full_scenario_timeout_plus_start_offset(self):
+        result = effective_ns3_sim_duration_s(
+            sim_duration_s=None, scenario_timeout_s=120.0, start_offset_ms=2000.0
+        )
+        self.assertGreaterEqual(result, 2000.0 / 1000.0 + 120.0)
+
+    def test_covers_scenario_timeout_at_any_value_not_just_the_old_hardcoded_case(self):
+        # The old bug (sim_duration_s=60.0 fixed) only happened to be
+        # "close" at scenario_timeout_s values near 60 -- proving this
+        # holds across a spread of values is what actually closes the
+        # bug class, not just the one default combination.
+        for scenario_timeout_s in (10.0, 30.0, 60.0, 90.0, 120.0, 300.0):
+            with self.subTest(scenario_timeout_s=scenario_timeout_s):
+                result = effective_ns3_sim_duration_s(
+                    sim_duration_s=None,
+                    scenario_timeout_s=scenario_timeout_s,
+                    start_offset_ms=2000.0,
+                )
+                self.assertGreaterEqual(result, 2000.0 / 1000.0 + scenario_timeout_s)
+
+    def test_includes_a_positive_drain_margin_beyond_the_bare_minimum(self):
+        # Not just "greater or equal" by luck -- there must be actual
+        # slack for in-flight repair/ACK traffic to resolve after the
+        # workload's own last legitimate send.
+        result = effective_ns3_sim_duration_s(
+            sim_duration_s=None, scenario_timeout_s=120.0, start_offset_ms=2000.0
+        )
+        self.assertGreaterEqual(
+            result, 2000.0 / 1000.0 + 120.0 + NS3_SIM_DURATION_DRAIN_MARGIN_S - 1e-9
+        )
+
+    def test_explicit_override_still_respected(self):
+        # A caller deliberately requesting a short duration (e.g. this
+        # investigation's own smoke tests) must still be able to opt out
+        # of the derived default.
+        result = effective_ns3_sim_duration_s(
+            sim_duration_s=15.0, scenario_timeout_s=120.0, start_offset_ms=2000.0
+        )
+        self.assertEqual(result, 15.0)
+
+    def test_drain_margin_matches_wait_for_completions_own_slack_constant(self):
+        # One clear duration contract: the SAME slack this codebase
+        # already grants the workload to finish (see
+        # wait_for_completion()'s own timeout_s formula) is what backs
+        # ns-3's own stop time too, rather than two independently-
+        # guessed numbers that could drift apart again.
+        self.assertEqual(NS3_SIM_DURATION_DRAIN_MARGIN_S, 60.0)
 
 
 if __name__ == "__main__":
