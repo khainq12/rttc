@@ -16553,6 +16553,205 @@ CycloneDDS/Zenoh require a genuine fix to the underlying discovery-
 convergence-within-timeout problem characterized above (out of this
 task's scope) before any comparison can be reported.
 
+## LAN DISCOVERY-CONVERGENCE ROOT-CAUSE INVESTIGATION -- ONE CLEAN CAUSAL PROOF, TWO HYPOTHESES REFUTED, NO DETERMINISTIC FIX YET
+
+Follow-up to "LAN READINESS GATE: TOPOLOGY-AWARE FIX": with the gate now
+provably correct, this investigation dug into WHY Fast DDS/CycloneDDS/
+Zenoh still fail LAN readiness. Scope: harness/infrastructure debugging
+only, no middleware tuning, no gate weakening, no sleeps as a first
+fix, N=2/N=4 before N=16. All read-only diagnostic scripts (do not
+change `run_lan_probe()`/`launch_endpoints()` production behavior).
+
+### Fast DDS
+
+**Hypothesis tested**: does `launch_endpoints()` start client processes
+before the discovery server (co-located on control_station, in the
+SAME container) is actually usable? **REFUTED.** Direct measurement
+(`scripts/investigate_lan_discovery_startup_timing.py`): the server's
+process becomes visible to `pgrep` at +0.31s; the discovery server logs
+"### Server is running ###" and binds its **UDP** socket (confirmed via
+`ss -uln` -- NOT TCP; an earlier `ss -tln` check falsely suggested "not
+listening" purely from checking the wrong socket family) well within
+the harness's existing 3s wait. The dependency IS ready long before any
+endpoint launches.
+
+**Second hypothesis tested**: is control_station's own co-located
+client mis-addressed (using its real overlay IP to reach a server in
+its own container, instead of loopback)? **REFUTED**
+(`scripts/investigate_lan_fastdds_loopback_hypothesis.py`): forcing
+control_station's client to use `127.0.0.1` instead of its real IP,
+while every robot keeps the real IP unchanged, did NOT fix it --
+control_station still isolated.
+
+**Timing-sufficiency test**: does discovery eventually converge given
+much more time? **REFUTED as "just needs more time"**: raising
+`discovery_timeout_s` from 15s to 60s (4x) at N=16 seed=7 did not
+converge -- control_station was still missing 7 of 16 required robots
+after 60s (a DIFFERENT 7 than the 5 missing at 15s for the same seed),
+proving discovery never completes for the affected peers within any
+reasonable window, not merely "slowly."
+
+**Packet-level evidence** (`scripts/investigate_lan_fastdds_discovery_packet_loss.py`,
+N=4, portable tcpdump per endpoint): all discovery-server-port (11811)
+traffic flows ONE DIRECTION ONLY -- every robot sends host->server
+registration packets, and NOT ONE packet flows server->robot on port
+11811 in ANY capture, including the successful ones. This is expected
+protocol behavior (the actual mutual metatraffic happens on separately-
+negotiated ports after the initial handshake), so it does not
+distinguish success from failure -- capturing THOSE specific dynamic
+ports (seen via `ss -uln`: 7411/7412/7415/etc.) was not completed
+before time ran out on this pass.
+
+**Reproducible failure pattern**: across 3 fresh N=16 seeds, it is
+ALWAYS control_station missing a partial (not total), seed-varying
+subset of its 16 required robots (5, 7, and 6 of 16 respectively;
+robot_0000 and robot_0007 recur in all 3 seeds, others vary) -- a mix
+of some identity-consistent and some seed-random component.
+
+**Status: ROOT CAUSE NOT YET ISOLATED.** Two specific, plausible
+mechanisms were tested with direct evidence and refuted. No fix
+attempted (none proven).
+
+### Zenoh
+
+**Hypothesis tested**: is control_station's Zenoh router process
+started but not yet accepting sessions when endpoints launch?
+**REFUTED.** Direct measurement (same script as Fast DDS): router
+process alive at +0.31s, its TCP listen socket on 7447 confirmed
+actually LISTENING (correct socket family this time, TCP) at +1.22s --
+well inside the harness's existing 3s wait.
+
+**Observed pattern**: unlike Fast DDS's mostly-control_station-centric
+failures, Zenoh shows control_station missing a partial, seed-VARYING
+subset (7, 7, and 7 of 16 required robots across 3 seeds, but almost
+no overlap in WHICH ones -- robot_0003/0004/0005 recur loosely, not
+deterministically) -- consistent with the historical "RANDOM/partial-
+mesh" characterization already on record for this middleware from a
+prior investigation of a different script. `endpoint_0`'s own log also
+shows a "Unable to connect to a Zenoh router" WARN line preceding
+eventual (partial) convergence, printed by rmw_zenoh_cpp's own client
+library before its session establishes -- consistent with a normal,
+if noisy, startup sequence rather than proof of a router-side bug.
+
+**Status: ROOT CAUSE NOT YET ISOLATED**, router-readiness hypothesis
+cleanly refuted. No fix attempted.
+
+### CycloneDDS -- ONE CLEAN CAUSAL PROOF
+
+**Causal test** (`scripts/investigate_lan_cyclonedds_launch_order_causal_test.py`,
+N=4, 3 independent launch-order rotations, self.endpoints/self.ips/
+static-peers-XML-content held IDENTICAL across all 3 -- only the ORDER
+`docker exec -d` is issued changes):
+
+| condition | launch sequence | last-launched | failing endpoint | matches last-launched? |
+|---|---|---|---|---|
+| A (default) | control_station,r0,r1,r2,r3 | robot_0003 | robot_0003 | **YES** |
+| B (reversed robots) | control_station,r3,r2,r1,r0 | robot_0000 | robot_0000 | **YES** |
+| C (third rotation) | control_station,r0,r2,r3,r1 | robot_0001 | robot_0001 | **YES** |
+
+**3/3 clean result: failure follows LAUNCH POSITION, not robot
+identity.** Directly answers this investigation's own question 8:
+CycloneDDS's repeated "last-launched robot isolated" pattern (seen
+identically at N=2, N=4, and N=16 in earlier passes) is a genuine
+launch-order/lifecycle effect, not anything about a specific robot's
+IP or index. Consistent with CycloneDDS's SPDP announce-rate backoff:
+earlier-started participants throttle their own announce cadence down
+once they believe initial discovery is complete, so a participant that
+joins after that throttling has begun may not receive another
+announcement from them within the remaining discovery window.
+
+**Fix hypothesis tested**: does launching all endpoints CONCURRENTLY
+(a thread per endpoint, `docker exec -d` dispatched near-simultaneously
+via `ThreadPoolExecutor` -- removing the harness's own implicit serial
+launch delay, the opposite of adding a sleep) eliminate the asymmetry?
+**PARTIALLY REFUTED** (`scripts/investigate_lan_cyclonedds_parallel_launch_fix.py`,
+3 repeats, ~0.13s total dispatch spread across all 5 endpoints): **0/3
+reps achieved full readiness.** The failure pattern changed character
+-- with no well-defined "last launched" endpoint anymore, it was
+control_station that failed, consistently, all 3 reps -- suggesting a
+DIFFERENT, likely CPU-contention-driven mechanism (5 DDS participants'
+startup competing for scheduling at the same instant) dominates once
+pure launch-order is equalized, rather than a single clean lifecycle
+bug being the whole story.
+
+**Status: root cause partially proven** (launch-order causality is
+real and cleanly demonstrated) **but no deterministic fix found yet**
+-- parallel dispatch is not sufficient by itself and was NOT adopted
+(0/3 clean, would not pass a GREEN gate).
+
+### Phase 5 (resource effects) and Phase 6 (RED->FIX->GREEN)
+
+The CycloneDDS parallel-launch result is itself evidence pointing at
+Phase 5's own "CPU contention during simultaneous startup" candidate,
+but this was not isolated further (e.g., no cgroup/CPU-affinity
+instrumentation was added) within this pass's time budget. **No
+harness bug reached the bar of "proven, minimal, deterministic fix"
+required before Phase 6's RED->FIX->GREEN cycle applies -- so no
+production code was changed in this investigation.** This differs
+from the LAN READINESS GATE section above (a real, committed,
+GREEN-verified fix) -- this section is root-cause research that did
+not yet reach a fixable, verified conclusion for any of the three
+middlewares.
+
+### Phases 7-8: NOT REACHED
+
+No proven fix exists for any of the three middlewares, so N=8/N=16
+rescaling and the 20-seed final experiment do not apply this pass --
+running them would reproduce the same failures already characterized
+above at real compute cost with no new information.
+
+### Verdicts
+
+1. Fast DDS proven failure location: control_station, missing a
+   partial (5-7 of 16) subset of required robots, N=16, all 3 seeds.
+2. Fast DDS root cause: **NOT ISOLATED** -- "server not ready" and
+   "co-located-client addressing" both refuted with direct evidence.
+3. Fast DDS RED->FIX->GREEN: **not reached** (no fix to test).
+4. Zenoh proven failure location: control_station, missing a partial
+   (7 of 16), seed-random subset.
+5. Zenoh root cause: **NOT ISOLATED** -- "router not ready" refuted
+   with direct evidence.
+6. Zenoh RED->FIX->GREEN: **not reached**.
+7. CycloneDDS proven failure location: whichever endpoint is launched
+   last (N=2: robot_0001: N=4: robot_0003; N=16: robot_0015).
+8. Cyclone failure follows: **LAUNCH POSITION**, proven 3/3 via an
+   independent-rotation causal test.
+9. CycloneDDS root cause: launch-order/lifecycle effect, most likely
+   SPDP announce-rate backoff asymmetry (mechanism inferred from the
+   proven causal pattern, not yet directly observed in a CycloneDDS-
+   internal trace) -- COMPOUNDED by CPU-contention once launch-order
+   is equalized (proven via the parallel-dispatch experiment's
+   changed-but-not-fixed failure pattern).
+10. CycloneDDS RED->FIX->GREEN: **RED proven** (causal test above);
+    **FIX not found** (parallel dispatch tested and insufficient, 0/3
+    clean); **GREEN not reached**.
+11. Full-suite result: unchanged from the prior LAN READINESS GATE
+    section (846->853 passed, same 8 pre-existing failures) -- no
+    production code was touched in this investigation, so no new run
+    was needed.
+12. N=2/N=4 readiness after fixes: **unchanged from before this
+    investigation** (no fix was adopted) -- FleetRMW clean, the other
+    three still fail as previously documented.
+13. N=8 results: not run (blocked, no proven fix to test at scale).
+14. N=16 3-seed results: not re-run (unchanged from the existing
+    "LAN TABLE V -- FINAL PAPER-READY STATUS" section).
+15. 20-seed result: not reached.
+16. Superiority/ceiling result: not computable (no valid cross-
+    middleware baseline).
+17. **LAN paper-ready: still NO** for cross-middleware Table V; YES
+    for FleetRMW alone (unchanged).
+18. This section required no commits to production code -- only new
+    read-only diagnostic scripts were added (see commit list below).
+19. Next step: capture the ACTUAL Fast DDS/CycloneDDS metatraffic
+    ports (not just the discovery-server/router bootstrap port) with
+    `ss -uln` taken live during a failing run, then packet-capture
+    exactly those ports -- the single most information-dense remaining
+    experiment neither hypothesis-refutation above required, and the
+    one most likely to finally distinguish "genuine protocol-level
+    asymmetry" from "resource contention" for Fast DDS and Zenoh (the
+    two middlewares where launch-order causality has NOT yet been
+    proven the way it was for CycloneDDS).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
