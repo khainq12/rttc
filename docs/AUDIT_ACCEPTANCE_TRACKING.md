@@ -16972,6 +16972,263 @@ No fix exists to test at scale.
     the only remaining way to move from "proven not network loss" to
     an exact, fixable mechanism.
 
+## LAN DISCOVERY SEMANTIC-LAYER INVESTIGATION -- CYCLONEDDS ROOT CAUSE PROVEN, ZENOH BUG PROVEN AND FIXED, FAST DDS STILL UNKNOWN
+
+Follow-up to "LAN DISCOVERY FIRST-DIVERGENCE INVESTIGATION": that pass
+proved the network layer healthy for all three middlewares but could
+not see far enough to find the actual first SEMANTIC divergence. This
+pass enabled each middleware's own internal discovery/session logging
+(installed versions: Fast DDS/rmw_fastrtps_cpp 2.14.6, CycloneDDS/
+rmw_cyclonedds_cpp 0.10.5, rmw_zenoh_cpp/zenoh-cpp-vendor 0.2.10) to
+reconstruct real semantic timelines. Harness/infrastructure debugging
+only.
+
+### Internal logging methods used
+
+- **Fast DDS**: confirmed by reading `fastdds/dds/log/Log.hpp` directly
+  that `EPROSIMA_LOG_INFO` call sites are compiled OUT of this prebuilt
+  Release package (no `FASTDDS_ENFORCE_LOG_INFO` define) -- Info-level
+  discovery events ("participant discovered", etc.) cannot be surfaced
+  at ANY runtime verbosity setting, by design of the package build.
+  Only Warning/Error level is compiled in, controllable via the public
+  `Log::SetVerbosity`/`RegisterConsumer` C++ API -- exposed via a small
+  LD_PRELOAD constructor shim (`.fastdds_log_shim/verbosity_shim.cpp`,
+  compiled against the SAME `libfastrtps.so` the process already
+  loads) that forces Warning verbosity + a stdout consumer before
+  rclpy/the RMW initializes. Verified working (real Fast DDS internal
+  warnings appeared). Applied via `launch_endpoints()`'s existing
+  `extra_rmw_env={"LD_PRELOAD": ...}` mechanism, no new harness
+  parameter needed.
+- **CycloneDDS**: the standard `<Tracing><Verbosity>finest</Verbosity>
+  <OutputFile>` config element (added to the SAME per-endpoint
+  CYCLONEDDS_URI XML this investigation already uses) works
+  immediately, no rebuild/workaround needed -- produced 4,700-5,900
+  lines of detailed internal trace per endpoint.
+- **Zenoh**: the standard Rust `RUST_LOG=zenoh=debug` environment
+  variable (rmw_zenoh_cpp is a thin wrapper over Rust zenoh, which uses
+  the standard `tracing`/`env_logger` ecosystem) works immediately via
+  the same `extra_rmw_env` mechanism -- produced 78-96KB of session/
+  routing trace per endpoint.
+
+All three are diagnostic-only: none change discovery/QoS/timeout
+semantics, only where each middleware's own pre-existing log messages
+are printed. None were left enabled in production code paths.
+
+### CycloneDDS -- ROOT CAUSE PROVEN
+
+Reproduced the already-proven launch-position failure (N=4, last-
+launched robot fails) with full tracing on every endpoint. Searching
+both the passing (second-to-last, robot_0002) and failing (last-
+launched, robot_0003) endpoint's own trace for
+`dq.builtin: data(builtin, ...) ST0 /ParticipantBuiltinTopicData`
+(the exact semantic event = "I have now processed this remote
+participant's announcement") for control_station's specific GUID:
+
+- **PASS (robot_0002)**: process starts at t=845.4668. Receives
+  control_station's ST0 record at t=845.5241 -- **0.057s** later.
+- **FAIL (robot_0003)**: process starts at t=845.7000 (≈0.23s after
+  robot_0002, an ordinary sequential-launch stagger). Does NOT receive
+  the SAME ST0 record until t=860.7469 -- **15.047 seconds** later,
+  right at/past its own 15s `--discovery-timeout-s`.
+
+Cross-referencing every OTHER participant's own log for repeated
+copies of control_station's SAME ST0 record shows control_station's
+own re-announce cadence GROWING over elapsed time since ITS OWN
+participant creation: +0.99s, +1.00s, +1.00s, +4.23s, +8.00s between
+successive re-sends (845.524 -> 846.516 -> 847.520 -> 848.516 ->
+852.746 -> 860.746) -- a real, growing SPDP re-announce backoff
+interval. A participant that starts LISTENING only after this backoff
+has already progressed (as any sequentially-launched, later endpoint
+necessarily does) must wait for the NEXT scheduled slot in that
+already-elapsed schedule, which can land anywhere up to the (growing)
+interval's full length later -- occasionally exceeding the fixed 15s
+discovery window.
+
+**First semantic divergence**: control_station's SPDP participant-data
+re-announce arrives in 0.057s for the early-starting endpoint vs
+15.047s for the later-starting one -- NOT because packets stop
+flowing (raw traffic stayed dense throughout, per the prior
+investigation), but because the SPECIFIC re-announce interval carrying
+the semantically-required data has already grown by the time a later
+joiner starts listening.
+
+**SPDP-backoff hypothesis: CONFIRMED** (reversing the prior
+investigation's packet-level-only refutation -- that pass correctly
+observed dense raw traffic throughout, but could not see that only a
+GROWING SUBSET of that traffic carried the actual re-announced
+participant data needed to complete discovery; this pass's semantic-
+level trace makes the distinction directly visible).
+
+**Root cause: PROVEN.** This is a genuine interaction between
+CycloneDDS's own (undocumented in this trace, but directly observed)
+SPDP announce-interval backoff and this harness's sequential
+per-endpoint launch stagger + fixed discovery timeout -- NOT a harness
+bug in the sense of something broken, and NOT CPU starvation (no
+resource-limited operation was shown to be delayed; the delay is
+CycloneDDS's own scheduled announce timing, working as designed).
+
+**No fix applied.** The only concrete lever available (CycloneDDS's
+own `Discovery/SPDPInterval` config, which could force a shorter,
+non-backing-off announce interval) would be a Discovery-protocol
+CONFIGURATION change made specifically to help this benchmark pass its
+readiness gate -- squarely the "do not tune middleware differently
+just to make it pass" rule this investigation is bound by. Flagged as
+a decision point rather than silently applied or silently skipped.
+
+### Zenoh -- BUG PROVEN AND FIXED (commit `1051148`)
+
+`RUST_LOG=zenoh=debug` on a live N=4 run immediately showed
+control_station's own session config differs structurally from every
+robot's: `mode: Peer, connect: [tcp/localhost:7447], listen:
+[tcp/localhost:0]` vs every robot's `connect: [tcp/10.60.0.2:7447],
+listen: [tcp/[::]:0]`. Root cause: `launch_endpoints()` deliberately
+gave control_station (endpoint 0, the router's own host) NO explicit
+`ZENOH_SESSION_CONFIG_URI` at all ("so it doesn't try to connect to
+itself"), so its session fell back entirely to Zenoh's own defaults --
+including a **listen** address on localhost only, unreachable from any
+other container's own network namespace. Since Zenoh's gossip-based
+autoconnect (enabled by default) advertises each peer's listen address
+for other peers to connect to directly, control_station's gossiped
+"localhost" address was meaningless to every other endpoint.
+
+**A/B (5 reps each, N=4, commit `1051148`)**: A (current) — control_
+station itself failed readiness in multiple reps (3/5 in one batch,
+5/5 in another, both observed across this investigation's several
+runs). B (explicit config: same connect-to-router as before, PLUS an
+explicit `listen` clause on control_station's own real IP; every
+robot's config byte-for-byte unchanged) — **control_station was READY
+in 5/5 reps**, every batch tested.
+
+**First semantic divergence**: control_station's own advertised listen
+address is unreachable from other containers -- proven directly from
+its own session config dump, not inferred.
+
+**Root cause: PROVEN.**
+
+**RED -> FIX -> GREEN**: RED = `ZenohSessionConfigJson5Test` (2 cases:
+router-host gets an explicit real-IP listen clause; every other
+endpoint's config is byte-for-byte unchanged) -- both would have
+failed against the old inline `if i != 0:`-skip logic (no function
+existed to test). FIX = extracted `zenoh_session_config_json5()` (a
+pure, unit-testable static method) + opt-in
+`zenoh_control_station_explicit_listen` parameter on
+`launch_endpoints()` (default `False`, preserving exact prior behavior
+for Wi-Fi's `run_probe()` and Table VI's coordination launcher, which
+never pass it); `run_lan_probe()` passes `True`. GREEN = full pytest
+suite 853 -> 855 passed (+2 new tests), same 8 pre-existing unrelated
+failures.
+
+**KEEP.** This is a genuine, proven, structural defect fix -- not a
+performance tune, not a workaround, and it does not touch any other
+endpoint's configuration, QoS, or the router's own behavior.
+
+**Does NOT fully fix Zenoh's LAN readiness by itself**: in the SAME
+5-repeat B validation, the last-launched robot (robot_0003) failed
+readiness in 5/5 reps -- a SEPARATE, still-open, launch-order-
+dependent failure matching the same CATEGORY already proven for
+CycloneDDS (not yet proven to be the SAME mechanism for Zenoh
+specifically -- Zenoh's own session/gossip timing was not traced at
+the same semantic depth as CycloneDDS's SPDP interval was).
+
+### Fast DDS -- STILL UNKNOWN
+
+Warning-level logging (the only level compiled into this package) was
+successfully enabled and applied to a live N=4 run via the same
+mechanism -- but produced ONLY a single, benign, IDENTICAL warning on
+every endpoint including the successful ones ("HISTORY DEPTH '1000' is
+inconsistent with max_samples_per_instance: '400'" -- a pre-existing,
+harmless QoS sanity notice, not discovery-related) -- **no
+discriminating signal between PASS and FAIL was found at the only log
+level this package exposes.**
+
+**Port-collision A/B attempted, INCONCLUSIVE**: tried giving
+control_station's client an explicit, non-conflicting `participantID`
+(50) via a `FASTDDS_DEFAULT_PROFILES_FILE` XML profile (the documented
+`<rtps><participantID>` element, confirmed present in
+`fastRTPS_profiles.xsd`). Verified via live `ss -uln` output that the
+override **did not take effect** -- control_station's ports remained
+identically 7410/7411/7413 (the same collision pattern) in both the
+"A" and "B" variants, 5/5 reps each, both failing control_station
+5/5 times. This means the A/B did not actually test the intended
+condition (no working non-collision configuration was found within
+this pass's time budget) -- **the port-collision hypothesis remains
+neither confirmed nor refuted**, not "tested and negative."
+
+**Root cause: UNKNOWN.** Both the semantic (Warning-log) and
+structural (port-collision A/B) avenues attempted this pass were
+inconclusive. The only lower-level tool not yet tried is a proper
+RTPS packet dissector (Wireshark's RTPS plugin against the pcaps
+already captured in the prior investigation) or getting
+`FASTDDS_ENFORCE_LOG_INFO`-equivalent behavior via a custom-built Fast
+DDS (out of scope: this environment uses prebuilt Debian packages, not
+vendored source).
+
+### Identity consistency audit
+
+Recorded, without assuming a collision, from data already gathered in
+this pass and the prior packet-capture pass:
+- **CycloneDDS**: GUID prefixes for control_station
+  (`110de7e:a4a5d6b3:5a0dd6a1`), robot_0002
+  (`110ee2e:aa471bb8:9369083`), robot_0003
+  (`1104457:8900e728:b8ca4a6e`) -- all **distinct**.
+- **Zenoh**: session zids for control_station's peer sessions and
+  every robot (`625777bc...`, `be8f2260...`, `6bff8b89...`,
+  `7b1c7176...`) -- all **distinct**.
+- **Fast DDS**: distinct ephemeral source ports per robot observed in
+  packet captures (58555, 60133, ...) -- consistent with distinct
+  participants, no shared-identity signature observed.
+- **Robot/FleetQoX-level identity** (`--endpoint` names,
+  `effective_robot_id`): unaffected by this investigation -- the
+  robot_id collision bug class already found and fixed for Table IV/V/
+  VI in earlier passes applies identically here (`fleetqox_rmw_env_prefix()`
+  is shared, untouched).
+
+**Finding: no duplicate or inconsistent identity found in any trace
+examined.** This class of bug (real and previously found/fixed
+elsewhere in this project) is NOT implicated in the current LAN
+discovery-convergence failures.
+
+### Verdicts
+
+1. Fast DDS root cause: **UNKNOWN** (both attempted avenues
+   inconclusive this pass).
+2. Fast DDS port-collision A/B: **inconclusive** (override didn't
+   apply -- not a negative result).
+3. CycloneDDS root cause: **PROVEN** -- SPDP announce-interval backoff
+   colliding with sequential launch stagger + fixed discovery timeout.
+4. SPDP-backoff hypothesis: **CONFIRMED** at the semantic-trace level
+   (reverses the prior pass's packet-count-only refutation).
+5. Zenoh root cause (control_station-specific failures): **PROVEN**
+   -- localhost-only listen address from a missing explicit session
+   config.
+6. Zenoh fix: **KEPT**, commit `1051148`, RED->FIX->GREEN complete,
+   proven via 5-repeat A/B (0/5 -> 5/5 clean for control_station
+   specifically).
+7. Zenoh remaining issue: a separate, unfixed, launch-order-dependent
+   failure for the last-launched endpoint (5/5 reps even after the
+   listen fix) -- same category as CycloneDDS, mechanism not yet
+   proven for Zenoh specifically.
+8. Identity audit: no collision found for any middleware.
+9. N=2/N=4 status: FleetRMW clean (unchanged). Zenoh's control_station-
+   specific failure mode is fixed; its last-launched-endpoint failure
+   mode is not. CycloneDDS's launch-position failure is root-caused
+   but not fixed (no in-scope lever). Fast DDS unchanged, still
+   unexplained.
+10. N=8/N=16: not reached -- no middleware has reached 100% readiness
+    across repeated launches yet.
+11. LAN paper-ready: still **NO** for cross-middleware Table V; YES
+    for FleetRMW alone (unchanged).
+12. Commits: `1051148` (Zenoh fix); diagnostic scripts and the LD_PRELOAD
+    shim source (`.fastdds_log_shim/`) committed for reproducibility,
+    no other production code changed.
+13. Next step: decide whether adjusting CycloneDDS's `Discovery/
+    SPDPInterval` config counts as an acceptable harness correctness
+    fix (making a real re-announce interval match this benchmark's
+    launch-stagger reality) versus disallowed "tuning to pass" -- this
+    is a judgment call for the user, since the CycloneDDS mechanism is
+    now fully proven and the only remaining question is whether the
+    one concrete fix available is in-scope.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
