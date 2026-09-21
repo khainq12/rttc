@@ -606,6 +606,49 @@ def main() -> int:
         help="max wait for every publisher to see at least one subscriber before sending",
     )
     parser.add_argument(
+        "--created-barrier-dir",
+        type=Path,
+        default=None,
+        help=(
+            "LAN shared-readiness-epoch fairness experiment (see "
+            "docs/AUDIT_ACCEPTANCE_TRACKING.md, 'LAN LIFECYCLE-FAIRNESS "
+            "INVESTIGATION'): opt-in (default None = old behavior, "
+            "discovery_timeout_s's own clock starts immediately after "
+            "THIS endpoint's own node/publishers/subscriptions are "
+            "created, independent of every other endpoint's own "
+            "timing). When set, this endpoint instead writes its own "
+            "marker file into this directory right after node creation, "
+            "then waits (polling, not sleeping -- keeps spinning the "
+            "node) until --total-endpoints marker files exist, and ONLY "
+            "THEN starts the discovery_timeout_s clock -- so every "
+            "endpoint's DDS/Zenoh participant already exists, and has "
+            "for comparable amounts of time, before ANY endpoint begins "
+            "counting down its own readiness deadline. Does not change "
+            "discovery_timeout_s's own duration, QoS, workload, or "
+            "network -- only WHEN the existing, unchanged clock starts. "
+            "Requires --total-endpoints."
+        ),
+    )
+    parser.add_argument(
+        "--total-endpoints",
+        type=int,
+        default=0,
+        help="required alongside --created-barrier-dir: how many marker files to wait for.",
+    )
+    parser.add_argument(
+        "--created-barrier-timeout-s",
+        type=float,
+        default=30.0,
+        help=(
+            "Safety ceiling for the --created-barrier-dir wait itself "
+            "(NOT part of discovery_timeout_s -- a separate, earlier "
+            "gate). If not all --total-endpoints markers appear within "
+            "this long, proceeds anyway (treated as a harness-level "
+            "problem, not folded into the readiness measurement) --  "
+            "logged, not silently ignored."
+        ),
+    )
+    parser.add_argument(
         "--start-wait-timeout-s",
         type=float,
         default=60.0,
@@ -703,6 +746,8 @@ def main() -> int:
         ),
     )
     args = parser.parse_args()
+    if args.created_barrier_dir is not None and args.total_endpoints <= 0:
+        parser.error("--created-barrier-dir requires --total-endpoints > 0")
 
     import rclpy
     import rclpy.publisher
@@ -849,6 +894,32 @@ def main() -> int:
                 discovery_peers_seen.add(msg.data)
 
         node.create_subscription(String, beacon_topic, on_beacon, beacon_qos)
+
+    # Shared readiness epoch (opt-in, see --created-barrier-dir's own
+    # help text): this endpoint's node/publishers/subscriptions/beacon
+    # all already exist above -- mark that fact, then wait for every
+    # OTHER endpoint to reach the same point before starting the
+    # discovery_timeout_s clock. Keeps spinning the node while waiting
+    # (not a blocking sleep) so this endpoint's own participant stays
+    # fully responsive to any peer that already found it.
+    created_barrier_wait_s = 0.0
+    created_barrier_timed_out = False
+    if args.created_barrier_dir is not None:
+        args.created_barrier_dir.mkdir(parents=True, exist_ok=True)
+        (args.created_barrier_dir / f"{args.endpoint}.created").touch()
+        barrier_start = time.monotonic()
+        barrier_deadline = barrier_start + args.created_barrier_timeout_s
+        while True:
+            marker_count = len(list(args.created_barrier_dir.glob("*.created")))
+            if marker_count >= args.total_endpoints:
+                break
+            if time.monotonic() >= barrier_deadline:
+                created_barrier_timed_out = True
+                break
+            for _ in range(20):
+                rclpy.spin_once(node, timeout_sec=0.0)
+            rclpy.spin_once(node, timeout_sec=0.05)
+        created_barrier_wait_s = time.monotonic() - barrier_start
 
     discovery_start = time.monotonic()
     discovery_deadline = discovery_start + args.discovery_timeout_s
@@ -1101,6 +1172,9 @@ def main() -> int:
         "discovery_required_peer_ids": sorted(required_peer_ids) if required_peer_ids is not None else None,
         "discovery_peers_seen_ids": sorted(discovery_peers_seen),
         "discovery_ready": converged,
+        "created_barrier_used": args.created_barrier_dir is not None,
+        "created_barrier_wait_s": created_barrier_wait_s,
+        "created_barrier_timed_out": created_barrier_timed_out,
         "start_wall_monotonic_ns": start_wall_ns,
         "drain_deadline_monotonic_ns": drain_deadline_ns,
         "final_drain_deadline_monotonic_ns": final_drain_deadline_ns,

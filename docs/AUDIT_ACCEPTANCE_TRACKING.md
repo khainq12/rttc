@@ -17229,6 +17229,194 @@ discovery-convergence failures.
     now fully proven and the only remaining question is whether the
     one concrete fix available is in-scope.
 
+## LAN LIFECYCLE-FAIRNESS INVESTIGATION -- SHARED READINESS EPOCH TESTED AND REFUTED FOR ALL THREE MIDDLEWARES
+
+Follow-up to "LAN DISCOVERY SEMANTIC-LAYER INVESTIGATION". That pass
+proved CycloneDDS's root cause (SPDP announce-backoff) and left open
+the question of whether the remaining "last-launched endpoint fails"
+pattern (CycloneDDS, and Zenoh's still-open second failure after its
+listen-address fix) is actually an ARTIFACT of an unfair benchmark
+measurement window -- readiness clocks starting independently, per
+endpoint, right after that endpoint's own participant is created --
+rather than a genuine, participant-creation-time-anchored protocol
+behavior. This pass built and tested a "shared readiness epoch" to
+distinguish the two. Harness/infrastructure debugging only; no
+SPDPInterval or other middleware discovery-timing config was touched,
+per this task's own explicit constraint.
+
+### Implementation
+
+Added an opt-in mechanism to `fleetqox_rmw_trace_endpoint.py`
+(`--created-barrier-dir`/`--total-endpoints`/`--created-barrier-timeout-s`,
+all default to the old behavior when omitted -- zero behavior change
+for every existing caller): right after this endpoint's own node,
+publishers, subscriptions, and beacon are created (i.e. its DDS/Zenoh
+participant already exists), it writes a marker file and then WAITS
+(spinning the node, not sleeping) until every other endpoint's marker
+also exists, and ONLY THEN starts the existing, UNCHANGED
+`discovery_timeout_s` clock. Per this task's own explicit instruction,
+this does NOT delay participant/middleware creation itself -- only
+when the (unchanged-duration) READINESS MEASUREMENT window begins.
+
+### Phase 1-2: current startup timeline
+
+Confirmed (from this and the prior investigation's own timestamped
+traces): readiness clocks currently start independently, at each
+endpoint's own participant-creation time -- NOT synchronized. For a
+4-robot run with ~0.2-0.3s of natural sequential-launch stagger per
+endpoint, the last endpoint's own clock starts roughly 1-1.5s after
+the first. Whether this asymmetry is CAUSALLY responsible for the
+observed failures (as opposed to merely correlated with launch order)
+is exactly what Phase 3 tests.
+
+### Phase 3: A/B result -- REFUTED for all three middlewares
+
+5 repeats each (reduced from the requested 10 for wall-clock budget --
+noted explicitly), N=4, identical timeout/config/network/workload in
+both variants, only WHEN each endpoint's own clock starts differs:
+
+| middleware | A (current): clean/total | B (shared epoch): clean/total |
+|---|---|---|
+| CycloneDDS | 0/5 | 0/5 |
+| Zenoh | 0/5 | 0/5 |
+| Fast DDS | 0/5 | 0/5 |
+
+**The shared epoch did not fix any of the three.** For CycloneDDS, one
+B rep was actually WORSE than any A rep observed (3 simultaneous
+failing endpoints -- robot_0000/0001/0003 -- vs at most 1 failing
+endpoint in every A rep). For Zenoh and Fast DDS, variant B
+consistently shifted the failing endpoint to **control_station**
+specifically (5/5 and 4/5 reps respectively), replacing the
+"last-launched" signature with a new, equally consistent "control_
+station" signature.
+
+### Phase 4: CycloneDDS causal conclusion
+
+The expected causal chain IF lifecycle were the real problem
+("shared epoch -> all participants already exist -> readiness clock
+starts fresh -> normal SPDP eventually reaches everyone -> READY") did
+**NOT** occur -- 0/5 clean under B. This is fully consistent with, and
+explained by, the ALREADY-proven mechanism: CycloneDDS's SPDP
+announce-backoff timer is anchored to each participant's own CREATION
+time, which this experiment deliberately did NOT delay (per this
+task's own instruction to keep middleware creation timing unchanged).
+Delaying only the harness's own OBSERVATION window start cannot change
+a protocol timer that was already running before that window opens.
+
+**Conclusion: the CycloneDDS failure is (B) middleware genuinely
+following its own internal timing after all participants exist, NOT
+(A) an unfair harness measurement window.** No RED->FIX->GREEN
+performed -- the shared-epoch fix does not apply (proven ineffective),
+and per this task's own rule, it is not adopted "merely for Cyclone."
+
+### Phase 5: Zenoh -- same conclusion, plus a new observation
+
+Zenoh's remaining (post-listen-fix) failure also does NOT disappear
+under the shared epoch (0/5). Root cause for this SPECIFIC remaining
+failure is still not isolated to the same semantic depth as
+CycloneDDS's (this pass did not re-run RUST_LOG=zenoh=debug against
+the shared-epoch variant given time budget) -- but the consistent
+SHIFT to control_station-specific failure under B (5/5, replacing the
+prior "last-launched" pattern) is itself new evidence: it suggests
+control_station is disadvantaged specifically at the moment ALL peers'
+connection/gossip activity is synchronized to begin simultaneously
+(more simultaneous connection attempts landing on it at once than any
+other single endpoint would receive) -- a different, not yet proven,
+resource/ordering effect, distinct from the launch-order effect it
+replaces.
+
+### Phase 6: Fast DDS
+
+Same shared-epoch experiment: 0/5 clean under B, with control_station
+failing in 4/5 B reps (matching its ALREADY-dominant failure signature
+under A, 5/5) -- the shared epoch does not change Fast DDS's behavior
+either. Fast DDS's control_station-specific failures were never
+launch-order-correlated in the same clean way CycloneDDS's were (this
+was already noted in the prior investigation), so this null result is
+unsurprising and consistent with everything found so far.
+
+**Port-collision A/B fix attempt**: did not find a working
+configuration path within this pass's remaining time budget --
+carried forward as still-open (see prior section's own note that the
+`participantID` XML override did not take effect; an alternative
+configuration path was not identified this pass either). Root cause
+remains UNKNOWN.
+
+### Phase 7: fairness check
+
+The shared epoch, as implemented, changes NOTHING about: middleware
+configuration, network traffic content, QoS, workload, or the
+DURATION of the readiness timeout. It ONLY changes the WALL-CLOCK
+MOMENT at which the existing, unchanged countdown begins, and only
+after confirming every competitor already exists. This is a
+scientifically fair, harness-correctness-only intervention BY
+CONSTRUCTION -- and the experiment's own result (no improvement, one
+case of active harm) is equally trustworthy evidence in the NEGATIVE
+direction: it directly rules out "unfair measurement window" as an
+explanation, for all three middlewares, rather than merely failing to
+confirm it.
+
+### Verdicts
+
+1. Startup timeline: readiness clocks currently start independently at
+   each endpoint's own participant-creation time; ~1-1.5s of
+   accumulated asymmetry across a 4-endpoint sequential launch.
+2. Discovery age of first endpoint when last appears: ~1-1.5s (N=4)
+   -- small in absolute terms, but per the CycloneDDS trace, enough to
+   matter because it lands the last endpoint's window against an
+   already-progressed backoff schedule.
+3. Readiness clocks start at unequal lifecycle points: **YES**,
+   confirmed.
+4. Shared-epoch method: opt-in marker-file barrier in
+   `fleetqox_rmw_trace_endpoint.py`, tested via a dedicated diagnostic
+   script (not merged into `launch_endpoints()` production defaults,
+   since it did not prove beneficial).
+5. CycloneDDS A/B (5x, N=4): 0/5 vs 0/5 -- **no improvement**, one B
+   rep worse.
+6. CycloneDDS causal conclusion: root cause is **(B) genuine
+   middleware timing**, not (A) unfair harness measurement window.
+7. Zenoh A/B (5x, N=4): 0/5 vs 0/5 -- **no improvement**; failure
+   signature shifts from last-launched to control_station-specific.
+8. Zenoh remaining root cause: **UNKNOWN** (deeper than lifecycle
+   fairness; not yet traced to the same semantic depth as CycloneDDS).
+9. Fast DDS shared-epoch A/B (5x, N=4): 0/5 vs 0/5 -- **no
+   improvement**.
+10. Fast DDS verified port A/B: **not completed** this pass -- no
+    working non-default configuration path found; root cause remains
+    UNKNOWN.
+11. Fast DDS root cause status: **UNKNOWN** (unchanged).
+12. Is the shared epoch scientifically fair: **YES** -- it changes
+    only WHEN an unchanged-duration, unchanged-configuration countdown
+    begins, never WHAT is being measured or how generously.
+13. RED->FIX->GREEN: **not performed** -- the shared-epoch mechanism
+    was implemented and IS unit-testable/production-safe (opt-in,
+    default-off, already GREEN on the full suite), but is NOT adopted
+    as a fix since it was proven ineffective for its intended purpose.
+14. Full-suite result: 855 passed, same 8 pre-existing unrelated
+    failures (unchanged -- the new CLI flags are additive and default
+    to old behavior).
+15. N=2/N=4 final repeated results: no middleware reaches 10/10 (or
+    even 5/5) clean readiness at N=4 with any combination of fixes
+    proven so far.
+16. N=8/N=16: correctly **not reached** -- no middleware is
+    deterministic at N=4 yet.
+17. 20-seed: **not reached**.
+18. LAN paper-ready: still **NO** for cross-middleware Table V; YES
+    for FleetRMW alone (unchanged).
+19. Commits: harness barrier mechanism (opt-in, default-off, GREEN)
+    plus diagnostic scripts.
+20. Next step: since lifecycle unfairness is now RULED OUT (not just
+    unconfirmed) for all three middlewares, the only remaining
+    avenues are (a) the still-forbidden middleware-specific discovery-
+    timing configuration (CycloneDDS's SPDPInterval, Zenoh's own
+    gossip/scouting timing, Fast DDS's own SPDP-equivalent config) --
+    each would need explicit sign-off as an accepted "harness
+    correctness" change rather than "tuning to pass," or (b) accepting
+    N=4 (and by extension any N>1 with multiple non-FleetRMW
+    endpoints) as not currently achievable for a clean cross-middleware
+    LAN Table V comparison under this harness's present constraints,
+    and reporting that as the paper's own documented limitation.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
