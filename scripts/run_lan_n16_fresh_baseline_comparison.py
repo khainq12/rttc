@@ -211,6 +211,13 @@ def run_one(
         "cpu_pct_mean": result.get("cpu_pct_mean"),
         "rss_mb_mean": result.get("rss_mb_mean"),
         "graph_join_failures": result.get("graph_join_failures"),
+        # Setup convergence time, reported SEPARATELY from Table V's
+        # delivery/latency metrics above (see docs/AUDIT_ACCEPTANCE_TRACKING.md,
+        # "LAN SOURCE + OFFICIAL-DOCUMENTATION AUDIT" Phase 4/8): the
+        # slowest endpoint's own time-to-converge, bounded by the setup
+        # watchdog (LAN_DISCOVERY_WATCHDOG_S) but never counted as part
+        # of the measured performance window itself.
+        "discovery_convergence_max_s": result.get("discovery_convergence_max_s"),
         "per_flow": per_flow,
         "raw_output_dir": str(output_dir.relative_to(ROOT)),
     }

@@ -18031,6 +18031,291 @@ a substitute for it.
     ladder now that N=2/N=4 are clean, per the user's own explicit
     sequencing.
 
+## LAN FINAL VALIDATION -- N=8, N=16, FROZEN 20-SEED: ALL CLEAN, CEILING EFFECT CONFIRMED, SUPERIORITY GATE NOT MET
+
+Direct continuation of the two sections above (Phases 1-9 of the LAN
+source+documentation audit). This section runs the validation ladder
+those phases earned the right to run: N=2/N=4 were already 5/5 clean
+for all four middlewares under commit `a2590e6` (watchdog fix +
+beacon-starvation fix). Per the user's own explicit sequencing ("do not
+run expensive scale experiments before small-scale GREEN"), this
+section only started after that was true.
+
+No middleware configuration was changed anywhere in this pass -- every
+run below uses the exact same `run_lan_probe()` production entry point,
+the exact same per-middleware `discovery_mode` convention already
+established (FleetRMW: default/static; Fast DDS: discovery_server;
+CycloneDDS: static_peers; Zenoh: default), the same workload generator,
+the same LAN topology, the same QoS. The only two things that changed
+relative to every prior LAN pass are the two already-documented fixes:
+`LAN_DISCOVERY_WATCHDOG_S=45.0` and `--sustain-beacon-until-deadline`.
+
+### Phase 1: N=8 readiness + performance (3 seeds x 4 middleware, counterbalanced)
+
+New driver: `scripts/run_lan_n8_post_fix_validation.py` (measurement
+only, reuses `run_lan_n16_fresh_baseline_comparison.py`'s own
+`MIDDLEWARE`/`run_one()`, output to a fresh
+`results_rmw_socket/lan_n8_post_a2590e6_validation/` tree).
+
+**Readiness table:**
+
+| Middleware | seed=7 | seed=13 | seed=29 |
+|---|---|---|---|
+| FleetRMW | READY | READY | READY |
+| Fast DDS | READY | READY | READY |
+| CycloneDDS | READY | READY | READY |
+| Zenoh | READY | READY | READY |
+
+**12/12 READY.** No timeout-as-ready anywhere (every run's `status`
+field is `ok`, meaning `discovery_converged()` returned True on its own
+merits -- `status=invalid_readiness` never occurred in this pass).
+
+**Performance table** (delivery% / fresh-deadline-success% / p50 / p99
+/ setup-convergence-max, all identical 100%/100% for delivery+fresh
+across the board, so shown once with latency+convergence broken out):
+
+| Middleware | delivery% | fresh% | p50 (ms) | p99 (ms) | max setup convergence (s) |
+|---|---|---|---|---|---|
+| FleetRMW | 100.0 | 100.0 | 0.68-0.97 | 1.48-2.42 | ~0 (static mode, no discovery step) |
+| Fast DDS | 100.0 | 100.0 | 0.70-0.90 | 1.47-1.66 | 3.25 |
+| CycloneDDS | 100.0 | 100.0 | (same range) | (same range) | 2.20 |
+| Zenoh | 100.0 | 100.0 | 0.68-0.91 | 1.48-1.66 | 2.36 |
+
+Every convergence time is comfortably under the 45s watchdog (max
+observed 3.25s) and under even the OLD 15s watchdog at this scale --
+N=8 alone does not stress discovery hard enough to need the new
+watchdog value; N=16 and the 20-seed set below do.
+
+### Phase 2: N=16 readiness + performance (3 seeds x 4 middleware, counterbalanced)
+
+Reused `scripts/run_lan_n16_fresh_baseline_comparison.py` unmodified
+(`--main-only`, fresh `--output-root
+results_rmw_socket/lan_n16_post_a2590e6_validation/` so the OLD,
+pre-fix N=16 baseline directory is untouched).
+
+**Readiness table:**
+
+| Middleware | seed=7 | seed=13 | seed=29 |
+|---|---|---|---|
+| FleetRMW | READY | READY | READY |
+| Fast DDS | READY | READY | READY |
+| CycloneDDS | READY | READY | READY |
+| Zenoh | READY | READY | READY |
+
+**12/12 valid** (`status=ok`, `endpoint_results_complete=true`,
+`intended>0` for every run).
+
+**Performance table:**
+
+| Middleware | delivery% | fresh% | max setup convergence (s) |
+|---|---|---|---|
+| FleetRMW | 100.0 | 100.0 | ~0.000005 |
+| Fast DDS | 100.0 | 100.0 | 6.77 |
+| CycloneDDS | 100.0 | 100.0 | 6.44 |
+| Zenoh | 100.0 | 100.0 | 4.70 |
+
+Convergence times grew somewhat from N=8 to N=16 (as expected -- more
+required peers per star-hub endpoint) but remain well inside the 45s
+watchdog with a >6x margin.
+
+### Phase 3: frozen 20-seed paired experiment, N=16
+
+Reused `scripts/run_lan_n16_paired_20seed_experiment.py` **exactly as
+written** -- the same frozen `SEEDS_20` list
+(`7,13,29,41,53,67,79,89,97,101,103,107,109,113,127,131,137,139,149,151`,
+fixed before this or any prior pass ever ran, not re-selected here),
+the same counterbalanced rotation, the same retry-once-if-invalid
+policy. Only the `--output-root` was changed, to
+`results_rmw_socket/lan_n16_paired_20seed_post_a2590e6/`, so this run's
+data is never mixed with the old, pre-fix 20-seed results (which are
+superseded below, not overwritten).
+
+**Result: 80/80 runs valid on the FIRST attempt -- zero retries
+needed, zero invalid runs, zero crashes.** Every single run: `status=ok`,
+`valid=true`, `delivery_pct=100.0`, `fresh_deadline_success_pct=100.0`.
+
+### Phase 4: final analysis (`scripts/analyze_lan_n16_paired_experiment.py`, unmodified, reused as-is)
+
+**Validity: 20/20 for all four middlewares** (`FleetRMW`, `Fast DDS`,
+`CycloneDDS`, `Zenoh` each 20/20 valid, 0 invalid first attempts, 0
+replacement runs needed).
+
+**Final 20-seed performance summary:**
+
+| Middleware | delivery% (mean/min/max) | fresh-deadline% (mean/min/max) | p50 mean (ms) | p95 mean (ms) | p99 mean (ms) |
+|---|---|---|---|---|---|
+| FleetRMW | 100.0 / 100.0 / 100.0 | 100.0 / 100.0 / 100.0 | 0.993 | 1.949 | 4.038 |
+| Fast DDS | 100.0 / 100.0 / 100.0 | 100.0 / 100.0 / 100.0 | 0.745 | 1.404 | 1.927 |
+| CycloneDDS | 100.0 / 100.0 / 100.0 | 100.0 / 100.0 / 100.0 | 0.701 | 1.439 | 2.016 |
+| Zenoh | 100.0 / 100.0 / 100.0 | 100.0 / 100.0 / 100.0 (stdev 0.0 across all 20 seeds) | 0.922 | 1.589 | 2.173 |
+
+**Fresh/deadline success comparison**: identical (100.0%) for all four
+middlewares, every seed -- zero variance.
+
+**Paired FleetRMW delta vs best-per-replicate baseline**: `+0.00
+percentage points` (best baseline is Fast DDS at 100.0% in all 20
+replicates; FleetRMW is also 100.0% in all 20 -- the paired difference
+is exactly zero in every single replicate, not just on average).
+
+**Paired bootstrap 95% CI** (10,000 resamples, fixed seed 20260919):
+`[0.00pp, 0.00pp]` -- necessarily degenerate, since every one of the 20
+paired differences is itself exactly 0.
+
+**Superiority gate: NOT MET.** Reasons (from the analysis script's own
+output, not summarized): "mean diff 0.00pp < required +15.0pp" AND
+"bootstrap 95% CI lower bound 0.00pp <= 0". Both legs of the AND
+condition fail.
+
+**Setup convergence-time summary** (20-seed set, N=16, reported
+SEPARATELY from the performance table above, never mixed into Table
+V's latency numbers): FleetRMW ~0s (static mode, no discovery step by
+design); Fast DDS mean 5.42s / max 14.86s; CycloneDDS mean 4.94s / max
+9.46s; Zenoh mean 4.83s / max 5.82s. Every one of these 80 convergence
+times is comfortably under the 45s watchdog -- the closest, Fast DDS's
+14.86s max, still has >3x headroom.
+
+### Phase 5: ceiling effect
+
+**CEILING EFFECT = YES.** All four middlewares reach 100.0% delivery
+and 100.0% fresh-deadline-success on every one of the 20 frozen seeds,
+at N=16, under this workload (3s duration, `fifo` policy, LAN network
+profile with no impairment). This LAN/N=16/3s workload does not create
+enough stress to discriminate reliability among FleetRMW, Fast DDS,
+CycloneDDS, or Zenoh -- all four saturate the metric. This is the
+CORRECT, honest reading of a 0.00pp/CI-degenerate result: it is not
+evidence of parity under harder conditions, and it is not evidence
+against FleetRMW -- the workload simply never asks hard enough
+questions to separate any of the four.
+
+Per the user's own explicit instruction, **no superiority claim is
+made from delivery, fresh-deadline-success, or the (very small)
+latency differences given the primary gate is not met.** Latency IS
+reported descriptively above: FleetRMW's mean p99 (4.04ms) is higher
+than the other three (1.93-2.17ms) under this specific LAN/N=16
+workload -- reported as a description of this one condition, not as a
+superiority or inferiority claim, since the workload that would let
+such a difference matter (one that actually stresses reliability, not
+just measures a idle-LAN's latency floor) is exactly what the ceiling
+effect says this pass does not have.
+
+### Phase 6: paper cleanup
+
+**Documenting the fix, in the exact terms requested:**
+
+- OLD: an endpoint stopped beaconing (permanently, for the rest of its
+  process life) the instant its OWN required-peer set was complete.
+- BUG: another endpoint could still require that exact beacon --
+  creating a readiness deadlock, not merely "slow" discovery, since the
+  beacon that endpoint needed would never be sent again regardless of
+  how long it waited.
+- FIX: continue servicing the beacon exchange for the full setup
+  lifecycle (bounded by `discovery_timeout_s`/the setup watchdog)
+  rather than stopping the instant local completion is reached --
+  `--sustain-beacon-until-deadline`, opt-in, LAN-only, zero effect on
+  Wi-Fi/Table VI/5G.
+- **45s is a SETUP watchdog, not a performance deadline.** Table V's
+  measured window (`start_wall` onward) only ever begins after the
+  `start_file` gate, itself only touched after every endpoint's
+  ready-file exists (Phase 4 of the audit section above, proven from
+  code) -- extending how long setup is allowed to take before being
+  declared non-convergent cannot move where the measured window begins
+  relative to actual convergence, and cannot turn a timeout into a
+  false "ready" (unchanged: `discovery_converged()`'s required-peer
+  check is exactly as strict as before every fix in this investigation).
+
+**Old LAN results marked INVALID/SUPERSEDED** (per the user's explicit
+list -- history preserved, not deleted, per this file's own
+conventions):
+
+- Premature receiver-shutdown runs (pre-`a6dffd1`) -- already marked
+  invalid in an earlier section ("HARNESS IDENTITY FIX VALIDATED");
+  reaffirmed superseded here.
+- robot_id-collision runs (pre-`1544008`) -- already marked invalid in
+  the same earlier section; reaffirmed superseded here.
+- False-ready runs (pre the ready-file-content fix documented in
+  `discovery_converged()`'s own docstring) -- reaffirmed superseded.
+- The old, arbitrary-15s-watchdog LAN comparisons -- ALL of them,
+  including the fresh N=16 3-seed baseline from commit `7082683` and
+  the 20-seed paired result from commit `36931d7` ("ceiling effect
+  confirmed" -- the SAME conclusion this pass reaches independently,
+  but under the unjustified 15s watchdog and WITHOUT the
+  beacon-starvation fix, so its validity/readiness counts cannot be
+  trusted even though its final headline finding happens to match).
+  **Superseded, not merely re-confirmed** -- the mechanism proving
+  correctness (a justified watchdog, a proven-fixed deadlock) did not
+  exist when those numbers were produced.
+- Every LAN result produced anywhere in this investigation before
+  commit `a2590e6` (the beacon-starvation fix + watchdog commit).
+
+**Only the fresh, post-`a2590e6` validation in this section (N=2/N=4
+from the prior section, plus N=8/N=16/20-seed in this section) may be
+cited as final LAN Table V evidence.**
+
+### Status against the user's 20-item report
+
+1. N=8 readiness table: 12/12 READY (above).
+2. N=8 performance table: 100%/100% delivery/fresh for all 4, latency
+   and convergence times above.
+3. N=16 readiness table: 12/12 valid (above).
+4. N=16 performance table: 100%/100% delivery/fresh for all 4,
+   convergence times above.
+5. 20-seed validity count per middleware: **20/20 for all four.**
+6. Final 20-seed performance summary: table above.
+7. Fresh/deadline success comparison: identical, 100.0%, zero variance,
+   all four middlewares.
+8. Paired FleetRMW delta vs best baseline: **+0.00pp.**
+9. Bootstrap 95% CI: **[0.00pp, 0.00pp].**
+10. Superiority gate: **NOT MET.**
+11. Ceiling effect: **YES.**
+12. Setup convergence-time summary: table above, all comfortably under
+    the 45s watchdog (max 14.86s, Fast DDS).
+13. Remaining LAN correctness issues: **none found** -- 80/80 (20-seed)
+    + 24/24 (N=8+N=16 3-seed) = 104/104 runs valid across this entire
+    validation pass, zero retries needed.
+14. Final paper-ready LAN Table V: the fresh, post-fix 20-seed N=16
+    result IS the final table (Phase 3/4 above) -- ready to cite, WITH
+    the ceiling-effect caveat attached (see conclusion below).
+15. Exact paper-safe conclusion: "Under the LAN network profile at
+    N=16 across 20 independently-run trace seeds, FleetRMW, Fast DDS,
+    CycloneDDS, and Zenoh all achieve 100% message delivery and 100%
+    fresh-deadline success -- a ceiling effect. This workload does not
+    discriminate reliability among the four middlewares; no
+    reliability-superiority claim is supported by this condition.
+    Descriptively, FleetRMW's p99 latency (4.04ms mean) is higher than
+    the other three (1.93-2.17ms mean) under this specific idle-LAN
+    workload; this is reported as a characteristic of this condition,
+    not as an inferiority claim, since a workload that actually
+    stresses reliability (packet loss, contention, scale beyond N=16)
+    is required before any superiority/inferiority conclusion about
+    FleetRMW can be drawn."
+16. Old results marked INVALID/SUPERSEDED: listed above (pre-`a6dffd1`,
+    pre-`1544008`, pre-ready-content-fix, ALL pre-`a2590e6` including
+    commits `7082683` and `36931d7`).
+17. Full-suite result: **859 passed**, same 8 pre-existing unrelated
+    failures, re-confirmed unchanged through this entire validation
+    pass (no production code changed during Phases 1-4 of this
+    section -- only two new measurement-only driver scripts and one
+    purely-additive reporting field in `run_one()`).
+18. Commits: `16b151b` (Phase 1-5 audit + Fast DDS env-var fix),
+    `a2590e6` (beacon-starvation fix + watchdog + N=2/N=4 validation),
+    and this section's commit (N=8/N=16/20-seed validation + analysis
+    + paper cleanup).
+19. **LAN FINAL STATUS: PAPER-READY -- YES, with the ceiling-effect
+    caveat.** The cross-middleware LAN Table V comparison that was
+    "still blocked" at the start of this investigation is now
+    complete, valid, and reproducible (104/104 runs across this final
+    validation pass) -- but the honest paper conclusion is "ceiling
+    effect, no superiority claim supported under LAN," not "FleetRMW
+    wins." That is itself a valid, citable scientific result for the
+    LAN condition, distinct from whatever Wi-Fi/5G's own (unaudited,
+    unchanged by this investigation) results show.
+20. Next step: none required for LAN Table V itself -- the validation
+    ladder is complete end to end. If the paper wants a
+    reliability-discriminating LAN condition, that would require a
+    NEW, explicitly harder workload (packet loss, higher load, N>16),
+    which is out of scope for this audit (workload changes were
+    explicitly forbidden throughout).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
