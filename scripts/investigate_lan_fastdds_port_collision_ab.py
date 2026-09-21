@@ -1,5 +1,6 @@
 """LAN Fast DDS port-collision A/B (see docs/AUDIT_ACCEPTANCE_TRACKING.md,
-"LAN DISCOVERY SEMANTIC-LAYER INVESTIGATION"). Socket mapping proved
+"LAN DISCOVERY SEMANTIC-LAYER INVESTIGATION" and "LAN SOURCE +
+OFFICIAL-DOCUMENTATION AUDIT" Phase 5). Socket mapping proved
 control_station's own client process collides with the co-located
 discovery-server process over port 7411 (the standard participant-ID-0
 metatraffic/user port), landing on a non-standard 7410+7413 pair
@@ -13,8 +14,25 @@ readiness deterministic?
 
 A = current (no explicit participantID, the observed collision).
 B = control_station given an explicit, non-conflicting participantID
-    (50) via FASTDDS_DEFAULT_PROFILES_FILE; every robot's config
+    (50) via FASTRTPS_DEFAULT_PROFILES_FILE; every robot's config
     unchanged.
+
+ROOT CAUSE of the PRIOR failed attempt at this exact fix (which used
+FASTDDS_DEFAULT_PROFILES_FILE and showed NO port change under `ss`):
+wrong environment variable name. rmw_fastrtps_cpp / ROS 2's Fast DDS
+XML configuration mechanism reads FASTRTPS_DEFAULT_PROFILES_FILE (the
+legacy name, still the one documented in ROS 2's own Fast DDS
+configuration tutorial: https://docs.ros.org/en/jazzy/Tutorials/Advanced/FastDDS-Configuration.html
+and https://fast-dds.docs.eprosima.com/en/2.14.x/fastdds/ros2/ros2_configure.html)
+-- FASTDDS_DEFAULT_PROFILES_FILE is a raw-Fast-DDS-only variable name
+that rmw_fastrtps_cpp does not read at all, so the profile silently
+never loaded. Live-verified in isolation (single container, no
+discovery server involved, plain rclpy node): FASTDDS_DEFAULT_PROFILES_FILE
++ participantID=50 left the participant on the stock 7410/7411 pair;
+FASTRTPS_DEFAULT_PROFILES_FILE + the SAME XML + participantID=50 moved
+it to 7510/7511 -- exactly PB(7400) + 250*domainID(0) + offsetd1(10) +
+2*participantID(50) = 7510, matching the RTPS port formula documented
+at https://fast-dds.docs.eprosima.com/en/2.14.x/fastdds/discovery/simple.html.
 
 Read-only diagnostic -- does not modify launch_endpoints() itself.
 """
@@ -110,7 +128,7 @@ def run_variant(variant: str, rep: int) -> dict:
             log_file = f"{results_dir_container}/endpoint_{i}.log"
             env_prefix = f"RMW_IMPLEMENTATION=rmw_fastrtps_cpp ROS_DISCOVERY_SERVER={server_ip}:{FASTDDS_DISCOVERY_SERVER_PORT} "
             if variant == "B_no_collision" and i == 0:
-                env_prefix += "FASTDDS_DEFAULT_PROFILES_FILE=/tmp/no_collision_profile.xml "
+                env_prefix += "FASTRTPS_DEFAULT_PROFILES_FILE=/tmp/no_collision_profile.xml "
             inner = (
                 "source /opt/ros/jazzy/setup.bash && "
                 f"export {env_prefix}&& "

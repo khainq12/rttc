@@ -17417,6 +17417,266 @@ confirm it.
     LAN Table V comparison under this harness's present constraints,
     and reporting that as the paper's own documented limitation.
 
+## LAN SOURCE + OFFICIAL-DOCUMENTATION AUDIT -- 15s TIMEOUT UNJUSTIFIED, TABLE V PROVEN TO MEASURE POST-READINESS PERFORMANCE, FAST DDS PORT BUG FOUND+FIXED BUT NOT THE ROOT CAUSE
+
+Context: continuation of the LAN Table V investigation, ordered by the
+user as a strict 9-phase SOURCE + OFFICIAL-DOCUMENTATION audit, run
+*before* any further middleware-specific configuration changes, to
+decide what counts as (1) normal required configuration, (2) benchmark
+tuning, or (3) a harness validity parameter. No middleware configs
+were changed as a result of this section except the one explicitly
+tested, verified, and reported in Phase 5 below.
+
+### Phase 3 (finished from the prior turn): origin of `discovery_timeout_s=15.0`
+
+Git-history trace (`git log --all -S`, `git show -s --format=%B` on
+`26b7913`, `7f0646b`, `9a5da04`): 15.0s is present as the `default=` in
+`--discovery-timeout-s` from the very FIRST commit that created
+`scripts/fleetqox_rmw_trace_endpoint.py` (`26b7913`), with generic help
+text ("max wait for every publisher to see at least one subscriber
+before sending") and no numeric justification anywhere in that commit
+message. Every later commit that touches it (`7f0646b`, `9a5da04`)
+explicitly preserves 15.0 as "the value that reproduces old behavior
+exactly," never re-derives it from any middleware guarantee.
+
+**Verdict: NO, 15s is not a scientifically justified universal
+readiness budget.** It is an arbitrary implementation default, carried
+forward unchanged purely to avoid changing existing behavior -- not
+derived from any DDS/Zenoh specification or vendor-documented
+discovery bound. Phase 1 below makes this worse, not better: it is
+*half* of CycloneDDS's own documented default discovery period.
+
+### Phase 4: what Table V actually measures
+
+Read `scripts/fleetqox_rmw_trace_endpoint.py` end-to-end
+(`main()`, lines ~900-1035). The sequence is strict and unconditional:
+
+1. Node/publishers/subscriptions/beacon created.
+2. Discovery/beacon wait loop runs for up to `discovery_timeout_s`
+   (or until `required_peer_ids` are all seen) -- `discovery_convergence_s`
+   is recorded as its own field.
+3. `ready_file` is written (`"ready"` or `"invalid_readiness"`,
+   line 1006) -- this is the ONLY place discovery outcome is recorded.
+4. The endpoint then blocks on `start_file` (line 1007-1012), a
+   data-plane start gate the ORCHESTRATOR only touches after every
+   endpoint's ready-file exists (`wait_for_ready_then_start()` in
+   `run_ns3_docker_container_fleet_probe.py`).
+5. Only after `start_file` exists does `start_wall = time.monotonic()`
+   get captured (line 1014) and the trace-replay send loop begin
+   (line 1034-1035, `replay_rows = outgoing`). Every timestamp fed into
+   `send_timing`/latency/delivery stats is relative to `start_wall`.
+
+**Verdict: Table V measures (A) steady-state transport/application
+performance strictly after middleware readiness, not (B) discovery
+speed.** `discovery_convergence_s` is reported as a separate
+diagnostic field and is never mixed into the delivery/latency
+statistics that become Table V's numbers. Readiness is a
+PRECONDITION, matching the user's own Phase 4 framing. Consequence for
+Phase 8: rejecting a middleware because its *normal, unmodified*
+discovery legitimately needs more than 15s is not measuring what Table
+V claims to measure -- it is silently smuggling a startup-latency
+penalty into a transport-performance table. Extending the setup
+watchdog (not the measured window) is therefore not "counting timeout
+as READY" and not "tuning for better delivery/latency" -- the
+measured window still starts at real convergence, whatever that takes.
+
+### Phase 1: official defaults, cited from the exact installed packages
+
+All three found via source+doc together; where the installed apt
+package only ships headers (no .c source, no schema doc), the
+GitHub/eprosima official documentation for the matching version was
+used to fill in the gap. No numbers below are guessed.
+
+**CycloneDDS 0.10.5** (`ros-jazzy-cyclonedds` 0.10.5-1noble). Source:
+`/opt/ros/jazzy/include/CycloneDDS/dds/ddsi/ddsi_cfgelems.h` lines
+1915-1962 (the config-schema table CycloneDDS itself uses to generate
+both the parser and https://cyclonedds.io/docs/cyclonedds/latest/config/config_file_reference.html):
+- `Discovery/SPDPInterval` default **"30 s"** -- "the interval between
+  spontaneous transmissions of participant discovery packets."
+- `Discovery/LeaseDuration` default **"10 s"**.
+- `Discovery/SPDPMulticastAddress` default **239.255.0.1** (IPv4) --
+  i.e. the documented normal transport for SPDP is multicast.
+- `Discovery/ParticipantIndex` default **"auto"**.
+- Official docs (https://cyclonedds.io/docs/cyclonedds/latest/about_dds/discovery_participants.html):
+  "The discovery process creates a burst of traffic each time a
+  participant is added to the system: all existing participants
+  respond to the SPDP message" -- confirms a real accelerate-on-new-peer
+  response mechanism exists on top of the flat 30s period, matching
+  the growing 0.99s/1.00s/1.00s/4.23s/8.00s re-announce pattern traced
+  in the prior semantic-layer investigation (a fast early-response
+  phase decaying toward the steady period). The exact decay formula is
+  in `spdp.c`, which is not shipped in this apt package and was not
+  independently re-derived -- flagged, not guessed.
+- Our harness's config differs from the documented default on two
+  axes: `AllowMulticast=false` (multicast is CycloneDDS's own
+  documented default SPDP transport; we use a static `<Peers>` list
+  instead) and it does NOT override `SPDPInterval` -- CycloneDDS is
+  running at its own stock 30s value.
+- **Our 15s discovery_timeout_s is HALF of CycloneDDS's own documented
+  default discovery period.** A worst-case-phase-aligned pair of
+  participants relying on the plain periodic (non-burst) SPDP cycle
+  can legitimately need up to ~1 full SPDPInterval (30s) to converge
+  under stock configuration. 15s does not cover this.
+
+**Fast DDS 2.14.6** (`rmw_fastrtps_cpp` 8.4.4). Source:
+`/opt/ros/jazzy/include/fastrtps/fastdds/rtps/attributes/RTPSParticipantAttributes.h`
+lines 210-262 (matches https://fast-dds.docs.eprosima.com/en/2.14.x/fastdds/discovery/simple.html):
+- Default `discoveryProtocol` = **SIMPLE** (our harness overrides to
+  **CLIENT**, via `ROS_DISCOVERY_SERVER`, using a Discovery Server --
+  a deliberate, officially-supported alternate discovery mode, chosen
+  in an earlier phase for the same "static config, fair comparison"
+  reason CycloneDDS got a static `<Peers>` list).
+- `InitialAnnouncementConfig`: **count=5, period=100ms** (burst
+  finishes within ~500ms of participant creation).
+- `leaseDuration` default **20s**, `leaseDuration_announcementperiod`
+  default **3s** (post-burst steady re-announce period).
+- RTPS unicast metatraffic port formula (https://fast-dds.docs.eprosima.com/en/2.14.x/fastdds/discovery/simple.html,
+  RTPS 9.6.1.1): `PB + DG*domainId + offsetd1 + PG*participantId`,
+  default PB=7400, DG=250, offsetd1=10, PG=2 -- for domain 0,
+  participant 0: 7410 (multicast-equiv unicast metatraffic) / 7411
+  (unicast user port). Live-confirmed via `ss -uln` in this exact
+  container image.
+- Fast DDS's own default steady-state re-announce cycle (3s) is well
+  under 15s -- SIMPLE-mode Fast DDS is not the timing risk here.
+  Server-Client (Discovery Server) mode's own re-announce cadence to
+  the server was not independently re-measured this phase, but there
+  is no evidence it is slower than SIMPLE's.
+
+**Zenoh** (session config traced via `RUST_LOG=zenoh=debug` in an
+earlier phase; defaults confirmed against
+https://github.com/eclipse-zenoh/zenoh/blob/main/DEFAULT_CONFIG.json5):
+- `scouting.multicast`: enabled=true, address `224.0.0.224:7446`,
+  ttl=1, autoconnect peer/client -> [router, peer, client].
+- `scouting.gossip`: enabled=true, multihop=false, same autoconnect
+  matrix.
+- `scouting.multicast.autoconnect`/client-mode `timeout`=3000ms;
+  peer-mode `delay`=500ms ("maximum period in milliseconds dedicated
+  to scouting remote peers before attempting other operations").
+- All Zenoh default discovery timers are sub-second to low-single-digit
+  seconds -- well under 15s. The already-fixed control_station-listen
+  bug and the still-open last-launched-robot failure are both matching
+  bugs / narrower semantic issues, not evidence of a slow *documented*
+  discovery cadence.
+
+### Phase 2: current-vs-official audit table
+
+| | CycloneDDS 0.10.5 | Fast DDS 2.14.6 | Zenoh |
+|---|---|---|---|
+| Discovery mode (harness) | Static peers, multicast off | Discovery Server (CLIENT) | Peer mode, router + gossip |
+| Discovery mode (official default) | Multicast SPDP | SIMPLE (multicast SPDP) | Peer mode, router + gossip (same) |
+| Differs from default? | Yes -- multicast disabled | Yes -- SIMPLE to Server-Client | No -- default matches |
+| Why the harness differs | Static/comparable config across all 3 middlewares in a container LAN (no reliable multicast assumption made) | Same reasoning; also avoids multicast dependency | N/A -- default already static-friendly (gossip+listen/connect) |
+| Announce interval (default) | 30s (SPDPInterval) | 3s steady / 100ms x5 burst | sub-second scouting/gossip |
+| Backoff/burst behavior | Yes, documented burst-on-new-peer, undocumented exact decay | Yes, documented initial-announcement burst | Not applicable (event-driven gossip, not periodic) |
+| Max documented discovery delay | ~1x SPDPInterval (30s) worst case, no formal upper bound published | Bounded by leaseDuration_announcementperiod (3s) once past burst | Sub-second in the common gossip/multicast path |
+| Listen/connect config required in this topology | Static `<Peers>` list (required peers derived from trace) | `ROS_DISCOVERY_SERVER=<ip>:<port>` on every process | Explicit `listen` for control_station (FIXED this session), `connect` to router for all |
+| Special container config required | `AllowMulticast=false` (container network doesn't guarantee reliable multicast) | Co-located Discovery Server + client on control_station's own host (port-formula collision risk, see Phase 5) | Router process + explicit listen address for the one host that is also a peer |
+| 15s timeout coverage | **NO** -- half of stock SPDPInterval | Yes, for SIMPLE steady-state; untested for Server-Client cadence specifically | Yes, all default timers are sub-3s |
+
+A difference from the documented default is not automatically a bug:
+CycloneDDS's `AllowMulticast=false` and Fast DDS's Discovery-Server
+mode both exist so all three middlewares get a *comparable*,
+multicast-independent, statically-addressed discovery configuration in
+the same container-LAN topology -- this is required topology
+configuration, not benchmark tuning, and it was already decided in an
+earlier phase for that reason.
+
+### Phase 5: Fast DDS root cause -- real bug found and fixed, but NOT the actual cause of the readiness failure
+
+Prior attempt (documented in an earlier phase) to give control_station's
+co-located client an explicit, non-conflicting `participantID` via
+`FASTDDS_DEFAULT_PROFILES_FILE` + `<rtps><participantID>50</participantID>`
+showed no effect under live `ss -uln`. Root cause of *that* found this
+phase: **wrong environment variable name.** `rmw_fastrtps_cpp` reads
+`FASTRTPS_DEFAULT_PROFILES_FILE` -- the name documented in ROS 2's own
+tutorial (https://docs.ros.org/en/jazzy/Tutorials/Advanced/FastDDS-Configuration.html)
+and in eProsima's ROS 2 integration docs
+(https://fast-dds.docs.eprosima.com/en/2.14.x/fastdds/ros2/ros2_configure.html)
+-- `FASTDDS_DEFAULT_PROFILES_FILE` is a plain-Fast-DDS-only variable
+name that rmw_fastrtps_cpp does not read at all, so the XML profile
+silently never loaded.
+
+Live isolation test (single container, bare `rclpy` node, no discovery
+server): `FASTDDS_DEFAULT_PROFILES_FILE` + participantID=50 -> ports
+unchanged (7400/7410/7411, the stock defaults). Same XML via
+`FASTRTPS_DEFAULT_PROFILES_FILE` -> ports **7400/7510/7511** --
+exactly `7400 + 250*0 + 10 + 2*50 = 7510`, matching the documented RTPS
+port formula. Fix confirmed live via `ss`, per the user's explicit
+requirement.
+
+Applied the corrected env var to
+`scripts/investigate_lan_fastdds_port_collision_ab.py` (variant
+`B_no_collision`) and re-ran the full A/B (N=4, 5 reps/variant, host
+Python + real Docker, per the script's existing design):
+
+| Variant | control_station ports (live `ss`) | Fully-ready reps |
+|---|---|---|
+| A_current (no participantID override) | 7411 shared with discovery server (7410/7411/7413, the collision) | 0/5 |
+| B_no_collision (participantID=50 via the corrected env var) | 7411 (server) + **7510/7511** (client, clean, no collision) | 0/5 |
+
+**The port collision is now genuinely and verifiably fixed -- and it
+made zero difference.** `control_station` still fails readiness 5/5 in
+both variants; all 4 robots pass in both. This DISPROVES port
+collision as the (or the dominant) root cause of Fast DDS's LAN
+readiness failure. It stays fixed/committed anyway because it is a
+real, independently-confirmed deployment bug (co-locating a Discovery
+Server and a ROS 2 client on the same host without distinct
+participant IDs is not correct Fast DDS deployment regardless of this
+benchmark), classified as **required topology config**, not tuning.
+
+New lead, not yet closed: `control_station`'s own endpoint log
+(`endpoint_0.log`) is completely empty in the B run -- no
+`DISCOVERY_TIMEOUT_DEBUG` diagnostic, which only prints when
+`beacon_pub is not None and not converged`. Since `converged=False`
+was still written (`invalid_readiness`), and no debug line printed,
+`beacon_pub` was most likely `None` for control_station -- meaning its
+readiness came down to the OTHER branch,
+`subscription_fallback_converged` (`all pub.get_subscription_count() > 0`),
+i.e. control_station's own PUBLISHERS never saw their SEDP match
+complete within 15s, not a participant-level SPDP problem at all. This
+is a plausible but **not yet proven** hypothesis -- Phase 5 is
+therefore reopened for a follow-up SEDP-level trace (mirroring the
+CycloneDDS/Zenoh semantic-trace technique already used successfully),
+not closed.
+
+### Status against the user's 22-item report (items answerable now)
+
+1. Table V measures: (A) steady-state performance; readiness is a
+   precondition (Phase 4, proven from code).
+2. `discovery_timeout_s=15.0` origin: unjustified arbitrary default
+   from the founding commit, never middleware-derived (Phase 3).
+3. Fast DDS official defaults: SIMPLE/burst 5x100ms/3s steady/20s
+   lease (Phase 1, header-cited).
+4. CycloneDDS official defaults: SPDPInterval 30s/LeaseDuration
+   10s/multicast default transport (Phase 1, header-cited).
+5. Zenoh official defaults: multicast+gossip scouting, sub-3s timers
+   (Phase 1, doc-cited).
+6. Harness-vs-normal-config table: Phase 2 above.
+7. Is 15s scientifically justified: **NO** -- it is half of
+   CycloneDDS's own documented default period, and does not
+   incorporate any middleware's guarantee.
+8. Fast DDS verified port A/B: **DONE**, live `ss`-verified, port
+   collision eliminated.
+9. Fast DDS root cause: **partially disproven, not yet found** -- port
+   collision fixed but not causal; new SEDP-matching lead open.
+10-11. Zenoh remaining divergence/root cause: not re-investigated this
+   phase (still the prior "last-launched robot" open item).
+12. Cyclone normal-vs-malfunction: strong evidence toward "our 15s
+   timeout is short relative to Cyclone's own 30s documented default,"
+   not "Cyclone is malfunctioning" -- not yet formally closed pending
+   Phase 6/7 completion.
+13-19: not reached -- Phase 8's fair contract has NOT been proposed
+   yet (deliberately: Phase 5/6/7 are not all closed, and the user's
+   own rules forbid proposing/implementing the contract before that).
+20. LAN paper-ready: still **NO**.
+21. Commits: env-var fix in the diagnostic script + this audit section
+    (see next commit).
+22. Next step: finish Phase 5 with a SEDP-level trace of
+    control_station's own publisher/subscription matching (same
+    technique as the CycloneDDS/Zenoh semantic traces), since the
+    port-collision fix -- while real -- was just proven not to be the
+    cause.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
