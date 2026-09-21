@@ -16752,6 +16752,226 @@ above at real compute cost with no new information.
     two middlewares where launch-order causality has NOT yet been
     proven the way it was for CycloneDDS).
 
+## LAN DISCOVERY FIRST-DIVERGENCE INVESTIGATION -- NETWORK LAYER PROVEN HEALTHY FOR ALL THREE, DIVERGENCE ISOLATED TO A HIGHER LAYER
+
+Follow-up to "LAN DISCOVERY-CONVERGENCE ROOT-CAUSE INVESTIGATION". That
+pass refuted two specific hypotheses per middleware but never captured
+the ACTUAL metatraffic/session ports (only the bootstrap discovery-
+server/router port, whose one-way pattern turned out to be identical
+for successful and failing endpoints alike -- uninformative). This pass
+gets exact socket/port mapping first, then packets on the real ports,
+then times the FIRST divergence between a PASS edge and a FAIL edge for
+each middleware. Harness/infrastructure debugging only -- no production
+code changed (all new files are read-only diagnostic scripts).
+
+### Phase 1: real socket mapping (`scripts/investigate_lan_discovery_socket_mapping.py`, N=4, `ss -uapn`/`ss -tapn` + `/proc` cmdline, 5 snapshots across the discovery window)
+
+**Fast DDS**: a genuine, reproducible PORT ANOMALY at control_station,
+absent everywhere else. A fresh robot uses the standard pair **7410 +
+7411** (both on its own ROS2 client process). control_station's client
+process (a SEPARATE OS process from the discovery server, both in the
+SAME container) ends up on **7410 + 7413** instead -- because port 7411
+is already held by the co-located discovery-server process
+("fast-discovery-", its own separate participant). This is a real,
+directly observed port-allocation collision between two independent
+Fast DDS participants sharing one host, stable from t=3s onward (not a
+transient race). Whether this collision is causally responsible for
+the missing-peer failures, or a harmless side effect, is addressed by
+Phase 2 below.
+
+**CycloneDDS**: no such collision -- both control_station's and every
+robot's participant land on the identical standard 7410+7411 pair
+(no co-located server process exists for this middleware). Consistent
+with the previously-proven pure launch-order causality having a
+different mechanism than Fast DDS's port anomaly.
+
+**Zenoh**: a genuine, reproducible SESSION-ROUTING ASYMMETRY. Every
+robot's client connects to the router via a DIRECT TCP session to
+control_station's REAL overlay IP (`10.60.0.2:7447`), matching its
+explicit `--connect` session config. **control_station's own client has
+no such explicit config** (deliberately skipped in `launch_endpoints()`
+for `i==0`, per that function's own pre-existing comment, "so it
+doesn't try to connect to itself") and instead falls back to Zenoh's
+default behavior, landing on a **loopback session**
+(`127.0.0.1:55328 <-> 127.0.0.1:7447`) -- structurally different from
+every other endpoint's connection path.
+
+### Phase 2/3: Fast DDS PASS vs FAIL packet-level divergence (`scripts/investigate_lan_fastdds_metatraffic_capture.py`, N=4, capture on ports 7400-7420 + 11811 on every endpoint's own eth0)
+
+**PASS path** (robot_0000, this run): process start -> Fast DDS
+participant binds 7410/7411 -> registers with discovery server (11811)
+-> receives relayed peer info -> exchanges metatraffic with
+control_station (101 packets on 7410 + 25 on 7411, from
+control_station) -> beacon topic matches -> harness observes READY.
+
+**FAIL path** (robot_0003, this run -- note: WHICH endpoint fails
+varies run to run, confirming the previously-documented randomness;
+this run happened to fail a robot rather than control_station):
+process start -> participant binds 7410/7411 -> registers with server
+-> **exchanges metatraffic with control_station continuously,
+bidirectionally, for the ENTIRE window** (control_station->robot_0003
+traffic spans a full 17.06s, MORE volume than the passing robot
+received: 83 packets on 7410 + 136 on 7411 = 219 total, vs the passing
+robot's 101+25=126) -> beacon topic does NOT match within
+15s -> harness observes INVALID_READINESS.
+
+**First divergence**: NOT at packet send, NOT at packet arrival (both
+proven healthy and MORE voluminous than the successful case) -- the
+divergence happens AFTER metatraffic exchange, at or before the
+application-level topic/endpoint match. This directly REFUTES
+"NETWORK_NOT_SENT" and "NETWORK_LOST" for this failure instance with
+direct packet evidence, not inference from peer counts.
+
+**Classification**: **MIDDLEWARE_NOT_PROCESSING** (the endpoint-
+discovery/topic-matching layer, sitting above the proven-healthy
+participant-level metatraffic) is the only evidence-supported category
+remaining, with RESOURCE_STARVATION as a plausible contributing
+mechanism (see the CycloneDDS parallel-dispatch finding from the prior
+section) for WHY that layer doesn't complete in time. Exact mechanism:
+**UNKNOWN** -- distinguishing "CPU-starved processing of already-
+received data" from "a genuine middleware-internal matching bug" would
+need an RTPS-aware packet dissector (to parse SEDP submessage content,
+not just count raw datagrams) or Fast DDS's own internal instrumentation,
+neither available in this environment's toolset.
+
+### Phase 4: CycloneDDS SPDP/SEDP capture (`scripts/investigate_lan_cyclonedds_spdp_capture.py`, N=4, ports 7405-7415, reproduces the already-proven launch-position failure)
+
+Direct test of the SPDP-backoff hypothesis from the prior section:
+**REFUTED.** The full per-packet timeline between control_station and
+the failing (last-launched) robot shows **dense, continuous,
+bidirectional exchange on port 7411 at ~10 packets/second for the
+ENTIRE ~16-second window** (t=759.46 through t=775.56, an uninterrupted
+back-and-forth every ~110ms) -- there is no slowdown, no backoff, no
+gap. Both directions are equally active throughout. The exchange
+stops right around the endpoint's own 15s deadline (consistent with
+the endpoint giving up and exiting its discovery loop at that point,
+not with the underlying traffic having stalled earlier).
+
+**First divergence**: identical conclusion to Fast DDS -- raw SPDP-
+level metatraffic is proven healthy, dense, and bidirectional for the
+entire window; the divergence is above that layer.
+
+**SPDP-backoff hypothesis: REFUTED** (direct packet timing evidence,
+not correlation).
+
+**Root cause: still UNKNOWN in exact mechanism**, but narrowed:
+combined with the prior section's causal proof (failure follows launch
+position) and the parallel-dispatch finding (removing launch-order
+stagger shifts, but does not eliminate, the failure), the most
+evidence-consistent explanation is that the LAST-started participant's
+own internal SEDP/endpoint-matching processing is delayed under CPU
+contention from N-1 other participants starting at nearly the same
+time -- not a protocol-level backoff or network loss, both now directly
+excluded by packet evidence.
+
+### Phase 5: Zenoh session capture (`scripts/investigate_lan_zenoh_session_capture.py`, N=4, TCP port 7447 + UDP 7446 on eth0 AND lo)
+
+**PASS path** (robot_0001, this run): TCP handshake to
+`control_station:7447` (real IP) -> Zenoh session established ->
+declaration exchange (modest sizes: 34/77/58/8/178/135/86/86 bytes) ->
+periodic keepalives -> harness observes READY.
+
+**FAIL path** (robot_0000, this run -- again, WHICH endpoints fail
+varies per run; 3 of 5 endpoints failed this particular run, a more
+severe instance than the earlier N=4 sanity check's single-endpoint
+failure): TCP handshake to `control_station:7447` (real IP, identical
+path to the passing case) -> Zenoh session established -> declaration
+exchange -- but with **substantially larger, bursty traffic**
+(multiple packets in the 111-519 byte range, vs the passing session's
+consistently sub-200-byte packets) -> periodic keepalives continue
+successfully through t=947 (session never dies or hangs) -> harness
+still observes INVALID_READINESS.
+
+**First divergence**: TCP connectivity and session establishment are
+IDENTICAL in mechanism and proven healthy for both PASS and FAIL (same
+real-IP path, working handshake, working keepalives) -- the divergence
+is in the SIZE/DURATION of the declaration-exchange phase, not its
+existence. The failing session exchanges MORE data, in larger bursts,
+than the passing one -- opposite of what a "starved/blocked" session
+would show, consistent with "declaring more resources takes
+measurably longer, occasionally exceeding the 15s window" rather than
+a connectivity break.
+
+**Classification**: **MIDDLEWARE_NOT_PROCESSING / capacity-timing**,
+not NETWORK_NOT_SENT/NETWORK_LOST/KERNEL_SOCKET_DROP (all excluded by
+the working, bidirectional, keepalive-sustained session). The
+control_station-specific loopback-routing asymmetry found in Phase 1
+was NOT the proximate cause in THIS run (a robot, not control_station,
+was the example captured) -- it remains a real, separate, unexplained
+structural asymmetry worth fixing on its own merits, but not yet
+proven to be on the causal path for any specific observed failure.
+
+**Root cause: UNKNOWN** in exact mechanism, same category as the other
+two middlewares.
+
+### Phase 6: resource evidence
+
+The CycloneDDS parallel-dispatch result from the prior section remains
+the strongest resource-contention evidence available (failure pattern
+changes character, doesn't disappear, when launch-order stagger is
+removed). No new CPU/RSS/fd/socket-drop counters were collected in
+this pass beyond what socket mapping already showed (no drop counters
+observed in any `ss` snapshot across any middleware).
+
+### Phase 7: RED -> FIX -> GREEN -- NOT PERFORMED
+
+Per this task's own explicit rule ("if no root cause is proven, make
+NO fix"): none of the three middlewares reached a root cause specific
+enough to derive a minimal, deterministic, testable fix from. All
+three converge on the SAME higher-level finding -- raw network
+send/receive is proven healthy and, in the failing cases observed,
+often MORE active than the passing cases -- pointing at an application/
+middleware-processing-layer timing issue, most likely compounded by
+CPU contention during simultaneous multi-process startup, but the
+EXACT mechanism (which specific internal step stalls, and why) remains
+outside what external packet capture can resolve. No production code
+was changed.
+
+### Phase 8: NOT REACHED
+
+No fix exists to test at scale.
+
+### Verdicts
+
+1. Socket/port mapping: Fast DDS has a real port collision at
+   control_station (7411 taken by the co-located discovery server,
+   forcing its client to 7410+7413); CycloneDDS has none; Zenoh has a
+   real session-routing asymmetry at control_station (loopback vs
+   every other endpoint's real-IP connection).
+2-5. Fast DDS: PASS path and FAIL path both show healthy, dense,
+   bidirectional metatraffic through the entire window; first
+   divergence is above the network layer; root cause UNKNOWN (network
+   loss explicitly excluded).
+6-10. CycloneDDS: PASS/FAIL packet timing is IDENTICAL in character
+   (dense, continuous, no backoff); SPDP-backoff hypothesis
+   **REFUTED** by direct timing evidence; root cause UNKNOWN in exact
+   mechanism, narrowed to CPU-contention-during-startup as the most
+   evidence-consistent explanation (not network-level).
+11-14. Zenoh: PASS/FAIL sessions both establish and stay alive
+   (keepalives sustained); the failing session shows MORE declaration
+   traffic, not less; root cause UNKNOWN in exact mechanism.
+15. Resource evidence at divergence: no drop counters observed in any
+   `ss` snapshot; the CycloneDDS parallel-dispatch experiment (prior
+   section) remains the best available resource-contention signal.
+16. RED->FIX->GREEN: **none performed** -- no root cause reached
+    fix-level specificity.
+17. N=2/N=4 status: **unchanged** -- same intermittent, run-to-run-
+    varying failures as before this pass, now with a clearer
+    negative-space understanding (proven NOT network loss) but no fix.
+18. N=8/N=16: not reached.
+19. LAN paper-ready: still **NO** for cross-middleware Table V; YES
+    for FleetRMW alone (unchanged).
+20. Commits: diagnostic scripts only, no production code changed.
+21. Next step: obtain an RTPS-aware and Zenoh-aware packet dissector
+    (or enable each middleware's own internal verbose/debug logging
+    successfully -- attempted once for Fast DDS this investigation via
+    env vars that did not surface output, not yet tried via an XML
+    `<Log>` profile or CycloneDDS's `Tracing` config element) to see
+    INSIDE the already-proven-healthy packet streams and identify
+    which specific submessage/declaration never completes -- this is
+    the only remaining way to move from "proven not network loss" to
+    an exact, fixable mechanism.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
