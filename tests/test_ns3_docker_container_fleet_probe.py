@@ -445,6 +445,34 @@ class RequiredPeersFromTraceTest(unittest.TestCase):
         )
 
 
+class ZenohSessionConfigJson5Test(unittest.TestCase):
+    """LAN Zenoh listen-address fix (see
+    docs/AUDIT_ACCEPTANCE_TRACKING.md, "LAN DISCOVERY SEMANTIC-LAYER
+    INVESTIGATION"): RUST_LOG=zenoh=debug tracing of a real run proved
+    control_station's session, when given no explicit config, falls
+    back to `listen.endpoints = [tcp/localhost:0]` -- unreachable from
+    any other container's own network namespace, unlike every other
+    endpoint which listens on `tcp/[::]:0` (all interfaces) because it
+    HAS an explicit config. needs_explicit_listen=True must produce a
+    config with a `listen` clause on the endpoint's own real IP;
+    needs_explicit_listen=False (every non-router endpoint) must be
+    unchanged from before this fix -- connect-only, no listen clause."""
+
+    def test_router_host_gets_explicit_real_ip_listen(self):
+        config = ReferenceTopologyProbe.zenoh_session_config_json5(
+            "10.60.0.2", "tcp/10.60.0.2:7447", True
+        )
+        self.assertIn('connect: { endpoints: ["tcp/10.60.0.2:7447"]', config)
+        self.assertIn('listen: { endpoints: ["tcp/10.60.0.2:0"]', config)
+
+    def test_non_router_host_is_connect_only_unchanged(self):
+        config = ReferenceTopologyProbe.zenoh_session_config_json5(
+            "10.60.0.3", "tcp/10.60.0.2:7447", False
+        )
+        self.assertEqual(config, '{ connect: { endpoints: ["tcp/10.60.0.2:7447"] } }')
+        self.assertNotIn("listen", config)
+
+
 class ComputeLatencyStatsMsTest(unittest.TestCase):
     def test_none_when_nothing_delivered(self):
         self.assertIsNone(compute_latency_stats_ms({"robot_0000": {"received": []}}))

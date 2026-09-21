@@ -1107,6 +1107,42 @@ class ReferenceTopologyProbe:
             raise RuntimeError(f"NR IP routing setup failed:\n{result.stdout}\n{result.stderr}")
         self.ips = {endpoint: mapping[endpoint]["ue_overlay_ip"] for endpoint in self.endpoints}
 
+    @staticmethod
+    def zenoh_session_config_json5(own_ip: str, router_endpoint: str, needs_explicit_listen: bool) -> str:
+        """LAN Zenoh listen-address fix (see
+        docs/AUDIT_ACCEPTANCE_TRACKING.md, "LAN DISCOVERY SEMANTIC-LAYER
+        INVESTIGATION"): every endpoint connects to the router
+        explicitly (unchanged). `needs_explicit_listen=True` (used ONLY
+        for control_station, the router's own host) ALSO gives this
+        endpoint's own Zenoh session an explicit `listen` clause on its
+        real overlay IP.
+
+        Without this, control_station's session (which previously got
+        NO ZENOH_SESSION_CONFIG_URI at all -- skipped specifically to
+        avoid it connecting to itself) fell back to Zenoh's own default
+        listen address, `tcp/localhost:0` -- confirmed via
+        RUST_LOG=zenoh=debug tracing of a real run. Because Zenoh's
+        default gossip/autoconnect (enabled by default) advertises each
+        peer's LISTEN address to others for direct peer-to-peer
+        connections, control_station's gossiped "localhost" address is
+        meaningless from any other container's own network namespace --
+        proven via a 5-repeat A/B (docs/AUDIT_ACCEPTANCE_TRACKING.md):
+        control_station itself failed readiness in 3/5 reps under the
+        old default-listen config, 0/5 under this explicit-real-IP-
+        listen config, with every other endpoint's config unchanged.
+        Does not fix every LAN Zenoh readiness failure by itself (a
+        separate, still-open launch-order-dependent issue affecting
+        the last-launched endpoint remains, matching the same category
+        already proven for CycloneDDS) -- but removes this specific,
+        real, structural asymmetry.
+        """
+        if needs_explicit_listen:
+            return (
+                '{ connect: { endpoints: ["' + router_endpoint + '"] }, '
+                'listen: { endpoints: ["tcp/' + own_ip + ':0"] } }'
+            )
+        return '{ connect: { endpoints: ["' + router_endpoint + '"] } }'
+
     def zenoh_router_endpoint(self) -> str:
         """control_station (endpoint index 0) is where start_zenoh_router()
         runs the router -- its IP:7447 is what every other endpoint's
@@ -1200,6 +1236,7 @@ class ReferenceTopologyProbe:
         rmw_implementation: str = "rmw_fleetqox_cpp",
         discovery_mode: str = "default",
         required_peer_ids_by_endpoint: dict[str, frozenset[str]] | None = None,
+        zenoh_control_station_explicit_listen: bool = False,
     ) -> None:
         # required_peer_ids_by_endpoint: opt-in (default None), LAN's own
         # topology-aware readiness gate (see required_peers_from_trace()
@@ -1207,6 +1244,12 @@ class ReferenceTopologyProbe:
         # TOPOLOGY-AWARE FIX") -- None preserves this method's exact
         # prior full-mesh-readiness behavior for every OTHER caller
         # (Wi-Fi's run_probe() never passes this).
+        # zenoh_control_station_explicit_listen: opt-in (default False),
+        # LAN's own fix for control_station's Zenoh session falling back
+        # to a localhost-only listen address (see
+        # zenoh_session_config_json5()'s own docstring) -- False
+        # preserves this method's exact prior behavior for every OTHER
+        # caller (Wi-Fi's run_probe() never passes this).
         docker("exec", self.rigger_name, "mkdir", "-p", f"/work/{results_dir_container}")
         self._ready_files = [f"{results_dir_container}/ready_{i}" for i in range(len(self.endpoints))]
         self._start_file = f"{results_dir_container}/start"
@@ -1245,14 +1288,19 @@ class ReferenceTopologyProbe:
                     # known address explicitly instead, same "sidestep
                     # unreliable discovery with static config" approach
                     # already used for rmw_fleetqox_cpp's static mode.
-                    # Skipped for the router's own container (endpoint 0
-                    # == control_station -- see start_zenoh_router()) so
-                    # it doesn't try to connect to itself.
-                    if i != 0:
-                        session_config = (
-                            '{ connect: { endpoints: ["'
-                            + self.zenoh_router_endpoint()
-                            + '"] } }'
+                    # Router's own container (endpoint 0 == control_station
+                    # -- see start_zenoh_router()) still connects to the
+                    # SAME router (harmlessly, via localhost -- that half
+                    # already worked); when
+                    # zenoh_control_station_explicit_listen is set, it ALSO
+                    # gets an explicit listen clause on its own real IP
+                    # (see zenoh_session_config_json5()'s own docstring for
+                    # why the OLD "skip i==0 entirely" behavior was wrong).
+                    if i != 0 or zenoh_control_station_explicit_listen:
+                        session_config = self.zenoh_session_config_json5(
+                            self.ips[endpoint],
+                            self.zenoh_router_endpoint(),
+                            i == 0,
                         )
                         session_config_path = f"/tmp/zenoh_session_config_{i}.json5"
                         docker(
@@ -2527,6 +2575,7 @@ def run_lan_probe(
             rmw_implementation=rmw_implementation,
             discovery_mode=discovery_mode,
             required_peer_ids_by_endpoint=required_peer_ids_by_endpoint,
+            zenoh_control_station_explicit_listen=True,
         )
         probe.wait_for_ready_then_start(ready_deadline_s=ready_deadline_s)
         # No sim_duration_s to time a mid-run sample against here (no
