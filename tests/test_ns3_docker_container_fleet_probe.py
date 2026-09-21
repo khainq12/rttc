@@ -1,10 +1,12 @@
 import csv
+import inspect
 import tempfile
 import unittest
 from pathlib import Path
 
 from scripts.run_ns3_docker_container_fleet_probe import (
     BASE_IP_PREFIX,
+    LAN_DISCOVERY_WATCHDOG_S,
     NS3_SIM_DURATION_DRAIN_MARGIN_S,
     RMW_PORT,
     STATIC_SUBSCRIPTION_TYPE_NAME,
@@ -20,6 +22,10 @@ from scripts.run_ns3_docker_container_fleet_probe import (
     fleetqox_rmw_env_prefix,
     parse_docker_mem_usage_mb,
     required_peers_from_trace,
+    run_coordination_probe,
+    run_lan_probe,
+    run_nr_probe,
+    run_probe,
     station_mac,
     topic_for,
 )
@@ -786,6 +792,59 @@ class EffectiveNs3SimDurationSTest(unittest.TestCase):
         # ns-3's own stop time too, rather than two independently-
         # guessed numbers that could drift apart again.
         self.assertEqual(NS3_SIM_DURATION_DRAIN_MARGIN_S, 60.0)
+
+
+class LanReadinessWatchdogTest(unittest.TestCase):
+    """PROVEN (see docs/AUDIT_ACCEPTANCE_TRACKING.md, "LAN SOURCE +
+    OFFICIAL-DOCUMENTATION AUDIT" Phases 1-8): the old fixed
+    discovery_timeout_s=15.0 for LAN Table V had no scientific
+    justification (Phase 3, git-history audit) and is HALF of
+    CycloneDDS 0.10.5's own documented default SPDPInterval (30s,
+    Phase 1, cited from the installed ddsi_cfgelems.h) -- a
+    still-normally-converging CycloneDDS participant relying on the
+    plain periodic (non-burst-accelerated) SPDP cycle can legitimately
+    need close to the full 30s and get incorrectly rejected by a 15s
+    watchdog. This does not test any live network behavior (that's
+    the already-completed live A/B evidence) -- it tests the single
+    fair-contract policy decision: LAN's own watchdog constant must be
+    evidence-derived and comfortably cover the slowest documented
+    normal middleware behavior, while every OTHER profile (Wi-Fi,
+    Table VI, 5G -- none audited or authorized to change here) keeps
+    its original, untouched default."""
+
+    def test_lan_watchdog_covers_cyclonedds_documented_spdp_interval(self):
+        # CycloneDDS's own installed config schema documents
+        # Discovery/SPDPInterval's default as "30 s" -- the watchdog
+        # must be strictly greater than that, not merely equal, so a
+        # worst-case-phase-aligned pair still has room to actually
+        # send and be received before the deadline fires.
+        cyclonedds_documented_default_spdp_interval_s = 30.0
+        self.assertGreater(
+            LAN_DISCOVERY_WATCHDOG_S, cyclonedds_documented_default_spdp_interval_s
+        )
+
+    def test_lan_watchdog_is_no_longer_the_unjustified_old_default(self):
+        self.assertNotEqual(LAN_DISCOVERY_WATCHDOG_S, 15.0)
+
+    def test_run_lan_probe_uses_the_derived_watchdog_by_default(self):
+        default = inspect.signature(run_lan_probe).parameters["discovery_timeout_s"].default
+        self.assertEqual(default, LAN_DISCOVERY_WATCHDOG_S)
+
+    def test_wifi_table_vi_and_5g_defaults_are_untouched(self):
+        # Strict rule: do not touch Wi-Fi/5G, and Table VI is a
+        # different benchmark (coordination, not Table V) -- none of
+        # these were audited here, so none of them may have silently
+        # picked up the new LAN-specific watchdog value.
+        self.assertEqual(
+            inspect.signature(run_probe).parameters["discovery_timeout_s"].default, 15.0
+        )
+        self.assertEqual(
+            inspect.signature(run_coordination_probe).parameters["discovery_timeout_s"].default,
+            15.0,
+        )
+        self.assertEqual(
+            inspect.signature(run_nr_probe).parameters["discovery_timeout_s"].default, 15.0
+        )
 
 
 if __name__ == "__main__":

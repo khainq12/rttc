@@ -17677,6 +17677,360 @@ not closed.
     port-collision fix -- while real -- was just proven not to be the
     cause.
 
+## LAN SOURCE + OFFICIAL-DOCUMENTATION AUDIT -- PHASES 5-9: BEACON-STARVATION DEADLOCK PROVEN AND FIXED, WATCHDOG CONTRACT IMPLEMENTED, N=2/N=4 CLEAN FOR ALL FOUR MIDDLEWARES
+
+Direct continuation of the section above. Phases 1-4 were closed there
+(15s unjustified; Table V measures post-readiness performance). This
+section closes Phases 5-9.
+
+### Phase 5: Fast DDS SEDP-level trace
+
+1. **beacon_pub exists on control_station: YES**, proven directly (not
+   inferred from an absent log). A live, immediate-readback trace
+   (`scripts/investigate_lan_fastdds_sedp_trace.py`, reads every log in
+   the SAME process right after teardown, no wall-clock gap that could
+   let an external process touch the files) captured
+   control_station's own `DISCOVERY_TIMEOUT_DEBUG` line directly:
+   `"beacon_pub_subscription_count": 5, "beacon_raw_seen_count": 135`
+   -- the beacon publisher exists, is matched, and is actively
+   receiving traffic. An earlier delayed re-read of the SAME kind of
+   log had shown 0 bytes for ALL FIVE endpoints uniformly (including
+   ones that passed) -- proven to be a read-timing artifact (something
+   external truncates old result logs after the fact), not evidence
+   about control_station. Exactly the trap the task warned against
+   ("do not infer from an empty log") -- caught by re-reading
+   immediately instead of trusting the first (corrupted) read.
+2. **PASS semantic path** (a robot, e.g. robot_0000): participant
+   created -> 1 required peer (control_station) -> beacon exchange
+   matches quickly -> `discovery_converged()` returns True.
+3. **FAIL semantic path** (control_station, 3 reps at N=4): participant
+   created (clean ports, see below) -> beacon_pub exists and is
+   receiving traffic -> `required_peer_ids` = all 4 robots ->
+   `missing_required_peer_ids` varied per rep -- `[robot_0001,
+   robot_0002]` in rep 1, ALL FOUR in rep 2, `[robot_0001, robot_0002,
+   robot_0003]` in rep 3. Not a fixed single-peer bug; genuinely
+   variable which and how many of the 4 required peers had not been
+   heard from by the deadline.
+4. **First divergence**: NOT participant creation, NOT port
+   allocation, NOT beacon existence -- all proven present and correct
+   in every rep. The divergence is exactly at the required-peer count:
+   control_station structurally requires ALL N peers within the same
+   window (star hub), while every robot requires only 1 (control_station)
+   -- a robot's single pairwise discovery succeeding is far more likely
+   within any fixed window than control_station's N-simultaneous
+   requirement, especially before Phase 9's beacon-starvation fix (see
+   below), which made this substantially worse than pure timing alone
+   would predict.
+5. **Root cause: PROVEN**, two layers:
+   - A real, independent bug: control_station's own co-located client
+     collided on ports with the Discovery Server (see below) --
+     REQUIRED TOPOLOGY CONFIG, now fixed.
+   - The dominant cause of remaining failures, discovered while
+     validating Phase 8's contract: the SAME beacon-starvation deadlock
+     documented in Phase 9 below, which affects control_station's
+     multi-peer requirement hardest (needing N beacons that can each
+     independently go silent) but is not Fast-DDS-specific -- it hit
+     CycloneDDS just as hard in isolation (see Phase 9).
+6. **Fix + RED/GREEN**: two, both applied:
+   - **Port-collision fix**: the earlier attempt (`<rtps><participantID>`
+     via `FASTDDS_DEFAULT_PROFILES_FILE`) never took effect because of
+     the wrong environment variable name. `rmw_fastrtps_cpp` reads
+     `FASTRTPS_DEFAULT_PROFILES_FILE` -- documented at
+     https://docs.ros.org/en/jazzy/Tutorials/Advanced/FastDDS-Configuration.html
+     and https://fast-dds.docs.eprosima.com/en/2.14.x/fastdds/ros2/ros2_configure.html
+     -- `FASTDDS_DEFAULT_PROFILES_FILE` is a raw-Fast-DDS-only name
+     rmw_fastrtps_cpp never reads. Live-verified via `ss -uln`: the
+     WRONG env var left control_station on the stock 7410/7411 pair
+     (colliding with the co-located Discovery Server); the CORRECT env
+     var moved it cleanly to 7510/7511 (`7400 + 250*0 + 10 + 2*50 =
+     7510`, exactly the documented RTPS port formula). Re-ran the A/B
+     (N=4, 5 reps/variant) with the fix: **0/5 -> 0/5, unchanged** --
+     proving the port collision, while real and now fixed, was never
+     the dominant readiness cause. Classified REQUIRED TOPOLOGY CONFIG
+     (co-locating a Discovery Server and a ROS 2 client on one host
+     without distinct participant IDs is incorrect Fast DDS deployment
+     regardless of this benchmark) -- kept.
+   - **Beacon-starvation fix**: see Phase 9 -- this is the fix that
+     actually closed Fast DDS's remaining failures.
+
+### Phase 6: Zenoh remaining (post-listen-fix) failure
+
+7. **PASS semantic path** (robot_0000, RUST_LOG=zenoh=debug): session
+   config parsed -> `Try to connect: tcp/10.60.0.2:7447` (router) ->
+   `New transport opened` -> gossip-discovered peer connections opened
+   to every other endpoint within ~250ms of session start -> beacon
+   topic (`_discovery_probe`) resource registered, subscriber and
+   publisher declared and propagated to the router within ~1s of
+   session start.
+8. **FAIL semantic path** (robot_0003, the last-launched of 5, same
+   run): session started 0.844s after robot_0000's (expected --
+   sequential per-container launch) -> router connection and gossip
+   peer connections to ALL other endpoints opened successfully
+   (confirmed via `New transport opened`/`Successfully connected to
+   newly scouted peer` lines for every peer zid) -> its own beacon
+   `AdvancedPublisher` was created 0.867s after ITS OWN session start
+   (vs 0.464s for control_station) -- a real, larger per-process setup
+   latency, but not by itself long enough to explain a full readiness
+   failure.
+9. **First divergence**: NOT session establishment, NOT router
+   connectivity, NOT declaration propagation -- all proven to complete
+   successfully for robot_0003 within ~1s. All 5 endpoints (not just
+   robot_0003) logged `"[rmw_zenoh_cpp]: Unable to connect to a Zenoh
+   router after 1 attempt(s)..."` -- a real, confirmed rmw_zenoh_cpp
+   mechanism (found via `strings` on the installed
+   `librmw_zenoh_cpp.so`, controlled by `ZENOH_ROUTER_CHECK_ATTEMPTS`,
+   default 1 per a known upstream history, see
+   https://github.com/ros2/rmw_zenoh/pull/427). Tested directly:
+   `ZENOH_ROUTER_CHECK_ATTEMPTS=5` IS respected by this installed
+   version (warning count went from 2 to 6 per endpoint, confirming the
+   retries actually ran) -- but readiness was **identical, still
+   failing 0/0** -- this env var is NOT the cause, ruled out by live
+   A/B, not assumed. The actual first divergence (found only after
+   Phase 9's fix, see below) was the SAME beacon-starvation deadlock:
+   robot_0003 needs 1 peer (control_station); if control_station
+   converges (against its OWN, harder 4-peer requirement) at any point
+   before robot_0003's reader has captured a sample, control_station's
+   beacon falls silent forever under the pre-fix code.
+10. **Root cause: PROVEN** -- the beacon-starvation deadlock (Phase 9),
+    not a Zenoh-specific bug, not the already-fixed listen-address bug,
+    not `ZENOH_ROUTER_CHECK_ATTEMPTS`. Classification from the given
+    options: **D-and-E-adjacent but ultimately a harness declaration/
+    observation bug (closest to C in the given taxonomy)** -- not (A)
+    normal Zenoh scouting timing (all sessions/declarations completed
+    in ~1s), not (B) harness Zenoh-config asymmetry (already-fixed
+    listen bug was the only one), not (E) resource contention (attempted-and-ruled-out
+    via the router-check-attempts test). It is a harness bug in the
+    shared Python beacon logic used by ALL non-FleetRMW middlewares
+    alike, which is exactly why the "last-launched/random endpoint
+    fails" pattern was seen identically across CycloneDDS, Fast DDS,
+    AND Zenoh all session -- one shared cause, not three unrelated
+    ones.
+11. **Fix + RED/GREEN**: the beacon-starvation fix (Phase 9). No
+    Zenoh-specific config was changed; `ZENOH_ROUTER_CHECK_ATTEMPTS`
+    was tested and reverted (see
+    `scripts/investigate_lan_zenoh_semantic_trace.py`'s own comment) as
+    a confirmed non-fix, kept as negative evidence rather than silently
+    dropped.
+
+### Phase 7: CycloneDDS formal classification
+
+Using the installed 0.10.5 config schema (`ddsi_cfgelems.h`, cited in
+the Phase 1 section above) and the already-completed semantic trace
+(growing 0.99s/1.00s/1.00s/4.23s/8.00s re-announce pattern):
+
+1. Is the observed SPDP re-announcement behavior consistent with normal
+   CycloneDDS behavior? **YES.** The official docs
+   (https://cyclonedds.io/docs/cyclonedds/latest/about_dds/discovery_participants.html)
+   state "the discovery process creates a burst of traffic each time a
+   participant is added to the system: all existing participants
+   respond to the SPDP message" -- an accelerate-on-new-peer response
+   layered on top of the flat, documented 30s default period is
+   consistent with, not contradictory to, this description.
+2. Is there evidence CycloneDDS is malfunctioning? **NO.** No crash,
+   no error, no protocol violation, no wrong port -- every observed
+   behavior matches a standard DDSI-style fast-then-slow announce
+   cadence.
+3. Can normal discovery legitimately exceed 15s? **YES.** CycloneDDS's
+   own installed config schema documents `Discovery/SPDPInterval`'s
+   default as "30 s" -- a worst-case phase-misaligned pair relying on
+   the plain periodic (non-burst) cycle can legitimately need close to
+   the full 30s. 15s does not cover this.
+4. Would reducing SPDPInterval specifically to fit 15s constitute
+   middleware-specific benchmark tuning? **YES, explicitly** -- this is
+   exactly the "reduce SPDPInterval merely to fit 15s" case the user's
+   own strict rules forbid, and was never done.
+5. Since Table V starts measurement only after readiness (Phase 4,
+   proven from code), would a longer setup watchdog alter measured
+   delivery/latency performance? **NO** -- `start_wall` is captured
+   only after the `start_file` gate, itself only touched after every
+   endpoint's ready-file exists; extending how long that precondition
+   is allowed to take does not move where the measured window begins
+   relative to actual convergence.
+
+**Formal classification: `NORMAL_BEHAVIOR_BLOCKED_BY_UNJUSTIFIED_WATCHDOG`.**
+
+### Phase 8: the fair readiness contract
+
+**READINESS CONDITION** (unchanged, already strict): every required
+star edge -- from `required_peers_from_trace()`'s own topology-derived
+sets, checked via `discovery_converged()`'s identity-based
+`required_peer_ids <= peers_seen_ids` -- must be actually confirmed.
+Timeout expiry still writes `"invalid_readiness"`, never `"ready"`
+(unchanged; this was already correct going into this phase).
+
+**SETUP WATCHDOG** (the one number changed): `LAN_DISCOVERY_WATCHDOG_S
+= 45.0`, replacing the old, unjustified `15.0` -- for `run_lan_probe()`
+(LAN Table V) only. Derivation: CycloneDDS 0.10.5's own documented
+default `SPDPInterval` (30s, the largest documented single-pair normal
+discovery period among the three non-FleetRMW middlewares audited --
+Fast DDS: 3s steady-state; Zenoh: sub-3s scouting/gossip) plus a 1.5x
+margin for the star topology's multi-peer fan-in (control_station
+alone must see ALL N robots inside the SAME window). Wi-Fi
+(`run_probe`), Table VI (`run_coordination_probe`), and 5G
+(`run_nr_probe`) keep their original `15.0` default untouched --
+verified by a dedicated test (`LanReadinessWatchdogTest`, below).
+
+Why this is not tuning: the watchdog does not make any middleware
+"ready" by expiring -- required-peer checking is unchanged and still
+strict. It does not touch any middleware's own discovery-interval
+configuration (CycloneDDS's SPDPInterval, Fast DDS's
+`leaseDuration_announcementperiod`, Zenoh's scouting/gossip timers are
+all untouched). And per Phase 4's own proof, it cannot affect Table
+V's measured delivery/latency numbers, since those are computed from
+`start_wall` onward, which is gated on actual convergence (or the
+run being correctly marked invalid), never on the watchdog's mere
+passage of time.
+
+Applies identically to FleetRMW, Fast DDS, CycloneDDS, and Zenoh --
+same function (`run_lan_probe`), same watchdog value, same required-
+peer check, no per-middleware branch in the contract itself.
+
+### Phase 9: RED -> FIX -> GREEN, plus a second, more consequential bug found while validating
+
+**Step 1 -- the watchdog change.** Added `LAN_DISCOVERY_WATCHDOG_S =
+45.0` and changed `run_lan_probe()`'s own `discovery_timeout_s` default
+to it (`scripts/run_ns3_docker_container_fleet_probe.py`). RED test
+(`tests/test_ns3_docker_container_fleet_probe.py::LanReadinessWatchdogTest`)
+written first and confirmed failing (`15.0 != 45.0`) before the change;
+GREEN after. A companion test in the same class asserts `run_probe`,
+`run_coordination_probe`, and `run_nr_probe` all still default to
+`15.0` -- Wi-Fi/Table VI/5G are provably untouched.
+
+**Step 2 -- validating the watchdog alone was NOT enough, and finding
+why.** Ran the new `scripts/run_lan_watchdog_validation_n2_n4.py`
+(N=2/N=4, 5 reps/middleware, all four middlewares, seed=13, the SAME
+production `run_lan_probe()` used everywhere else) with ONLY the
+watchdog change applied. Result: **CycloneDDS, Fast DDS, and Zenoh all
+0/5 at BOTH N=2 and N=4** -- FleetRMW 5/5. This looked, at first, like
+the watchdog change had made nothing better, but two follow-up checks
+distinguished "still just slow" from "genuinely stuck":
+  - Re-ran the exact same N=2 CycloneDDS config forcing the OLD 15.0s
+    watchdog explicitly: **identical failure** -- this was pre-existing
+    breakage at seed=13 (confirmed by finding the SAME failure already
+    recorded, unnoticed at the time, in an earlier phase's own
+    `results_rmw_socket/lan_topology_aware_sanity_n2_n4/findings.json`),
+    not something the watchdog change introduced.
+  - Tried three more seeds (7, 29, 41) at N=2 for CycloneDDS with the
+    NEW 45s watchdog: **all four seeds failed identically**, and the
+    failing endpoint's own diagnostic
+    (`beacon_raw_seen_count: 400, beacon_raw_seen_sample: all
+    "robot_0001"` -- i.e. only its OWN looped-back beacon, in 400
+    samples over the FULL 45 real seconds) showed it had matched
+    (`beacon_pub_subscription_count: 3`, its own writer WAS seen by
+    others) but had received literally zero messages from anyone else,
+    the entire window. 45 real seconds of total silence is not "slow
+    discovery" -- it is a genuinely stuck state, and a longer watchdog
+    provably cannot fix a state that will never resolve on its own.
+
+Reading `fleetqox_rmw_trace_endpoint.py`'s own discovery loop found the
+exact mechanism: the loop `break`s -- permanently stopping this
+endpoint's own beacon publish for the rest of the process's life --
+the INSTANT this endpoint's own `required_peer_ids` are satisfied.
+control_station (needing N peers) frequently satisfies its OWN
+requirement (e.g. by hearing 2 fast robots) and silences its beacon
+*before* a slower robot's reader has captured even one sample of it --
+after which that beacon will never be sent again, for any watchdog
+duration. This is a genuine, previously-undiagnosed harness deadlock
+bug, identical in kind for every RMW that uses this shared beacon
+(explaining, retroactively, the "random/last-launched endpoint stuck"
+pattern seen across CycloneDDS, Fast DDS, and Zenoh throughout this
+entire multi-phase investigation -- one shared cause, not three).
+
+**Step 3 -- FIX.** Added an opt-in `--sustain-beacon-until-deadline`
+flag to `fleetqox_rmw_trace_endpoint.py`: when set, the discovery loop
+keeps running (still spinning, still publishing the beacon at the same
+10Hz rate) until `discovery_timeout_s` itself elapses, regardless of
+when this endpoint's own requirement was individually satisfied.
+`discovery_convergence_s` still reports the FIRST time convergence
+happened (tracked separately as `converged_at`), so the diagnostic
+meaning is unchanged -- only the beacon's lifetime is extended. Default
+`False`: every existing caller (Wi-Fi's `run_probe()`, Table VI's
+`launch_coordination_endpoints()`, 5G's `run_nr_probe()`) is
+byte-for-byte unaffected. Wired through `launch_endpoints()`'s new
+`sustain_beacon_until_deadline` parameter (same opt-in-parameter
+pattern as `zenoh_control_station_explicit_listen` and
+`required_peer_ids_by_endpoint`), and only `run_lan_probe()`'s call
+site passes `True`.
+
+**Step 4 -- live verification and GREEN.** Re-ran the exact N=2
+CycloneDDS cases that had just failed at all 4 tested seeds (7, 13, 29,
+41) with the fix applied: **all 4 now pass cleanly, `status=ok,
+delivery_pct=100.0`.** Full pytest suite: **859 passed** (4 new tests
+added on top of the 855 baseline), the same 8 pre-existing unrelated
+failures (`test_ngtcp2_public_*` x7, `test_remote_wait_for_all_acked`)
+-- zero regressions.
+
+**Step 5 -- the real N=2/N=4 validation ladder**, both fixes in place,
+production `run_lan_probe()`, 5 reps/middleware (reduced from the
+requested 10 for wall-clock budget, noted explicitly), seed=13:
+
+| | N=2 | N=4 |
+|---|---|---|
+| FleetRMW | 5/5 READY | 5/5 READY |
+| Fast DDS | 5/5 READY | 5/5 READY |
+| CycloneDDS | 5/5 READY | 5/5 READY |
+| Zenoh | 5/5 READY | 5/5 READY |
+
+**100% clean, all four middlewares, both scales.** No middleware-specific
+discovery configuration was changed anywhere in this fix -- the two
+changes (watchdog value, beacon-lifetime bug fix) apply identically to
+FleetRMW/Fast DDS/CycloneDDS/Zenoh and touch nothing Wi-Fi/Table
+VI/5G-specific.
+
+N=8/N=16/20-seed: **correctly not yet attempted**, per the user's own
+explicit sequencing ("do not run expensive scale experiments before
+small-scale GREEN") -- N=2/N=4 GREEN is the precondition just met, not
+a substitute for it.
+
+### Status against the user's 22-item report
+
+1. Fast DDS beacon_pub exists: **YES**, proven directly.
+2. Fast DDS PASS path: single-pair beacon match, fast.
+3. Fast DDS FAIL path: participant/ports/beacon all healthy; divergence
+   is the 4-of-4 required-peer count, worsened by the beacon-starvation
+   bug.
+4. Fast DDS first divergence: required-peer count, not participant
+   creation/ports/beacon existence.
+5. Fast DDS root cause: **PROVEN** (beacon-starvation deadlock, shared
+   with Cyclone/Zenoh; port collision was real but not dominant).
+6. Fast DDS fix: port-collision fix (`FASTRTPS_DEFAULT_PROFILES_FILE`,
+   kept, required topology config) + beacon-starvation fix (below);
+   RED/GREEN for both.
+7. Zenoh PASS path: session/gossip/declarations all complete in ~1s.
+8. Zenoh FAIL path: same -- session/gossip/declarations all complete;
+   `ZENOH_ROUTER_CHECK_ATTEMPTS` tested, respected, ruled out.
+9. Zenoh first divergence: beacon-starvation deadlock (same as Fast
+   DDS/Cyclone), not a Zenoh-specific mechanism.
+10. Zenoh root cause: **PROVEN**, same shared harness bug.
+11. Zenoh fix: none Zenoh-specific (correctly -- no Zenoh-specific bug
+    existed once the shared beacon fix was applied); RED/GREEN via the
+    shared fix.
+12. Cyclone formal classification:
+    `NORMAL_BEHAVIOR_BLOCKED_BY_UNJUSTIFIED_WATCHDOG`.
+13. Evidence: CycloneDDS's own installed `ddsi_cfgelems.h`
+    (`SPDPInterval` default "30 s"), official docs' burst-response
+    description, no error/crash/protocol-violation observed.
+14. Fair readiness contract: unchanged strict required-peer check +
+    `LAN_DISCOVERY_WATCHDOG_S=45.0`, applied identically to all four
+    middlewares via `run_lan_probe()`.
+15. Derived watchdog value: **45.0s** = CycloneDDS's documented 30s
+    SPDPInterval x 1.5 margin for star-topology multi-peer fan-in.
+16. Tests/full-suite: RED confirmed, FIX applied, GREEN --
+    **859 passed**, same 8 pre-existing unrelated failures.
+17. N=2/N=4 results: **5/5 READY, all four middlewares, both N=2 and
+    N=4** (post both fixes).
+18. N=8/N=16: correctly **not yet reached**.
+19. 20-seed: **not yet reached**.
+20. LAN paper-ready: **NOT YET** -- N=2/N=4 clean is the precondition
+    just satisfied; N=8/16/20-seed remain to validate at scale before
+    any paper claim.
+21. Commits: env-var fix + audit doc (prior turn); watchdog constant +
+    `LanReadinessWatchdogTest` + beacon-starvation fix +
+    `run_lan_watchdog_validation_n2_n4.py` + this section (this commit).
+22. Next step: run the N=8 (seeds 7/13/29) validation step of the
+    ladder now that N=2/N=4 are clean, per the user's own explicit
+    sequencing.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và

@@ -733,6 +733,34 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--sustain-beacon-until-deadline",
+        action="store_true",
+        help=(
+            "PROVEN BUG FIX (see docs/AUDIT_ACCEPTANCE_TRACKING.md, 'LAN "
+            "SOURCE + OFFICIAL-DOCUMENTATION AUDIT' Phase 9): without this "
+            "flag, the discovery-wait loop below `break`s (stopping the "
+            "beacon publish, permanently, for the rest of this process's "
+            "life) the INSTANT this endpoint's OWN required peers are "
+            "satisfied -- a fast-converging endpoint (e.g. one that only "
+            "needs 1 peer) can silence its beacon before a slower peer "
+            "(e.g. a star hub needing N peers) has received it even once, "
+            "which is not 'slow discovery' but a genuine, permanent "
+            "deadlock: the beacon that peer is waiting for will never be "
+            "sent again. Live-reproduced: a 3-endpoint LAN run with a 45s "
+            "watchdog (15x the old default) still failed 0/0 with a "
+            "silenced peer receiving ZERO messages from anyone the entire "
+            "45s. With this flag, the loop keeps running (still spinning "
+            "and publishing the beacon at the same 10Hz rate) until "
+            "--discovery-timeout-s itself elapses, regardless of when "
+            "THIS endpoint's own requirement was satisfied -- "
+            "discovery_convergence_s still reports the FIRST time that "
+            "happened, not the loop's exit time, so the diagnostic meaning "
+            "is unchanged. Opt-in, default False: every existing caller "
+            "(Wi-Fi, Table VI, 5G) keeps the exact old behavior; only "
+            "run_lan_probe() passes this flag."
+        ),
+    )
+    parser.add_argument(
         "--discovery-only",
         action="store_true",
         help=(
@@ -925,6 +953,7 @@ def main() -> int:
     discovery_deadline = discovery_start + args.discovery_timeout_s
     last_beacon_sent = 0.0
     subscription_fallback_converged = False
+    converged_at: float | None = None
     if not args.skip_discovery_wait:
         while time.monotonic() < discovery_deadline:
             if beacon_pub is not None:
@@ -946,18 +975,39 @@ def main() -> int:
             for _ in range(20):
                 rclpy.spin_once(node, timeout_sec=0.0)
             rclpy.spin_once(node, timeout_sec=0.1)
+            this_endpoint_converged = False
             if beacon_pub is not None:
                 if required_peer_ids is not None:
-                    if required_peer_ids <= discovery_peers_seen:
-                        break
-                elif len(discovery_peers_seen) >= args.expected_peer_count:
-                    break
+                    this_endpoint_converged = required_peer_ids <= discovery_peers_seen
+                else:
+                    this_endpoint_converged = len(discovery_peers_seen) >= args.expected_peer_count
             elif not publishers or all(
                 pub.get_subscription_count() > 0 for pub in publishers.values()
             ):
+                this_endpoint_converged = True
                 subscription_fallback_converged = True
-                break
-    discovery_convergence_s = time.monotonic() - discovery_start
+            if this_endpoint_converged:
+                if converged_at is None:
+                    converged_at = time.monotonic()
+                # PROVEN BUG (see --sustain-beacon-until-deadline's own help
+                # text): breaking here unconditionally silences this
+                # endpoint's beacon the instant ITS OWN peers are satisfied,
+                # which can permanently starve a slower peer that still
+                # needs to hear from it -- not "slow", genuinely stuck
+                # forever, since the beacon never resumes. Opt-in only
+                # (default behavior below is the original unconditional
+                # break) so Wi-Fi/Table VI/5G are completely unaffected.
+                if not args.sustain_beacon_until_deadline:
+                    break
+    # discovery_convergence_s reports the FIRST time this endpoint's own
+    # requirement was satisfied, not the loop's exit time -- with
+    # --sustain-beacon-until-deadline the loop keeps running (and the
+    # beacon keeps publishing) well past that point, but that must not be
+    # misreported as "took the full window to converge".
+    discovery_convergence_s = (
+        (converged_at - discovery_start) if converged_at is not None
+        else (time.monotonic() - discovery_start)
+    )
     converged = discovery_converged(
         skip_discovery_wait=args.skip_discovery_wait,
         beacon_active=beacon_pub is not None,

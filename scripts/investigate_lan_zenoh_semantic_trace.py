@@ -82,12 +82,20 @@ def main() -> int:
             discovery_timeout_s=15.0,
             static_mode=False,
             static_subscriptions=None,
+            # ZENOH_ROUTER_CHECK_ATTEMPTS=5 was tested here (see
+            # docs/AUDIT_ACCEPTANCE_TRACKING.md, "LAN SOURCE +
+            # OFFICIAL-DOCUMENTATION AUDIT" Phase 6): the env var IS
+            # respected by this installed rmw_zenoh_cpp (warning count
+            # went 2->6 per endpoint), but readiness for the
+            # last-launched robot was IDENTICAL (still fails) -- ruled
+            # out, reverted to the plain RUST_LOG-only config below.
             extra_rmw_env={"RUST_LOG": "zenoh=debug"},
             results_dir_container=results_dir_container,
             start_wait_timeout_s=45.0,
             rmw_implementation="rmw_zenoh_cpp",
             discovery_mode="default",
             required_peer_ids_by_endpoint=required_peer_ids_by_endpoint,
+            zenoh_control_station_explicit_listen=True,
         )
         try:
             probe.wait_for_ready_then_start(ready_deadline_s=30.0)

@@ -97,6 +97,30 @@ NS3_ATTACH_WAIT_S = 3
 # process sharing one already-warm container, so per-endpoint ready-gate
 # latency is meaningfully higher and more variable across runs.
 READY_DEADLINE_S = 60
+# LAN Table V setup watchdog (see docs/AUDIT_ACCEPTANCE_TRACKING.md, "LAN
+# SOURCE + OFFICIAL-DOCUMENTATION AUDIT" Phase 8): run_lan_probe()'s own
+# discovery_timeout_s default, derived from evidence rather than chosen
+# arbitrarily (the old value, 15.0, was proven -- via git-history audit,
+# Phase 3 -- to have no such derivation at all). CycloneDDS 0.10.5's own
+# installed config schema (dds/ddsi/ddsi_cfgelems.h) documents
+# Discovery/SPDPInterval's default as "30 s" -- the largest documented
+# NORMAL single-pair discovery period among the three non-FleetRMW
+# middlewares audited (Fast DDS: 3s steady-state re-announce; Zenoh:
+# sub-3s scouting/gossip timers) -- so a worst-case phase-misaligned pair
+# relying on CycloneDDS's plain periodic (non-burst-accelerated) SPDP
+# cycle can legitimately need close to one full SPDPInterval to converge
+# under stock configuration. This watchdog is that documented worst case
+# (30s) plus a 1.5x margin for the star topology's multi-peer fan-in
+# (control_station alone must see ALL N robots inside the SAME window,
+# not just one -- proven, for Fast DDS specifically via a live SEDP
+# trace, to be the dominant source of its own readiness fragility even
+# with zero middleware config bugs). This is a SETUP WATCHDOG only: it
+# does not change any per-pair discovery timing for any middleware, does
+# not make required-peer checking any less strict (discovery_converged()
+# is unchanged), and does not affect Table V's measured delivery/latency
+# window, which (per the Phase 4 code trace) only ever starts after real
+# convergence, however long that took.
+LAN_DISCOVERY_WATCHDOG_S = 45.0
 CONTAINER_PREFIX = "fleetqox_ref"
 # Must match fleetqox_trace_replay_tap.cc's PrintWifiStats() reschedule
 # period (Simulator::Schedule(Seconds(5.0), ...)) exactly -- used to size
@@ -1237,6 +1261,7 @@ class ReferenceTopologyProbe:
         discovery_mode: str = "default",
         required_peer_ids_by_endpoint: dict[str, frozenset[str]] | None = None,
         zenoh_control_station_explicit_listen: bool = False,
+        sustain_beacon_until_deadline: bool = False,
     ) -> None:
         # required_peer_ids_by_endpoint: opt-in (default None), LAN's own
         # topology-aware readiness gate (see required_peers_from_trace()
@@ -1413,6 +1438,16 @@ class ReferenceTopologyProbe:
             if required_peer_ids_by_endpoint is not None and rmw_implementation != "rmw_fleetqox_cpp":
                 required = required_peer_ids_by_endpoint.get(endpoint, frozenset())
                 required_peer_ids_flag = f" --required-peer-ids={shlex.quote(','.join(sorted(required)))}"
+            # PROVEN BUG FIX (see --sustain-beacon-until-deadline's own
+            # help text in fleetqox_rmw_trace_endpoint.py): opt-in, only
+            # for beacon-based RMWs -- FleetRMW's static mode has no
+            # beacon/discovery loop for this to affect (same reasoning as
+            # required_peer_ids_flag above).
+            sustain_beacon_flag = (
+                " --sustain-beacon-until-deadline"
+                if sustain_beacon_until_deadline and rmw_implementation != "rmw_fleetqox_cpp"
+                else ""
+            )
             inner = (
                 "source /opt/ros/jazzy/setup.bash && "
                 f"{rmw_setup}&& "
@@ -1438,7 +1473,8 @@ class ReferenceTopologyProbe:
                 f"--start-wait-timeout-s={start_wait_timeout_s} "
                 f"--expected-peer-count={expected_peer_count}"
                 f"{required_peer_ids_flag}"
-                f"{skip_discovery_wait_flag} "
+                f"{skip_discovery_wait_flag}"
+                f"{sustain_beacon_flag} "
                 f"--summary-json=/work/{result_json} "
                 f"--ready-file=/work/{self._ready_files[i]} "
                 f"--start-file=/work/{self._start_file}"
@@ -2473,7 +2509,7 @@ def run_lan_probe(
     seed: int,
     start_offset_ms: float = 2000.0,
     drain_s: float = 10.0,
-    discovery_timeout_s: float = 15.0,
+    discovery_timeout_s: float = LAN_DISCOVERY_WATCHDOG_S,
     static_mode: bool = True,
     extra_rmw_env: dict[str, str] | None = None,
     rmw_implementation: str = "rmw_fleetqox_cpp",
@@ -2576,6 +2612,7 @@ def run_lan_probe(
             discovery_mode=discovery_mode,
             required_peer_ids_by_endpoint=required_peer_ids_by_endpoint,
             zenoh_control_station_explicit_listen=True,
+            sustain_beacon_until_deadline=True,
         )
         probe.wait_for_ready_then_start(ready_deadline_s=ready_deadline_s)
         # No sim_duration_s to time a mid-run sample against here (no
