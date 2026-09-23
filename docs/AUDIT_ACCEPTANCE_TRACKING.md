@@ -20211,6 +20211,92 @@ image being rebuilt from its own already-committed Dockerfile.
     N=2, and needs a full, fresh baseline before anything currently
     published can be trusted as still accurate.
 
+## TABLE V WI-FI RE-BASELINE (23/09/2026): OLD RESULTS MARKED SUPERSEDED_INVALID_ENVIRONMENT, CORRECTED-IMAGE MEASUREMENT IN PROGRESS
+
+Direct continuation of the section above. Scope this turn: re-baseline
+Table V's Wi-Fi profile on the corrected image, per its own explicit,
+strict rules -- no FleetRMW/Gateway optimization, no network-parameter
+changes, no 20-seed final run yet, small-N/small-seed-count corrected
+baseline first. Preflight guard added and passing (see the commit
+right before this section): `scripts/check_ns3_image_freshness.py`
+confirms `localhost/fleetrmw/rmw-netem:jazzy` (image
+`789b7624f146...`, created 2026-09-23) postdates
+`external/rmw-netem/Dockerfile`'s last commit and has no apt `ns3`
+package installed.
+
+### Item 2: marking the old results
+
+**Every Wi-Fi-profile (ns-3 TapBridge/802.11 `fleetqox_trace_replay_tap.cc`)
+Table IV/V number recorded ANYWHERE in this document, from whenever
+Wi-Fi measurement began through 2026-09-23 (today), was measured
+against the image built 2026-09-02 -- i.e. BEFORE commit `30bc4160`
+(2026-09-11) actually put the TapBridge address-autolearn fix into the
+Dockerfile.** That image was never rebuilt in between, so this covers
+the full span of Wi-Fi-profile sections in this document, specifically
+including but not limited to: the original Bảng IV/V Wi-Fi tables
+(13/09/2026, "phát hiện CHẤN ĐỘNG -- Stale ratio ~99-100%"), the
+Ours-fifo vs Ours-predictive N=16 comparison (15/09/2026), the
+MAC/PHY-layer FLEETQOX_WIFI_STATS measurement pass (15/09/2026), every
+Table VI N=8 investigation (19/09/2026, all of which run over the SAME
+Wi-Fi ns-3 TapBridge path, not LAN), and every WiFi-Gateway benchmark
+finding prior to this turn's fix commit (`e606148`).
+
+**Marking rule applied**: every such result is **SUPERSEDED_INVALID_ENVIRONMENT**
+-- not deleted, not edited in place (this document's own convention is
+append-only/historical), but explicitly superseded as of this section.
+The reason is exactly as prescribed: *the benchmark source
+(`fleetqox_trace_replay_tap.cc` + its harness callers) was WRITTEN
+expecting the patched ns-3 TapBridge behavior (the harness's own
+`SetAddress()` calls, `station_mac()`'s own docstring, and this
+file's own header comment about the TapBridge race all describe and
+depend on the patch being active) -- but the DEPLOYED runtime image
+did not actually contain that patch for the entire span these results
+were measured in.* This is an environment/deployment defect, not a
+finding about any middleware's real behavior -- a `mac_rx_drop_total`
+or 0%/collapsed delivery number measured under the stale image tells
+you about the unpatched TapBridge bug, not about FleetRMW, Fast DDS,
+CycloneDDS, or Zenoh's actual Wi-Fi behavior.
+
+**LAN and 5G are explicitly NOT invalidated by this**, per the
+evidence: `wire_network_lan()` (Table V's own LAN profile) uses a
+plain Linux bridge and never starts an ns-3 process at all -- confirmed
+architecturally clean, zero exposure to TapBridge in any form. The 5G
+profile's own `wire_network_nr_l2()` DOES use the same `TapBridge`
+class (bridging to a `CsmaNetDevice`, not a `WifiNetDevice`), so the
+same binary/patch technically applies there too -- but the specific
+FAILURE MODE this whole investigation traced (a `WifiMac`-level
+"is this frame destined for me" address check rejecting a
+correctly-relayed unicast frame) is a Wi-Fi/`WifiNetDevice`-specific
+mechanism; `fleetqox_trace_replay_nr.cc`'s own module docstring states
+explicitly that `CsmaNetDevice` "supports SendFrom/promiscuous mode
+natively, so TapBridge's UseLocal mode works with NO MAC
+synchronization trick at all" -- i.e. 5G's own architecture does not
+rely on exact-address-match unicast delivery the way Wi-Fi's does, so
+it is very unlikely to exhibit the same failure. This is a REASONED
+conclusion from source, not a live-retested one -- 5G was NOT
+re-benchmarked this turn (out of this task's explicit scope), so this
+is flagged as "very likely unaffected" rather than "confirmed clean".
+
+### Item 3-6: corrected WiFi-Direct baseline (N=2/4/8, seeds 7/13/29, 4 RMWs)
+
+In progress -- see the live run log/results appended immediately below
+this notice once the staged N=2 -> N=4 -> N=8 (-> N=16 validity-only)
+sweep completes. Frozen parameters used (matching every prior
+established convention in this document): `policy=fifo`,
+`layout=circle`, `circle_radius=7.5`, `path_loss_exponent=2.7`,
+`tx_power_dbm=15.0`, `rx_sensitivity_dbm=-82.0`, `mobility_speed=0.0`,
+`num_aps=1` (all `run_probe()` defaults, never overridden anywhere in
+this investigation); discovery mode per the ALREADY-established
+fair-comparison convention (13/09/2026, "BẢNG IV ĐẦY ĐỦ"): FleetRMW
+`static_mode=True` (default), Fast DDS `discovery_server`, CycloneDDS
+`static_peers`, Zenoh default (its own router); `seconds=3`,
+`sim_duration_s=30.0` (the script's own CLI defaults);
+`start_offset_ms=2000`, `drain_s=10`, `discovery_timeout_s=15`;
+`ns3_seed=42`, `ns3_run=1` (matching the "ns3_seed=42" convention used
+throughout this document); workload seeds 7, 13, 29 (three INDEPENDENT
+workload seeds, per this turn's own explicit instruction -- not the
+historical "same seed, 3 ns3_run replicates" convention).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
