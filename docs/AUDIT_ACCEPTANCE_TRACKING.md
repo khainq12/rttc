@@ -19454,6 +19454,273 @@ warn against.
     ends, not just the AP) -- this is the direct, minimal continuation
     of STEP 6's "prove the mechanism before fixing" requirement.
 
+## WIFI GATEWAY BENCHMARK -- N=2 AP UNICAST RELAY MECHANISM PROVEN: RECEIVE-SIDE ADDRESS-FILTER REJECTS A CORRECTLY-RELAYED, CORRECTLY-ADDRESSED FRAME
+
+Direct continuation of the section above. Task this turn: prove the
+exact internal ns-3 mechanism causing a correctly-addressed unicast
+frame to disappear between the AP-side relay path and the destination
+station/TAP. No Gateway work, no optimization, no FleetRMW change, no
+Wi-Fi parameter change, no speculative fixes, no N=4/N=8, no other
+middleware -- honored; `git diff --stat
+external/ns3/fleetqox_trace_replay_tap.cc` is empty, the tracked
+production ns-3 source was never touched.
+
+### Method
+
+`TypeId`-based reflection (`GetTraceSourceN()`/`GetAttributeN()`) was
+tried first to enumerate `ApWifiMac`/`StaWifiMac`'s available trace
+sources without guessing; it crashed (garbage trace-source counts,
+e.g. `2863311531`) -- this build's attribute/trace-source help-text
+metadata is stripped, consistent with `NS_LOG` component strings also
+being entirely absent from the shipped `.so` (confirmed via `strings`
+-- this build has logging compiled out, so `NS_LOG`-based tracing was
+never viable either, ruling that path out cleanly rather than
+assuming it would work).
+
+Fell back to a SCRATCH, instrumented COPY of
+`fleetqox_trace_replay_tap.cc` (`fleetqox_trace_replay_tap_diag.cc`,
+lives only under a scratch dir, never touches the tracked repo file,
+built into a separate `/tmp/fleetqox_tap_bridge_diag` binary used only
+for this one diagnostic run) adding UNCONDITIONAL (no `--heavyTracing`
+gate, no JSON-marker/`ExtractEventId()` requirement) per-stage,
+per-`Packet::GetUid()` logging for frames <=120 bytes (ARP/management-
+sized) across: `MacTx`/`MacTxDrop`/`MacRx`/`MacRxDrop` (already-used
+trace names, just logged unconditionally here) plus two NEWLY
+connected trace sources verified live via their own boolean connect-
+result rather than assumed: `WifiPhy::MonitorSnifferRx`/
+`MonitorSnifferTx` (ns-3's own monitor-mode/pcap-capture trace --
+fires on every frame the PHY successfully decodes or transmits,
+REGARDLESS of MAC-level address acceptance -- confirmed connected:
+`true` on all 4 devices) and `PromiscSniffer` (guessed generic
+NetDevice name, confirmed NOT present on `WifiNetDevice` in this
+version: `false` on all 4 -- correctly not relied upon). `Packet::Uid()`
+is preserved across ns-3's own internal same-BSS relay (a single
+re-transmission of the same in-memory `Packet`, not a `Copy()`), which
+is what makes cross-stage, cross-station correlation of ONE specific
+frame possible without needing payload content at all.
+
+### Selected DATA frame / successful ARP frame
+
+The DATA frame itself never reaches this layer at all (blocked
+upstream by the same ARP failure this section explains -- see the
+prior turn's finding). The ARP exchange substitutes as the analysis
+target, exactly as the prior turn established, now traced with exact
+`Packet::GetUid()` identity instead of inferred boundaries. Three
+independent, complete request/reply rounds were captured
+(`uid=816/830`, `uid=904/918`, `uid=987/1001`) -- all three show the
+IDENTICAL sequence below; `uid=830`'s round is used as the reference.
+
+### Internal path -- ARP REQUEST (uid=816, robot_0000 -> broadcast) -- SUCCEEDS end to end
+
+`mac_tx robot_0000` -> `phy_tx_begin/phy_monitor_tx robot_0000` ->
+**`phy_monitor_rx AP0` + `mac_rx AP0`** (AP receives AND accepts) ->
+AP's own native same-BSS broadcast relay: `phy_tx_begin/phy_monitor_tx
+AP0` (AP re-transmits the SAME `uid=816`) -> **`phy_monitor_rx` +
+`mac_rx` (accepted, not dropped) at control_station, robot_0000, AND
+robot_0001** -- every station in the BSS, including the frame's own
+original sender, receives and ACCEPTS the AP's rebroadcast. Broadcast
+relay is proven fully correct.
+
+### Internal path -- ARP REPLY (uid=830, control_station -> robot_0000, unicast) -- FAILS at the destination's own MAC filter
+
+`mac_tx control_station` -> `phy_tx_begin/phy_monitor_tx
+control_station` -> **`phy_monitor_rx AP0`** (AP's PHY receives it;
+AP then sends an 802.11 ACK, `phy_tx_begin AP0` size-14 frame,
+confirming it was successfully received at the PHY/MAC level even
+though our own `MacRx` trace callback did not fire for it -- see
+"ApWifiMac receive result" below for why this is not itself evidence
+of a bug) -> **AP's own relay: `phy_tx_begin/phy_monitor_tx AP0`
+re-transmits the SAME `uid=830`** (PROVEN: the AP DOES decide to
+forward this unicast frame, and DOES attempt transmission) ->
+**`phy_monitor_rx robot_0000` at STRONG signal (-48.68 dBm, matching
+the AP's own known signal level, not a weak/marginal reception) --
+robot_0000's PHY successfully receives the AP's retransmission** ->
+**`mac_rx_drop robot_0000`** -- robot_0000's own MAC layer REJECTS the
+frame. Reproduced identically for `uid=918` and `uid=1001` (3 for 3).
+
+### First ARP-vs-DATA / request-vs-reply divergence
+
+The two paths are IDENTICAL through "AP receives and decides to
+relay" for both directions (uplink request, downlink reply) and both
+frame classes (broadcast ARP, and by direct mechanical extension any
+unicast IPv4 DATA frame, since 802.11 address filtering happens BELOW
+the L3/L4 payload -- it inspects only the MAC header's address fields
+before the frame contents are ever interpreted, so this defect cannot
+distinguish ARP from UDP DATA). They diverge at EXACTLY ONE point:
+whether the relayed frame's destination is BROADCAST (accepted by
+every station's MAC unconditionally) or UNICAST addressed to a
+specific reassigned station (rejected by that station's own MAC,
+despite physically, strongly receiving it). This is not an ARP-vs-DATA
+difference at all -- it is a broadcast-vs-unicast-to-a-reassigned-
+station difference, which explains why DATA (always unicast in this
+workload) can never succeed while ARP requests (always broadcast)
+always do.
+
+### Answers to the required per-stage checks
+
+- **ApWifiMac receive result**: the AP's PHY provably received `uid=830`
+  (`phy_monitor_rx AP0`) and provably ACK'd it (`phy_tx_begin AP0`
+  size-14 immediately after) -- both are only possible if the AP's own
+  MAC accepted the frame. The generic `MacRx` trace callback did NOT
+  fire for it specifically, which is architecturally expected, not a
+  bug: this is the SAME trace used for AP-destined application traffic
+  (`ForwardUp()`), and an AP relaying a frame addressed to one of its
+  OWN associated stations does not need to hand it up its own
+  application stack -- it re-queues it for retransmission via a
+  different internal path. The retransmission itself (`phy_tx_begin
+  AP0` re-emitting the identical `uid=830`) is direct, positive proof
+  the AP DID accept and act on it, independent of which named trace
+  source fired.
+- **Destination association-table result**: not directly queryable
+  (no public accessor on `ApWifiMac`/`StaWifiMac` for the live
+  station table in this headers-only image, and `TypeId` reflection is
+  broken in this build -- see Method); indirectly, `associated_stations=3`
+  (cumulative) plus the AP's OWN successful relay decision (it clearly
+  knows to send `uid=830` onward, not just drop it) both indicate the
+  AP believes robot_0000 is associated and know where to send it.
+- **AP forwarding decision**: local delivery N/A (not addressed to the
+  AP itself); wireless forwarding -- PROVEN (the AP transmits `uid=830`
+  a second time, unicast, toward robot_0000).
+- **AP transmit result**: PROVEN SUCCESS -- `phy_tx_begin`/
+  `phy_monitor_tx AP0` fire for the retransmission, and it is
+  successfully received at strong signal by the destination's own PHY.
+- **Destination PHY result**: SEEN -- `phy_monitor_rx robot_0000
+  uid=830`, signal -48.68 dBm (strong, not marginal).
+- **Destination MAC result**: REJECTED -- `mac_rx_drop robot_0000
+  uid=830`. Per the prior turn's ns-3-header ground-truth
+  (`WifiMac::NotifyRxDrop()`, "the packet we received but is not
+  destined for us"), this is a definitive statement that robot_0000's
+  own receive-side address check does not recognize this frame as
+  addressed to itself -- despite it being genuinely, verifiably
+  addressed to robot_0000's real, assigned MAC at every layer observed
+  so far (Ethernet-level, per the prior turn's capture, and now
+  802.11-level, since the AP successfully looked it up and relayed it
+  there).
+- **Destination WifiNetDevice result**: never reaches `ForwardUp()`
+  (that's precisely what the `MacRxDrop`/`NotifyRxDrop` rejection
+  prevents) -- so TapBridge is never even invoked for this frame; the
+  loss point is strictly upstream of TapBridge.
+- **TapBridge result**: N/A -- proven irrelevant to this defect. The
+  frame never reaches the point where TapBridge would receive it at
+  all (rejected one layer earlier, at the MAC address filter). No
+  TapBridge Mode/MAC inspection was needed once this was established.
+
+### Root-cause gate
+
+**"When ApWifiMac relays a unicast frame whose destination is a
+station that had its MAC address explicitly reassigned at setup time
+(via `WifiNetDevice::SetAddress()` + `StaWifiMac`'s
+`FrameExchangeManager::SetAddress()` -- the existing, already-applied
+fix for outgoing-frame identity, see this file's own header comment),
+the destination station's own MAC-layer receive filter
+(`WifiMac::NotifyRxDrop`, fired as `MacRxDrop`) rejects the frame as
+'not destined for us' even though it is genuinely, verifiably
+addressed to that station -- because the receive-side address
+comparison does not consult the same address reference that was
+updated for the send side."** Confirmed reproducible 3-for-3 across
+independent ARP rounds, at strong signal, with the AP's own relay
+decision and transmission both independently proven to have succeeded.
+
+**Classification: ADDRESS_MAPPING_BUG** (an asymmetry between the
+send-path address override this harness already applies and
+`StaWifiMac`'s own receive-path address reference -- not
+`AP_FORWARDING_BUG`, since the AP's forwarding decision and
+transmission are both proven correct; not `WIFI_MAC_FILTER_BUG` in
+the generic sense, since the filter itself behaves exactly as
+documented, it is just comparing against a stale/different address
+value; not `TAPBRIDGE_BUG`, proven irrelevant -- the frame never
+reaches TapBridge; not `STATION_ASSOCIATION_STATE_BUG` in the sense of
+"never associated" -- `associated_stations=3` and the AP's own
+successful relay both show the AP considers robot_0000 associated and
+reachable).
+
+**What remains NOT pinned down**: the EXACT internal C++
+variable/call inside `StaWifiMac` that the receive-side filter
+actually compares against. This image ships only ns-3's HEADERS (no
+`.cc` implementation source), and `TypeId` reflection is broken in
+this build (see Method) -- there is no way, from inside this
+container, to inspect which specific internal address field is stale
+without either the real ns-3 source tree or a debugger attached to a
+debug build (neither available here). Per this task's own explicit
+gate ("do not try random fixes" / "only if you can state... because
+Z"), the BEHAVIORAL mechanism (Z = "receive-side address check doesn't
+see the send-side override") is proven with concrete, reproducible,
+per-frame evidence; the exact LINE of C++ responsible is not, and
+guessing at a specific additional `SetAddress()`-style call to insert
+without source access to verify it would be exactly the kind of
+speculative fix this task prohibits.
+
+### Status against the user's 25-item report
+
+1. Selected DATA frame: never reaches this layer (blocked upstream by
+   this exact mechanism, since DATA is always unicast); analysis
+   target is the ARP exchange that stands in for it, per the prior
+   turn's own established substitution.
+2. Successful ARP frame: `uid=816` (robot_0000's broadcast request).
+3. ARP internal path: request succeeds end to end (see above);
+   reply (`uid=830`) fails at the destination's own MAC filter after
+   a fully successful AP relay.
+4. DATA internal path: N/A directly (never sent -- see #1); by
+   mechanical extension of the SAME address-filter mechanism (which
+   inspects only 802.11 header fields, not L3/L4 payload), any DATA
+   frame the AP had to relay unicast to robot_0000 would be rejected
+   identically.
+5. First ARP-vs-DATA divergence: none specific to ARP vs DATA -- the
+   real divergence is broadcast (accepted by all) vs unicast-to-a-
+   reassigned-station (rejected by that station specifically).
+6. ApWifiMac receive result: PROVEN accepted (PHY receive + ACK sent,
+   `MacRx` trace itself architecturally not expected to fire for a
+   relay-only frame).
+7. Destination association-table result: not directly queryable in
+   this build (see Method); indirect evidence (AP successfully
+   targets/relays the frame) is consistent with the AP believing
+   robot_0000 is associated.
+8. AP forwarding decision: PROVEN -- wireless relay, not local
+   delivery or drop.
+9. AP transmit result: PROVEN SUCCESS, received at strong signal.
+10. Destination PHY result: SEEN, strong signal (-48.68 dBm).
+11. Destination MAC result: REJECTED (`MacRxDrop`, "not destined for
+    us").
+12. Destination WifiNetDevice result: never reached (`ForwardUp()`
+    never called -- prevented by the MAC rejection itself).
+13. TapBridge result: N/A, proven irrelevant -- upstream of this
+    layer entirely.
+14. Exact first loss point: `StaWifiMac`'s own receive-side address
+    acceptance check, immediately after a fully successful PHY
+    reception and a fully successful AP relay.
+15. Root cause classification: **ADDRESS_MAPPING_BUG**.
+16. Exact mechanism: proven at the behavioral level (see Root-cause
+    gate above); exact internal C++ variable NOT pinned down (headers-
+    only image, broken TypeId reflection -- see What remains NOT
+    pinned down).
+17. RED evidence: 3/3 independent ARP rounds (`uid=830`, `uid=918`,
+    `uid=1001`) show the identical AP-relay-succeeds/destination-MAC-
+    rejects sequence.
+18. Fix: **NOT ATTEMPTED** -- the exact internal line is not proven,
+    only the behavioral mechanism; attempting a fix without that would
+    be the speculative "random fix" this task explicitly prohibits.
+19. WiFi-Direct GREEN result: not reached (no fix applied).
+20. WiFi-Gateway confirmation: not run (gated on Direct GREEN, not
+    reached).
+21. sim_lag_s: 0.0172s -- far under `MAX_HEALTHY_SIM_LAG_S=10.0`,
+    simulator valid.
+22. Files changed: **NONE** in the tracked repo (`git diff --stat
+    external/ns3/fleetqox_trace_replay_tap.cc` empty) -- all
+    instrumentation lived in a scratch copy, removed after use.
+23. Tests: N/A, no repo code changed; prior 875-pass baseline
+    unaffected.
+24. Commit hash: this section's own documentation-only commit (see
+    below).
+25. Exactly one next step: obtain ns-3's actual `.cc` implementation
+    source for `StaWifiMac`/`FrameExchangeManager` (not available in
+    this headers-only build image -- would need the upstream ns-3
+    source tree, e.g. from the ns-3 release this image's version
+    (v41) corresponds to) to identify the EXACT receive-side address
+    field that does not reflect this harness's existing
+    `SetAddress()`-based send-path fix, so a minimal, source-verified
+    correction (rather than a guess) can finally be made and tested
+    RED->GREEN.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
