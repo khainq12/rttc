@@ -56,8 +56,10 @@ from scripts.run_ns3_docker_container_fleet_probe import (  # noqa: E402
     MAX_HEALTHY_SIM_LAG_S,
     READY_DEADLINE_S,
     RMW_PORT,
+    STATIC_SUBSCRIPTION_TYPE_NAME,
     ReadinessFailure,
     ReferenceTopologyProbe,
+    build_static_subscriptions,
     container_pid,
     docker,
     endpoint_list,
@@ -65,6 +67,7 @@ from scripts.run_ns3_docker_container_fleet_probe import (  # noqa: E402
     parse_wifi_stats,
     rigger_run,
     station_mac,
+    topic_for,
     wifi_stats_target_s,
 )
 from scripts.fleetqox_rmw_trace_endpoint import _topic_for  # noqa: E402
@@ -151,6 +154,26 @@ def wire_gateway_control_segment(
     return gateway_wired_ip, control_ip
 
 
+def _static_entries(
+    pairs: list[tuple[str, str]], ip_for_dst, topic_suffix: str = ""
+) -> list[str]:
+    """Builds FLEETQOX_RMW_STATIC_SUBSCRIPTIONS entries in the EXACT
+    same format launch_endpoints() already uses for WiFi-Direct
+    (`"{ip}:{port}|0|{topic}|{type}"`), but with the destination IP
+    resolved by ip_for_dst(dst) instead of self.ips[dst] directly --
+    WiFi-Direct's own build_static_subscriptions() output gives the
+    (dst, flow_class) PAIRS (a workload-level fact, unchanged by this
+    topology), but the physical IP each pair must route to is NOT
+    unchanged: a robot's "control_station" pair must resolve to the
+    GATEWAY's address (the only thing it can physically reach), not
+    control_station's own real address."""
+    return [
+        f"{ip_for_dst(dst)}:{RMW_PORT}|0|{topic_for(dst, flow_class) + topic_suffix}|"
+        f"{STATIC_SUBSCRIPTION_TYPE_NAME}"
+        for dst, flow_class in pairs
+    ]
+
+
 def _cyclonedds_static_peers_config(peer_ips: list[str]) -> str:
     """Mirrors launch_endpoints()'s own CycloneDDS static-peers config
     exactly (same AllowMulticast=false + explicit unicast Peers list +
@@ -184,11 +207,22 @@ def run_wifi_gateway_probe(
     drain_s: float = 10.0,
     discovery_timeout_s: float = 15.0,
     disable_gateway: bool = False,
+    fleetqox_static_subscriptions: bool = True,
 ) -> dict[str, Any]:
     """disable_gateway=False (default): normal run. disable_gateway=True
-    is the Phase 3 RED-test knob -- everything is wired and launched
-    identically EXCEPT the gateway process itself is never started, so
-    robot->control delivery must be 0 with no other change."""
+    is the Phase 3 no-bypass-test knob -- everything is wired and
+    launched identically EXCEPT the gateway process itself is never
+    started, so robot->control delivery must become zero with no other
+    change (see STEP 5's A/B/C sequence).
+
+    fleetqox_static_subscriptions=True (default, the fix): FleetRMW
+    endpoints use static_mode=True with the topology-correct
+    static_subscriptions table built below. False reproduces the
+    pre-fix RED case (static_mode=False, no routing table at all) for
+    before/after comparison -- kept as an explicit, named parameter
+    (same pattern as disable_gateway) rather than a one-off hack, since
+    it is exactly the variable STEP 2/STEP 3 of this investigation
+    compares."""
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     run_id = output_dir.name.lstrip(".")
@@ -202,6 +236,17 @@ def run_wifi_gateway_probe(
     )
     write_simulator_csv(events, trace_path)
     trace_container_path = f"/work/{trace_path.relative_to(ROOT)}"
+
+    # STEP 1 (see docs/AUDIT_ACCEPTANCE_TRACKING.md, "WIFI GATEWAY
+    # BENCHMARK" Phase 3): the (dst, flow_class) PAIRS a publisher
+    # sends on are a workload-level fact, unchanged from WiFi-Direct --
+    # reuse build_static_subscriptions() verbatim for those. What
+    # DIFFERS is the physical IP each pair must resolve to (built
+    # per-role below, once container IPs are known).
+    workload_endpoints = [CONTROL_STATION_NAME] + [
+        f"robot_{i:04d}" for i in range(num_robots)
+    ]
+    static_pairs_by_publisher = build_static_subscriptions(trace_path, policy, workload_endpoints)
 
     wifi_endpoints = wifi_gateway_endpoint_list(num_robots)  # ["gateway", robot_0000, ...]
     probe = ReferenceTopologyProbe(
@@ -242,6 +287,17 @@ def run_wifi_gateway_probe(
         probe.start_ns3(sim_duration_s=float(seconds) + start_offset_ms / 1000.0 + drain_s + 5.0)
 
         gateway_wifi_ip = probe.ips["gateway"]
+        # STEP 3 (continued): FleetRMW's static_mode has NO discovery
+        # step by design -- see --skip-discovery-wait's own help text
+        # in both endpoint scripts. Applies to all three roles
+        # uniformly when the static-subscriptions fix is active;
+        # completely absent (empty string) for every other middleware
+        # and for the fleetqox_static_subscriptions=False RED case.
+        fleetqox_skip_discovery_flag = (
+            " --skip-discovery-wait"
+            if rmw_implementation == "rmw_fleetqox_cpp" and fleetqox_static_subscriptions
+            else ""
+        )
         # Router/discovery-server infra runs on the gateway (reusing
         # these UNCHANGED -- they already target
         # self.endpoint_container_names[0]/self.endpoints[0], which is
@@ -258,10 +314,32 @@ def run_wifi_gateway_probe(
         }
         start_file = f"{results_dir_container}/start"
 
-        def env_prefix_for(role: str, own_ip: str, peer_ips: list[str]) -> str:
+        def env_prefix_for(
+            role: str, own_ip: str, peer_ips: list[str],
+            static_subscription_entries: list[str] | None = None,
+        ) -> str:
             peers_str = ",".join(f"{ip}:{RMW_PORT}" for ip in peer_ips)
             if rmw_implementation == "rmw_fleetqox_cpp":
-                prefix = fleetqox_rmw_env_prefix(role, peers_str, False, [], None)
+                # STEP 3: static_mode=True with a topology-correct
+                # static_subscription_entries table -- the SAME
+                # subscription-aware routing semantics WiFi-Direct uses
+                # (see fleetqox_rmw_env_prefix()'s own docstring),
+                # applied to the gateway's 3-role topology instead of
+                # the 2-role direct one. Previously this was
+                # static_mode=False (no routing table at all, relying
+                # solely on FLEETQOX_RMW_PEERS broadcast) -- changed
+                # here because a control experiment against the
+                # EXISTING, unmodified WiFi-Direct run_probe() showed
+                # tx>0/rx=0 for every endpoint when
+                # static_subscriptions was omitted, matching this
+                # topology's own pre-fix symptom (see
+                # docs/AUDIT_ACCEPTANCE_TRACKING.md, "WIFI GATEWAY
+                # BENCHMARK" Phase 3/STEP 1-3).
+                prefix = fleetqox_rmw_env_prefix(
+                    role, peers_str, fleetqox_static_subscriptions,
+                    (static_subscription_entries or []) if fleetqox_static_subscriptions else [],
+                    None,
+                )
                 return f"source /work/{FLEETQOX_RMW_INSTALL}/setup.bash && export {prefix}"
             prefix = f"RMW_IMPLEMENTATION={rmw_implementation} "
             if rmw_implementation == "rmw_zenoh_cpp":
@@ -294,7 +372,20 @@ def run_wifi_gateway_probe(
                 continue
             required = required_peers[robot]
             required_ips = [gateway_wifi_ip]
-            rmw_setup = env_prefix_for(robot, probe.ips[robot], required_ips)
+            # STEP 1: robot_i's own publish pairs are UNCHANGED from
+            # WiFi-Direct (always (control_station, flow_class)) -- the
+            # only thing that differs is the physical destination,
+            # which must resolve to the GATEWAY's Wi-Fi IP (the only
+            # thing this robot can reach), not control_station's real
+            # (physically unreachable) address. Topic name unsuffixed:
+            # this is exactly what the robot ALREADY publishes today,
+            # zero code/behavior change on the robot's own side.
+            robot_static_entries = _static_entries(
+                static_pairs_by_publisher.get(robot, []), lambda _dst: gateway_wifi_ip
+            )
+            rmw_setup = env_prefix_for(
+                robot, probe.ips[robot], required_ips, robot_static_entries
+            )
             result_json = f"{results_dir_container}/result_{robot}.json"
             log_file = f"{results_dir_container}/endpoint_{robot}.log"
             inner = (
@@ -306,7 +397,8 @@ def run_wifi_gateway_probe(
                 f"--discovery-timeout-s={discovery_timeout_s:.12g} "
                 f"--start-wait-timeout-s=90 --expected-peer-count=1 "
                 f"--required-peer-ids={shlex.quote(','.join(sorted(required)))} "
-                f"--incoming-topic-suffix={RELAY_TOPIC_SUFFIX} "
+                f"--incoming-topic-suffix={RELAY_TOPIC_SUFFIX}"
+                f"{fleetqox_skip_discovery_flag} "
                 f"--summary-json=/work/{result_json} "
                 f"--ready-file=/work/{ready_files[robot]} --start-file=/work/{start_file}"
             )
@@ -315,7 +407,18 @@ def run_wifi_gateway_probe(
 
         # --- launch control_station (wired side, unchanged trace-endpoint script) ---
         required = required_peers[CONTROL_STATION_NAME]
-        rmw_setup = env_prefix_for(CONTROL_STATION_NAME, control_ip, [gateway_wired_ip])
+        # STEP 1: control_station's own publish pairs are UNCHANGED
+        # from WiFi-Direct (always (robot_i, flow_class)) -- physical
+        # destination resolves to the GATEWAY's WIRED IP (the only
+        # thing control_station can reach), topic name unsuffixed
+        # (control_station's own publish code/behavior is unchanged).
+        control_static_entries = _static_entries(
+            static_pairs_by_publisher.get(CONTROL_STATION_NAME, []),
+            lambda _dst: gateway_wired_ip,
+        )
+        rmw_setup = env_prefix_for(
+            CONTROL_STATION_NAME, control_ip, [gateway_wired_ip], control_static_entries
+        )
         result_json = f"{results_dir_container}/result_{CONTROL_STATION_NAME}.json"
         log_file = f"{results_dir_container}/endpoint_{CONTROL_STATION_NAME}.log"
         inner = (
@@ -327,7 +430,8 @@ def run_wifi_gateway_probe(
             f"--discovery-timeout-s={discovery_timeout_s:.12g} "
             f"--start-wait-timeout-s=90 --expected-peer-count=1 "
             f"--required-peer-ids={shlex.quote(','.join(sorted(required)))} "
-            f"--incoming-topic-suffix={RELAY_TOPIC_SUFFIX} "
+            f"--incoming-topic-suffix={RELAY_TOPIC_SUFFIX}"
+            f"{fleetqox_skip_discovery_flag} "
             f"--summary-json=/work/{result_json} "
             f"--ready-file=/work/{ready_files[CONTROL_STATION_NAME]} --start-file=/work/{start_file}"
         )
@@ -337,7 +441,31 @@ def run_wifi_gateway_probe(
         if not disable_gateway:
             required = required_peers["gateway"]
             peer_ips_for_gateway = [probe.ips[r] for r in wifi_endpoints if r != "gateway"] + [control_ip]
-            rmw_setup = env_prefix_for("gateway", gateway_wifi_ip, peer_ips_for_gateway)
+            # STEP 1: the gateway's OWN outbound pairs are exactly what
+            # it relays: "uplink" (every robot's pairs, all destined
+            # control_station-ward) resolves to the REAL control_ip
+            # (physically reachable from the gateway's wired
+            # interface); "downlink" (control_station's own pairs,
+            # each destined to one specific robot) resolves to THAT
+            # robot's own real Wi-Fi IP (individually addressable from
+            # the gateway's Wi-Fi interface). Topic name SUFFIXED
+            # (RELAY_TOPIC_SUFFIX) for both -- this is what the gateway
+            # actually publishes on, matching what robots/
+            # control_station now subscribe to instead of the
+            # unsuffixed original.
+            uplink_pairs: set[tuple[str, str]] = set()
+            for r in wifi_endpoints:
+                if r != "gateway":
+                    uplink_pairs.update(static_pairs_by_publisher.get(r, []))
+            downlink_pairs = static_pairs_by_publisher.get(CONTROL_STATION_NAME, [])
+            gateway_static_entries = _static_entries(
+                sorted(uplink_pairs), lambda _dst: control_ip, RELAY_TOPIC_SUFFIX
+            ) + _static_entries(
+                downlink_pairs, lambda dst: probe.ips[dst], RELAY_TOPIC_SUFFIX
+            )
+            rmw_setup = env_prefix_for(
+                "gateway", gateway_wifi_ip, peer_ips_for_gateway, gateway_static_entries
+            )
             result_json = f"{results_dir_container}/result_gateway.json"
             log_file = f"{results_dir_container}/endpoint_gateway.log"
             inner = (
@@ -348,7 +476,8 @@ def run_wifi_gateway_probe(
                 f"--relay-topic-suffix={RELAY_TOPIC_SUFFIX} "
                 f"--discovery-timeout-s={discovery_timeout_s:.12g} "
                 f"--start-wait-timeout-s=90 --drain-s={drain_s:.12g} "
-                f"--required-peer-ids={shlex.quote(','.join(sorted(required)))} "
+                f"--required-peer-ids={shlex.quote(','.join(sorted(required)))}"
+                f"{fleetqox_skip_discovery_flag} "
                 f"--summary-json=/work/{result_json} "
                 f"--ready-file=/work/{ready_files['gateway']} --start-file=/work/{start_file}"
             )
@@ -386,9 +515,40 @@ def run_wifi_gateway_probe(
             # error. wait_for_completion below still runs so we can prove
             # zero application delivery occurred.
             status = "gateway_disabled_red_test"
-            time.sleep(discovery_timeout_s + 2.0)
 
-        time.sleep(float(seconds) + start_offset_ms / 1000.0 + drain_s + 3.0)
+        # Poll for result files to actually exist instead of a fixed
+        # sleep -- a fixed sleep here was a real harness bug (see
+        # docs/AUDIT_ACCEPTANCE_TRACKING.md, "WIFI GATEWAY BENCHMARK"
+        # Phase 3/STEP 2-3): it read the gateway's own summary before
+        # that process had reached its own drain-then-write, since
+        # discovery alone can legitimately take up to
+        # discovery_timeout_s before any of these processes even
+        # starts its own measured window. Bounded by
+        # READY_DEADLINE_S + discovery_timeout_s + the measured window
+        # + a fixed margin -- generous, not tuned to any specific
+        # observed timing.
+        expected_result_files = [
+            f"{results_dir_container}/result_{e}.json" for e in all_logical_endpoints
+        ]
+        if not disable_gateway:
+            expected_result_files.append(f"{results_dir_container}/result_gateway.json")
+        # +90.0 matches --start-wait-timeout-s used on every launch
+        # command below -- in the invalid-readiness case, robots/
+        # control_station/gateway all wait that long before giving up,
+        # so the collection window must cover it too or results are
+        # read before ANY of them could possibly have written anything.
+        collection_deadline = time.monotonic() + (
+            discovery_timeout_s + float(seconds) + start_offset_ms / 1000.0 + drain_s + 90.0 + 10.0
+        )
+        while time.monotonic() < collection_deadline:
+            check = docker(
+                "exec", probe.rigger_name, "bash", "-lc",
+                " && ".join(f"test -s /work/{f}" for f in expected_result_files),
+                check=False,
+            )
+            if check.returncode == 0:
+                break
+            time.sleep(1.0)
 
         for e in all_logical_endpoints:
             result_json = f"{results_dir_container}/result_{e}.json"

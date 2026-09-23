@@ -124,6 +124,27 @@ def main() -> int:
         ),
     )
     parser.add_argument("--discovery-timeout-s", type=float, default=15.0)
+    parser.add_argument(
+        "--skip-discovery-wait",
+        action="store_true",
+        help=(
+            "Matches fleetqox_rmw_trace_endpoint.py's own flag of the "
+            "same name and the SAME reason: FleetRMW's static_mode has "
+            "no discovery step by design (peers are known at launch via "
+            "FLEETQOX_RMW_PEERS/FLEETQOX_RMW_STATIC_SUBSCRIPTIONS,  "
+            "nothing to wait for) -- the beacon topic itself is NOT "
+            "part of any trace-derived static_subscriptions table (it "
+            "is a harness-internal mechanism, not a workload topic), "
+            "so under static_mode's subscription-aware routing (no "
+            "fallback broadcast) the beacon has no route and can never "
+            "converge if this flag is omitted. Confirmed live: applying "
+            "static_mode=True with a correct static_subscriptions table "
+            "alone was NOT sufficient -- discovery_peers_seen_ids stayed "
+            "empty until this flag was also added (see "
+            "docs/AUDIT_ACCEPTANCE_TRACKING.md, 'WIFI GATEWAY BENCHMARK' "
+            "Phase 3/STEP 3)."
+        ),
+    )
     parser.add_argument("--required-peer-ids", type=str, required=True)
     parser.add_argument("--start-wait-timeout-s", type=float, default=60.0)
     parser.add_argument("--drain-s", type=float, default=10.0)
@@ -221,22 +242,23 @@ def main() -> int:
     discovery_deadline = discovery_start + args.discovery_timeout_s
     last_beacon_sent = 0.0
     converged_at: float | None = None
-    while time.monotonic() < discovery_deadline:
-        now = time.monotonic()
-        if now - last_beacon_sent >= 0.1:
-            beacon_pub.publish(beacon_msg)
-            last_beacon_sent = now
-        for _ in range(20):
-            rclpy.spin_once(node, timeout_sec=0.0)
-        rclpy.spin_once(node, timeout_sec=0.1)
-        if required_peer_ids <= discovery_peers_seen and converged_at is None:
-            converged_at = time.monotonic()
+    if not args.skip_discovery_wait:
+        while time.monotonic() < discovery_deadline:
+            now = time.monotonic()
+            if now - last_beacon_sent >= 0.1:
+                beacon_pub.publish(beacon_msg)
+                last_beacon_sent = now
+            for _ in range(20):
+                rclpy.spin_once(node, timeout_sec=0.0)
+            rclpy.spin_once(node, timeout_sec=0.1)
+            if required_peer_ids <= discovery_peers_seen and converged_at is None:
+                converged_at = time.monotonic()
     discovery_convergence_s = (
         (converged_at - discovery_start) if converged_at is not None
         else (time.monotonic() - discovery_start)
     )
     converged = discovery_converged(
-        skip_discovery_wait=False,
+        skip_discovery_wait=args.skip_discovery_wait,
         beacon_active=True,
         peers_seen=len(discovery_peers_seen),
         expected_peer_count=len(required_peer_ids),
@@ -248,40 +270,62 @@ def main() -> int:
     if args.ready_file:
         args.ready_file.parent.mkdir(parents=True, exist_ok=True)
         args.ready_file.write_text("ready\n" if converged else "invalid_readiness\n")
+
+    def write_result(start_gate_timed_out: bool) -> None:
+        # Factored out so a start-gate timeout (readiness never became
+        # valid, see docs/AUDIT_ACCEPTANCE_TRACKING.md, "WIFI GATEWAY
+        # BENCHMARK" STEP 2) still records the diagnostic counts
+        # gathered SO FAR (received/forwarded/dropped -- all real,
+        # nothing invented) instead of losing them to an uncaught
+        # exception with no summary written at all. This is diagnostic
+        # visibility only -- it does not change whether readiness was
+        # valid, does not fabricate a "ready" result, and does not
+        # affect any measured Table V metric.
+        result = {
+            "endpoint": "gateway",
+            "discovery_ready": converged,
+            "discovery_convergence_s": discovery_convergence_s,
+            "discovery_required_peer_ids": sorted(required_peer_ids),
+            "discovery_peers_seen_ids": sorted(discovery_peers_seen),
+            "uplink_topics": uplink_topics,
+            "downlink_topics": downlink_topics,
+            "start_gate_timed_out": start_gate_timed_out,
+            "gateway_received_count": received_count,
+            "gateway_forwarded_count": forwarded_count,
+            "gateway_dropped_count": dropped_count,
+            "gateway_processing_time_ns_mean": (
+                sum(processing_times_ns) / len(processing_times_ns) if processing_times_ns else None
+            ),
+            "gateway_processing_time_ns_max": (
+                max(processing_times_ns) if processing_times_ns else None
+            ),
+        }
+        args.summary_json.parent.mkdir(parents=True, exist_ok=True)
+        args.summary_json.write_text(json.dumps(result, sort_keys=True), encoding="utf-8")
+
     if args.start_file:
         start_deadline = time.monotonic() + args.start_wait_timeout_s
         while time.monotonic() < start_deadline and not args.start_file.exists():
             rclpy.spin_once(node, timeout_sec=0.05)
         if not args.start_file.exists():
+            write_result(start_gate_timed_out=True)
             raise RuntimeError("timed out waiting for data-plane start gate")
 
     # No fixed replay schedule of its own (the gateway does not know
     # the workload's timing, only relays whatever arrives) -- stays
     # alive and spinning through the whole measurement + drain window
-    # so nothing sent late by a robot/control_station is missed.
-    run_deadline = time.monotonic() + args.drain_s + 60.0
+    # so nothing sent late by a robot/control_station is missed. Margin
+    # matches robot/control_station's own drain-based lifecycle (a
+    # small fixed buffer beyond drain_s, not an arbitrary large number)
+    # -- an earlier +60.0 here made the orchestrator's own result
+    # collection read this process's summary before it had been
+    # written, a harness bug (see docs/AUDIT_ACCEPTANCE_TRACKING.md,
+    # "WIFI GATEWAY BENCHMARK" Phase 3/STEP 3), not a real requirement.
+    run_deadline = time.monotonic() + args.drain_s + 5.0
     while time.monotonic() < run_deadline:
         rclpy.spin_once(node, timeout_sec=0.1)
 
-    result = {
-        "endpoint": "gateway",
-        "discovery_ready": converged,
-        "discovery_convergence_s": discovery_convergence_s,
-        "discovery_required_peer_ids": sorted(required_peer_ids),
-        "uplink_topics": uplink_topics,
-        "downlink_topics": downlink_topics,
-        "gateway_received_count": received_count,
-        "gateway_forwarded_count": forwarded_count,
-        "gateway_dropped_count": dropped_count,
-        "gateway_processing_time_ns_mean": (
-            sum(processing_times_ns) / len(processing_times_ns) if processing_times_ns else None
-        ),
-        "gateway_processing_time_ns_max": (
-            max(processing_times_ns) if processing_times_ns else None
-        ),
-    }
-    args.summary_json.parent.mkdir(parents=True, exist_ok=True)
-    args.summary_json.write_text(json.dumps(result, sort_keys=True), encoding="utf-8")
+    write_result(start_gate_timed_out=False)
     print(json.dumps({"status": "ok", "endpoint": "gateway", "forwarded": forwarded_count}))
     node.destroy_node()
     rclpy.shutdown()

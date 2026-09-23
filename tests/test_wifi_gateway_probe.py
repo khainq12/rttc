@@ -20,6 +20,7 @@ from pathlib import Path
 from scripts.run_wifi_gateway_probe import (
     RELAY_TOPIC_SUFFIX,
     CONTROL_STATION_NAME,
+    _static_entries,
     required_peers_for_wifi_gateway,
     wifi_gateway_endpoint_list,
 )
@@ -163,6 +164,50 @@ class IncomingTopicSuffixTest(unittest.TestCase):
         base = _topic_for("control_station", "state")
         suffixed = base + RELAY_TOPIC_SUFFIX
         self.assertNotEqual(base, suffixed)
+
+
+class StaticEntriesTest(unittest.TestCase):
+    """STEP 1: the static_subscriptions table must resolve each pair's
+    destination through the PHYSICALLY reachable address (the gateway),
+    not the logical workload destination's own (unreachable) address --
+    this is the actual fix under test, see docs/AUDIT_ACCEPTANCE_TRACKING.md,
+    "WIFI GATEWAY BENCHMARK" Phase 3/STEP 1."""
+
+    def test_entry_format_matches_launch_endpoints_own_convention(self):
+        entries = _static_entries(
+            [("control_station", "state")], lambda _dst: "10.60.0.2"
+        )
+        self.assertEqual(
+            entries,
+            ["10.60.0.2:9100|0|/fleetqox_trace/control_station/state|std_msgs/msg/String"],
+        )
+
+    def test_ip_resolves_through_callable_not_the_literal_dst_name(self):
+        # The whole point: "control_station" the STRING must not be
+        # used as an address -- ip_for_dst is what actually decides the
+        # physical destination.
+        entries = _static_entries(
+            [("control_station", "state")], lambda _dst: "10.61.0.2"
+        )
+        self.assertIn("10.61.0.2:9100", entries[0])
+        self.assertNotIn("control_station:9100", entries[0])
+
+    def test_topic_suffix_applies_to_every_entry(self):
+        entries = _static_entries(
+            [("robot_0000", "control")], lambda _dst: "10.60.0.3", RELAY_TOPIC_SUFFIX
+        )
+        self.assertTrue(entries[0].split("|")[2].endswith(RELAY_TOPIC_SUFFIX))
+
+    def test_per_pair_ip_resolution_for_multiple_destinations(self):
+        # The gateway's own downlink entries must route EACH robot
+        # pair to THAT robot's own IP, not a single shared address.
+        ips = {"robot_0000": "10.60.0.3", "robot_0001": "10.60.0.4"}
+        entries = _static_entries(
+            [("robot_0000", "control"), ("robot_0001", "control")],
+            lambda dst: ips[dst],
+        )
+        self.assertIn("10.60.0.3:9100", entries[0])
+        self.assertIn("10.60.0.4:9100", entries[1])
 
 
 if __name__ == "__main__":

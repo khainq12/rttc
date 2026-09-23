@@ -18746,6 +18746,209 @@ the NEW 3-hop gateway topology specifically.
 24. Final classification: **IMPLEMENTATION_BLOCKED** -- the topology and gateway application are implemented and one real bug in them has been found and fixed, but end-to-end message delivery through the gateway has not yet been demonstrated for any middleware, so Phase 3's own gate ("do not proceed to larger experiments until N=2/N=4 pass") is not yet satisfied.
 25. Exactly one next step: resolve the Wi-Fi-side beacon non-convergence for the gateway topology specifically -- first by testing FleetRMW with `static_mode=True` AND a correctly-built `static_subscriptions` table for the gateway's 3-role topology (robot->gateway, gateway->control_station, gateway->robot, control_station->gateway), since the confounding control experiment suggests that configuration (not the `static_mode=False` currently used in `run_wifi_gateway_probe()`) may be what real FleetRMW delivery actually requires.
 
+## WIFI GATEWAY BENCHMARK -- N=2 FLEETRMW: STATIC_SUBSCRIPTIONS FIX PROVEN CORRECT (WIRED LEG 280/280), Wi-Fi LEG LOCALIZED TO NS-3 MAC/PHY, STILL RED OVERALL
+
+Direct continuation of the section above, scoped to exactly one task:
+make the N=2 FleetRMW WiFi-Gateway case use the SAME static-subscription
+semantics the real, working WiFi-Direct harness uses. No other
+middleware touched, no N=4/N=8, no production FleetRMW change, no
+existing-profile change.
+
+### STEP 1: the correct static_subscriptions table
+
+The (dst, flow_class) PAIRS are workload-level facts, unchanged from
+WiFi-Direct (`build_static_subscriptions()` reused verbatim). What
+differs is the physical IP each pair resolves to -- new helper
+`_static_entries(pairs, ip_for_dst, topic_suffix="")`:
+
+- **robot_i** (publishes UNCHANGED, unsuffixed
+  `/fleetqox_trace/control_station/<flow>`): entries route to the
+  **gateway's Wi-Fi IP** (`10.60.0.2`), not control_station's real
+  (physically unreachable) address.
+- **control_station** (publishes UNCHANGED, unsuffixed
+  `/fleetqox_trace/robot_i/<flow>`): entries route to the **gateway's
+  wired IP** (`10.61.0.2`).
+- **gateway** (publishes the SUFFIXED, relayed topics): "uplink" pairs
+  (everything robots send, control_station-ward) route to
+  **control_station's real IP** (`10.61.0.3`); "downlink" pairs
+  (everything control_station sends, robot-ward) route to **each
+  robot's own real Wi-Fi IP** individually.
+
+Concrete N=2/seed=7/fifo table (from a live run):
+uplink = `{coordination, debug, human_qoe, perception, state}` all
+addressed to control_station; downlink = `{control}` addressed to each
+of `robot_0000`/`robot_0001` individually. No reverse-direction flows
+beyond these -- confirmed by `uplink_and_downlink_topics()` deriving
+directly from the trace's own `dst` column, nothing assumed.
+
+### STEP 2: RED (before the fix)
+
+`fleetqox_static_subscriptions=False` (the pre-fix state, `static_mode=False`,
+matching what stage-2's commit had shipped): `status=invalid_readiness`,
+`discovery_ready=False` for every role, `gateway_received_count=0`,
+`gateway_forwarded_count=0`, robot/control_station results unavailable
+(their own `--start-wait-timeout-s` aborts them before they ever write
+a summary -- confirmed as the correct, expected outcome of an invalid
+readiness gate, not a new bug).
+
+A real harness bug was found and fixed WHILE reproducing this cleanly:
+the gateway script previously raised an uncaught exception on a
+start-gate timeout with NO summary written at all, and the
+orchestrator's own fixed-sleep result collection read files before
+either the gateway's post-readiness margin (`+60.0`, arbitrary) or a
+genuinely-invalid run's full abort sequence could complete. Fixed:
+gateway now writes a partial summary (`start_gate_timed_out: true`,
+real received/forwarded/dropped counts up to that point) before
+raising; result collection now polls for files to exist instead of a
+fixed sleep, bounded generously (not tuned to any specific timing).
+
+### STEP 3: the fix (smallest harness-only change)
+
+Two parts, both required (confirmed live -- part 1 ALONE was NOT
+sufficient, see below):
+
+1. `static_mode=True` with the STEP 1 table, for all three roles
+   (robot/control_station/gateway), replacing the prior
+   `static_mode=False` (no routing table at all).
+2. `--skip-discovery-wait`, threaded through to all three roles when
+   the fix is active. Required because the discovery BEACON topic
+   (`/fleetqox_trace/_discovery_probe`) is a harness-internal
+   mechanism, not part of the trace-derived static_subscriptions table
+   -- under `static_mode=True`'s subscription-aware routing (no
+   fallback broadcast), the beacon has no route and can never
+   converge if this flag is omitted, exactly matching
+   fleetqox_rmw_trace_endpoint.py's own existing contract ("static
+   mode has no discovery step by design"). Live-confirmed: applying
+   only part 1 left `discovery_peers_seen_ids` empty and readiness
+   still `invalid_readiness`; adding part 2 made readiness instant and
+   `true` for every role (matching WiFi-Direct's own ~microsecond
+   convergence for static FleetRMW).
+
+No production FleetRMW code changed. No other middleware's launch path
+touched (`fleetqox_skip_discovery_flag`/the static-entries construction
+are both gated on `rmw_implementation == "rmw_fleetqox_cpp"`).
+
+### STEP 4: GREEN attempt
+
+With both fix parts: `status=ok`, `endpoint_results_complete=true`,
+readiness `true` for all four roles, run completed in ~30s (vs the RED
+case needing the full ~130s abort sequence). **Gateway
+received=280, forwarded=280, dropped=0** -- exactly matching
+control_station's own `tx=280`. Metadata preservation, no-duplicate
+forwarding: not independently exercised as separate checks yet, since
+end-to-end delivery itself (the precondition for checking them
+meaningfully) has not succeeded -- see below.
+
+**However: `control_station rx=0`, `robot_0000 rx=0`, `robot_0001
+rx=0`.** The fix is proven correct for the WIRED leg specifically
+(control_station -> gateway: 280 sent, 280 received by the gateway,
+zero loss) but the Wi-Fi leg (robot <-> gateway, both directions)
+still shows zero delivery end to end.
+
+### STEP 5: no-bypass A/B/C -- not meaningfully executable yet
+
+Since delivery is not yet non-zero WITH the gateway running, the A/B/C
+sequence (gateway running -> succeeds; gateway disabled -> becomes
+zero; gateway restored -> returns) cannot distinguish "gateway
+required" from "nothing works regardless" for the Wi-Fi leg -- doing
+this comparison before A succeeds would not be meaningful evidence,
+so it was correctly not attempted. The WIRED leg's own no-bypass
+property remains what Phase 2's original wiring proof already
+established (physical: robots have no route to control_station's
+segment at all).
+
+### STEP 6: localizing the remaining failure (not fixed, per the task's own instruction)
+
+`wifi_stats` from the SAME GREEN-config run: `mac_tx_total=2354`,
+`mac_rx_total=136`, **`mac_rx_drop_total=11657`** (`phy_rx_drop_total=476`,
+`phy_rx_drop_by_reason=[[4,244],[8,214],[9,18]]`). Real 802.11 frames
+are being transmitted (matching real FleetRMW application traffic --
+tx counts move exactly as expected), but the vast majority are dropped
+at the ns-3 MAC/PHY reception layer specifically (~98.8% of what would
+need to arrive for `mac_rx_total` to match `mac_tx_total`) --
+`associated_stations=3` confirms all 3 Wi-Fi stations (gateway +
+2 robots) are associated with the AP, so this is not an association
+failure. The funnel breaks at: `robot publish -> FleetRMW send -> TAP
+-> ns-3 -> [FIRST LOSS POINT: ns-3 MAC/PHY reception] -> gateway TAP ->
+...` -- confirmed BEFORE the gateway's own TAP/FleetRMW receive stage,
+since the wired leg (which does not touch ns-3 at all) achieved 100%
+delivery under the identical FleetRMW config. Per the task's own
+classification taxonomy: **NETWORK MODEL**, not HARNESS/GATEWAY/
+MIDDLEWARE -- the static_subscriptions fix (a harness/config concern)
+is proven correct and is not implicated in this remaining loss.
+**No optimization attempted** -- per the task's own explicit
+instruction ("Fix nothing else"), the ns-3 Wi-Fi PHY/MAC parameters
+were not touched.
+
+### Status against the user's 18-item report
+
+1. Exact static_subscriptions table: STEP 1 above.
+2. RED evidence: STEP 2 -- `invalid_readiness`, gateway
+   received/forwarded = 0/0, robot/control results unavailable
+   (process aborts before writing, confirmed expected).
+3. Change made: `static_mode=True` + correct per-role
+   static_subscriptions table + `--skip-discovery-wait` for FleetRMW
+   only, plus two harness-diagnostic fixes (gateway writes a partial
+   summary on start-gate timeout; result collection polls instead of
+   sleeping a fixed duration).
+4. Readiness result: **TRUE for all four roles** (was FALSE/invalid
+   for all four).
+5. Robot->gateway result: **STILL ZERO** (`robot_0000 tx=85, rx=0`;
+   `robot_0001 tx=72, rx=0` at the ROBOT's own rx, i.e. downlink from
+   gateway; robots' own uplink sends never reached the gateway either
+   -- see item 6).
+6. Gateway receive count: **280** (matches control_station's tx
+   exactly -- confirms the WIRED leg's receives, not the Wi-Fi leg's;
+   0 of the combined 157 robot-originated messages reached the
+   gateway).
+7. Gateway forward count: **280** (all 280 wired-leg-received messages
+   were successfully republished; 0 dropped).
+8. Gateway->control result: **the WIRED leg itself succeeded** (280
+   received by the gateway from control_station) but the reverse --
+   what the gateway forwards ROBOT-ward -- never reaches either robot
+   (0/280 forwarded messages received). control_station's own rx (for
+   anything robots sent) is also 0, consistent with 0 robot-originated
+   messages ever reaching the gateway in the first place.
+9. Metadata preservation result: **not yet meaningfully testable** --
+   no message has yet completed the full robot->gateway->control_station
+   path to check event_id/sent_wall_ns/payload against.
+10. No-duplicate result: **0 duplicates observed** in what data DID
+    move (dropped_count=0, forwarded_count exactly equals
+    received_count on the working wired leg) -- not yet exercised on
+    a full end-to-end path.
+11. Gateway-disabled result: not run (STEP 5, correctly deferred --
+    would not be meaningful evidence before the Wi-Fi leg succeeds at
+    all).
+12. Gateway-restored result: not run, same reason.
+13. First loss point: **ns-3 MAC/PHY reception**, specifically the
+    robot<->gateway Wi-Fi leg (`mac_rx_total=136` vs
+    `mac_rx_drop_total=11657` on this exact run) -- proven to be AFTER
+    ns-3 station association (`associated_stations=3`) and BEFORE the
+    gateway's own FleetRMW receive (since the identical FleetRMW
+    config achieves 100% delivery on the non-ns-3 wired leg).
+14. Files changed: `scripts/run_wifi_gateway_probe.py`,
+    `scripts/fleetqox_rmw_gateway_endpoint.py`,
+    `tests/test_wifi_gateway_probe.py`. No change to
+    `fleetqox_rmw_trace_endpoint.py`, no change to production FleetRMW,
+    no change to WiFi-Direct/LAN/5G/Table VI code paths.
+15. Tests: 16 focused tests (12 existing + 4 new for `_static_entries`),
+    all passing; full suite 875 passed, same 8 pre-existing unrelated
+    failures.
+16. Commit hash: this section's own commit (see below).
+17. **Final verdict: `N2_GATEWAY_STILL_RED`.** The static_subscriptions
+    fix itself is proven correct (100% delivery on the wired leg under
+    the identical config) -- the overall N=2 FleetRMW case remains RED
+    because of a separate, now precisely-localized ns-3 MAC/PHY issue
+    on the robot<->gateway Wi-Fi leg, which this task's own scope
+    explicitly excludes fixing.
+18. Exactly one next step: investigate the ns-3 MAC/PHY reception drop
+    on the robot<->gateway Wi-Fi leg specifically (mac_rx_drop_total
+    vastly exceeding mac_rx_total despite full station association) --
+    likely comparing against WiFi-Direct's own already-documented
+    Wi-Fi loss characteristics at small N to determine whether this is
+    the SAME known network-model behavior re-surfacing, or something
+    specific to the gateway's 3-station topology.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
