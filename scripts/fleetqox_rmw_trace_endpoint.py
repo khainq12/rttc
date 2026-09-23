@@ -715,6 +715,32 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--incoming-topic-suffix",
+        type=str,
+        default="",
+        help=(
+            "Wi-Fi Gateway experiment (see "
+            "docs/AUDIT_ACCEPTANCE_TRACKING.md, 'WIFI GATEWAY BENCHMARK'): "
+            "appended to the topic name used for SUBSCRIPTIONS only (the "
+            "topics this endpoint listens on) -- PUBLISH topic names are "
+            "never touched by this flag. Default '' preserves the exact "
+            "existing topic names for every current caller (WiFi-Direct, "
+            "LAN, 5G, Table VI all omit this flag). Exists so a gateway "
+            "process can subscribe on the SAME (unsuffixed) name a robot "
+            "or control_station already publishes on, then republish the "
+            "identical payload on the suffixed name -- and robots/"
+            "control_station, in gateway mode ONLY, subscribe to that "
+            "suffixed name instead of the original. This is what makes a "
+            "gateway relay possible WITHOUT an infinite loop: a node's own "
+            "publish on a topic it also subscribes to would otherwise "
+            "re-trigger its own callback. Robots' and control_station's "
+            "own PUBLISH topic names are completely unchanged either way "
+            "-- this keeps the workload/trace semantics identical between "
+            "WiFi-Direct and WiFi-Gateway, only how each endpoint listens "
+            "changes."
+        ),
+    )
+    parser.add_argument(
         "--skip-discovery-wait",
         action="store_true",
         help=(
@@ -789,7 +815,7 @@ def main() -> int:
     )
     incoming_topics = sorted(
         {
-            _topic_for(row["dst"], row["flow_class"])
+            _topic_for(row["dst"], row["flow_class"]) + args.incoming_topic_suffix
             for row in rows
             if row["dst"] == args.endpoint
         }
