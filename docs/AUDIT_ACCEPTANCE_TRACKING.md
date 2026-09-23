@@ -20277,25 +20277,157 @@ conclusion from source, not a live-retested one -- 5G was NOT
 re-benchmarked this turn (out of this task's explicit scope), so this
 is flagged as "very likely unaffected" rather than "confirmed clean".
 
-### Item 3-6: corrected WiFi-Direct baseline (N=2/4/8, seeds 7/13/29, 4 RMWs)
+### Item 3-6: corrected WiFi-Direct baseline (N=2/4/8, seeds 7/13/29, 4 RMWs) -- COMPLETE
 
-In progress -- see the live run log/results appended immediately below
-this notice once the staged N=2 -> N=4 -> N=8 (-> N=16 validity-only)
-sweep completes. Frozen parameters used (matching every prior
-established convention in this document): `policy=fifo`,
-`layout=circle`, `circle_radius=7.5`, `path_loss_exponent=2.7`,
-`tx_power_dbm=15.0`, `rx_sensitivity_dbm=-82.0`, `mobility_speed=0.0`,
-`num_aps=1` (all `run_probe()` defaults, never overridden anywhere in
-this investigation); discovery mode per the ALREADY-established
-fair-comparison convention (13/09/2026, "BẢNG IV ĐẦY ĐỦ"): FleetRMW
-`static_mode=True` (default), Fast DDS `discovery_server`, CycloneDDS
-`static_peers`, Zenoh default (its own router); `seconds=3`,
-`sim_duration_s=30.0` (the script's own CLI defaults);
-`start_offset_ms=2000`, `drain_s=10`, `discovery_timeout_s=15`;
-`ns3_seed=42`, `ns3_run=1` (matching the "ns3_seed=42" convention used
-throughout this document); workload seeds 7, 13, 29 (three INDEPENDENT
-workload seeds, per this turn's own explicit instruction -- not the
-historical "same seed, 3 ns3_run replicates" convention).
+Ran the staged N=2 -> N=4 -> N=8 -> N=16 (single-seed validity-only)
+sweep, 40 real `run_probe()` calls total, via the real, unmodified
+harness (no scratch/diagnostic copies, no code changes). Raw per-run
+summaries committed at `docs/data/wifi_rebaseline_20260923/results_N{2,4,8,16}.jsonl`
+(one JSON line per run: middleware, seed, tx/rx, delivery%, p50/p99,
+jitter, stale ratio, `sim_lag_s` from `wifi_stats` -- the canonical,
+already-established validity metric -- CPU/RSS, graph/join failures).
+Frozen parameters: `policy=fifo`, `layout=circle`, `circle_radius=7.5`,
+`path_loss_exponent=2.7`, `tx_power_dbm=15.0`, `rx_sensitivity_dbm=-82.0`,
+`mobility_speed=0.0`, `num_aps=1` (all `run_probe()` defaults, never
+overridden anywhere in this investigation); discovery mode per the
+already-established fair-comparison convention (13/09/2026, "BẢNG IV
+ĐẦY ĐỦ"): FleetRMW `static_mode=True` (default), Fast DDS
+`discovery_server`, CycloneDDS `static_peers`, Zenoh default (its own
+router); `seconds=3`, `sim_duration_s=30.0` (the script's own CLI
+defaults); `start_offset_ms=2000`, `drain_s=10`, `discovery_timeout_s=15`
+(Wi-Fi profile's own long-standing default -- NOT changed to try to
+"fix" any readiness failure below, per this task's own explicit
+"do not change middleware configuration" rule); `ns3_seed=42`,
+`ns3_run=1`; workload seeds 7, 13, 29 (three independent workload
+seeds, per this turn's explicit instruction).
+
+**Results (mean across the seeds that reached readiness; `sim_lag_s`
+is the canonical `wifi_stats`-embedded metric, NOT the cruder
+harness-wide elapsed-time figure some earlier runs also expose --
+using that second, unrelated figure would have produced false
+INVALID_SIMULATOR flags for otherwise-healthy runs, caught and
+corrected before this table was written):**
+
+| N | Middleware | Seeds OK | Delivery | sim_lag_s | p50 (ms) | p99 (ms) |
+|---|---|---|---|---|---|---|
+| 2 | FleetRMW | 3/3 | 100.0% | 0.02 | 2.8 | 13.6 |
+| 2 | Fast DDS | 3/3 | 100.0% | 0.02 | 1.4 | 3.1 |
+| 2 | CycloneDDS | 0/3 | -- READINESS FAILURE, all 3 seeds -- | | | |
+| 2 | Zenoh | 0/3 | -- READINESS FAILURE, all 3 seeds -- | | | |
+| 4 | FleetRMW | 3/3 | 88.0±0.7% | 1.81 | 1021.8 | 14973.2 |
+| 4 | Fast DDS | 1/3 | 100.0% (seed 29 only; seeds 7/13 readiness-failed) | 0.01 | 1.6 | 5.1 |
+| 4 | CycloneDDS | 3/3 | 100.0% | 0.02 | 1.8 | 112.4 |
+| 4 | Zenoh | 0/3 | -- READINESS FAILURE, all 3 seeds -- | | | |
+| 8 | FleetRMW | 3/3 | 60.2±1.8% | 7.23 | 3652.9 | 31698.0 |
+| 8 | Fast DDS | 3/3 | 100.0% | 1.70 | 1807.7 | 2424.6 |
+| 8 | CycloneDDS | 0/3 | -- READINESS FAILURE, all 3 seeds -- | | | |
+| 8 | Zenoh | 0/3 | -- READINESS FAILURE, all 3 seeds -- | | | |
+| 16 | FleetRMW | 1/1 | 55.3% | **17.22 -- INVALID_SIMULATOR** | 12105.5 | 37132.2 |
+| 16 | Fast DDS | 0/1 | -- READINESS FAILURE -- | | | |
+| 16 | CycloneDDS | 0/1 | -- READINESS FAILURE -- | | | |
+| 16 | Zenoh | 0/1 | -- READINESS FAILURE -- | | | |
+
+**Headline result: the stale-image fix is confirmed restoring healthy
+Wi-Fi behavior.** FleetRMW and Fast DDS both show clean 100% delivery
+at N=2 -- the first non-zero N=2 Wi-Fi FleetRMW numbers this
+repository has ever produced (matching the prior turn's GREEN finding,
+now replicated across all 3 seeds). Neither shows the total,
+uniform 0%/near-0% collapse that characterized every stale-image
+measurement.
+
+**Readiness failures are real, reproducible, and classified separately
+from delivery, per this task's own explicit rule.** CycloneDDS's
+`static_peers` unicast discovery and Zenoh's own scouting/router
+convergence both fail to converge within `discovery_timeout_s=15s`
+(the frozen Wi-Fi default) at EVERY scale tried in this pass (N=2, and
+CycloneDDS additionally at N=8/16; Zenoh at every N). This is NOT new:
+it is consistent with this document's own much earlier finding (LAN
+investigation, "15s timeout unjustified... Table V proven to measure
+post-readiness performance") that 15s is a tight bound for
+beacon-based discovery generally, now observed under genuine (if
+now-corrected) Wi-Fi loss conditions specifically. No discovery
+timeout value was changed to "fix" this, per the task's own rule.
+CycloneDDS's own N=4 all-3-seeds SUCCESS (100% delivery) sitting
+between two all-3-seeds FAILURES at N=2 and N=8 is genuinely
+non-monotonic -- plausible given discovery convergence for a
+retry/timing-sensitive unicast beacon protocol depends on real-time
+scheduling races that do not have to move monotonically with N, but
+this specific pattern was not further investigated this turn (out of
+scope: this is a readiness/setup-phase question, not the Wi-Fi-image
+question this whole investigation has been about).
+
+**Loss-funnel classification for FleetRMW's own delivery degradation
+at N=4/N=8/N=16 (per this task's "no optimization, classify only"
+rule)**: extracted `fleetqox_transport_metrics` from the already-saved
+N=8/seed=7 per-endpoint result files (no new live run needed). App
+level: `tx=1598, rx=985` (613 messages, 38.4%, never delivered).
+Transport level: `frames_sent=15494` (~9.7x the app message count,
+almost entirely fragmentation + retransmission overhead) with
+**`nack_retransmissions=13896`** -- FleetRMW's own reliable-delivery
+NACK/retransmit mechanism attempting to repair real channel loss
+roughly 8-9 TIMES per original message on average.
+`reliable_timeout_retransmissions=0` and `unreachable_retry_giveups=0`
+(no complete give-ups from unreachability). **First proven loss
+point: the ns-3 Wi-Fi PHY/MAC layer itself, under genuine 802.11g
+channel contention among 9 real stations sharing one AP at N=8 --
+FleetRMW's own transport-layer repair mechanism is clearly active and
+working (13896 real retransmission attempts, not silence), but cannot
+fully keep up within the fixed measurement window at this station
+count.** This is exactly the "genuine network saturation" class of
+finding this task's own Section 6/8 anticipated, is architecturally
+the SAME mechanism this document's own much earlier, extensive Table
+VI N=8 retransmission-feedback-loop investigation already
+characterized in depth for the coordination workload -- not a new bug,
+not something to fix in this task. `data_frames_matched_zero_subscriptions=516`
+was also observed (frames arriving at an endpoint that don't match any
+of its own subscriptions) -- plausible as ordinary shared-medium
+overhearing (see the prior turn's `MacRxDrop` ground-truth finding for
+the analogous mechanism one layer down) rather than a second loss
+mechanism, but not conclusively separated from the NACK-driven
+picture above; noted, not further chased this turn.
+
+**Simulator validity**: every N=2/4/8 run that reached readiness stays
+under `MAX_HEALTHY_SIM_LAG_S=10.0` (FleetRMW's own `sim_lag_s` climbs
+steadily -- ~0.02s -> ~1.8s -> ~7.2s -- approaching but not crossing
+the threshold). **At N=16, FleetRMW's `sim_lag_s=17.22s` DOES cross
+the threshold -- INVALID_SIMULATOR**, exactly matching this
+document's own prior N=16 finding ("the detailed ns-3 model can
+exceed the real-time lag threshold there") that motivated this task's
+own explicit "N=16 may be attempted only as a simulator-validity
+check" instruction. FleetRMW's N=16 delivery=55.3%/p99=37.1s numbers
+are therefore explicitly NOT to be interpreted as real middleware
+performance at that scale -- the simulator itself was not keeping up
+with real time. The other 3 middlewares never even reached readiness
+at N=16, so no delivery number exists for them to (mis)interpret in
+the first place.
+
+### Item 9: Table V scale-by-scale status
+
+- **N=2: PAPER_USABLE** for FleetRMW and Fast DDS (3/3 seeds each,
+  100% delivery, simulator healthy). CycloneDDS and Zenoh: **NOT_USABLE**
+  at N=2 this pass (0/3 seeds reached readiness -- a setup-phase
+  finding, not a delivery finding; could become usable with a
+  longer `discovery_timeout_s`, which this task's own rules
+  correctly forbid changing here).
+- **N=4: PAPER_USABLE** for FleetRMW (3/3, simulator healthy) and
+  CycloneDDS (3/3, 100% delivery, simulator healthy). Fast DDS:
+  **NOT_USABLE** this pass (only 1/3 seeds reached readiness -- too
+  flaky for a 3-seed baseline as measured; would need more seeds/reps
+  to characterize, not attempted this turn per "no 20-seed final run
+  yet"). Zenoh: **NOT_USABLE** (0/3 readiness).
+- **N=8: PAPER_USABLE** for FleetRMW (3/3, simulator healthy despite
+  real, expected delivery degradation from genuine channel
+  contention -- see loss-funnel classification above) and Fast DDS
+  (3/3, 100% delivery, simulator healthy). CycloneDDS and Zenoh:
+  **NOT_USABLE** (0/3 readiness each).
+- **N=16: INVALID_SIMULATOR** for FleetRMW (the only one to reach
+  readiness at all; `sim_lag_s` crosses the 10.0s threshold). Fast
+  DDS/CycloneDDS/Zenoh: **NOT_TESTED** in the sense that matters for
+  a paper number (readiness never converged, so there is no
+  delivery/latency figure to classify as valid or invalid in the
+  first place).
+
+## Quy ước cập nhật file này
 
 ## Quy ước cập nhật file này
 
