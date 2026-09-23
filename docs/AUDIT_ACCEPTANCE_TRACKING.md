@@ -18580,6 +18580,172 @@ confirmation (not a correctness gap), the same interface-counter
 technique used for LAN here could be repeated live for Wi-Fi and the
 Open5GS 5G profile specifically.
 
+## WIFI GATEWAY BENCHMARK -- PHASE 1-3 IN PROGRESS: TOPOLOGY DESIGNED, ONE REAL WIRING BUG FOUND+FIXED, END-TO-END DELIVERY NOT YET GREEN
+
+New, ADDITIVE experiment (does not modify WiFi-Direct/LAN/5G/Table VI
+in any way): `robot_i -- Wi-Fi/ns-3 -- GATEWAY -- (new wired segment)
+-- control_station`, with the gateway as a real, separate container
+and a real middleware endpoint. This section documents Phases 1-3;
+Phases 4 onward (end-to-end semantics measurement, N=2/N=4 sweep
+across all 4 middlewares, Direct-vs-Gateway A/B) are NOT YET reached
+-- basic message delivery through the gateway is not yet proven
+working, so nothing past that point can be attempted honestly yet.
+
+### Phase 1 audit (GO decision)
+
+1. Current Wi-Fi topology: `wire_network()` gives every endpoint
+   (control_station + N robots) its own per-station TAP+bridge into
+   `ns3sim`'s netns; the ns-3 `fleetqox_tap_bridge` process simulates
+   the 802.11 channel between them.
+2. Robot->control packet path: robot eth0 -> veth -> per-station
+   bridge -> tap -> ns-3 TapBridge -> simulated WifiNetDevice (MAC/PHY)
+   -> destination's simulated WifiNetDevice -> TapBridge -> tap ->
+   bridge -> veth -> control_station eth0.
+3. TAP/MAC/PHY all live inside the single `ns3sim` container's
+   `fleetqox_tap_bridge` process.
+4. Middleware selection: `RMW_IMPLEMENTATION` env var + a
+   `discovery_mode` string picking a per-middleware discovery config
+   (CycloneDDS static peers XML, Fast DDS Discovery Server, Zenoh
+   router, FleetRMW `FLEETQOX_RMW_PEERS`) -- constructed entirely in
+   the launcher; the endpoint application itself has zero RMW-specific
+   code.
+5. Can one common gateway app run all four? YES -- confirmed by the
+   fact `fleetqox_rmw_trace_endpoint.py` already does exactly this for
+   pub/sub; the new gateway script
+   (`scripts/fleetqox_rmw_gateway_endpoint.py`) follows the identical
+   pattern (plain rclpy, zero RMW-specific code).
+6. Metadata that must survive forwarding: the existing wire payload
+   already carries only `{event_id, deadline_ms, sent_wall_ns,
+   payload}` -- source-robot identity is recovered OFFLINE via
+   `event_id` -> trace-CSV lookup, not from the wire, in the ALREADY-
+   EXISTING direct topology. A byte-identical relay (never parsing the
+   JSON) trivially preserves everything required with zero new schema
+   field.
+7. Does the gateway change FleetRMW semantics? No production FleetRMW
+   code changes; the gateway is just another `rmw_fleetqox_cpp`
+   participant, architecturally a 2-hop relay like any other.
+8. Design decision this audit settled: a gateway subscribing AND
+   republishing on the identical topic name would self-loop (its own
+   publish re-triggers its own subscription, the same class of bug the
+   discovery beacon already has a documented fix for). Fix: publish
+   topic names stay IDENTICAL for robots/control_station (zero code
+   impact on them); a NEW opt-in `--incoming-topic-suffix` flag on
+   `fleetqox_rmw_trace_endpoint.py` (default `""`, every existing
+   caller unaffected) changes only what they SUBSCRIBE to. The gateway
+   subscribes on the original name, republishes on
+   `name + "__relayed"`; robots/control_station, in gateway mode only,
+   subscribe to the suffixed name.
+
+**GO** -- proceeded to Phase 2/3.
+
+### Phase 2: topology implementation
+
+New files (none touch WiFi-Direct/LAN/5G/Table VI):
+`scripts/fleetqox_rmw_gateway_endpoint.py` (the one common gateway
+app), `scripts/run_wifi_gateway_probe.py` (orchestration).
+
+The gateway takes over station-index-0's OLD Wi-Fi position (the slot
+`control_station` used in every other profile) -- confirmed safe by
+reading `fleetqox_trace_replay_tap.cc` directly: with the default
+`--numAps=1` (this profile's only supported case), station 0 gets no
+special AP/position treatment in the C++ binary beyond being first in
+a label array used purely for logging. `wire_network()`/
+`start_ns3()`/`build_ns3_binary()` are reused completely UNMODIFIED.
+The real `control_station` moves to a brand-new, separate container on
+a second, wired-only segment (new subnet, `10.61.0.0/24`), reachable
+ONLY through the gateway's second interface -- robots and
+control_station never share a network segment, so "no bypass" is a
+physical property, not application logic.
+
+Readiness contract: `required_peers_for_wifi_gateway()` (new,
+deliberately NOT `required_peers_from_trace()`, which derives peers
+from workload src/dst -- that would name a physically-unreachable pair
+here) -- robots and control_station each require only `{"gateway"}`;
+the gateway requires every robot plus control_station.
+
+**Real bug found and fixed during this phase** (not a design flaw, an
+implementation mistake, caught by live testing): the first version of
+`wire_gateway_control_segment()` gave the gateway's second interface
+(`eth1`) BOTH an IP address AND bridge-port membership
+(`master gwctlbr`) at the same time. Once an interface is a bridge
+port, the kernel's L3 stack for that address stops working -- all L3
+processing moves to the bridge device instead. Live-caught via a raw
+UDP send/recv test between the gateway and control_station timing out
+on every attempt (0/1, then 0/1 again) despite `ip -s link`/
+`docker inspect` showing every interface, IP, and route looked
+correct. Root cause confirmed by comparing against
+`wire_network_lan()`'s own (correct) pattern: that method only ever
+enslaves the BRIDGE-side veth ends to the bridge, never a container's
+OWN addressed interface. Fixed by replacing the bridge with a bare
+point-to-point veth PAIR for this exactly-2-member segment (a bridge
+is for joining 3+ ports; 2 members need no bridge device at all).
+Live-reverified after the fix: `control_station received: b'hello'
+('10.61.0.2', 58445)` -- the wired segment is now proven correct.
+
+### Phase 3: RED/GREEN -- NOT YET REACHED
+
+Attempted the first live N=2 FleetRMW smoke test after the wiring fix.
+Result: `control_station` now reaches `discovery_ready=True` (its
+wired path to the gateway works), but `gateway`, `robot_0000`, and
+`robot_0001` all still report `invalid_readiness` -- the beacon
+readiness signal is not yet converging on the Wi-Fi side.
+
+Investigating this surfaced a SEPARATE, confounding discovery: a
+control-experiment call to the EXISTING, unmodified `run_probe()`
+(WiFi-Direct, not this new profile) at N=2 with FleetRMW, called
+directly with `static_subscriptions` omitted, showed `tx>0, rx=0` for
+EVERY endpoint (control_station tx=940/rx=0, robot_0000 tx=288/rx=0,
+robot_0001 tx=222/rx=0) at two different trace durations. Because the
+historical, already-accepted Table V numbers for WiFi-Direct FleetRMW
+show real, non-zero delivery (e.g. 27.9% at N=16), this is read as
+evidence that `static_subscriptions` (the peer-to-topic static routing
+table FleetRMW's subscription-aware mode needs) is REQUIRED for real
+delivery, and my bare test call -- not the real harness callers, which
+always construct it via `build_static_subscriptions()` -- was missing
+it. This means the raw-socket Wi-Fi connectivity tests run earlier in
+this investigation (which also showed 0/80 packets delivered over a
+plain unicast UDP burst, even for the standard, known-working
+WiFi-Direct topology) are NOT reliable evidence of a real Wi-Fi
+connectivity problem either way -- they were confounded by the same
+kind of test-methodology gap (a bare socket send has no ARP-priming
+guarantee under ns-3's TapBridge, separate from whatever the real
+issue is).
+
+**Net effect: Phase 3's RED/GREEN no-bypass proof is NOT YET
+established.** What IS established: the wired segment (gateway<->
+control_station) is proven correct at the raw network level (UDP
+send/recv test) and at the readiness-beacon level (control_station
+reached `discovery_ready=True`). What is NOT yet established: real
+message delivery across the FULL path (robot -> gateway -> control_station),
+for any middleware. The most likely next cause to check is the
+gateway topology's OWN FleetRMW config choosing `static_mode=False`
+(no subscription-aware routing table needed) while the confounding
+discovery above suggests `static_mode=True` WITHOUT a correctly-built
+`static_subscriptions` table is what breaks delivery in the unrelated
+control experiment -- these are two different configurations, and
+neither has yet been proven to produce real end-to-end delivery in
+the NEW 3-hop gateway topology specifically.
+
+### Status against the user's 25-item report
+
+1. Old WiFi-Direct topology: unchanged, described in Phase 1 above (audit only, no source modified).
+2. New WiFi-Gateway topology: implemented, described in Phase 2 above.
+3. Gateway implementation: `scripts/fleetqox_rmw_gateway_endpoint.py` -- receive, relay byte-identical payload with a topic suffix, forward; no per-middleware branches.
+4. One common gateway app for all four: YES, by construction (no RMW-specific code in the gateway script).
+5. RED evidence: NOT YET produced (blocked on Phase 3 above).
+6. GREEN evidence: NOT YET produced.
+7. No-bypass proof: the PHYSICAL claim (robots/control_station never share a segment) is proven true from the wiring code and live `docker inspect`/interface checks; the RUNTIME claim (delivery only happens via the gateway) cannot yet be demonstrated because no delivery has yet been demonstrated at all.
+8-10. N=2/N=4/N=8 results: NOT YET reached -- per the user's own explicit rule, do not proceed past small-scale correctness until it passes, and it has not passed yet.
+11-17. sim_lag_s / fresh success / delivery / latency / gateway processing time / wire bytes / CPU-RSS: not meaningful to report while status 5-6 are unresolved; `sim_lag_s` machinery IS implemented and reused correctly (`MAX_HEALTHY_SIM_LAG_S`, `parse_wifi_stats`, `wifi_stats_target_s` all imported from the existing module, not reimplemented) but no valid measurement window exists yet.
+18. Measured bottleneck: ONE confirmed and fixed (the bridge/IP-enslavement bug, Phase 2). ONE still open/unconfirmed (Wi-Fi-side beacon non-convergence for gateway/robots, confounded with a separate static_subscriptions gap discovered in an unrelated control experiment).
+19. Optimizations attempted: none -- per Phase 9's own rule ("only optimize after a measured problem exists," and no valid baseline exists yet to optimize against).
+20. Optimizations KEPT/REJECTED: N/A yet.
+21. Fairness verdict: the DESIGN is fair (identical topology/workload/gateway app for all four, per Phase 10's checklist) -- verdict on whether the IMPLEMENTATION achieves this fairly across all four cannot be given until delivery works for at least one.
+22. Existing result invalidated: NO -- nothing in WiFi-Direct/LAN/5G/Table VI was touched; the `run_probe()` control-experiment finding above is a NEW observation about an UNTESTED-BEFORE tiny/bare invocation pattern (N=2, `static_subscriptions` omitted), not a claim about any EXISTING, already-published result (which all go through the real harness callers that DO construct `static_subscriptions` correctly).
+23. Commits: this section's own commit (see below).
+24. Final classification: **IMPLEMENTATION_BLOCKED** -- the topology and gateway application are implemented and one real bug in them has been found and fixed, but end-to-end message delivery through the gateway has not yet been demonstrated for any middleware, so Phase 3's own gate ("do not proceed to larger experiments until N=2/N=4 pass") is not yet satisfied.
+25. Exactly one next step: resolve the Wi-Fi-side beacon non-convergence for the gateway topology specifically -- first by testing FleetRMW with `static_mode=True` AND a correctly-built `static_subscriptions` table for the gateway's 3-role topology (robot->gateway, gateway->control_station, gateway->robot, control_station->gateway), since the confounding control experiment suggests that configuration (not the `static_mode=False` currently used in `run_wifi_gateway_probe()`) may be what real FleetRMW delivery actually requires.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
