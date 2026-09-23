@@ -19222,6 +19222,238 @@ shown to fail identically.
     instruction, now correctly re-scoped to WiFi-Direct/Gateway jointly
     rather than Gateway alone.
 
+## WIFI GATEWAY BENCHMARK -- N=2 SINGLE-PACKET BOUNDARY TRACE: FIRST LOSS POINT PROVEN INSIDE NS-3's AP UNICAST RELAY, EXACT MECHANISM STILL UNKNOWN
+
+Direct continuation of the section above. Task this turn: localize the
+N=2 WiFi-Direct zero-delivery failure at the exact packet boundary
+between ns-3 and the destination container, using ONE isolated,
+identifiable DATA packet (no load/contention confound). No FleetRMW
+optimization, no radio-parameter changes, no N=4/N=8, no other
+middleware -- honored (git tree shows zero source changes this turn;
+pure diagnostic pass, same as the prior two turns).
+
+### Method
+
+`tcpdump` is not installed in the build image and `apt-get` has no
+network access in this sandbox (confirmed: install attempt killed
+after timeout) -- per the task's own "smallest diagnostic method"
+fallback, built a ~90-line AF_PACKET/SOCK_RAW Python sniffer
+(`raw_sniff.py`, one-off diagnostic script, not part of the repo)
+that needs no extra binary (confirmed CAP_NET_RAW is available by
+default in this image's containers) and validated it against a
+manually-sent test packet before trusting it. Reused
+`ReferenceTopologyProbe`'s own methods directly (not `run_probe()`) so
+sniffer capture and `--heavyTracing=true` could be started mid-setup,
+before any packet exists to miss. Used `generate_trace_events()`'s
+existing `event_filter` hook to reduce the trace to exactly ONE
+robot_0000 -> control_station DATA event (topic `/semantic_obstacles`,
+flow_class `perception`, 770 bytes) -- eliminating load/contention as
+a confound entirely (STEP 4/5's own "isolate topology/addressing
+failure from load/contention failure" distinction, answered
+immediately: this is not a load/contention issue, since there is no
+load). Also enabled `FLEETQOX_RMW_LOSS_FUNNEL_TRACE_PROFILING=1`
+(existing, already-built rmw_fleetqox_cpp env var) for real
+sendto()-level tracing.
+
+### Selected packet identity
+
+`event_id=0` (the CSV's only row), `src=robot_0000`,
+`dst=control_station`, topic `/fleetqox_trace/control_station/perception`,
+IP 10.60.0.3:9100 -> 10.60.0.2:9100 (both bound `0.0.0.0:9100`, same
+shared send/recv socket per FleetRMW's own `FLEETQOX_RMW_BIND`
+convention). `robot_0000`'s own result: `tx=1`. `control_station`'s
+own result: `rx=0`. Reproduced identically twice, once with
+`start_offset_ms=2000` and once with `start_offset_ms=8000` (to test
+and rule out a simple startup-timing race -- see below).
+
+### Evidence chain
+
+1. **Sender application -> FleetRMW UDP send**: `send_timing` shows
+   `publish()` called at the correct scheduled offset;
+   `fleetqox_loss_funnel_trace.send` shows 4 real `::sendto()` events:
+   1 `ATTEMPT_FAILED` (`errno=90`=EMSGSIZE -- the 770-byte payload plus
+   FleetRMW's own envelope/AEAD overhead exceeds this path's usable
+   MTU, entirely expected) immediately followed by 3
+   `ATTEMPT_SUCCESS` (`errno=0`) fragment sends, all logged with
+   `target=10.60.0.2:9100` -- the SAME `sockaddr_in` variable just
+   passed to the real `::sendto()` call (`endpoint_to_string(target)`
+   is called on it directly, not a separately-cached string), so this
+   is not a logging/target mismatch.
+2. **Sender container interface (boundary A)**: a validated raw-socket
+   sniffer on `robot_0000`'s own `eth0`, running for the ENTIRE window,
+   saw **64-69 total frames, of which ZERO were IPv4** (`ip_proto_hist`
+   empty; only IPv6 ND/MLD and 6 ARP frames). Despite 3 "successful"
+   `sendto()` calls, not one UDP/IPv4 frame ever left this station's
+   own interface.
+3. **ARP resolution (the actual mechanism)**: `/proc/net/arp` /
+   `ip neigh show` on `robot_0000`, sampled mid-run and post-completion,
+   showed the neighbor entry for `10.60.0.2` going
+   `INCOMPLETE` -> `FAILED`. This is the real, complete explanation for
+   #2: UDP `sendto()` to an as-yet-unresolved neighbor returns success
+   immediately (fire-and-forget at the syscall level) while the kernel
+   queues the datagram pending ARP resolution; if that resolution never
+   completes, the datagram is silently discarded by the kernel and
+   never actually reaches the wire -- exactly what was observed.
+4. **Why did ARP fail -- traced hop by hop**: `robot_0000` broadcasts
+   an ARP request ("who has 10.60.0.2") -- confirmed present,
+   correctly formed, at boundary A (sender eth0) AND B (ns-3 ingress
+   `ftap1`). It reaches `control_station` -- confirmed present at D
+   (ns-3 egress `ftap0`) AND E (`control_station`'s own eth0).
+   `control_station`'s kernel correctly answers with an ARP reply --
+   confirmed present at D and E, **with the CORRECT Ethernet
+   destination MAC (`02:00:00:00:00:01`, robot_0000's real, documented
+   `station_mac(1)` value, byte-for-byte correct)**. This reply is
+   injected into ns-3's simulated Wi-Fi channel via `control_station`'s
+   own WifiNetDevice (station index 0) successfully. **It never
+   reaches boundary B or A** -- 6-for-6 replies (3 attempts x 2 runs)
+   vanish somewhere between the AP's relay and `robot_0000`'s own tap,
+   despite carrying the exact correct destination address at every
+   observed hop before that point. Meanwhile the SAME pairing's
+   broadcast traffic (the ARP request itself) and uplink direction
+   both succeed 100% of the time.
+5. **Ruled out explicitly**: (a) wrong/stale destination MAC -- the
+   captured reply's Ethernet destination is provably correct, so this
+   is NOT a recurrence of the file's own documented historical
+   TapBridge-auto-learn address-mismatch bug in its ORIGINAL form
+   (that bug produces a WRONG address; here the address is right and
+   the frame is still lost); (b) a one-time 802.11
+   association-not-yet-complete startup race -- re-ran the identical
+   isolated-packet test with `start_offset_ms` raised from 2000 to
+   8000 (4x more real settling time before any traffic is sent) and
+   observed the IDENTICAL failure (`robot_0000 rx=0`, same
+   `INCOMPLETE`->`FAILED` ARP progression, same byte-correct-but-lost
+   reply pattern) -- a real association race would be expected to heal
+   itself well within an extra 6 seconds of real wall-clock time; it
+   did not, so this is a deterministic, repeatable relay defect, not a
+   transient timing window; (c) `mac_event_extracted=0` for all
+   attempts (both runs) -- confirmed as an INSTRUMENTATION LIMITATION,
+   not evidence: `ExtractEventId()` only matches a plaintext
+   `"data":"<base64>"` JSON marker, which cannot match an AEAD-encrypted
+   payload (`configure_udp_aead()` runs during socket setup) or an ARP
+   frame at all -- ruled out as a data point either way, not
+   over-interpreted per STEP 6's own "do not infer the cause from the
+   total counter" instruction.
+6. **Localization relative to the custom relay code**: with
+   `numAps=1` (the only value either WiFi-Direct or WiFi-Gateway ever
+   uses), `fleetqox_trace_replay_tap.cc`'s own custom
+   `ApCrossGroupRelay()` function is a documented no-op (`if
+   (targetApDevice == device) { ...; return false; }` -- there is only
+   one AP device when `numAps==1`, so this condition is always true).
+   All intra-BSS unicast relay in this configuration is handled
+   ENTIRELY by ns-3's own native, core `ApWifiMac::ForwardDown`
+   mechanism -- i.e. the defect, if it is a defect in this program's
+   own code at all, is NOT in FleetQoX's custom relay logic (verified
+   by reading that it's inert here), narrowing the search to either
+   ns-3's own core Wi-Fi module behavior under this specific setup, or
+   a TapBridge-side effect on the RECEIVING station specifically that
+   the historical patch does not fully cover.
+
+### What is proven vs still unknown
+
+**PROVEN**: the first point where this specific, correctly-addressed
+packet's journey breaks is INSIDE ns-3's simulated Wi-Fi channel,
+specifically the AP-to-station (downlink) UNICAST relay direction, for
+this station pairing -- after the frame is verified correctly formed
+and injected at the source station's WifiNetDevice, and before it
+would need to re-emerge at the destination station's own tap. Uplink
+(station-to-AP) and broadcast traffic through the exact same AP, same
+run, same stations, succeed reliably.
+
+**STILL UNKNOWN**: the exact internal ns-3 mechanism causing THIS
+specific relay to fail deterministically (whether it's an
+association-table/AID lookup inconsistency inside `ApWifiMac` despite
+`associated_stations` reporting all 3 associated, a TapBridge-side
+effect specific to the receiving station that the existing patch
+doesn't fully address, or something else) was not pinned down --
+doing so would require attaching to or adding new C++-level
+instrumentation to ns-3's own `ApWifiMac`/`TapBridge` internals, which
+was correctly NOT attempted this turn: the task's own STEP 6 gates any
+fix on the mechanism being PROVEN first ("Only after the first loss
+point and mechanism are PROVEN"), and only the loss POINT (not yet the
+full internal mechanism) is proven here. Attempting a fix without
+that would be exactly the kind of speculation STEP 6 and the prior
+turn's own "do not infer the cause from the total counter" instruction
+warn against.
+
+### Status against the user's 21-item report
+
+1. Selected packet identity: `event_id=0`, `robot_0000 (10.60.0.3:9100)
+   -> control_station (10.60.0.2:9100)`, topic
+   `/fleetqox_trace/control_station/perception`, 770-byte original
+   payload (fragmented into 3 UDP datagrams by FleetRMW's own PMTU
+   handling).
+2. Sender application evidence: `send_timing` confirms `publish()`
+   called at the scheduled offset; `robot_0000`'s own result `tx=1`.
+3. Sender container evidence: `fleetqox_loss_funnel_trace.send` shows
+   1 `ATTEMPT_FAILED` (EMSGSIZE) + 3 real `ATTEMPT_SUCCESS`
+   (`errno=0`) `sendto()` calls to `10.60.0.2:9100`; a validated raw-
+   socket sniffer on the SAME container's own `eth0` observed **zero**
+   IPv4 frames leave it during the entire window.
+4. ns-3 ingress evidence: N/A for the DATA payload itself (never left
+   the sender at IP layer -- see #3/#10); the sender's own ARP
+   broadcast IS observed crossing into ns-3 correctly at `ftap1`.
+5. ns-3 destination reception evidence: `control_station`'s ARP reply
+   (Ethernet dst = robot_0000's correct real MAC) is confirmed
+   successfully injected into ns-3 via `control_station`'s own
+   WifiNetDevice (observed leaving its own eth0 and entering `ftap0`).
+6. Destination TAP evidence: N/A for the DATA payload (never sent);
+   for the ARP reply used to localize the defect, it is confirmed
+   PRESENT at the source-side tap (`ftap0`) but ABSENT at the
+   destination-side tap (`ftap1`) -- the defect is between these two.
+7. Destination container evidence: `control_station`'s `rx=0`; a
+   validated sniffer on its own `eth0` DOES see the ARP exchange
+   (request in, reply out) but never any IPv4 traffic either.
+8. FleetRMW recvfrom evidence: `fleetqox_loss_funnel_trace.raw_recvfrom`
+   is empty for `control_station` -- `recvfrom()` was never called
+   with any bytes to process, consistent with nothing ever arriving.
+9. Application callback evidence: N/A -- no message ever reached
+   `recvfrom()`, so no callback stage was ever reached; not fabricated.
+10. Exact first loss boundary: between ns-3's AP-side relay of a
+    unicast frame and its re-emergence at the destination station's
+    own tap device (`ftap1`) -- PROVEN via the ARP-reply substitute
+    packet (identical topology/addressing/direction as our DATA
+    packet would have needed, and directly responsible for why the
+    DATA packet's own destination IP never resolved).
+11. Root cause: **PROVEN** (the loss boundary and failure direction) /
+    **STILL UNKNOWN** (the exact internal ns-3 mechanism) -- reported
+    honestly as split per the task's own two-part question.
+12. Exact mechanism: not fully proven; ruled out: wrong/stale MAC
+    address, a one-time association-startup race, and the historical
+    TapBridge address-mismatch bug in its documented original form (a
+    WRONG address) -- none of these fit the observed byte-correct,
+    deterministic, direction-specific failure. Custom FleetQoX relay
+    code (`ApCrossGroupRelay`) is confirmed inert at `numAps=1`, so
+    the search narrows to ns-3's own native `ApWifiMac` relay path or
+    a receiver-side TapBridge effect.
+13. RED evidence: both runs (2000ms and 8000ms start offset) show
+    identical, reproducible zero-delivery with the same ARP
+    `INCOMPLETE`->`FAILED` progression and the same byte-correct-but-
+    lost reply pattern.
+14. Minimal fix: **NOT ATTEMPTED** -- mechanism not yet proven at the
+    level STEP 6 requires before fixing; attempting one now would be
+    speculation, explicitly against this task's own instructions.
+15. WiFi-Direct GREEN result: **NOT REACHED** (unchanged).
+16. WiFi-Gateway N=2 confirmation: **NOT RUN** -- explicitly gated on
+    WiFi-Direct reaching GREEN first, which it has not.
+17. sim_lag_s: 0.0169s (2000ms-offset run) / 0.0170s (8000ms-offset
+    run) -- both far under `MAX_HEALTHY_SIM_LAG_S=10.0`; simulator
+    valid in both.
+18. Files changed: **NONE** -- pure diagnostic pass (one-off
+    `raw_sniff.py` and orchestration script lived only under a
+    scratch directory, removed after use; `git status` clean).
+19. Tests: N/A, no code changed; prior 875-pass baseline unaffected.
+20. Commit hash: this section's own documentation-only commit (see
+    below).
+21. Exactly one next step: instrument ns-3's own `ApWifiMac` (or
+    attach a debugger) specifically around its unicast-relay decision
+    for an AP with exactly one associated-station group, to determine
+    whether it consults a stale/incomplete per-station table entry for
+    `robot_0000` at relay time despite `associated_stations` reporting
+    it associated, or whether the loss is instead on `robot_0000`'s
+    OWN receiving WifiNetDevice/TapBridge side (i.e. instrument BOTH
+    ends, not just the AP) -- this is the direct, minimal continuation
+    of STEP 6's "prove the mechanism before fixing" requirement.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
