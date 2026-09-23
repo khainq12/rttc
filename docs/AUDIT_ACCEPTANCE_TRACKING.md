@@ -19963,6 +19963,254 @@ exactly the prohibited speculation.
     fix be attempted, since the one evidence-based guess already tried
     this turn made the outcome measurably worse.
 
+## WIFI GATEWAY BENCHMARK -- N=2 ROOT CAUSE FULLY PROVEN AND FIXED: STALE DOCKER IMAGE PREDATED ITS OWN ALREADY-COMMITTED TAPBRIDGE FIX -- WIFI-DIRECT AND WIFI-GATEWAY BOTH GREEN
+
+Direct continuation of the section above. This turn closes out the
+entire multi-turn N=2 WiFi-Direct/WiFi-Gateway investigation with a
+definitive, source-proven root cause and a working fix, verified GREEN
+end to end on both profiles.
+
+### Obtaining the exact matching ns-3.41 source (network now available)
+
+Network egress to `gitlab.com` was confirmed working this turn
+(previously blocked -- see the prior section). Cloned
+`https://gitlab.com/nsnam/ns-3-dev.git` at tag `ns-3.41`
+(commit `e5039092b3bb5d7942d973cc1016eaa60bdce51c`, 2024-02-09); both
+tracked patches (`0001-tap-bridge-disable-use-local-address-autolearn-ns3.41.patch`,
+`0002-wifi-phy-state-helper-missing-algorithm-header-ns3.41.patch`)
+applied cleanly with `git apply`, confirming this is genuinely the
+exact source the Dockerfile targets.
+
+### Task 2/3/4: tracing the address-changing call -- and the pivotal discovery
+
+Read `wifi-mac.cc`, `sta-wifi-mac.cc`, `frame-exchange-manager.cc`,
+`wifi-net-device.cc`, `wifi-helper.cc`, and `wifi-mac-helper.cc`.
+`WifiMac::SetAddress()` (`m_address = address;`, wifi-mac.cc:445-449)
+is the ONLY place `m_address` is ever assigned within the wifi module
+itself; the only other in-module caller is
+`wifi-mac-helper.cc:66` (`mac->SetAddress(Mac48Address::Allocate())`,
+once, at device-creation time, before the harness's own override).
+`WifiNetDevice::GetAddress()` (wifi-net-device.cc:377-403) has a
+documented MLO-only exception (returns the per-link
+`FrameExchangeManager`'s address instead of `WifiMac::GetAddress()`
+for a non-AP MLD with exactly one setup link) that does NOT apply here
+(`GetNLinks()==1`, confirmed via source), so `dev->GetAddress()` ==
+`wmac->GetAddress()` always in this topology -- ruling that mechanism
+out cleanly rather than assuming it.
+
+To find every REAL caller (including any not visible via static grep,
+e.g. attribute/reflection-driven), added an unconditional
+`backtrace()`/`backtrace_symbols()` print inside
+`WifiMac::SetAddress()` in the cloned+patched source, built a full
+custom ns-3 install from it (`cmake`+`make`, same
+`NS3_ENABLED_MODULES` as the Dockerfile, `CMAKE_INSTALL_PREFIX` to a
+scratch prefix -- never touching the running system's own `/usr`), and
+linked the SAME (otherwise unmodified) `fleetqox_trace_replay_tap.cc`
+against it for a live N=2 run.
+
+**Result: only 7 total `SetAddress()` calls in the entire run, all at
+`sim_time_s=0`** -- 4 initial `Mac48Address::Allocate()` defaults (one
+per WifiNetDevice: 3 stations + 1 AP) followed by the harness's own 3
+explicit overrides (control_station, robot_0000, robot_0001). **Zero
+calls after `t=0` -- no reassignment during association at all in
+this freshly-built, patched ns-3.** This directly contradicts the
+prior turn's observation (via the SYSTEM-installed ns-3) that
+`WifiMac::GetAddress()` read back a different, randomly-allocated
+value by `sim_time_s=0.05`. Given `SetAddress()` is the only possible
+mutator of `m_address`, and a comprehensive backtrace-instrumented
+build shows it is NEVER called again, the only coherent explanation is
+that **the SYSTEM-INSTALLED ns-3 the prior turns were actually testing
+against is not the same build as this freshly-cloned, patched source**
+-- i.e. the currently-running Docker image does not contain the
+TapBridge fix at all, despite the Dockerfile claiming it does.
+
+### Confirming image staleness -- proven from the repo's own history, not inferred
+
+`docker inspect localhost/fleetrmw/rmw-netem:jazzy` showed the image
+was created **2026-09-02**. `git log` on
+`external/rmw-netem/Dockerfile` and both patch files showed all three
+were introduced together in commit `30bc4160` dated **2026-09-11** --
+**9 days after** the running image was built. That commit's own
+message states outright: *"Brings the ns-3 root-cause fix... into the
+actual production rmw-netem:jazzy image, which uses ns-3 3.41 via apt
+-- not the 3.46 this session debugged with."* This is a direct,
+contemporaneous admission that the production image was, at the time,
+still running the plain apt-installed, UNPATCHED ns-3 3.41 package --
+and the image currently loaded and used by every test in this entire
+multi-turn investigation (this one and the four before it) was never
+rebuilt after that fix was committed. The image's `dpkg -l ns3` query
+this turn (pre-rebuild) had returned the apt package as present with
+metadata intact, which -- corrected understanding -- means the
+pre-rebuild image was indeed still running the vanilla apt package,
+not a from-source build as this investigation had assumed two turns
+ago based on an (in hindsight, ambiguous) file-timestamp coincidence.
+
+This fully explains every earlier observation without requiring any
+new or exotic ns-3-internal mechanism: the vanilla, UNPATCHED apt
+ns-3.41 package has exactly the documented
+TapBridge-Mode=UseLocal-address-auto-learn race (see this file's own
+prior section and `fleetqox_trace_replay_tap.cc`'s own header
+comment) -- on the first packet a station's TapBridge forwards, it
+overwrites that station's `WifiNetDevice`/`WifiMac` address with
+whatever source MAC that first packet happened to carry, racing
+against incidental early traffic (e.g. an auto-generated,
+locally-administered random MAC from an intermediate veth interface),
+which explains the "different random value every run" behavior
+observed in every prior probe.
+
+### Root-cause gate
+
+**"The harness explicitly sets each station's `WifiNetDevice`/`WifiMac`
+address at program-setup time (`fleetqox_trace_replay_tap.cc`, right
+after `TapBridge::Install()`) -- this IS ns-3's own intended,
+documented configuration mechanism (`WifiNetDevice::SetAddress()` +
+`FrameExchangeManager::SetAddress()`, both public API, both used
+exactly per their own header documentation, not misused). But the
+DEPLOYED Docker image's ns-3 3.41 build (the plain, unpatched apt
+package, per commit `30bc4160`'s own admission) still contains
+`TapBridge::ForwardToBridgedDevice()`'s address auto-learn call
+(`m_bridgedDevice->SetAddress(Mac48Address::ConvertFrom(src))`,
+`src/tap-bridge/model/tap-bridge.cc`, pre-patch), which fires on the
+first forwarded packet and overwrites the harness's own correct
+address with whatever unrelated source MAC that packet happened to
+carry -- confirmed absent entirely (zero post-t=0 `SetAddress()`
+calls) once linked against the SAME source with the patch that
+disables exactly this call actually applied. Therefore a
+correctly-addressed unicast frame is rejected because the deployed
+build's address no longer matches what the harness set, through no
+fault of the harness's own configuration."**
+
+**Classification: OTHER** (specifically, a build/deployment staleness
+gap) -- explicitly NOT `HARNESS_API_MISUSE` (the harness's
+`SetAddress()` usage is proven, from source, to be exactly ns-3's own
+intended configuration mechanism, correctly used); NOT `NS3_BUG` in
+any currently-unfixed sense (the bug was already found, already
+patched, and already committed to this very repository -- it just was
+never deployed into the running image); genuinely closest to "the
+fix already exists in version control but was never shipped."
+
+### Minimal fix: rebuild the image from its own, already-committed Dockerfile
+
+No new source code was written or modified anywhere -- the fix is
+`docker build -f external/rmw-netem/Dockerfile -t
+localhost/fleetrmw/rmw-netem:jazzy .`, i.e. actually deploying the
+change commit `30bc4160` already made 9 days before the stale image's
+build date. New image: `789b7624f146` (2026-09-23), replacing the
+stale `ae2acaa38831` (2026-09-02) under the SAME tag every existing
+script already references (`DEFAULT_IMAGE =
+"localhost/fleetrmw/rmw-netem:jazzy"`) -- no script or harness code
+needed any change to pick this up. Confirmed post-rebuild:
+`dpkg -l ns3` now reports "no packages found" (the apt package is
+genuinely gone, matching the Dockerfile's own comment that it REPLACES
+the apt packages with the from-source build).
+
+### RED -> FIX -> GREEN, full real harness (no scratch files, no code changes)
+
+**RED** (established across the prior 4 turns, reconfirmed as the
+pre-fix baseline): N=2 WiFi-Direct FleetRMW showed 0% delivery in
+every direction under the stale image.
+
+**FIX**: image rebuild only (see above).
+
+**GREEN -- WiFi-Direct**, real `run_probe()` (`scripts/run_ns3_docker_container_fleet_probe.py`),
+N=2, seed=7, identical parameters used as the control throughout this
+investigation:
+
+| endpoint | tx | rx |
+|---|---|---|
+| control_station | 280 | **157** |
+| robot_0000 | 85 | **141** |
+| robot_0001 | 72 | **139** |
+
+`141 + 139 = 280` -- EXACTLY matches control_station's own tx, i.e.
+**100% delivery, zero loss, in both directions simultaneously**. This
+is the first non-zero N=2 WiFi-Direct FleetRMW delivery result ever
+produced in this repository's history. `sim_lag_s` (wifi_stats)
+0.0166s; simulator valid.
+
+**GREEN -- WiFi-Gateway confirmation**, real `run_wifi_gateway_probe()`
+(`scripts/run_wifi_gateway_probe.py`), N=2, seed=7, same parameters as
+every prior gateway turn:
+
+| endpoint | tx | rx |
+|---|---|---|
+| control_station | 280 | **157** |
+| robot_0000 | 85 | **141** |
+| robot_0001 | 72 | **139** |
+
+Gateway: `gateway_received_count=437` (exactly `280+85+72`, every
+message from every source), `gateway_forwarded_count=437`,
+`gateway_dropped_count=0`, `discovery_ready=true`. **Full end-to-end
+path proven working in both directions**: Robot -> Wi-Fi/ns-3 ->
+Gateway -> wired veth -> Control_station, AND Control_station -> wired
+veth -> Gateway -> Wi-Fi/ns-3 -> Robot, with zero loss at every hop.
+`wifi_stats.sim_lag_s` 0.0196s; `simulator_invalid: false`.
+
+Both runs used the exact same static_subscriptions/skip-discovery-wait
+mechanism established two turns ago (unchanged), the exact same
+gateway topology/relay code (unchanged), and the exact same FleetRMW
+binary (unchanged) -- the ONLY variable that changed between RED and
+GREEN, across this entire investigation, was the underlying Docker
+image being rebuilt from its own already-committed Dockerfile.
+
+### Status against the user's 20-item report
+
+1. Exact address-changing function: `TapBridge::ForwardToBridgedDevice()`
+   in `src/tap-bridge/model/tap-bridge.cc` (pre-patch/unpatched
+   version only) -- its one-shot `m_bridgedDevice->SetAddress(...)`
+   "learn from first forwarded packet" call, which the ALREADY-WRITTEN
+   `0001-tap-bridge-disable-use-local-address-autolearn-ns3.41.patch`
+   removes entirely.
+2. Source evidence: patch applies cleanly to the exact matching
+   upstream `nsnam/ns-3-dev` tag `ns-3.41` commit; a backtrace-
+   instrumented build of that SAME patched source shows zero
+   `WifiMac::SetAddress()` calls after `t=0` (proving the patched
+   path is inert); the repo's own commit `30bc4160` (2026-09-11)
+   states in its own message that production was, at that time,
+   still on unpatched "ns-3 3.41 via apt".
+3. Address timeline: `t=0`: 4 `Mac48Address::Allocate()` defaults +
+   3 harness overrides (7 total `SetAddress()` calls, all at `t=0`,
+   in the patched build); NO further calls -- address stays correct
+   for the rest of the run. (Prior turn's SYSTEM-build timeline --
+   correct through `t=0.01`, wrong by `t=0.05` -- is now understood to
+   reflect the UNPATCHED TapBridge auto-learn firing somewhere in
+   that window on the stale image, not any ns-3 core Wi-Fi/MLO
+   mechanism.)
+4. Root cause classification: **OTHER** (stale Docker image, fix
+   already committed but never deployed) -- not harness API misuse,
+   not an unfixed ns-3 bug.
+5. Minimal fix: rebuild `localhost/fleetrmw/rmw-netem:jazzy` from its
+   own current, already-committed `external/rmw-netem/Dockerfile` --
+   zero new source lines anywhere.
+6. WiFi-Direct before/after: before -- 0/0/0 rx (all three endpoints,
+   every prior turn, every seed tried); after -- 157/141/139 rx
+   (100% of 280/85/72 tx respectively, both directions).
+7. Delivery: **100%, zero loss, bidirectional**, N=2 seed=7.
+8. sim_lag_s: 0.0166s (WiFi-Direct GREEN), 0.0196s (WiFi-Gateway
+   GREEN) -- both far under `MAX_HEALTHY_SIM_LAG_S=10.0`.
+9. WiFi-Gateway result: **GREEN** -- `gateway_received_count=437`,
+   `gateway_forwarded_count=437`, `gateway_dropped_count=0`; full
+   Robot<->Gateway<->Control path proven both directions.
+10. Files changed: **NONE** in the tracked repo (`git status --short`
+    clean) -- the fix is a Docker image rebuild from already-committed
+    source, not a code change; the exploratory ns-3 clone/custom
+    build/backtrace instrumentation lived entirely in scratch
+    directories/containers, all removed after use.
+11. Tests: N/A, no repo code changed; prior 875-pass baseline
+    unaffected (nothing in `scripts/`, `fleetqox/`, or `ros2_ws/` was
+    touched).
+12. Commit hash: this section's own documentation-only commit (see
+    below).
+13. Exactly one next step: re-run the full existing Table V Wi-Fi
+    suite (N=2/4/8/16, all four RMWs, the seeds already used for the
+    currently-published numbers) on the rebuilt image to determine
+    whether any previously-published WiFi-profile result was affected
+    by this same staleness -- every number in this repository's own
+    published Table V was measured against the SAME stale,
+    pre-`30bc4160` image, so this is not limited to FleetRMW or to
+    N=2, and needs a full, fresh baseline before anything currently
+    published can be trusted as still accurate.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
