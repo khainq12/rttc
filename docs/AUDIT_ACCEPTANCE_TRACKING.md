@@ -18949,6 +18949,279 @@ were not touched.
     the SAME known network-model behavior re-surfacing, or something
     specific to the gateway's 3-station topology.
 
+## WIFI GATEWAY BENCHMARK -- N=2 ROOT-CAUSE LOCALIZATION: DIRECT CONTROL PROVES THE Wi-Fi FAILURE IS NOT GATEWAY-SPECIFIC; MAC_RX_DROP_TOTAL METRIC MISREAD CORRECTED
+
+Direct continuation of the section above. Task this turn: localize the
+~98.8% ns-3 MAC/PHY receive-drop rate reported for N=2 FleetRMW
+WiFi-Gateway by comparing directly against WiFi-Direct under an
+EXACT-MATCH control configuration. No FleetRMW optimization, no
+N=4/N=8, no other middleware, no radio-parameter tuning, no
+LAN/5G/Table VI change -- all honored (git tree shows zero source
+changes this turn; this is a pure diagnostic pass).
+
+### STEP A: Direct control run -- RESULT OVERTURNS THE PREMISE
+
+`run_probe()` (WiFi-Direct, unmodified) called DIRECTLY (not via its
+CLI, whose own `--ns3-seed` default of 42 would have been a silent
+mismatch) with every parameter Gateway's own `start_ns3()` call uses
+implicitly (num_robots=2, policy=fifo, seed=7, seconds=3,
+start_offset_ms=2000, drain_s=10, discovery_timeout_s=15,
+static_mode=True, layout=circle, circle_radius=7.5,
+path_loss_exponent=2.7, tx_power_dbm=15.0, rx_sensitivity_dbm=-82.0,
+mobility_speed=0.0, num_aps=1, sim_duration_s=20.0 matching Gateway's
+own `seconds + start_offset_ms/1000 + drain_s + 5.0` derivation) --
+first with `ns3_seed=1` (Gateway's own, unnoticed default -- `start_ns3()`'s
+method-level default, which every OTHER real Table V caller in this
+repo overrides to 42; Gateway's own code never overrides it, a latent
+harness inconsistency worth flagging but NOT itself the cause, see
+below), then again with `ns3_seed=42` (the documented convention used
+by every published Table V number) to rule that variable out
+specifically.
+
+**Both control runs show COMPLETE, IDENTICAL failure at the application
+level: control_station tx=280/rx=0, robot_0000 tx=85/rx=0,
+robot_0001 tx=72/rx=0 -- for WiFi-Direct, the existing, unmodified,
+un-touched-this-session harness.** `ns3_seed` was not the variable
+(seed=1 and seed=42 both show rx=0 for every endpoint, near-identical
+`mac_tx_total` 524 vs 528, `mac_rx_total` 231 vs 251,
+`mac_rx_drop_total` 2425 vs 2435). `sim_lag_s` is healthy in both
+(0.017s/0.017s at the wifi_stats snapshot -- the simulator is not
+falling behind real time), `associated_stations=3` in both (no
+association failure).
+
+Per the task's own explicit instruction: **"If Direct is also broken
+under this exact control configuration: STOP. The Gateway is not yet
+proven responsible."** That condition is met, twice over (two
+different ns3_seed values). Searching this session's own history
+(`docs/AUDIT_ACCEPTANCE_TRACKING.md` line ~18687, "Phase 3: RED/GREEN
+-- NOT YET REACHED") confirms N=2 FleetRMW WiFi-Direct with a
+correctly-built `static_subscriptions` table had in fact **never been
+run successfully before this turn** -- the only previously-accepted
+non-zero FleetRMW Wi-Fi delivery number in this repo is the N=16
+Table V figure (27.9%, `ns3_seed=42`, much longer `seconds`/
+`sim_duration_s`). "The real working WiFi-Direct harness" the
+original task referred to is the MECHANISM (static_mode=True +
+static_subscriptions), proven correct at N=16 over a long window --
+not a previously-verified N=2/short-window data point. This
+investigation is the first time that specific combination (N=2, short
+window) has actually been tested for WiFi-Direct, and it fails
+identically to Gateway.
+
+### STEP B: ns-3 topology diff -- Wi-Fi-side topology is BYTE-IDENTICAL
+
+For the Wi-Fi portion specifically (both reuse `wire_network()`,
+`build_ns3_binary()`, `station_mac()`, and the same
+`fleetqox_trace_replay_tap.cc` binary UNCHANGED):
+
+| | station idx 0 | station idx 1 | station idx 2 | AP |
+|---|---|---|---|---|
+| Direct role | control_station | robot_0000 | robot_0001 | (n/a) |
+| Gateway role | gateway | robot_0000 | robot_0001 | (n/a) |
+| tap device | ftap0 | ftap1 | ftap2 | none |
+| bridge | br0 | br1 | br2 | none |
+| MAC | 02:00:00:00:00:00 | 02:00:00:00:00:01 | 02:00:00:00:00:02 | ns-3-assigned |
+| Wi-Fi IP | 10.60.0.2 | 10.60.0.3 | 10.60.0.4 | n/a |
+| position (circle, r=7.5) | (7.5, 0, 0) | (-3.75, 6.495, 0) | (-3.75, -6.495, 0) | (0, 0, 0) |
+| WifiNetDevice | STA idx 0 | STA idx 1 | STA idx 2 | 1 AP (numAps=1) |
+
+Identical between Direct and Gateway in every column -- same
+`totalStations=3` (1+num_robots either way), same MAC-generation
+formula, same IP-generation formula (`BASE_IP_PREFIX{i+2}`), same
+circle layout/radius, same AP. `fleetqox_trace_replay_tap.cc`'s own
+module comment (confirmed by source read, `isolateController`
+special-casing station 0 is explicitly a no-op when `numAps==1`, which
+is the only value either profile ever uses) rules out any residual
+"station 0 = control_station" assumption in the C++ binary --
+`stationEndpointLabels[0]` is purely a log string.
+
+The ONLY structural difference is entirely OUTSIDE the ns-3 Wi-Fi
+station set: the gateway container additionally carries a second
+interface (`eth1`, 10.61.0.0/24, wired veth to a 4th, non-Wi-Fi
+container `control_station`) that Direct's `control_station` (a
+plain, single-interface Wi-Fi station) does not have. Since Direct
+fails identically WITHOUT this second interface existing anywhere in
+its topology, the extra NIC is ruled out as the cause (see IMPORTANT
+CHECK below for the routing-level argument).
+
+### IMPORTANT CHECK: gateway's extra NIC -- ruled out
+
+Static analysis of `wire_network()` + `wire_gateway_control_segment()`'s
+own commands: eth0 (10.60.0.0/24) gets a connected-subnet route plus
+an explicit `224.0.0.0/4 dev eth0` multicast route (from
+`wire_network()`, applied identically to every endpoint including the
+gateway); eth1 (10.61.0.0/24) gets only its own connected-subnet
+route. **No default route is ever added on any interface, on either
+profile.** With two non-overlapping /24s and no default route, Linux's
+longest-prefix-match routing is unambiguous: any destination in
+10.60.0.0/24 goes out eth0, any destination in 10.61.0.0/24 goes out
+eth1, with no possibility of the kernel choosing the wrong interface,
+and outbound source-IP selection follows the standard connected-route
+"preferred source" for whichever interface is chosen -- no ARP
+confusion, no interface-binding ambiguity. This is confirmed
+structurally correct, but ALSO moot: Direct's containers have exactly
+one interface each and still show the identical rx=0 failure, so
+whatever is broken is not reachable through this NIC at all.
+
+### STEP C: drop-reason classification -- the headline "98.8%" number was a METRIC MISREAD, not evidence of loss
+
+Ground-truthed the actual ns-3 header shipped in the build image
+(`/usr/include/ns3/wifi-mac.h`) rather than inferring from the total
+counter, per the task's own explicit instruction not to do that.
+`WifiMac::NotifyRxDrop()` (which is what this codebase's `MacRxDrop`
+trace hook fires) is documented, verbatim, in ns-3's own header as:
+**"the packet we received but is not destined for us."** This is the
+ONLY reason this specific trace fires in this ns-3 version -- it is
+NOT a generic "any MAC-layer reception failure" counter. In an
+infrastructure Wi-Fi network with 1 AP + 3 stations sharing one
+channel, EVERY station physically hears EVERY other transmission in
+range (that's how a shared radio medium works) but only keeps frames
+addressed to itself; every overheard-but-not-mine frame that clears
+PHY decode successfully increments `mac_rx_drop_total` once. **This
+counter, taken alone, was never valid evidence of "this station's own
+traffic being dropped" -- it is dominated by ordinary promiscuous
+overhearing of traffic addressed to the OTHER two stations**, exactly
+as the task's own instruction warned ("do not infer the cause from
+the total counter").
+
+The enumerated, ground-truthed PHY-level failure reasons (from
+`/usr/include/ns3/wifi-phy-common.h`'s `WifiPhyRxfailureReason` enum,
+confirmed against the actual shipped header, not assumed from memory)
+are a much smaller, more meaningful number and tell a consistent story
+across all three runs:
+
+| run | reason 4 = TXING | reason 8 = BUSY_DECODING_PREAMBLE | reason 9 = PREAMBLE_DETECT_FAILURE | phy_rx_drop_total | mac_rx_total | mac_rx_drop_total | mac_tx_total |
+|---|---|---|---|---|---|---|---|
+| Direct (ns3_seed=1) | 49 | 36 | 17 | 102 | 231 | 2425 | 524 |
+| Direct (ns3_seed=42) | 53 | 54 | 3 | 110 | 251 | 2435 | 528 |
+| Gateway (ns3_seed=1, prior turn) | 244 | 214 | 18 | 476 | 136 | 11657 | 2354 |
+
+TXING (a station can't receive while transmitting -- normal
+half-duplex behavior at this contention level) and
+BUSY_DECODING_PREAMBLE (genuine collision/overlap) roughly split the
+real PHY-level loss; PREAMBLE_DETECT_FAILURE (weak-signal proxy) is a
+small tail in every run -- i.e. the actual PHY-level failure rate is
+real but modest (~5-20% of `mac_tx_total`), NOT the ~90-99% figure
+`mac_rx_drop_total` alone would suggest. `dropped_mpdu_*` counters
+read 0 in every run because `--heavyTracing` (default off, per this
+turn's own no-optimization/no-new-live-experiment scope) never
+connects that trace source -- these zeros are an artifact of
+instrumentation being off, NOT evidence that retry-limit exhaustion
+never happened; not corrected this turn (would require an additional
+live run with `--heavyTracing=true`, deferred to the next step below).
+
+### What remains genuinely unresolved
+
+Correcting the `mac_rx_drop_total` metric misread does NOT explain
+away the actual finding that matters: **the intended recipient's
+own application-level `rx` is 0 in every one of these runs (Direct
+AND Gateway alike).** Neither `phy_rx_drop_total` (5-20% of tx) nor
+the corrected understanding of `mac_rx_drop_total` (mostly normal
+overhearing) is large enough, on its own, to obviously explain 100%
+application-level loss. The genuine remaining question -- whether
+this is a real PHY-level collision collapse specific to N=2's very
+short measurement window (too little traffic for FleetRMW's own
+retry/repair mechanism to complete even one successful round trip
+before the run ends, unlike N=16's much longer window where 27.9%
+non-zero delivery was achieved), or a resurfacing of the exact
+address-mismatch MAC-drop class of bug this file's own header already
+documents once (TapBridge auto-learn race, supposedly patched) -- is
+NOT answered by this turn's evidence and was correctly NOT
+speculated on further, per STEP 6/the task's own "do not infer the
+cause from the total counter" and "STOP" instructions once Direct was
+shown to fail identically.
+
+### Status against the user's 18-item report
+
+1. Direct control result: **BROKEN, identically to Gateway** --
+   `control_station tx=280/rx=0`, `robot_0000 tx=85/rx=0`,
+   `robot_0001 tx=72/rx=0` (both ns3_seed=1 and ns3_seed=42).
+2. Direct MAC/PHY counters: ns3_seed=1 -- `mac_tx_total=524,
+   mac_rx_total=231, mac_rx_drop_total=2425, phy_rx_drop_total=102`
+   (reasons: TXING=49, BUSY_DECODING_PREAMBLE=36,
+   PREAMBLE_DETECT_FAILURE=17); ns3_seed=42 -- `mac_tx_total=528,
+   mac_rx_total=251, mac_rx_drop_total=2435, phy_rx_drop_total=110`
+   (TXING=53, BUSY_DECODING_PREAMBLE=54, PREAMBLE_DETECT_FAILURE=3);
+   `associated_stations=3` both, `sim_lag_s≈0.017s` both (simulator
+   healthy).
+3. Gateway MAC/PHY counters (from the prior turn, unchanged, reused
+   for this comparison): `mac_tx_total=2354, mac_rx_total=136,
+   mac_rx_drop_total=11657, phy_rx_drop_total=476` (TXING=244,
+   BUSY_DECODING_PREAMBLE=214, PREAMBLE_DETECT_FAILURE=18).
+4. Exact topology/config difference: NONE inside the ns-3 Wi-Fi
+   station set (byte-identical station count/MACs/IPs/positions/AP,
+   see STEP B table); the only difference is the gateway's extra,
+   non-Wi-Fi `eth1` interface, ruled out (IMPORTANT CHECK above) both
+   structurally (no routing ambiguity) and empirically (Direct fails
+   identically with zero extra interfaces anywhere in its topology).
+5. Isolated robot->gateway packet result: **not run** -- STEP D was
+   correctly skipped once STEP A proved the premise ("gateway is
+   uniquely broken, direct works") false; running a gateway-specific
+   isolation test would not distinguish anything once the SAME failure
+   is proven present with no gateway involved at all.
+6. Isolated gateway->robot packet result: same -- not run, same
+   reason.
+7. Drop reason breakdown: PHY-level (ground-truthed against
+   `wifi-phy-common.h`): TXING and BUSY_DECODING_PREAMBLE roughly
+   split the real loss (~45% each of `phy_rx_drop_total`),
+   PREAMBLE_DETECT_FAILURE a small tail (~4-17%) -- real but modest
+   (5-20% of `mac_tx_total`). MAC-level `mac_rx_drop_total` (ground-
+   truthed against `wifi-mac.h`'s `NotifyRxDrop()` doc comment: "the
+   packet we received but is not destined for us") is DOMINATED by
+   normal promiscuous overhearing on a shared 3-station channel, not
+   loss of the receiving station's own traffic -- the previous turn's
+   "~98.8% MAC-layer receive drop rate" framing was a metric misread,
+   corrected here. `dropped_mpdu_*` reason counters are uninstrumented
+   zeros this turn (`--heavyTracing` off), not evidence of zero
+   retry-limit exhaustion.
+8. First proven divergence point: **NONE FOUND between Direct and
+   Gateway** -- both fail identically under the exact same
+   configuration; STEP A's own explicit stop condition applies.
+9. Root cause: **STILL UNKNOWN** for the underlying zero-delivery
+   failure itself (which is now proven common to both profiles, not
+   gateway-specific); the ONE thing PROVEN this turn is negative but
+   real: it is not the gateway topology, not its extra NIC, not
+   `ns3_seed`, not station-index/MAC/IP/position assumptions, and not
+   fully explained by `mac_rx_drop_total` at face value.
+10. Minimal fix: **N/A** -- no fix attempted; the task's own STOP
+    condition fired before reaching STEP F, and the premise a
+    gateway-specific fix would address does not hold.
+11. GREEN result after fix: N/A, no fix attempted.
+12. Full Robot->Gateway->Control delivery: unchanged from the prior
+    turn's report -- still 0% for the robot<->gateway leg; the wired
+    control_station<->gateway leg remains separately proven correct
+    (280/280, unaffected by this turn's findings).
+13. sim_lag_s: Direct ns3_seed=1: 0.0167s; Direct ns3_seed=42:
+    0.0166s -- both far under `MAX_HEALTHY_SIM_LAG_S=10.0`, simulator
+    valid in both control runs.
+14. Files changed: **NONE** -- this was a pure diagnostic/investigation
+    pass; `git status` shows a clean tree, no source or test changes.
+15. Tests: N/A (no code changed); prior turn's 875-pass baseline
+    unaffected.
+16. Commit hash: this section's own documentation-only commit (see
+    below).
+17. **Final verdict: `WIFI_ROOT_CAUSE_STILL_UNKNOWN`.** Explicitly NOT
+    `N2_GATEWAY_GREEN` (no fix was made or needed against the gateway
+    specifically) and NOT a gateway-attributed RED either -- the
+    controlled comparison proves the failure is NOT gateway-specific,
+    which is itself the required, honest answer to this turn's
+    question ("is the Gateway responsible" -- no).
+18. Exactly one next step: capture a real packet trace (`tcpdump` in
+    the `robot_0000`/`control_station` netns, or the gateway's own
+    `heavyTracing=true` mode for `DroppedMpdu`-by-reason detail) during
+    a live N=2 WiFi-Direct run to determine whether physically-correct,
+    correctly-addressed UDP frames ARE reaching the destination's OS
+    stack (meaning the bug is above the network layer, e.g. in
+    `rmw_fleetqox_cpp`'s own receive-side processing or the FleetRMW
+    static-subscriptions table itself under a short-window workload) or
+    whether they never arrive at all (meaning the bug is still inside
+    ns-3, e.g. a resurfacing of the address-mismatch `MacRxDrop` class
+    already documented once in `fleetqox_trace_replay_tap.cc`'s own
+    header comment) -- this determines which of the two remaining
+    hypotheses to pursue and is the natural, minimal continuation of
+    STEP 6's "find the first point where the message disappears"
+    instruction, now correctly re-scoped to WiFi-Direct/Gateway jointly
+    rather than Gateway alone.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
