@@ -18316,6 +18316,270 @@ cited as final LAN Table V evidence.**
     which is out of scope for this audit (workload changes were
     explicitly forbidden throughout).
 
+## CONTAINER ARCHITECTURE AUDIT (READ-ONLY) -- LAN/WI-FI/5G/TABLE VI TOPOLOGY VERIFIED AGAINST SOURCE
+
+Read-only audit, no benchmark/harness/middleware/workload change. New
+artifact: `scripts/audit_lan_container_topology.py` (diagnostic only,
+launches a real N=2/N=4 LAN run, inspects `docker inspect`/network
+namespaces/interfaces, and proves the data path via `ip -s link`
+RX/TX byte+packet counters -- `tcpdump`/`tshark` are not installed in
+the image, confirmed live, so counter deltas are the evidence
+instead). Full pytest suite unaffected: 859 passed, same 8
+pre-existing unrelated failures.
+
+### 1. Claimed topology
+
+No standalone paper document with an explicit container/network
+diagram exists in this repo. The closest artifacts: `docs/EXPERIMENTAL_METHODOLOGY.md`'s
+T2E tier lists "Docker network namespaces," "routed LAN vs same
+subnet," "NAT-like topology" as VARIABLES to explore, not a fixed
+required architecture. `docs/BANG_V_VI_KET_QUA.md` explicitly states
+(14/09/2026) that the "5G" row now means "5G SA emulation (Open5GS +
+UERANSIM)": a real 5G SA core (Open5GS) + simulated gNB/UE
+(UERANSIM), with traffic over real NGAP/GTP-U/PFCP -- this IS an
+explicit topology claim for 5G specifically. The "N robots + 1
+control_station" convention (`endpoint_list()`) is used everywhere as
+the logical unit of "one participant per container." No document
+claims the specific user/control -> router -> N-robots 3-tier
+container diagram given as an example in the audit request; that
+example was explicitly not required to be forced onto the actual
+topology, per the audit's own instructions.
+
+### 2-5. Actual topology per profile (from source, `scripts/run_ns3_docker_container_fleet_probe.py` unless noted)
+
+**LAN** (`wire_network_lan()`, :866-911): 1 `control_station` + N
+`robot_i` containers, each `--network=none` with its own veth/eth0/IP
+(`10.60.0.{i+2}/24`), ALL plugged into ONE shared Linux kernel bridge
+(`lanbr0`) built by hand (`ip link add ... type bridge`) inside the
+`ns3sim` container's netns -- `ns3sim` is repurposed purely as a
+bridge host for this profile; no ns-3 process ever runs for LAN
+(docstring, :867-877, quotes the paper's own framing: "network
+control: do tre thap va it mat goi" -- an ideal switched network,
+not an impairment model). A separate `rigger` container
+(`--pid=host --network=none`, NET_ADMIN+SYS_ADMIN+`/dev/net/tun`)
+only executes the `nsenter`/`ip link` setup commands at wiring time;
+it has no interface other than loopback and is not part of the data
+path at runtime (live-confirmed below). **No Docker bridge network
+driver is used anywhere** (`--network=none` on every container) and
+**no separate IP-router container/process exists for LAN** -- stated
+explicitly, per the audit's own request, since this was verified to
+be intentional, not an oversight.
+
+**Wi-Fi / Table VI** (`wire_network()`, :816-865): each endpoint gets
+its OWN separate bridge (`br{i}`) + TAP device (`ftap{i}`) inside
+`ns3sim`'s netns, plus its own veth to the container. The actual
+"network" is the `fleetqox_tap_bridge` ns-3 discrete-event simulator
+process (started via `start_ns3()`, :970-1006) running inside
+`ns3sim`, which attaches each TAP via ns-3's TapBridge helper to a
+simulated 802.11 WifiNetDevice; simulated PHY/MAC (contention, path
+loss, mobility) decides frame delivery. Table VI
+(`run_coordination_probe()`, confirmed at :2280+ calling
+`probe.wire_network()`/`probe.start_ns3()` then
+`launch_coordination_endpoints()`) reuses this EXACT same wiring --
+identical topology to Wi-Fi Table V, different workload only.
+
+**5G** ("5G SA emulation," the CURRENT Table V/VI 5G data source per
+`docs/BANG_V_VI_KET_QUA.md` -- NOT the older ns-3 5G-LENA ghost-node
+path in this same file's `wire_network_nr_l2()`, which is explicitly
+marked historical/non-comparable). Audited via a dedicated
+source-only pass over `scripts/run_open5gs_docker_fleet_probe.py`,
+`external/open5gs/*`:
+- 12 real Open5GS core-network-function containers (`mongo, nrf, scp,
+  ausf, udr, udm, smf, upf, amf, pcf, bsf, nssf`), 1 shared UERANSIM
+  gNB container, and **N+1 dedicated UERANSIM UE containers** (one
+  per endpoint, including control_station -- confirmed NOT shared
+  between robots) each paired with **N+1 dedicated "app" containers**
+  running the actual FleetQoX/ROS 2 process via
+  `--network=container:<ue>` (Docker's own netns-join, not a custom
+  bridge), plus 1 rigger.
+- Data path: robot/control app process (shares its own UE's netns) ->
+  `uesimtun0` TUN -> UERANSIM's Radio-Link-Simulation UDP socket
+  (port 4997, where the documented 2% `tc netem` loss is injected,
+  confirmed applied ONLY to that port via `tc filter ... match ip
+  dport/sport 4997`) -> the shared `nr_gnb` container -> real NGAP
+  (SCTP 38412, gNB<->AMF) / real GTP-U (UDP 2152, gNB<->UPF) -> UPF,
+  which switches robot<->control_station traffic via internal "local
+  breakout" (not NAT'd, confirmed by the `MASQUERADE` rule only
+  firing `! -o ogstun`) -- never touching N6/internet egress.
+  **control_station follows the identical path** (its own UE, same
+  tunnel mechanism) -- it does not attach directly to the UPF's data
+  side and does not bypass the RAN/core.
+- One historical near-miss bypass was found and ALREADY fixed before
+  current Table V/VI 5G numbers were produced: without an explicit
+  `ip route add <UE_IPV4_INTERNET> dev uesimtun0`, UE-to-UE traffic
+  could silently fall back to the container's normal Docker-bridge
+  route on `docker_open5gs_default`, skipping the tunnel/UPF entirely
+  -- the explicit route is now always added (see
+  `_wait_for_ue_ip()`'s own docstring and the 15/09/2026 entry in this
+  file). Does not affect any currently-cited result.
+- The documented "retry with a completely new UE container" fix
+  (up to 3 attempts, `_launch_ue_pair()` recreates BOTH the UE and its
+  paired app container together, since Docker's `--network=container:`
+  binding is fixed at creation) means the per-robot UE is "one
+  container lineage, possibly recreated 1-3 times" rather than
+  literally one single container instance for the whole run when a
+  radio-link-registration retry fires -- noted for completeness, does
+  not change the "N+1 dedicated UEs, one per endpoint" claim.
+
+### 6. Container counts (live-verified, LAN, N=2 and N=4)
+
+| N | rigger | ns3sim (bridge host) | control_station | robot containers | TOTAL |
+|---|---|---|---|---|---|
+| 2 | 1 | 1 | 1 | 2 | **5** |
+| 4 | 1 | 1 | 1 | 4 | **7** |
+
+Formula: `2 + (N+1)`. **Zero separate router containers** for LAN (by
+design, see above). For 5G, per the source audit above: `14 + 2*(N+1)`
+(12 core + 1 gNB + 1 rigger + (N+1) UE + (N+1) app) -- e.g. N=2 -> 20,
+N=4 -> 24; independently confirmed in this file's own 14-15/09/2026
+entries ("N=32 (33 UE container + 33 app container + core, tong ~80
+container dong thoi)").
+
+### 7-9. Process placement (live-verified, LAN, N=2)
+
+`docker inspect` on all 5 containers: every one of `control_station`,
+`robot_0000`, `robot_0001`, `ns3sim` has `NetworkMode=none`,
+`IpcMode=private`, `PidMode=""` (own namespaces); only `rigger` has
+`PidMode=host` (needed for `nsenter`, confirmed not present in the
+data path at runtime -- see below). Distinct PIDs (403184/403250/403316
+for control_station/robot_0000/robot_0001) and distinct
+`eth0@ifN` peer indices confirm genuinely separate network
+namespaces, not shared ones. **control_station is a dedicated,
+separate container in every profile** (LAN/Wi-Fi live and source
+confirmed; 5G source-confirmed via the agent's citations) -- never
+found running on host, inside `ns3sim`/`rigger`/core containers, or
+inside a robot's container. The FleetQoX/ROS 2 endpoint process itself
+launches via `docker exec -d <endpoint_container_names[i]> ...` (LAN/
+Wi-Fi/Table VI, :1483/:1699) directly inside each endpoint's own
+container; for 5G it launches inside the paired "app" container,
+netns-joined to that endpoint's own dedicated UE (by design, not a
+cross-role bypass). The "router" role has NO dedicated process for
+LAN (a passive kernel L2 device only); for Wi-Fi/Table VI it is the
+`fleetqox_tap_bridge` ns-3 process inside `ns3sim`; for 5G it is the
+real Open5GS UPF's own container.
+
+### 10-11. Packet path, control_station<->robot_0000, LAN N=2 (live interface-counter proof)
+
+`ip -s link` RX/TX byte+packet deltas captured immediately before and
+after a real FleetRMW send/receive workload:
+
+| Interface (netns) | RX pkts/bytes (delta) | TX pkts/bytes (delta) |
+|---|---|---|
+| control_station eth0 (own netns) | 2285 / 1,473,043 | 2767 / 1,779,734 |
+| bridge `vlan0br` (ns3sim netns, control_station's veth end) | 2765 / 1,779,574 | 2279 / 1,472,523 |
+| bridge `vlan1br` (ns3sim netns, robot_0000's veth end) | 2324 / 1,508,260 | 2500 / 1,608,225 |
+| robot_0000 eth0 (own netns) | 2504 / 1,608,585 | 2325 / 1,508,350 |
+| bridge device `lanbr0` itself | 10 / 496 | 5 / 430 |
+
+Cross-check (this IS the hop-traversal proof, not inference from IP
+addresses): control_station eth0 TX (2767 pkt/1,779,734 B) matches
+`vlan0br` RX (2765 pkt/1,779,574 B) almost exactly (the small
+difference is counter-snapshot timing, not loss); `vlan0br` TX (2279/
+1,472,523) matches control_station eth0 RX (2285/1,473,043); the same
+symmetric match holds for `vlan1br` <-> robot_0000's eth0. The
+`lanbr0` bridge DEVICE's own counters stay tiny (10/5 packets) because
+a Linux kernel bridge only counts traffic addressed to itself
+(e.g. ARP) -- inter-port forwarded traffic is switched transparently
+and does not increment the master bridge device's own RX/TX counters,
+which is the textbook-correct signature of an L2 switch, not an L3
+router, and further confirms no IP-layer routing decision is made
+anywhere in this path. Exact hop chain, both directions: `container
+eth0 (own netns) -> veth pair -> bridge-side veth (ns3sim netns) ->
+lanbr0 kernel L2 switch -> other bridge-side veth -> veth pair ->
+other container's eth0`.
+
+Wi-Fi/5G packet paths are stated from source above (not
+re-live-verified with this same counter technique in this pass, since
+Wi-Fi's channel/MAC-level packet behavior was already extensively
+live-traced with dedicated instrumentation in an earlier phase of this
+investigation -- the N=8 per-packet loss-point A-E classification work
+-- and 5G's was independently, exhaustively source-cited by a
+dedicated audit pass this turn).
+
+### 12. Bypass audit
+
+| Bypass | LAN | Wi-Fi/Table VI | 5G |
+|---|---|---|---|
+| Host networking | PROVEN ABSENT (`NetworkMode=none` live-confirmed; no `--network=host` in source) | PROVEN ABSENT (same) | PROVEN ABSENT (grep confirmed) |
+| Shared netns across DIFFERENT roles | PROVEN ABSENT (live-confirmed, every container own PID/netns) | PROVEN ABSENT (source: per-endpoint veth) | NOT APPLICABLE -- app<->UE netns sharing is INTENTIONAL, same-role pairing, not cross-role |
+| Robot/control sharing a bridge when a router was "intended" | NOT APPLICABLE -- LAN's own documented intent IS a flat switch, no router claimed | NOT APPLICABLE -- no bridge sharing exists (per-station isolation) | NOT APPLICABLE -- real UPF exists and is used |
+| Localhost between logical machines | PROVEN ABSENT (real distinct IPs, live-confirmed) | PROVEN ABSENT (source) | PROVEN ABSENT (per agent citations) |
+| Middleware router creating a shortcut | UNDERSTOOD, not a bypass -- Zenoh router/Fast DDS discovery server are middleware processes co-located in control_station's own container (already documented, intentional harness choice from an earlier phase), traffic still traverses the same physical L2 path | NOT APPLICABLE | NOT APPLICABLE |
+| Direct host UDP/TCP bypassing ns-3 | NOT APPLICABLE (LAN has no ns-3) | PROVEN ABSENT (`--network=none` means no host-stack path exists for any container) | NOT APPLICABLE |
+| Direct container-to-container bypassing 5G core | NOT APPLICABLE | NOT APPLICABLE | PROVEN ABSENT, POST-FIX (one historical near-miss found and fixed before current results existed, see above) |
+| control_station sharing infra's namespace | PROVEN ABSENT | PROVEN ABSENT | PROVEN ABSENT |
+| Shared IPC mode | PROVEN ABSENT (`IpcMode=private` live-confirmed) | PROVEN ABSENT (source) | PROVEN ABSENT (source) |
+
+### 13. Router-semantics disambiguation
+
+- **Network router** (forwards IP packets between distinct networks):
+  does NOT exist in LAN (flat L2 switch only) or Wi-Fi/Table VI
+  (ns-3 simulates a shared-medium radio channel, not routing). DOES
+  exist in 5G, genuinely, as Open5GS's real UPF.
+- **Zenoh router**: a Zenoh-protocol-level routing/broker process,
+  present only when `rmw_zenoh_cpp` is the RMW under test; for LAN it
+  runs as a process inside `control_station`'s own container. Not an
+  IP router.
+- **Fast DDS Discovery Server**: a DDS-participant-discovery bootstrap
+  helper process; for LAN it also runs inside `control_station`'s own
+  container. Not an IP router, not a data-plane component at all.
+- **ns-3**: a discrete-event network SIMULATOR process; for LAN it
+  never runs; for Wi-Fi/Table VI it simulates the entire radio
+  channel; the older, non-current 5G ghost-node path also used it
+  (superseded by the Open5GS+UERANSIM path for current Table V/VI
+  numbers).
+- **5G UPF**: the one REAL, genuine packet-forwarding component
+  audited across all profiles -- part of Open5GS, not simulated.
+
+### 14. Claimed vs implemented
+
+| | Claimed | LAN | Wi-Fi | 5G | Table VI | Match |
+|---|---|---|---|---|---|---|
+| N+1 dedicated containers (robots + control_station) | Yes (`endpoint_list()` convention, used project-wide) | Yes | Yes | Yes (app+UE pairs) | Yes (= Wi-Fi) | YES |
+| A distinct network/router component | Not formally claimed anywhere as a required 3rd role; T2E lists it as an explorable variable, not a fixed requirement | Explicitly NO router (documented, intentional "ideal switched network") | Simulator process, not a router | Real UPF (router-like) | = Wi-Fi | PARTIAL -- only 5G matches a literal "router" reading; LAN's absence of one is a stated design choice, not a gap |
+| control_station isolated in its own container | Implied by the endpoint convention | Yes | Yes | Yes | Yes | YES |
+
+### 15-18. Architecture verdicts
+
+- **LAN: ARCHITECTURE VERIFIED.** Matches its own documented intent
+  exactly; live-verified container count, namespace isolation, and
+  hop-by-hop packet path via interface counters; zero unintended
+  bypass found.
+- **Wi-Fi: ARCHITECTURE VERIFIED.** Source-confirmed per-station
+  TAP/bridge isolation into a genuine ns-3-simulated channel; no
+  Docker-bridge or host-network shortcut is even possible
+  (`--network=none` everywhere); consistent with this session's own
+  earlier, independent live packet-level tracing of this exact
+  profile.
+- **5G: ARCHITECTURE VERIFIED.** Real Open5GS core + real UERANSIM
+  gNB/UE, real NGAP/GTP-U/PFCP traffic, per-endpoint dedicated UE,
+  control_station treated identically to a robot; the one historical
+  near-miss bypass was already found and fixed before current results
+  were produced.
+- **Table VI: ARCHITECTURE VERIFIED.** Identical, already-verified
+  Wi-Fi topology; only the workload (`launch_coordination_endpoints()`)
+  differs.
+
+### 19. Does any existing result become invalid?
+
+**NO.** This audit found no NEW contradiction between the topology any
+profile claims and what it implements, and no currently-unfixed
+bypass. The one historical 5G routing near-miss was already
+discovered and fixed (per this file's own 15/09/2026 entry) before
+the Open5GS-based numbers currently in `docs/BANG_V_VI_KET_QUA.md`
+were produced -- it does not retroactively invalidate them.
+
+### 20. Next step
+
+None required to validate architecture further -- LAN now has live,
+quantitative (interface-counter) hop-by-hop proof to match its
+source-level design; Wi-Fi and 5G's source-level evidence is already
+unambiguous (Wi-Fi additionally backed by this session's own earlier
+live packet-level work). If desired as an OPTIONAL extra
+confirmation (not a correctness gap), the same interface-counter
+technique used for LAN here could be repeated live for Wi-Fi and the
+Open5GS 5G profile specifically.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
