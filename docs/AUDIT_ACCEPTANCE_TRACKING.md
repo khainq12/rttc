@@ -21159,6 +21159,232 @@ that airtime for other, still-useful traffic. This is a testable,
 narrowly-scoped hypothesis for a future controlled A/B (with/without
 deadline-aware suppression), not a decision made here.
 
+## DEADLINE-AWARE RETRANSMISSION SUPPRESSION (25/09/2026): implemented, RED/GREEN-verified, causally ablated -- REVERTED
+
+Full RED -> FIX -> GREEN -> paired A/B -> ablation cycle for the
+optimization candidate proposed in the previous section. **Final
+verdict: REVERT** -- the causal ablation proves the observed benefit is
+not attributable to the new code. All C++/harness changes made this
+task have been reverted; the repository is back to commit `ac3763a`'s
+exact state. This section is the permanent record of the investigation.
+
+### 1. Source audit
+
+`ReliableRetransmitEntry` (`rmw_pubsub.cpp:287-322`) already stores
+`qos` (a full copy of the publisher's `rmw_qos_profile_t`, including
+`.lifespan`) and `source_timestamp_ns`, set once at ledger insertion
+(`reset_pooled_retransmit_entry()`, called from `publish_payload()`
+with `data->qos` -- the real publisher QoS). `frame_exceeds_lifespan(qos,
+source_timestamp_ns)` (existing function, `rmw_pubsub.cpp:9681`,
+`now - source_timestamp_ns > lifespan_ns`, strict `>`) is ALREADY used
+for lazy ledger EVICTION in three places (`publish_payload()`'s own
+walk, the timeout-retransmit loop's walk, a graph-eviction sweep) --
+but was NEVER called at the actual NACK-triggered send site,
+`send_retransmission_frame()` (`rmw_pubsub.cpp:3113-3196`), which had
+no expiry-like check at all before this task.
+
+**Critical finding that shaped the whole task**: the harness's actual
+per-message `deadline_ms` (the JSON `"d"` field the loss-funnel
+investigation's `stale_ratio` metric is computed from) is invisible to
+the RMW transport layer -- it exists only inside the opaque app
+payload. `DataFrame::deadline_ms` (the wire-format field that COULD
+carry a real per-frame deadline) is hardcoded to `0.0` at the only
+production call site (`publish_payload()`, line ~13065) and read by
+nothing downstream. Populating it would require either parsing the app
+payload in the transport layer (explicitly prohibited by this task) or
+a new API surface (out of scope, not a small change). The one
+genuinely small, additive, zero-new-plumbing path found: `deadline_ms`
+is CONSTANT per (dst, flow_class) topic (a fixed FlowClass constant,
+`fleetqox/simulator.py`), so setting the STANDARD ROS 2 QoS `lifespan`
+policy at publisher-creation time, to that topic's own already-known
+deadline, faithfully represents the same per-message deadline via a
+channel FleetRMW's ledger already threads through -- no wire-protocol
+change, no payload parsing, no invented value.
+
+### 2. Safety contract
+
+Suppress ONLY when `frame_exceeds_lifespan(entry.qos, entry.source_timestamp_ns)`
+is true for the SAME ledger entry a real NACK is about to trigger a
+resend for, looked up fresh (under `g_bus_mutex`) at the exact
+`send_retransmission_frame()` call site. `frame_exceeds_lifespan()`
+itself already returns `false` whenever `lifespan_ns <= 0` (unset/
+disabled) -- so "no usable deadline" is never suppressed by
+construction. If the ledger entry is no longer present (already
+pruned/evicted for any other reason), the new check is simply never
+consulted -- existing behavior preserved exactly. `g_retransmit_ledger`
+is exclusively DATA frames (confirmed: the sole writer is
+`publish_payload()`; ACKs/heartbeats/graph advertisements never touch
+it) -- no separate type discriminator was needed.
+
+### 3. RED tests (`deadline_aware_retransmission_suppression_probe.cpp`)
+
+Built against the REAL `send_retransmission_frame()` via a new
+test-only hook (`rmw_fleetqox_cpp_test_send_retransmission_frame_for_publisher`)
+that resolves a real ledger entry (created by a real `rmw_publish()`
+call) by (publisher, sequence) and invokes the exact production
+function -- not a mocked/synthetic entry, avoiding a full NACK-packet
+round-trip while still exercising the exact code under test. Five
+scenarios (A-E): A) 30ms lifespan, checked 200ms later (expired);
+B) 10s lifespan, checked immediately (unexpired); C) lifespan left
+unset, checked 200ms later (no usable deadline); D) first transmission
+(every `rmw_publish()` call itself must return `RMW_RET_OK`, confirmed
+structurally unaffected since this function is only ever reached from
+NACK processing); E) 100ms lifespan, one attempt at 20ms (before) and
+one at 300ms (after), same publisher, proving a deterministic
+transition. **RED result** (fix disabled via
+`RTC_DEADLINE_AWARE_RETRANSMISSION_SUPPRESSION_RED_TEST_DISABLE=1`):
+`ret_a_expired=0` (RMW_RET_OK -- sent, not suppressed), proving current
+behavior retransmits already-expired data, exactly as the task
+required RED to fail on.
+
+### 4. Implementation
+
+Minimal, at the exact call site (`send_retransmission_frame()`,
+immediately before the transport-airtime-spending send): look up the
+ledger entry by the already-computed `repair_key`, check
+`frame_exceeds_lifespan()`, and if true, increment
+`retransmission_suppressed_expired_`/`bytes_suppressed_expired_` and
+return `RMW_RET_UNSUPPORTED` (the same code every other existing
+give-up path in this function already returns, so the caller's own
+`loss_notice`/`unavailable_ranges` accounting is unaffected). No packet
+format change. No payload parsing. No scheduler redesign.
+
+### 5. GREEN tests
+
+Same probe, fix enabled: `ret_a_expired=3` (`RMW_RET_UNSUPPORTED`),
+`ret_e_after_expiry=3`, `ret_b_unexpired=0`, `ret_c_no_deadline=0`,
+`ret_e_before_expiry=0` -- exactly the required expired-suppressed /
+unexpired-unchanged / unknown-deadline-unchanged / first-send-unchanged
+matrix, deterministically. `requested_delta=5` (all attempts counted),
+`suppressed_delta=2` (A and E-after only), `bytes_suppressed_delta=916`.
+
+### 6. Full-suite result
+
+888 passed both before and after (same 8 pre-existing, unrelated
+failures) -- confirmed at every stage (baseline, RED, GREEN, and again
+after the final revert).
+
+### 7. Runtime counters (added, later reverted with everything else)
+
+`retransmission_requested_`, `retransmission_suppressed_expired_`,
+`bytes_suppressed_expired_` (new atomics) plus reuse of the existing
+`nack_retransmissions_` for "sent" -- exposed via new
+`rmw_fleetqox_cpp_socket_*` ctypes accessors, wired into
+`fleetqox_transport_metrics()`.
+
+### 8-9. Controlled paired A/B (N=4/N=8, seeds 7/13/29, counterbalanced)
+
+Same corrected image, Wi-Fi topology, workload, radio parameters, and
+all three readiness-correctness fixes as the official 24/09/2026
+baseline. A = `qos.lifespan` unset (byte-for-byte prior behavior,
+confirmed by probe scenario C). B = `deadline_aware_retransmission_lifespan=True`
+(harness sets `lifespan` per topic to its own fixed `deadline_ms`).
+
+| N | Seed | Delivery A→B | Fresh-deadline A→B | Wire eff. A→B | Total wire bytes A→B | sim_lag A/B |
+|---|---|---|---|---|---|---|
+| 4 | 7  | 86.52→63.71 | 10.52→8.51 | 0.45%→1.95% | 37.80M→7.86M | 2.43/1.63 |
+| 4 | 13 | 89.11→63.96 | 9.04→8.46  | 0.74%→2.10% | 25.68M→7.43M | 1.92/1.43 |
+| 4 | 29 | 86.95→64.20 | 9.47→9.47  | 0.75%→1.95% | 24.23M→7.79M | 1.94/1.78 |
+| 8 | 7  | 58.82→47.31 | 1.38→1.38  | 0.53%→1.08% | 54.56M→20.93M | 6.84/7.67 |
+| 8 | 13 | 56.52→49.97 | 1.27→1.34  | 0.94%→0.98% | 25.84M→21.13M | 7.04/7.17 |
+| 8 | 29 | 59.24→48.48 | 1.24→1.24  | 0.52%→1.06% | 52.22M→17.75M | 7.01/6.87 |
+
+**Mean deltas (B-A)**: N=4 fresh -0.86pp, delivery -23.57pp, wire-bytes
+-73.7%. N=8 fresh +0.02pp (noise), delivery -9.61pp, wire-bytes -54.9%.
+CPU/RSS: no meaningful difference between A and B at either scale
+(within ~1-3 percentage points / <0.5MB, consistent with measurement
+noise). `sim_lag_s` stayed under the 10.0 threshold for all 12 runs
+(max 7.67s) -- simulator valid throughout.
+
+`retransmission_suppressed_expired` (B) was small and highly seed-
+variable: 5-103 across the six runs -- while `nack_retransmissions`
+dropped from 17,917-29,393 (A) to exactly 0 (B) every time. This gap
+(tens of thousands vs. tens) is the tell that something OTHER than the
+new check is doing most of the work -- see item 10.
+
+### 10. Ablation -- the causal result that decides the verdict
+
+Suspecting a confound (setting `qos.lifespan` for the first time in
+this benchmark could ALSO activate the PRE-EXISTING, previously-
+dormant lazy pruning that already calls `frame_exceeds_lifespan()` in
+three other places, unrelated to the new check), ran a third condition,
+**C**: `qos.lifespan` set exactly as in B, but the NEW send-time check
+compiled OUT (`RTC_DEADLINE_AWARE_RETRANSMISSION_SUPPRESSION_ABLATION_DISABLE=1`)
+-- same six seeds.
+
+| N | Seed | Delivery B / C | Fresh B / C | Wire bytes B / C |
+|---|---|---|---|---|
+| 4 | 7  | 63.71 / 65.37 | 8.51 / 8.98 | 7.86M / 8.34M |
+| 4 | 13 | 63.96 / 67.56 | 8.46 / 8.92 | 7.43M / 8.00M |
+| 4 | 29 | 64.20 / 66.40 | 9.47 / 8.31 | 7.79M / 7.99M |
+| 8 | 7  | 47.31 / 49.87 | 1.38 / 1.50 | 20.93M / 20.98M |
+| 8 | 13 | 49.97 / 48.25 | 1.34 / 1.65 | 21.13M / 15.85M |
+| 8 | 29 | 48.48 / 51.46 | 1.24 / 1.31 | 17.75M / 22.69M |
+
+**B and C are statistically indistinguishable** -- every metric in C
+falls within normal seed-to-seed noise of the matched B value, despite
+C having the new optimization's own code compiled out entirely
+(`retransmission_suppressed_expired=0` for all six C runs, by
+construction). **This proves the new send-time check's own, isolated
+causal contribution to the observed wire-byte reduction and delivery
+pattern is negligible** -- the actual driver is the pre-existing,
+previously-inert pruning mechanism, activated as a side effect of
+configuring `lifespan` at all, not the code this task wrote.
+
+### 11-19. Causal gate
+
+1. Expired retransmission traffic materially decreases: **true**, but
+   not because of this task's own code (see item 10).
+2. Fresh-deadline success improves, or does not regress while
+   useful/wire efficiency materially improves: fresh-deadline does
+   **not improve** (flat at N=8, mean -0.86pp at N=4, all 3 N=4 seeds
+   non-positive) -- and the wire-efficiency gain that DOES exist is now
+   proven (item 10) not attributable to the suppression mechanism this
+   task built.
+3. No correctness regression for unexpired/unknown-deadline traffic:
+   confirmed at the code level (GREEN probe, item 5) -- not the
+   deciding factor here.
+4. Simulator remains valid: confirmed, `sim_lag_s < 10.0` throughout.
+
+Per this task's own explicit rule -- *"If suppression reduces bytes
+but produces no meaningful benefit: report that honestly; do not claim
+performance improvement"* and *"prove the improvement comes from the
+suppression"* -- the ablation disproves that requirement. **VERDICT:
+REVERT.**
+
+### 20. Revert
+
+`git checkout --` on every file this task touched
+(`ros2_ws/src/rmw_fleetqox_cpp/CMakeLists.txt`,
+`ros2_ws/src/rmw_fleetqox_cpp/src/rmw_pubsub.cpp`,
+`scripts/fleetqox_rmw_trace_endpoint.py`,
+`scripts/run_ns3_docker_container_fleet_probe.py`,
+`tests/test_rmw_fleetqox_cpp_package.py`), plus deletion of the new
+probe file
+(`ros2_ws/src/rmw_fleetqox_cpp/src/deadline_aware_retransmission_suppression_probe.cpp`)
+and a rebuild of `librmw_fleetqox_cpp.so` from the reverted source,
+confirmed by `git status --short` returning empty and the full test
+suite returning to exactly 888 passed / same 8 pre-existing failures.
+The repository is byte-for-byte back to commit `ac3763a`. Aggregated
+per-run A/B/C summary data:
+`docs/data/deadline_suppression_ab_20260925/summary.json`.
+
+### 23 (sharper next-task candidate, superseding the previous one)
+
+The PREVIOUS section's own candidate ("deadline-aware retransmission
+suppression") is now proven NOT to be the right lever -- it is not the
+optimization worth pursuing. The genuinely interesting, evidence-backed
+candidate this ablation surfaced instead: **the pre-existing lazy
+ledger-pruning mechanism itself** (already implemented, already
+triggered by `qos.lifespan`, already responsible for a 55-74% wire-byte
+reduction with no clean single-seed evidence yet of a real fresh-
+deadline effect either way) deserves its own, independent, properly-
+paired investigation -- specifically, whether ACTIVATING it (via
+`lifespan`) has ANY causal effect on fresh-deadline success at a larger
+seed count, independent of the (now-reverted) new send-time check. This
+is a DIFFERENT, sharper hypothesis than before, not a repeat of this
+task.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
