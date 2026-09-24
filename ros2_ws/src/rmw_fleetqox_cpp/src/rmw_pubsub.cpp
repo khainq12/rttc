@@ -570,6 +570,32 @@ struct LossFunnelSendEvent
   // g_loss_funnel_current_send.is_retransmission (see that struct's own
   // doc comment for how it gets there), purely observational.
   bool is_retransmission{false};
+  // Added for the "RETRANSMISSION-DELAYS-FIRST-ATTEMPT" investigation (see
+  // docs/AUDIT_ACCEPTANCE_TRACKING.md, dated 24/09/2026): lets Python-side
+  // analysis compute first_send_wait = first_sendto_ns - T_publish_ready
+  // and separately localize LOCAL_SEND_BLOCKING (waiting on
+  // udp_send_mutex_, this file's sole cross-send-type convergence point)
+  // from WIFI_AIRTIME_CONTENTION (delay after sendto() actually runs).
+  // Both captured UNCONDITIONALLY (not gated by
+  // publish_stage_profiling_enabled(), unlike the pre-existing
+  // mutex_wait_t0/kUdpSendMutexWait aggregate-only stat a few lines above
+  // this function) so they are always available whenever loss-funnel
+  // tracing itself is on -- cost is two extra monotonic_timestamp_ns()
+  // calls (cheap clock_gettime) per send_datagram_to_targets() call, only
+  // ever paid when FLEETQOX_RMW_LOSS_FUNNEL_TRACE_PROFILING is already
+  // set. enqueue_ns: timestamp taken at the very top of
+  // send_datagram_to_targets(), before udp_send_mutex_ is even attempted
+  // -- this is the entry instant for THIS specific send call (first
+  // attempt or retransmission alike). first_sendto_ns: timestamp taken
+  // immediately after udp_send_mutex_ is acquired, i.e. the instant this
+  // call is actually able to begin its sendto() loop (pace_udp_send_locked()
+  // is a confirmed no-op in this harness -- see the audit's proven fact
+  // #5 -- so this is a precise T_first_sendto proxy for the first target).
+  // Both are 0 for any LossFunnelSendEvent recorded before this field was
+  // added is impossible (additive-only, always populated once tracing is
+  // active).
+  std::int64_t enqueue_ns{0};
+  std::int64_t first_sendto_ns{0};
 };
 
 struct LossFunnelRecvEvent
@@ -7240,6 +7266,13 @@ private:
     const char * label,
     bool * out_exceeds_path_mtu = nullptr)
   {
+    // Unconditional (not gated by publish_stage_profiling_enabled()) entry
+    // timestamp for the "RETRANSMISSION-DELAYS-FIRST-ATTEMPT" investigation
+    // -- see LossFunnelSendEvent::enqueue_ns's doc comment. Cheap
+    // clock_gettime; always taken so it is available whenever loss-funnel
+    // tracing is separately enabled, without depending on the unrelated
+    // publish-stage-profiling flag also being on.
+    const std::int64_t send_call_entry_ns = monotonic_timestamp_ns();
     const size_t payload_size = payload.size();
     size_t previous_high_water = udp_datagram_size_high_water_.load(
       std::memory_order_relaxed);
@@ -7281,6 +7314,12 @@ private:
     if (profiling) {
       record_publish_stage(PublishStage::kUdpSendMutexWait, monotonic_timestamp_ns() - mutex_wait_t0);
     }
+    // Unconditional twin of the above -- see LossFunnelSendEvent::
+    // first_sendto_ns's doc comment. Taken right after udp_send_mutex_ is
+    // acquired (this is the moment this call can actually begin its
+    // sendto() loop; pace_udp_send_locked() below is a proven no-op in
+    // this harness), independent of publish_stage_profiling_enabled().
+    const std::int64_t post_mutex_ns = monotonic_timestamp_ns();
     const bool loss_funnel_tracing =
       loss_funnel_trace_profiling_enabled() && g_loss_funnel_current_send.active;
     auto record_loss_funnel_event = [&](
@@ -7301,6 +7340,8 @@ private:
       event.failed_target = failed_target;
       event.wall_ns = monotonic_timestamp_ns();
       event.is_retransmission = g_loss_funnel_current_send.is_retransmission;
+      event.enqueue_ns = send_call_entry_ns;
+      event.first_sendto_ns = post_mutex_ns;
       std::lock_guard<std::mutex> trace_lock(g_loss_funnel_trace_mutex);
       g_loss_funnel_send_events.push_back(std::move(event));
     };
@@ -15742,6 +15783,8 @@ const char * rmw_fleetqox_cpp_loss_funnel_send_trace_json()
     built += "\"wall_ns\":" + std::to_string(event.wall_ns) + ",";
     built += "\"is_retransmission\":";
     built += event.is_retransmission ? "true" : "false";
+    built += ",\"enqueue_ns\":" + std::to_string(event.enqueue_ns) + ",";
+    built += "\"first_sendto_ns\":" + std::to_string(event.first_sendto_ns);
     built += "}";
   }
   built += "]";
