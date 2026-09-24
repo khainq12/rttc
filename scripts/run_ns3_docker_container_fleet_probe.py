@@ -2067,6 +2067,7 @@ def run_probe(
     endpoint_results: dict[str, Any] = {}
     ns3_log_text = ""
     discovery_bytes_ftap0: int | None = None
+    total_wire_bytes_ftap0: int | None = None
     resource_usage: dict[str, dict[str, float]] = {}
     wifi_stats: dict[str, Any] | None = None
     ns3_real_elapsed_s_at_log_read: float | None = None
@@ -2123,6 +2124,17 @@ def run_probe(
             zenoh_control_station_explicit_listen=zenoh_control_station_explicit_listen,
         )
         probe.wait_for_ready_then_start(ready_deadline_s=ready_deadline_s)
+        # Read back on the SUCCESS path too (previously only read on
+        # ReadinessFailure, see that branch's own comment below) -- this
+        # is the only way to get a real per-endpoint discovery_convergence_s
+        # for a run that actually passed, needed for the official Table V
+        # Wi-Fi baseline's own "setup convergence time" column (see
+        # docs/AUDIT_ACCEPTANCE_TRACKING.md, "OFFICIAL TABLE V WI-FI
+        # DIRECT BASELINE"). Best-effort: does not affect status/error.
+        try:
+            readiness_diagnostics = probe.collect_readiness_diagnostics(results_dir_container)
+        except Exception:  # noqa: BLE001
+            pass
         # Snapshot right as the shared start-gate releases -- by
         # definition every endpoint has finished its own discovery by this
         # point (that's what "ready" means here), so this delta is the
@@ -2146,6 +2158,14 @@ def run_probe(
             results_dir_container=results_dir_container,
         )
         endpoint_results = probe.collect_results(results_dir_container)
+        # Total wire bytes (RX+TX, control_station's ftap0) across the
+        # WHOLE run -- discovery_bytes_ftap0 above only covers the
+        # pre-ready discovery phase; this covers discovery+data+drain
+        # combined, needed for the official Table V Wi-Fi "useful/wire
+        # efficiency" column (see docs/AUDIT_ACCEPTANCE_TRACKING.md,
+        # "OFFICIAL TABLE V WI-FI DIRECT BASELINE"). Read-only, changes
+        # no traffic/timing -- purely additive.
+        total_wire_bytes_ftap0 = probe.tap_byte_counter() - discovery_bytes_before
         # wait_for_completion() above returns as soon as every endpoint's
         # result file appears, which can be well before enough SIMULATED
         # (~= real, since this is RealtimeSimulatorImpl) time has passed
@@ -2281,6 +2301,7 @@ def run_probe(
         "latency_stats_ms": compute_latency_stats_ms(endpoint_results),
         "jitter_stale_repair_stats": compute_jitter_stale_repair_stats(endpoint_results),
         "discovery_bytes_ftap0": discovery_bytes_ftap0,
+        "total_wire_bytes_ftap0": total_wire_bytes_ftap0,
         # max, not mean: the paper's own definition ("đến khi graph đạt
         # trạng thái quan sát ổn định") is a whole-fleet property -- the
         # graph isn't stable until its SLOWEST endpoint converges, same

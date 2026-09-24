@@ -20650,6 +20650,233 @@ explanation (genuine channel congestion, evidenced by the 45s
 diagnostic plateau) rather than an unexplained failure. No open
 "unknown cause" remains at any scale attempted.
 
+## OFFICIAL TABLE V WI-FI DIRECT BASELINE (24/09/2026)
+
+Frozen from commit `3f2b4e2`, Docker image `localhost/fleetrmw/rmw-netem:jazzy`
+digest `sha256:789b7624f1463672ad7bf26a220db160f1efa85e366f268d5e5736de797315ee`
+(re-confirmed fresh via `check_image_freshness()` immediately before this
+run: `image_created_epoch=1790162393 > dockerfile_last_commit_epoch=1789132907`,
+`apt_ns3_package_present=False` -- proof recorded verbatim as the first
+line of every raw `official_N{2,4,8}.jsonl` file). Frozen correctness
+flags, threaded through `run_probe()` and printed into EVERY per-run
+JSON record (`docs/data/wifi_official_baseline_20260924/official_N{2,4,8}.jsonl`):
+`topology_aware_readiness=True`, `sustain_beacon_until_deadline=True`,
+`zenoh_control_station_explicit_listen=True`, `discovery_timeout_s=15.0`
+(unchanged, verified in every record). No radio/workload parameter,
+middleware discovery config, or FleetRMW code changed in this task.
+
+### 0. Reporting ambiguity resolution
+
+The prior turn's own chat summary claimed "setup convergence: sub-second
+to ~20s for all GREEN runs." That number is WRONG as stated: it came
+ONLY from the diagnostic-only `discovery_timeout_s=45.0` CycloneDDS N=8
+side-experiment (`robot_0000` converging at 20.349s, `robot_0001` at
+20.725s -- both inside a 45s-timeout run, never a 15s one). No GREEN
+(15s-timeout) run's setup convergence time was actually measured in
+that pilot -- `readiness_diagnostics` was only being captured on the
+`ReadinessFailure` path, not on success, so there was no real number to
+report for a passing run in the first place. Fixed this turn:
+`run_probe()` now calls `collect_readiness_diagnostics()` on the
+SUCCESS path too (diagnostic-only, reads a file every endpoint already
+writes unconditionally; changes no pass/fail decision), so every
+record in this official baseline carries a REAL, measured
+`setup_convergence_max_s` (max across endpoints, i.e., when the
+slowest-to-converge endpoint in that run actually finished). Confirmed
+by the data itself: EVERY VALID run's `setup_convergence_max_s` is
+comfortably under its own `discovery_timeout_s=15.0` (by construction
+-- a run cannot be VALID/readiness-passed otherwise) -- see the per-
+scale tables below for the real, measured ranges. The doc's own prior
+sections never actually asserted the wrong "~20s for GREEN runs" claim
+in writing (grep-confirmed) -- only the interim chat reply did; this
+section is the correction of record.
+
+### 1-3. Scope, scales, middleware
+
+N=2, N=4, N=8 only (no N=16 performance comparison -- it remains
+INVALID_SIMULATOR per the existing, independently-established finding
+and was not re-tested here). All four middleware run at every scale;
+CycloneDDS N=8 is the sole exception, per its own already-proven
+genuine-Wi-Fi-congestion INVALID_READINESS finding.
+
+### 3. Seed / replication protocol
+
+Paired + counterbalanced, reusing the EXACT already-frozen LAN protocol
+(`scripts/run_lan_n16_paired_20seed_experiment.py`): same seed run
+across all 4 middleware (pairing unit = seed/workload-trace), execution
+order cyclically rotated by seed index (`counterbalanced_order()`,
+identical formula). Seed list: the already-established
+`PRIOR_10_SEED_LIST` -- `7, 13, 29, 41, 53, 67, 79, 89, 97, 101` -- the
+first 10 of the frozen 20-seed list, used here rather than the full 20
+for practical wall-clock reasons (~2 hours of live Docker/ns-3 runs for
+10 seeds x 3 scales); this is an explicit, disclosed scope reduction
+from "the full 20-seed protocol," not a silent one. No seed was ever
+retried -- first-attempt outcome is the recorded outcome for every one
+of the 117 live runs below.
+
+Early validity gate (applied ONLY to CycloneDDS N=8, the one
+combination already proven systematically invalid): after 3 live
+confirmation seeds (7, 13, 29) all independently reproduced
+`INVALID_READINESS`, the remaining 7 seeds were not run live and are
+recorded as `EARLY_EXIT_CONFIRMED_INVALID` rather than burning ~7 more
+minutes reconfirming an already-established finding. Every other
+combination (15 of 16 middleware x N cells) ran the full 10 live seeds.
+
+Total: 117 live `run_probe()` invocations (40 + 40 + 27 + 3 CycloneDDS
+N=8 confirmations) + 7 recorded early-exits.
+
+### 6. N=2 official table (n=10 seeds each, all VALID)
+
+| Middleware | n_valid/attempted | Delivery% | Fresh-deadline% | p50 (ms) | p99 (ms) | AoI (s) | Wire eff. | Setup conv. max (s) | sim_lag_s max | CPU% | RSS (MB) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| FleetRMW | 10/10 | 100.0 | 100.0 | 2.78 | 13.73 | 0.017 | 3.8% | ~0 (static, no discovery) | 0.018 | 66.6 | 38.3 |
+| Fast DDS | 10/10 | 100.0 | 100.0 | 1.41 | 2.98 | 0.015 | 20.5% | 1.34 (max 1.40) | 0.025 | 60.0 | 46.2 |
+| CycloneDDS | 10/10 | 100.0 | 100.0 | 1.39 | 3.01 | 0.015 | 16.7% | 0.44 (max 0.58) | 0.021 | 62.9 | 37.7 |
+| Zenoh | 10/10 | 100.0 | 100.0 | 1.56 | 3.44 | 0.015 | 33.8% | 0.48 (max 0.82) | 0.017 | 60.2 | 45.8 |
+
+Superiority gate (N=2): n_paired=10, mean diff = 0.00pp, 95% CI
+[0.00, 0.00] -- **NOT MET** (all four tie at 100%/100%, no separation
+possible).
+
+### 7. N=4 official table (n=10 seeds each, all VALID)
+
+| Middleware | n_valid/attempted | Delivery% | Fresh-deadline% | p50 (ms) | p99 (ms) | AoI (s) | Wire eff. | Setup conv. max (s) | sim_lag_s max | CPU% | RSS (MB) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| FleetRMW | 10/10 | 88.0 (sd 1.66) | **9.2** (sd 0.87) | 1060.0 | 13054.5 | 5.76 | 0.6% | ~0 | 2.98 | 66.0 | 38.2 |
+| Fast DDS | 10/10 | 100.0 | 100.0 | 1.63 | 4.52 | 0.013 | 19.8% | 1.53 (max 1.63) | 0.053 | 61.1 | 44.8 |
+| CycloneDDS | 10/10 | 100.0 | 100.0 | 1.64 | 5.46 | 0.014 | 13.4% | 2.38 (max 3.03) | 0.046 | 65.7 | 38.1 |
+| Zenoh | 10/10 | 100.0 | 100.0 | 1.82 | 6.88 | 0.013 | 33.9% | 0.86 (max 0.93) | 0.054 | 59.9 | 44.0 |
+
+**FleetRMW's fresh-deadline column is the notable new finding here**:
+delivery_pct alone (88.0%) looked reasonable in every prior turn's
+reporting, but `stale_ratio` is 0.895 -- 89.5% of the messages that DO
+arrive, arrive AFTER their own deadline. Fresh-deadline success (the
+metric the superiority gate actually uses, matching the established
+LAN methodology's own `delivery_pct x (1 - stale_ratio)` formula) is
+only 9.2%. This was not visible in prior turns because fresh-deadline
+success was never computed for Wi-Fi before this task.
+
+Superiority gate (N=4): n_paired=10, mean diff = **-90.77pp**, 95% CI
+[-91.28, -90.25] -- **NOT MET** (FleetRMW trails, not leads).
+
+### 8. N=8 official table
+
+| Middleware | n_valid/attempted | Delivery% | Fresh-deadline% | p50 (ms) | p99 (ms) | AoI (s) | Wire eff. | Setup conv. max (s) | sim_lag_s max | CPU% | RSS (MB) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| FleetRMW | 10/10 | 56.4 (sd 4.00) | **1.4** (sd 0.16) | 3322.5 | 27252.9 | 5.44 | 0.7% | ~0 | 7.85 | 62.3 | 37.8 |
+| Fast DDS | 10/10 | 81.3 (sd 1.59) | **0.0** | 7309.3 | 7766.6 | 7.22 | 11.3% | 5.17 (max 7.05) | 4.63 | 63.3 | 43.9 |
+| CycloneDDS | **0/10** | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- |
+| Zenoh | 10/10 | 69.9 (sd 2.26) | **69.4** (sd 2.25) | 2.46 | 39.5 | 0.030 | 28.4% | 3.83 (max 4.71) | 0.98 | 61.6 | 43.8 |
+
+CycloneDDS N=8: 3/3 live confirmation seeds INVALID_READINESS
+(consistent with the prior turn's finding), 7/10 EARLY_EXIT_CONFIRMED_INVALID
+per the gate above. **n_valid/attempted = 0/10.**
+
+**Fast DDS's fresh-deadline column is a second notable new finding**:
+its delivery_pct (81.3%) looked like the best non-FleetRMW number at
+N=8 in every prior turn's reporting, but `stale_ratio=1.0` -- literally
+every single delivered Fast DDS message at N=8 arrived after its
+deadline (p50=7.3s, matching the ~3s send window plus queueing under
+real contention). Fresh-deadline success is 0.0%. Zenoh, by contrast,
+has stale_ratio=0.0076 (almost nothing late) and fresh-deadline=69.4%,
+essentially equal to its raw delivery_pct. This is a purely descriptive,
+already-computed finding -- not something this task investigates
+further or fixes.
+
+Superiority gate (N=8): n_paired=10 (FleetRMW vs. best-of-{Fast DDS,
+Zenoh}, CycloneDDS excluded as invalid), mean diff = **-68.05pp**, 95%
+CI [-69.32, -66.76] -- **NOT MET**.
+
+### 9. Invalid/infrastructure counts (all three scales combined)
+
+- INVALID_READINESS: 3 (CycloneDDS N=8, live-confirmed).
+- EARLY_EXIT_CONFIRMED_INVALID: 7 (CycloneDDS N=8, not re-run per the
+  early-validity gate -- disclosed here, not silently omitted).
+- INVALID_SIMULATOR: 0 (every VALID run's `sim_lag_s` stayed under the
+  10.0s threshold at every scale attempted -- worst observed was Fast
+  DDS N=8 at 4.63s and FleetRMW N=8 at 7.85s, both comfortably clear).
+- INFRASTRUCTURE_FAILURE: 0.
+
+### 12. Fleet N=8 retransmission descriptive statistics (all 10 valid seeds, no causal claim)
+
+| Seed | app_tx | app_rx | frames_sent | frames_received | nack_retrans | frag_retrans | delivery% |
+|---|---|---|---|---|---|---|---|
+| 7 | 1598 | 923 | 13391 | 17272 | 11793 | 67 | 57.8 |
+| 13 | 1573 | 902 | 11501 | 18520 | 9928 | 85 | 57.3 |
+| 29 | 1607 | 933 | 10690 | 15783 | 9083 | 121 | 58.1 |
+| 41 | 1619 | 804 | 6017 | 16820 | 4398 | 122 | 49.7 |
+| 53 | 1592 | 899 | 11909 | 17747 | 10317 | 100 | 56.5 |
+| 67 | 1590 | 974 | 10024 | 18277 | 8434 | 125 | 61.3 |
+| 79 | 1591 | 812 | 3157 | 15445 | 1566 | 79 | 51.0 |
+| 89 | 1608 | 844 | 2487 | 16375 | 879 | 129 | 52.5 |
+| 97 | 1543 | 911 | 14133 | 17783 | 12590 | 86 | 59.0 |
+| 101 | 1595 | 968 | 13342 | 14823 | 11747 | 125 | 60.7 |
+
+`reliable_timeout_retransmissions=0` for all 10 seeds. Descriptive
+only, per this task's own rule: `nack_retransmissions` varies by more
+than 14x across seeds (879 to 12590) with no monotonic relationship to
+`delivery_pct` visible by inspection (seed 41's low nack count of 4398
+still only reaches 49.7% delivery, the WORST of the 10 seeds) -- this
+is reported as raw correlation-eligible data only; no causal claim
+about retransmission traffic driving the delivery gap is made here, per
+this task's own explicit instruction that such a claim requires a
+separate controlled A/B.
+
+### 13-15. Fresh/deadline paired differences, bootstrap CI, superiority gate -- summary
+
+| N | n_paired | Mean diff (Fleet vs. best-of-others), pp | 95% CI | Gate |
+|---|---|---|---|---|
+| 2 | 10 | 0.00 | [0.00, 0.00] | NOT MET |
+| 4 | 10 | -90.77 | [-91.28, -90.25] | NOT MET |
+| 8 | 10 | -68.05 | [-69.32, -66.76] | NOT MET |
+
+Gate definition unchanged from its first establishment (LAN 20-seed
+experiment): mean diff >= +15.0pp AND bootstrap 95% CI lower bound > 0
+(`analyze_lan_n16_paired_experiment.py`'s own constants,
+`SUPERIORITY_MIN_DELTA_PP=15.0`, 10,000 resamples). Not weakened or
+redefined after seeing results -- the gate was already NOT MET on LAN
+before this task began.
+
+### 16. Setup convergence summary
+
+All real, measured (not diagnostic-only) this time -- see per-scale
+tables above for exact means/maxes. Every VALID run's own max
+per-endpoint `discovery_convergence_s` stayed under its `discovery_timeout_s=15.0`
+by construction (else it would not be VALID). Range observed:
+essentially 0 for FleetRMW (static mode, `--skip-discovery-wait`) up to
+~7.05s (Fast DDS N=8's single worst endpoint) -- comfortably inside the
+frozen 15s budget at every scale actually reported as VALID.
+
+### 17. CPU/RSS summary
+
+CPU% (mean of per-endpoint-container `docker stats`) clusters
+59-67% across every middleware/scale with no large outlier. RSS
+clusters 37-46MB. No CPU/RSS-driven explanation is visible for any of
+the delivery differences reported above.
+
+### 18. Raw data paths
+
+`docs/data/wifi_official_baseline_20260924/official_N{2,4,8}.jsonl` --
+one JSON line per run (first line of each file is the image-freshness
+diagnostic dict, proving the frozen image was verified fresh
+immediately before that scale's batch started).
+
+### 19-20. Which Wi-Fi results are now paper-usable
+
+**Now paper-usable**: N=2 (all 4 middleware, 10/10 seeds each), N=4
+(all 4 middleware, 10/10 seeds each), N=8 for FleetRMW/Fast DDS/Zenoh
+(10/10 seeds each) -- 11 of the 12 attempted middleware x N cells at
+these three scales.
+
+**Still unusable**: CycloneDDS N=8 (INVALID_READINESS, genuine Wi-Fi
+channel congestion, proven previous turn) and N=16 for any middleware
+(INVALID_SIMULATOR / not attempted here, per this task's own explicit
+scope exclusion). All pre-24/09/2026 stale-image Wi-Fi numbers remain
+SUPERSEDED_INVALID_ENVIRONMENT (unchanged). The 3-seed 23/09/2026
+readiness-fix pilot data remains labeled pilot/validation evidence, not
+statistically mixed with this 10-seed official set. LAN and 5G remain
+untouched. Table VI remains superseded where it used the stale
+Wi-Fi/ns-3 image; not regenerated here.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
