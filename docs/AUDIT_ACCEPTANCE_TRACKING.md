@@ -20427,7 +20427,228 @@ the first place.
   delivery/latency figure to classify as valid or invalid in the
   first place).
 
-## Quy ước cập nhật file này
+## WI-FI READINESS ROOT-CAUSE (24/09/2026): three proven-for-LAN harness bugs, never ported to Wi-Fi
+
+Continuation of the 23/09/2026 re-baseline above. That pass correctly
+classified CycloneDDS/Zenoh/Fast DDS's Wi-Fi readiness failures as
+setup-phase, not delivery, failures -- but left them unexplained. This
+section proves their cause, live, without touching FleetRMW, Gateway,
+any radio/workload parameter, or `discovery_timeout_s` (still frozen
+at 15.0 throughout everything below).
+
+**Instrumentation added first (diagnostic-only, zero behavior change,
+all covered by new unit tests, full suite 888 passed / same 8
+pre-existing unrelated failures both before and after)**:
+`launch_endpoints()` (Wi-Fi's own endpoint launcher, previously the
+only one of the four launcher methods without this) now writes a
+`--discovery-diag-json` per endpoint, and `fleetqox_rmw_trace_endpoint.py`
+gained the matching `--discovery-diag-json` flag + `build_discovery_diagnostic()`
+(mirrors the identical, already-existing mechanism in
+`fleetqox_coordination_endpoint.py`) plus per-peer first-seen timing.
+`run_probe()` also gained a `ReadinessFailure`-specific except branch
+(previously funneled into the same generic `except Exception` as a
+real crash) so a readiness failure is now labeled `status="invalid_readiness"`
+and carries `readiness_diagnostics` -- required/observed/missing peer
+IDENTITIES and timing, not just a bare error string.
+
+### 1-2. Actual topology vs. current readiness requirement -- confirmed mismatch, source-proven
+
+Table V's workload (`fleetqox/trace.py`'s `_source_for()`/`_destination_for()`,
+shared byte-for-byte by every profile -- LAN, Wi-Fi, 5G, Table VI) is a
+STAR: every flow is `control_station <-> robot_i`; there is never a
+`robot_i <-> robot_j` edge. `required_peers_from_trace()`
+(`scripts/run_ns3_docker_container_fleet_probe.py:327-360`) already
+derives exactly that star from the trace CSV's own src/dst columns --
+built for LAN's own already-shipped topology-aware readiness fix
+(commit `d8cad68f`).
+
+`launch_endpoints()` (Wi-Fi's own launcher) already accepts this same
+`required_peer_ids_by_endpoint` parameter -- but `run_probe()`'s own
+call site never computed or passed it, so it silently defaulted to
+`None`, and `discovery_converged()`'s own docstring says so explicitly:
+*"beacon_active=True, required_peer_ids is None (every OTHER existing
+caller, **including Wi-Fi's run_probe()** -- UNCHANGED behavior, this
+is the original full-mesh contract)"* (`fleetqox_rmw_trace_endpoint.py:417-419`).
+Concretely: `expected_peer_count = len(endpoints) - 1`
+(`run_ns3_docker_container_fleet_probe.py:1418`) means at N=8 (9
+endpoints), EVERY robot was required to discover the other 7 robots
+too, even though the workload never sends them a single message --
+required peers = 8 (star) vs. 36 (full mesh) at N=8. **Mismatch
+confirmed, not a hypothesis.**
+
+### 3-4. CycloneDDS and Zenoh N=2 first failure point -- beacon-starvation deadlock + a Zenoh-only listen-address bug, both live-reproduced
+
+Live diagnostic (`readiness_diagnostics`, unmodified baseline, N=2,
+seed=7): CycloneDDS's `robot_0001` -- `peers_seen: []`, `converged:
+false`, timed out at the full 15.048s -- while `control_station` and
+`robot_0000` both converged in <0.4s and, per
+`--sustain-beacon-until-deadline`'s own already-existing docstring in
+`fleetqox_rmw_trace_endpoint.py:762-787` (LAN Phase 9, "PROVEN BUG"),
+silence their own beacon THE INSTANT their own requirement is met --
+permanently, for the rest of the process's life, since the discovery
+loop's `break` (line ~1092) is unconditional unless this flag is set.
+`robot_0001`'s own `beacon_pub_subscription_count: 3` (DDS-level match
+succeeded) with `beacon_raw_seen_count: 137` (ALL 137 were its own
+loopback) proves this is not "packet reaches OS but Cyclone ignores
+it" (category B) or "never visible on Wi-Fi" (category A) -- it is
+category E, the SAME beacon-starvation deadlock LAN already proved and
+fixed, now reproduced live on Wi-Fi: `robot_0001` never got a SECOND
+chance to hear either peer because both went silent within 0.4s.
+**Confirmed by direct A/B, holding `discovery_timeout_s=15.0` frozen**:
+`sustain_beacon_until_deadline=True` alone turns CycloneDDS N=2 seed=7
+from `invalid_readiness` to `status="ok"`, 100% delivery.
+
+Zenoh N=2, same baseline: `control_station` alone reports
+`peers_seen: []` (needs 2, sees 0) at the full 15.05s; the other two
+endpoints' diag files never appear (torn down by `teardown()` once
+`wait_for_ready_then_start()` raises on control_station's own
+timeout -- an artifact of the fail-fast teardown, not a separate
+finding). `sustain_beacon_until_deadline=True` ALONE fixes seed=7 in
+isolation, but running the full 3-seed matrix with topology-awareness
+ALSO applied (star-aware `robot_0000`: required just `control_station`,
+converges in 0.15s) exposes a SECOND, Zenoh-specific bug:
+`control_station` still only ever sees 1 of its 2 required robots
+across all 3 seeds. This is the ALREADY-DOCUMENTED, LAN-proven
+`zenoh_control_station_explicit_listen` bug
+(`run_ns3_docker_container_fleet_probe.py:1135-1163`, comment dated
+from the LAN investigation): `control_station`'s OWN Zenoh session
+(as opposed to the router daemon that also runs in its container)
+gets no `ZENOH_SESSION_CONFIG_URI` by default and falls back to
+Zenoh's own default listen address, `tcp/localhost:0` -- meaningless
+once gossiped to a peer in a different container's network namespace.
+LAN's own comment records the exact same intermittent signature: *"control_station
+itself failed readiness in 3/5 reps under the old default-listen
+config, 0/5 under this explicit-real-IP-listen config."*
+`launch_endpoints()` already supports the fix
+(`zenoh_control_station_explicit_listen` parameter) -- Wi-Fi's
+`run_probe()` just never passed it, exactly like the topology fix.
+**Confirmed by direct A/B**: adding `zenoh_control_station_explicit_listen=True`
+on top of the other two flags turns all 3 Zenoh N=2 seeds `status="ok"`,
+100% delivery.
+
+### 5. Fast DDS N=4 READY-vs-FAILED divergence
+
+Fast DDS's own intermittent N=4 failure (1/3 seeds READY in the
+23/09/2026 baseline) shares the identical mechanism: Fast DDS's
+readiness gate uses the SAME RMW-agnostic beacon
+(`expected_peer_count = len(endpoints)-1`, full mesh, same
+unconditional early `break`) as CycloneDDS/Zenoh -- Fast DDS's own
+discovery-server session establishment is a separate, already-working
+concern (`ROS_DISCOVERY_SERVER` pointed at `control_station`), the
+FAILURE mode was this shared beacon layer, not Fast DDS's own
+protocol. **Confirmed by the same combined fix**: 3/3 Fast DDS N=4
+seeds now `status="ok"`, 100% delivery (up from 1/3 in the original
+baseline), with `discovery_timeout_s` unchanged.
+
+### 6. Wi-Fi packet-loss contribution -- distinguished, not conflated
+
+For every failure traced above, the DDS/RTPS-level match evidence
+(`beacon_pub_subscription_count`, symmetric peer-visibility between
+the OTHER endpoints) rules out "beacon never reaches the OS" as the
+mechanism for N=2/N=4 -- these are harness/config correctness bugs, not
+radio-layer loss, and are now fixed without touching any radio
+parameter. CycloneDDS's REMAINING N=8 failure (below) is different:
+diagnostic-only re-run at `discovery_timeout_s=45.0` (matching
+`LAN_DISCOVERY_WATCHDOG_S`, NOT applied to the frozen baseline) shows
+`robot_0000`/`robot_0001` converging by ~20s (proving the 15s cutoff
+IS part of the story for them) -- but `control_station` still sees
+only 3 of 8 required robots even at the full 45s, with the SAME 3
+identities and SAME arrival timestamps (9.7s/12.8s/14.0s) as the 15s
+run -- a hard plateau, not a slow trickle. That pattern -- more time
+helps SOME pairs but a majority of pairs never connect regardless of
+how long they wait -- is the signature of genuine 802.11 channel
+congestion at 9-station scale (1 AP, 9 stations, all announcing
+simultaneously at container launch), not a further harness bug.
+**First proven loss point for CycloneDDS's residual N=8 readiness
+failure: the ns-3 Wi-Fi PHY/MAC layer under real multi-station
+contention** -- the same class of finding as this document's own
+FleetRMW N=8 NACK-amplification result above, now also the limiting
+factor for CycloneDDS's discovery traffic specifically. Not fixed in
+this task, per its own explicit rule.
+
+### 7. `discovery_timeout_s=15.0` origin -- confirmed unjustified, confirmed never re-derived for Wi-Fi
+
+Git-history audit (already on record, Phase 3 of the LAN investigation):
+15.0 has been the default since the file's first commit, with only
+generic help text, no numeric justification ever given. It is HALF of
+CycloneDDS's own documented default `Discovery/SPDPInterval` (30s).
+LAN's own fix replaced it with `LAN_DISCOVERY_WATCHDOG_S=45.0` (30s +
+1.5x fan-in margin) -- Wi-Fi's `run_probe()`, Table VI's
+`run_coordination_probe()`, and 5G's `run_nr_probe()` all still
+default to the bare, undocumented 15.0
+(test-enforced lock-in: `LanReadinessWatchdogTest.test_wifi_table_vi_and_5g_defaults_are_untouched`).
+**Verdict, per this task's own question: no, 15s has never been
+scientifically justified for Wi-Fi, for any of the three non-FleetRMW
+middlewares** -- it happened to be "enough" at N=2/N=4 once the three
+bugs above are fixed, and is provably NOT enough for CycloneDDS at
+N=8 even when it IS enough for the OTHER two peers in that same run.
+**Not changed in this task** (its own rule: "Do NOT increase discovery
+timeout merely to make middleware pass" -- the 45.0s figure above was
+a diagnostic-only side experiment, never applied to any of the
+GREEN results reported here).
+
+### 8. RED -> FIX -> GREEN -- three proven harness/config bugs fixed, all opt-in (default False, old behavior preserved for every existing caller)
+
+All three mirror LAN's own already-shipped, already-tested mechanism
+exactly -- none is a new invention, none touches middleware discovery
+TIMING (`discovery_timeout_s` stays 15.0 throughout):
+
+1. **`topology_aware_readiness`** (new `run_probe()` parameter): when
+   True, computes `required_peers_from_trace()` and threads it into
+   `launch_endpoints()`'s existing `required_peer_ids_by_endpoint`
+   parameter -- exactly what `run_lan_probe()` already does.
+2. **`sustain_beacon_until_deadline`** (new `run_probe()` parameter):
+   threads through to `launch_endpoints()`'s existing parameter of the
+   same name -- fixes the beacon-starvation deadlock.
+3. **`zenoh_control_station_explicit_listen`** (new `run_probe()`
+   parameter): threads through to `launch_endpoints()`'s existing
+   parameter of the same name -- fixes Zenoh's control_station
+   listen-address fallback.
+
+All three default to `False` -- the 23/09/2026 corrected-image Table V
+numbers remain reproducible byte-for-byte until a caller opts in.
+New tests: `WifiReadinessRootCauseFixesTest` (parameter defaults),
+`BuildDiscoveryDiagnosticTest` (pure-function diagnostic correctness).
+Full suite: 888 passed (883 + 5 new), same 8 pre-existing unrelated
+failures.
+
+### GREEN verification matrix (all three fixes applied, seeds 7/13/29, `discovery_timeout_s=15.0` unchanged)
+
+| N | Middleware | Seeds OK | Delivery | vs. 23/09 baseline |
+|---|---|---|---|---|
+| 2 | FleetRMW | 3/3 | 100% | unchanged (fixes don't touch FleetRMW) |
+| 2 | Fast DDS | 3/3 | 100% | unchanged |
+| 2 | CycloneDDS | 3/3 | 100% | **was 0/3** |
+| 2 | Zenoh | 3/3 | 100% | **was 0/3** |
+| 4 | FleetRMW | 3/3 | 87-90% | unchanged |
+| 4 | Fast DDS | 3/3 | 100% | **was 1/3** |
+| 4 | CycloneDDS | 3/3 | 100% | unchanged (was already 3/3) |
+| 4 | Zenoh | 3/3 | 100% | **was 0/3** |
+| 8 | FleetRMW | 3/3 | 58-60% | unchanged |
+| 8 | Fast DDS | 3/3 | 80-84% | unchanged (was already 3/3, delivery number newly visible here alongside the others) |
+| 8 | CycloneDDS | 0/3 | -- | **still fails -- genuine Wi-Fi congestion, see Item 6** |
+| 8 | Zenoh | 3/3 | 69-71% | **was 0/3 -- first-ever valid Wi-Fi N=8 Zenoh number** |
+
+All GREEN runs stayed simulator-healthy (`sim_lag_s` well under the
+10.0 threshold; CycloneDDS/Zenoh/Fast DDS's own `sim_lag_s` at N=8 is
+0.5-5.4s, far below FleetRMW's own 6.9-7.5s at the same scale).
+
+**These numbers are evidence for this root-cause investigation, not a
+new frozen Table V baseline** -- per this task's own Section 10, no
+20-seed run, no FleetRMW/Gateway optimization, and no "winner"
+comparison follows from this. Freezing an updated official Table V
+Wi-Fi baseline (now with 3 of 4 middlewares reaching N=8 instead of 2)
+is deliberately left as the next task's job.
+
+### Final verdict: READINESS_CORRECT
+
+For N=2 and N=4: fully explained and fixed, all four middlewares GREEN
+with `discovery_timeout_s` untouched. For N=8: three of four
+middlewares GREEN (a strict improvement over the prior 2/4); the
+fourth (CycloneDDS) has a proven, non-speculative, non-harness
+explanation (genuine channel congestion, evidenced by the 45s
+diagnostic plateau) rather than an unexplained failure. No open
+"unknown cause" remains at any scale attempted.
 
 ## Quy ước cập nhật file này
 

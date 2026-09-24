@@ -1277,6 +1277,19 @@ class ReferenceTopologyProbe:
         # caller (Wi-Fi's run_probe() never passes this).
         docker("exec", self.rigger_name, "mkdir", "-p", f"/work/{results_dir_container}")
         self._ready_files = [f"{results_dir_container}/ready_{i}" for i in range(len(self.endpoints))]
+        # Diagnostic-only (see launch_coordination_endpoints()'s identical
+        # field and collect_readiness_diagnostics()'s docstring): written
+        # unconditionally by every endpoint right after its own discovery
+        # loop exits, so a run that never reaches READY still yields
+        # per-endpoint required/observed/missing PEER IDENTITY data here.
+        # Wi-Fi's run_probe() never had this wired in (only the Table VI
+        # coordination launcher did) -- added to investigate the 23-
+        # 24/09/2026 corrected-image Wi-Fi readiness failures (see
+        # docs/AUDIT_ACCEPTANCE_TRACKING.md); adds a file write, changes
+        # no pass/fail decision.
+        self._readiness_diag_files = [
+            f"{results_dir_container}/readiness_diag_{i}.json" for i in range(len(self.endpoints))
+        ]
         self._start_file = f"{results_dir_container}/start"
         for i, endpoint in enumerate(self.endpoints):
             peers = ",".join(
@@ -1476,6 +1489,7 @@ class ReferenceTopologyProbe:
                 f"{skip_discovery_wait_flag}"
                 f"{sustain_beacon_flag} "
                 f"--summary-json=/work/{result_json} "
+                f"--discovery-diag-json=/work/{self._readiness_diag_files[i]} "
                 f"--ready-file=/work/{self._ready_files[i]} "
                 f"--start-file=/work/{self._start_file}"
             )
@@ -1941,7 +1955,19 @@ def run_probe(
     capacity_airtime_ns_per_second: int | None = None,
     event_filter: Callable[[list[dict[str, Any]]], list[dict[str, Any]]] | None = None,
     save_ns3_log_path: Path | None = None,
+    topology_aware_readiness: bool = False,
+    sustain_beacon_until_deadline: bool = False,
+    zenoh_control_station_explicit_listen: bool = False,
 ) -> dict[str, Any]:
+    # topology_aware_readiness / sustain_beacon_until_deadline: opt-in
+    # (default False, exact prior behavior for every existing caller),
+    # added 24/09/2026 to investigate the corrected-image Wi-Fi readiness
+    # failures documented in docs/AUDIT_ACCEPTANCE_TRACKING.md, "WI-FI
+    # READINESS ROOT-CAUSE (24/09/2026)". Both flags are ALREADY proven
+    # correct for LAN (run_lan_probe() passes both unconditionally) --
+    # this only threads the same, already-tested mechanism through to
+    # Wi-Fi's own call site so it can be A/B tested here without touching
+    # discovery_timeout_s or any radio/workload parameter.
     # save_ns3_log_path is a DIAGNOSTIC-ONLY hook (default None = no
     # behavior change): the full ns-3 stdout log is already read into
     # ns3_log_text below before teardown() destroys the container, but
@@ -2045,6 +2071,7 @@ def run_probe(
     wifi_stats: dict[str, Any] | None = None
     ns3_real_elapsed_s_at_log_read: float | None = None
     ns3sim_resource_usage: dict[str, float] | None = None
+    readiness_diagnostics: dict[str, Any] = {}
     try:
         probe.start_containers()
         probe.build_ns3_binary()
@@ -2087,6 +2114,13 @@ def run_probe(
             start_wait_timeout_s=start_wait_timeout_s,
             rmw_implementation=rmw_implementation,
             discovery_mode=discovery_mode,
+            required_peer_ids_by_endpoint=(
+                required_peers_from_trace(trace_path, policy, endpoints)
+                if topology_aware_readiness
+                else None
+            ),
+            sustain_beacon_until_deadline=sustain_beacon_until_deadline,
+            zenoh_control_station_explicit_listen=zenoh_control_station_explicit_listen,
         )
         probe.wait_for_ready_then_start(ready_deadline_s=ready_deadline_s)
         # Snapshot right as the shared start-gate releases -- by
@@ -2143,6 +2177,24 @@ def run_probe(
         ns3sim_resource_usage = probe.sample_ns3sim_resource_usage()
         ns3_log_text = probe.ns3_log()
         wifi_stats = parse_wifi_stats(ns3_log_text, stats_target_s)
+    except ReadinessFailure as exc:
+        # See run_lan_probe()'s identical branch -- a setup/readiness-
+        # validity failure, not a delivery/latency result, must be
+        # classified separately (per docs/AUDIT_ACCEPTANCE_TRACKING.md,
+        # "TABLE V WI-FI RE-BASELINE (23/09/2026)" and this task's own
+        # explicit rule). result_i.json never gets written on this path,
+        # but each endpoint's own readiness_diag_i.json still can have
+        # been -- read it back for root-cause diagnosis.
+        status = "invalid_readiness"
+        error_text = str(exc)
+        try:
+            ns3_log_text = probe.ns3_log()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            readiness_diagnostics = probe.collect_readiness_diagnostics(results_dir_container)
+        except Exception:  # noqa: BLE001
+            pass
     except Exception as exc:  # noqa: BLE001 -- report to caller, don't hide the traceback
         status = "failed"
         error_text = str(exc)
@@ -2198,6 +2250,7 @@ def run_probe(
         "schema_version": "fleetqox.ns3_docker_container_fleet_probe.v1",
         "status": status,
         "error": error_text,
+        "readiness_diagnostics": readiness_diagnostics,
         "trace": str(trace_path.relative_to(ROOT)),
         "packet_rows": packet_rows,
         "num_robots": num_robots,

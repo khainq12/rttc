@@ -847,5 +847,33 @@ class LanReadinessWatchdogTest(unittest.TestCase):
         )
 
 
+class WifiReadinessRootCauseFixesTest(unittest.TestCase):
+    """PROVEN 24/09/2026 (see docs/AUDIT_ACCEPTANCE_TRACKING.md, "WI-FI
+    READINESS ROOT-CAUSE"): three harness/config correctness bugs
+    already fixed for LAN were never ported to Wi-Fi's run_probe() --
+    full-mesh (not star) readiness, the beacon-starvation deadlock, and
+    Zenoh's control_station localhost-listen fallback. All three are
+    live-A/B-confirmed to restore N=2/N=4 readiness for CycloneDDS/
+    Zenoh/Fast DDS with discovery_timeout_s left at its frozen 15.0.
+    They are wired as opt-in run_probe() parameters (default False) so
+    the already-committed 23/09/2026 corrected-image Table V numbers
+    are reproducible byte-for-byte until a caller explicitly opts in."""
+
+    def test_new_readiness_fix_params_default_to_prior_behavior(self):
+        params = inspect.signature(run_probe).parameters
+        self.assertFalse(params["topology_aware_readiness"].default)
+        self.assertFalse(params["sustain_beacon_until_deadline"].default)
+        self.assertFalse(params["zenoh_control_station_explicit_listen"].default)
+
+    def test_discovery_timeout_s_default_unchanged_by_this_fix(self):
+        # The three fixes are harness/config correctness fixes, not a
+        # timing change -- discovery_timeout_s must stay exactly as it
+        # was (15.0, matching LanReadinessWatchdogTest's own Wi-Fi
+        # lock-in above) regardless of whether the new flags are used.
+        self.assertEqual(
+            inspect.signature(run_probe).parameters["discovery_timeout_s"].default, 15.0
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

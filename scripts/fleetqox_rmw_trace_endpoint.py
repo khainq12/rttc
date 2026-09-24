@@ -370,6 +370,44 @@ def compute_receive_capable_deadline_s(
     return (last_event_ms + start_offset_ms) / 1000.0 + drain_s
 
 
+def build_discovery_diagnostic(
+    *,
+    endpoint: str,
+    required_peers: set[str],
+    peers_seen: set[str],
+    converged: bool,
+    beacon_active: bool,
+    skip_discovery_wait: bool,
+    expected_peer_count: int,
+    discovery_timeout_s: float,
+    discovery_convergence_s: float,
+    peer_first_seen_s: dict[str, float],
+) -> dict[str, Any]:
+    """Table IV/V IDENTITY-level readiness diagnostic -- mirrors
+    fleetqox_coordination_endpoint.py's own build_discovery_diagnostic()
+    (added there for the Table VI post-readiness investigation) so the
+    same required/observed/missing-peer-identity + per-peer first-seen
+    timing evidence is available for run_probe()'s own callers (see
+    docs/AUDIT_ACCEPTANCE_TRACKING.md, "WI-FI READINESS ROOT-CAUSE
+    (24/09/2026)"). Pure function, no clock/rclpy -- unit-testable in
+    isolation, same pattern as discovery_converged() below.
+    """
+    missing = sorted(required_peers - peers_seen)
+    return {
+        "endpoint": endpoint,
+        "required_peers": sorted(required_peers),
+        "peers_seen": sorted(peers_seen),
+        "missing_peers": missing,
+        "converged": converged,
+        "beacon_active": beacon_active,
+        "skip_discovery_wait": skip_discovery_wait,
+        "expected_peer_count": expected_peer_count,
+        "discovery_timeout_s": discovery_timeout_s,
+        "discovery_convergence_s": discovery_convergence_s,
+        "peer_first_seen_s": dict(peer_first_seen_s),
+    }
+
+
 def discovery_converged(
     *,
     skip_discovery_wait: bool,
@@ -673,6 +711,26 @@ def main() -> int:
     parser.add_argument("--ready-file", type=Path, default=None)
     parser.add_argument("--start-file", type=Path, default=None)
     parser.add_argument(
+        "--discovery-diag-json",
+        type=Path,
+        default=None,
+        help=(
+            "Optional, mirrors fleetqox_coordination_endpoint.py's own "
+            "--discovery-diag-json (see build_discovery_diagnostic()'s "
+            "docstring here): written UNCONDITIONALLY right after this "
+            "endpoint's own discovery loop exits, BEFORE the --start-file "
+            "wait (which raises RuntimeError, killing the process before "
+            "--summary-json is ever written, on any run this endpoint "
+            "itself judges not converged). Without this, an "
+            "invalid_readiness run leaves zero artifacts behind for its "
+            "own endpoints -- added 24/09/2026 for the corrected-image "
+            "Wi-Fi readiness investigation (see "
+            "docs/AUDIT_ACCEPTANCE_TRACKING.md, 'WI-FI READINESS "
+            "ROOT-CAUSE'); default None preserves prior behavior exactly "
+            "(no file written) for every existing caller."
+        ),
+    )
+    parser.add_argument(
         "--expected-peer-count",
         type=int,
         default=0,
@@ -930,6 +988,12 @@ def main() -> int:
         else None
     )
     discovery_peers_seen: set[str] = set()
+    # Measurement-only (mirrors fleetqox_coordination_endpoint.py's
+    # identical dict): WHEN, relative to discovery_start, each peer
+    # identity was first observed -- lets the diagnostic tell apart
+    # "never saw peer X" from "saw peer X only after the deadline had
+    # effectively already been lost" (LATE vs NEVER).
+    discovery_peer_first_seen_monotonic: dict[str, float] = {}
     beacon_pub = None
     if args.expected_peer_count > 0 or required_peer_ids is not None:
         beacon_topic = "/fleetqox_trace/_discovery_probe"
@@ -945,6 +1009,8 @@ def main() -> int:
         def on_beacon(msg: String) -> None:
             beacon_raw_seen.append(msg.data)
             if msg.data != args.endpoint:  # a beacon can loop back on some RMWs
+                if msg.data not in discovery_peers_seen:
+                    discovery_peer_first_seen_monotonic[msg.data] = time.monotonic()
                 discovery_peers_seen.add(msg.data)
 
         node.create_subscription(String, beacon_topic, on_beacon, beacon_qos)
@@ -1064,6 +1130,44 @@ def main() -> int:
                 }
             ),
             flush=True,
+        )
+
+    if args.discovery_diag_json:
+        # Written UNCONDITIONALLY here, before --ready-file/--start-file
+        # below (the latter raises RuntimeError -- killing this process
+        # before --summary-json is ever written -- on any run this
+        # endpoint itself judges not converged). See
+        # build_discovery_diagnostic()'s docstring: without this, an
+        # invalid_readiness run leaves zero artifacts behind for its own
+        # endpoints.
+        # This script (unlike fleetqox_coordination_endpoint.py) has no
+        # --peers identity list -- full-mesh mode (required_peer_ids is
+        # None) only ever knows a COUNT (--expected-peer-count), not the
+        # other endpoints' identities, so "missing_peers" can't be
+        # computed there; peers_seen + expected_peer_count still tell
+        # the full story for that mode.
+        required_peers_for_diag = (
+            required_peer_ids if required_peer_ids is not None else frozenset()
+        )
+        args.discovery_diag_json.parent.mkdir(parents=True, exist_ok=True)
+        args.discovery_diag_json.write_text(
+            json.dumps(
+                build_discovery_diagnostic(
+                    endpoint=args.endpoint,
+                    required_peers=set(required_peers_for_diag),
+                    peers_seen=set(discovery_peers_seen),
+                    converged=converged,
+                    beacon_active=beacon_pub is not None,
+                    skip_discovery_wait=args.skip_discovery_wait,
+                    expected_peer_count=args.expected_peer_count,
+                    discovery_timeout_s=args.discovery_timeout_s,
+                    discovery_convergence_s=discovery_convergence_s,
+                    peer_first_seen_s={
+                        peer: round(t - discovery_start, 3)
+                        for peer, t in discovery_peer_first_seen_monotonic.items()
+                    },
+                )
+            )
         )
 
     if args.ready_file:

@@ -5,6 +5,7 @@ import unittest
 
 from scripts.fleetqox_rmw_trace_endpoint import (
     _topic_for,
+    build_discovery_diagnostic,
     build_payload,
     compute_receive_capable_deadline_s,
     discovery_converged,
@@ -863,6 +864,69 @@ class TopologyAwareReadinessContractTest(unittest.TestCase):
                 subscription_fallback_ok=False,
             )
         )
+
+
+class BuildDiscoveryDiagnosticTest(unittest.TestCase):
+    """Mirrors fleetqox_coordination_endpoint.py's own identical test for
+    build_discovery_diagnostic() -- added 24/09/2026 (see
+    docs/AUDIT_ACCEPTANCE_TRACKING.md, "WI-FI READINESS ROOT-CAUSE") so
+    run_probe()'s callers get the same required/observed/missing-peer-
+    identity evidence on an invalid_readiness run that Table VI already
+    had. Pure function -- no clock/rclpy involved."""
+
+    def test_missing_peers_is_required_minus_seen(self):
+        diag = build_discovery_diagnostic(
+            endpoint="robot_0001",
+            required_peers={"control_station"},
+            peers_seen=set(),
+            converged=False,
+            beacon_active=True,
+            skip_discovery_wait=False,
+            expected_peer_count=2,
+            discovery_timeout_s=15.0,
+            discovery_convergence_s=15.05,
+            peer_first_seen_s={},
+        )
+        self.assertEqual(diag["missing_peers"], ["control_station"])
+        self.assertEqual(diag["required_peers"], ["control_station"])
+        self.assertEqual(diag["peers_seen"], [])
+        self.assertFalse(diag["converged"])
+
+    def test_no_missing_peers_when_all_required_seen(self):
+        diag = build_discovery_diagnostic(
+            endpoint="control_station",
+            required_peers={"robot_0000", "robot_0001"},
+            peers_seen={"robot_0000", "robot_0001"},
+            converged=True,
+            beacon_active=True,
+            skip_discovery_wait=False,
+            expected_peer_count=2,
+            discovery_timeout_s=15.0,
+            discovery_convergence_s=0.4,
+            peer_first_seen_s={"robot_0000": 0.19, "robot_0001": 0.39},
+        )
+        self.assertEqual(diag["missing_peers"], [])
+        self.assertTrue(diag["converged"])
+        self.assertEqual(diag["peer_first_seen_s"], {"robot_0000": 0.19, "robot_0001": 0.39})
+
+    def test_extra_seen_peers_not_required_are_harmless(self):
+        # A peer this endpoint's workload never talks to may show up in
+        # peers_seen (e.g. full-mesh mode's beacon) with no effect on
+        # missing_peers -- mirrors discovery_converged()'s own subset-
+        # check semantics for required_peer_ids.
+        diag = build_discovery_diagnostic(
+            endpoint="robot_0000",
+            required_peers={"control_station"},
+            peers_seen={"control_station", "robot_0004", "robot_0005"},
+            converged=True,
+            beacon_active=True,
+            skip_discovery_wait=False,
+            expected_peer_count=8,
+            discovery_timeout_s=45.0,
+            discovery_convergence_s=20.3,
+            peer_first_seen_s={"control_station": 20.3},
+        )
+        self.assertEqual(diag["missing_peers"], [])
 
 
 if __name__ == "__main__":
