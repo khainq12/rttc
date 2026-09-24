@@ -21645,6 +21645,428 @@ eventually delivered late" loss into fresh delivery instead -- a
 different, sharper hypothesis than either of the last two tasks, not
 a re-test of what has now been tried twice.
 
+## RETRANSMISSION-DELAYS-FIRST-ATTEMPT CAUSAL PROBE (24/09/2026): LOCAL BLOCKING RULED OUT, AIRTIME CORRELATION FOUND BUT CAUSAL REMOVAL DID NOT HELP -- CLASSIFIED D, NO PRIORITIZATION JUSTIFIED
+
+Tests the hypothesis named as the previous section's own "one remaining
+open question": does NACK-driven retransmission traffic consume
+transmission opportunities that FIRST-ATTEMPT DATA needs to arrive
+fresh? Answer, from direct measurement plus one controlled causal probe:
+**no meaningful evidence of interference at either scale tested.** No
+optimization implemented; the one diagnostic mechanism built for this
+task was measured and then fully reverted (see item 18).
+
+### 1. First-send production path
+
+`send_data_frame(encoded_frame, qos)` (`rmw_pubsub.cpp:3014`, current
+line numbers after this task's own additive instrumentation -- see item
+16) is a one-line wrapper around `send_frame_with_qos()`
+(`:3019-3119`), which decodes the frame, resolves targets, and calls
+`send_payload_to_targets()` -> `send_datagram_to_targets()`.
+
+### 2. Retransmission production path
+
+Two branches inside `send_retransmission_frame()` (`:3139-3222`, called
+only from `handle_ack_nack_feedback()` on a NACK, on the dedicated
+background `receive_thread_`): (a) no repair plan configured/matched ->
+`send_frame()` (`:3009-3012`, `qos=nullptr`) -> the SAME
+`send_frame_with_qos()` as first attempts; (b) a repair-plan rule
+matches -> `send_payload_to_targets()` directly with
+`repair_targets_for_path_ids()`'s own target list, bypassing (a)
+entirely. Both branches funnel into `send_datagram_to_targets()`
+exactly like first attempts (there is no second, retransmission-only
+send function below that point).
+
+### 3. Exact convergence / shared-resource point
+
+`send_datagram_to_targets()` (`:7263-7476` after this task's own
+additive lines) is the sole point every send type (first-attempt DATA,
+retransmission DATA, ACK/NACK, KEX, fragment-repair, heartbeat/graph)
+passes through. It acquires `udp_send_mutex_` (one process-wide
+`std::mutex`) before looping over targets and calling `::sendto()`.
+`pace_udp_send_locked()`, called inside that locked loop, is a confirmed
+no-op in this harness (pacing env var never set by
+`run_ns3_docker_container_fleet_probe.py`) -- so the only way a
+retransmission send can delay a first-attempt send BEFORE `sendto()` is
+brief mutex contention, and the only way it can delay one AFTER
+`sendto()` is competing for actual Wi-Fi airtime once both are on the
+wire. These are exactly axes A (`FIRST_SEND_LOCAL_BLOCKING`) and B
+(`RETRANSMISSION_AIRTIME_CONTENTION`) from this task's own causal gate.
+
+**Instrumentation added to measure axis A directly (KEPT, not part of
+the reverted diagnostic -- see item 18):** `LossFunnelSendEvent` gained
+two unconditional fields, `enqueue_ns` (captured at the very top of
+`send_datagram_to_targets()`, before `udp_send_mutex_` is even
+attempted -- chosen over the exact line the audit spec suggested
+alongside `mutex_wait_t0`, since the top-of-function point is a truer
+call-entry instant and the budget/PMTU checks between the two points
+are negligible-cost synchronous branches; a documented judgment call)
+and `first_sendto_ns` (captured immediately after the mutex is
+acquired -- with pacing confirmed inert, this is a precise
+T_first_sendto proxy for the call's first target). Both are populated
+in the existing `record_loss_funnel_event` lambda and exported by
+`rmw_fleetqox_cpp_loss_funnel_send_trace_json()`; zero-cost when
+`FLEETQOX_RMW_LOSS_FUNNEL_TRACE_PROFILING` is off, same pattern as
+every other loss-funnel field.
+
+### Methodology: correlating C++ send identity to Python T_publish_ready
+
+`T_publish_ready` uses the existing Python-side
+`send_timing[].publish_before_wall_ns` (`time.monotonic_ns()` captured
+immediately before the synchronous `publisher.publish(msg)` call) --
+valid because `rmw_publish()` runs synchronously inline on the calling
+thread (already proven) and `librmw_fleetqox_cpp.so` is loaded in-process
+by that same Python interpreter, so `time.monotonic_ns()` and the C++
+`std::chrono::steady_clock` (`monotonic_timestamp_ns()`, `:9628`) are
+the literal same kernel clock -- no offset correction needed.
+
+Joining a C++ `LossFunnelSendEvent` (`source_id`, `source_sequence`,
+`topic`) to a Python `event_id` turned out to need a fix to the
+technique prior turns used (payload-hex decode via
+`subscription_match`): **`source_id` (the C++ publisher_id) is NOT
+globally unique across a run.** It is allocated by a per-process counter
+(`allocate_publisher_id()`), and this benchmark names topics by
+DESTINATION (`_topic_for(dst, flow_class)`), so multiple different
+sending robots publish to identically-named topics with independently
+counted publisher_ids -- confirmed empirically (the exact same
+`(source_id, source_sequence, topic)` triple appeared, with three
+completely different timings, once per distinct sending robot). Fix:
+key everything by `(sending_endpoint, topic, source_sequence)` instead
+(the sending endpoint's own name disambiguates, since each endpoint's
+`send` trace only records its own sends) -- and for the receive side,
+`subscription_match`'s existing `robot_id` field (already present for
+exactly this reason per its own doc comment) plays the sending
+endpoint's role.
+
+For `T_publish_ready`, this task uses ORDINAL correlation, not
+payload-hex decoding: within one process, one ROS topic maps to exactly
+one C++ publisher, and `next_source_sequence++` assigns strictly
+increasing integers in the exact order `publish()` is called -- the
+same order Python's own `send_timing` list records calls in, per topic
+(confirmed empirically: per-topic distinct `source_sequence` values are
+always a gapless run `1..N` in wall-clock order). This works for EVERY
+first-attempt message, including ones NEVER delivered anywhere (unlike
+payload decoding, which only works for delivered messages) --
+cross-validated against the payload-decode method wherever both are
+available: **100% agreement, 669/669 at N=4 and 795/795 at N=8.**
+
+### 4. `first_send_wait` -- LOCAL_SEND_BLOCKING measured and ruled out
+
+N=4/N=8, seed 53, `FLEETQOX_RMW_LOSS_FUNNEL_TRACE_PROFILING=1`,
+identical Wi-Fi/workload params and the 4 frozen readiness flags:
+
+| | N=4 (n=855) | N=8 (n=1592) |
+|---|---|---|
+| first_send_wait_ms: min | 0.073 | 0.075 |
+| median | 0.092 | 0.103 |
+| p90 | 0.271 | 0.221 |
+| max | 0.538 | 0.475 |
+| mean | 0.134 | 0.133 |
+
+Sub-millisecond at every percentile, at both scales -- and, critically,
+**flat across FRESH/STALE/LOST classes** (item 5's own per-class medians
+range only 0.083-0.204ms, no class stands out). `udp_send_mutex_`
+contention is a real, proven structural possibility (item 3) but its
+MEASURED magnitude is negligible: it cannot explain why some first
+attempts arrive fresh and others don't.
+
+### 5. FIRST_ATTEMPT classification (own-outcome only, NOT eventual delivery)
+
+Per this task's explicit instruction, retransmission-assisted delivery
+must NOT count as the first attempt being fresh/delivered. Rule used
+(documented judgment call): no retransmission ever attempted for that
+key -> first attempt's fate IS the eventual fate (unambiguous). Retransmission(s)
+attempted but never delivered anywhere -> `FIRST_ATTEMPT_LOST`
+(trivially true). Retransmission(s) attempted AND delivered -> if the
+earliest arrival (`subscription_match` wall_ns, `CLOCK_MONOTONIC`,
+directly comparable across containers since Docker containers share the
+host's boot-relative monotonic clock) happened STRICTLY BEFORE the
+first retransmission was even sent, causality proves the first attempt
+succeeded -> classify FRESH/STALE by its own deadline; otherwise
+(ambiguous timing) -> `FIRST_ATTEMPT_LOST` per the task's own
+instruction not to credit an ambiguous, retransmission-coincident
+delivery to the first attempt.
+
+| | N=4 | N=8 |
+|---|---|---|
+| FIRST_ATTEMPT_FRESH | 86 (10.1%) | 19 (1.2%) |
+| FIRST_ATTEMPT_STALE | 440 (51.5%) | 755 (47.4%) |
+| FIRST_ATTEMPT_LOST | 95 (11.1%) | 691 (43.4%) |
+| LOST (retransmission-ambiguous) | 234 (27.4%) | 127 (8.0%) |
+
+Network delay (`arrival_ns - first_attempt_first_sendto_ns`, unambiguous
+FRESH/STALE only): N=4 FRESH median 31.5ms vs STALE median 836.9ms
+(27x); N=8 FRESH median 57.7ms vs STALE median 3150.8ms (54x). The gap
+between fresh and stale is entirely a NETWORK-side (post-`sendto()`)
+phenomenon, not a local-send-timing one -- consistent with item 4.
+
+### 6. Retransmission/traffic correlation around each class (Section 3)
+
+Traffic in the 1/5/10/50ms windows PRECEDING each first attempt's own
+`enqueue_ns`: retransmission sends nearby are essentially **zero across
+every class and window size at N=4** (0.0% of sampled messages had any
+retransmission in even a 50ms preceding window) and **near-zero at N=8**
+(0.0-1.2%, marginally higher for LOST/STALE than FRESH). Retransmissions
+of OTHER messages are not literally clustering in the instant before a
+first attempt's own send call.
+
+A second, more relevant view -- total fleet-wide channel bytes DURING
+each message's own `[first_sendto_ns, arrival_ns)` transit window,
+RATE-normalized (bytes/ms, controlling for STALE messages simply having
+a much longer exposure window by definition, e.g. N=8 STALE median
+transit 3175.7ms vs FRESH 57.7ms):
+
+| | N=4 FRESH | N=4 STALE | N=8 FRESH | N=8 STALE |
+|---|---|---|---|---|
+| fleet-wide bytes/ms during transit (median) | 51.2 | 70.3 | 60.5 | 62.6 |
+| of which retransmission bytes/ms (median) | 0 | 0 | 0 | 0 |
+| of which retransmission bytes/ms (p90) | 0 | 36.3 | 0 | 62.8 |
+| of which retransmission bytes/ms (max) | 0 | 258.3 | 0 | 81.5 |
+
+Total channel-load RATE is only modestly higher for STALE at N=4 (+37%
+at the median) and essentially IDENTICAL at N=8 (median 60.5 vs 62.6) --
+the channel appears persistently loaded regardless of a message's
+eventual fate. Retransmission-specific load shows a real but
+HEAVY-TAILED association with staleness (zero at the median for both
+classes, but STALE's upper tail reaches 36-63 bytes/ms of
+retransmission-specific rate where FRESH's never does) -- a genuine
+correlational signal, concentrated in the worst-case (longest-transit)
+messages, but modest at the median. **Correlation only -- see item 9 for
+the causal test.**
+
+### 7. N=4 network-side evidence / 8. N=8 network-side evidence
+
+No new ns-3 instrumentation was added (per the task's own constraint);
+network-side evidence is the transit-window analysis in item 6 above,
+identical methodology at both scales. Both scales show the same
+qualitative pattern: FRESH messages have short transit times with
+near-zero retransmission-specific load; STALE messages have long transit
+times whose UPPER TAIL (not median) coincides with heavy retransmission
+load. `mac`/PHY-level ns-3 counters were not separately queried for this
+task (the existing harness does not expose a not-already-used channel-
+busy-time/collision counter beyond what item 6 already captures via
+send-trace timing; adding one would have required new ns-3
+instrumentation, explicitly out of scope).
+
+### 9. Diagnostic causal-probe design
+
+Per the task's own requirement, ONE temporary, revertible mechanism was
+added: an env var,
+`FLEETQOX_RMW_DIAG_SUPPRESS_RETRANSMISSION_DATA_MS="<start_ms>-<end_ms>"`,
+gated at the very top of `send_retransmission_frame()` (before either
+branch from item 2), returning `RMW_RET_UNSUPPORTED` and incrementing a
+distinctive counter (`retransmission_diag_suppressed_`, exposed via
+`rmw_fleetqox_cpp_socket_retransmission_diag_suppressed()`) instead of
+sending, whenever elapsed time since the `LoopbackSocketTransport`
+singleton's own construction falls in the configured window.
+First-attempt DATA (`send_data_frame()`, never routed through this
+function) is completely untouched. No existing caller sets this env
+var, so it is a no-op everywhere else (confirmed: full suite unaffected
+both before and after this task).
+
+**Window-calibration finding, reported honestly rather than glossed
+over:** the task's own illustrative window (simulation seconds
+`[10,20]` of a ~30s run) does not transfer directly to this harness,
+because this workload's FIRST-ATTEMPT sends are concentrated in a very
+short burst (empirically: ~3-6.4s wide) immediately after data flow
+starts, while retransmissions of THOSE messages continue for a much
+longer tail afterward (20-40+s). A window of `[10000,20000]`ms relative
+to transport construction landed entirely AFTER the first-attempt burst
+had already finished (confirmed: 0 first-attempt sends fell inside that
+window in either the observational or diagnostic run), so it could not
+possibly show an effect on first-attempt freshness even if one existed
+-- this was caught before being reported as a false negative, by
+checking `retransmission_diag_suppressed` counts and the actual
+first-attempt timing distribution. The final window used,
+`FLEETQOX_RMW_DIAG_SUPPRESS_RETRANSMISSION_DATA_MS="0-15000"`, was
+chosen to span from process start through the full first-attempt burst
+plus the beginning of the retransmission tail, confirmed by checking
+that first attempts DO fall inside the window (284/855 at N=4,
+1592/1592 at N=8) and that a large, real suppression gap is empirically
+detectable in the retransmission timeline (10-19s wide per endpoint).
+
+Because `diag_epoch_ns_` (transport construction) is not itself logged
+to Python, and two separate `docker run` invocations start at different
+absolute points on the shared, host-boot-relative `CLOCK_MONOTONIC`
+clock, comparing the diagnostic run's window to the observational
+(baseline) run's own timeline required converting to a RELATIVE offset
+(milliseconds since each endpoint's OWN earliest recorded send in that
+run) rather than reusing absolute nanosecond timestamps directly --
+confirmed necessary empirically (the naive absolute-window comparison
+produced `n_in_window=0` for the baseline side every time). All
+FIRST_ATTEMPT_FRESH comparisons below are measured within this
+per-endpoint RELATIVE window, applied identically to both runs.
+
+Same N, seed=53, workload, Wi-Fi parameters, image, and the 4 frozen
+readiness/discovery flags (unchanged) as every prior turn.
+
+### 10. N=4 normal vs no-retransmission first-attempt-fresh result
+
+Within the suppression window (284 first-attempt messages at both
+conditions, same window by construction):
+
+| | observational (normal) | diag_suppressed |
+|---|---|---|
+| n in window | 284 | 284 |
+| FIRST_ATTEMPT_FRESH | 43 (15.14%) | 37 (13.03%) |
+
+Suppressing retransmission DATA **did not increase** first-attempt
+fresh success -- it decreased slightly (-2.1pp).
+
+### 11. N=8 result
+
+`sim_lag_s` did not stay under the 10.0s validity gate at N=4 either
+(see item 17's caveat) -- reported anyway, per this task's own
+instruction to report what was measured with the caveat stated, rather
+than silently skip N=8:
+
+| | observational (normal) | diag_suppressed |
+|---|---|---|
+| n in window | 1592 | 1592 |
+| FIRST_ATTEMPT_FRESH | 19 (1.19%) | 18 (1.13%) |
+
+Effectively flat (a difference of exactly 1 message out of 1592) --
+no improvement, consistent with N=4's direction (non-improving).
+
+### 12. Wire-byte change
+
+N=4: whole-run approximate total send bytes (first-attempt + every
+retransmission send event, bytes-per-event x count) dropped from
+4,682,748 to 415,258 (**-91.1%**). N=8: 2,439,346 -> 955,364
+(**-60.8%**). Confirms the suppression mechanism engaged strongly at
+both scales (N=8's smaller relative drop matches its smaller absolute
+`retransmission_diag_suppressed` count observed during calibration --
+its per-endpoint burst timing had more run-to-run jitter, discussed in
+item 17).
+
+### 13. Raw-delivery change
+
+N=4: 760/855 (88.9%) -> 570/855 (66.7%), **-22.2pp**. N=8: 901/1592
+(56.6%) -> 866/1592 (54.4%), **-2.2pp**. Removing retransmission
+predictably removes its own direct repair contribution to eventual
+delivery -- expected and unsurprising (that is retransmission's actual
+job), not itself evidence about freshness either way.
+
+### 14. First-attempt-fresh change
+
+N=4: 15.14% -> 13.03% (**-2.1pp, a regression, not an improvement**).
+N=8: 1.19% -> 1.13% (**-0.06pp, effectively flat**). At neither scale
+did removing retransmission airtime during the exact window first
+attempts were being sent produce a material improvement in first-attempt
+fresh success -- the required evidence for classification B, per this
+task's own causal gate, is absent.
+
+### 15. Classification: **D. NO_MEANINGFUL_INTERFERENCE**
+
+- **A (FIRST_SEND_LOCAL_BLOCKING): RULED OUT.** `first_send_wait`
+  (mutex-wait-inclusive) is sub-millisecond at every percentile at both
+  scales and does not differ meaningfully between FRESH/STALE/LOST
+  (item 4).
+- **B (RETRANSMISSION_AIRTIME_CONTENTION): NOT CONFIRMED CAUSALLY.**
+  Item 6 found a real but heavy-tailed, median-weak correlation between
+  retransmission-rate exposure during a message's transit and it being
+  STALE rather than FRESH -- but the controlled removal experiment
+  (items 9-14) shows removing 61-91% of that traffic by BYTES does not
+  materially improve, and at N=4 slightly WORSENS, first-attempt fresh
+  success. Per the task's own explicit rule ("If retransmission removal
+  only reduces bytes without improving first-attempt outcomes, STOP --
+  classify D"), this is exactly that outcome.
+- Therefore **not C** (needs both A and B); **D** is the classification
+  the measured evidence supports at both N=4 and N=8.
+
+**Honest confidence caveat (documented, not glossed over):** this
+verdict rests on a SINGLE seed (53, per this repo's own established
+"median representative seed" convention) at each scale, and `sim_lag_s`
+did not stay under the 10.0s validity gate in EITHER the observational
+or diagnostic runs at EITHER scale this session (N=4: 24.8s
+observational / 16.1s diagnostic; N=8: 37.0s observational / 37.0s
+diagnostic) -- markedly worse than this exact harness's own
+previously-documented clean baseline (max 7.67s across 12 runs, same
+day, see the immediately preceding two sections). The cause was not
+conclusively isolated (host load was moderate, 24 cores, load average
+~2.6, when checked); repeated single-run retries (3 independent N=4
+attempts, with and without loss-funnel tracing) all landed in the
+19-37s degraded range, so this reads as a real condition of this
+measurement session rather than a one-off fluke. Consequence for
+interpretation: item 4's LOCAL_SEND_BLOCKING measurement is UNAFFECTED
+by ns-3 falling behind real time (it is a purely RMW-process-internal,
+real-wall-clock measurement, independent of whether ns-3 kept pace), so
+that ruling stays solid. Items 6-14 (anything depending on ns-3
+faithfully reproducing real Wi-Fi timing, i.e. network delay and the
+causal-probe comparison) should be read as a directionally consistent,
+but not statistically bulletproof, result -- a healthy-sim-lag,
+multi-seed repeat of items 9-14 would be needed to fully close out
+residual uncertainty. D is reported here (not E) because the measured
+direction is consistent (non-improving at both N, not scattered/mixed),
+and it is exactly the outcome the task's own stopping rule describes --
+but the caveat above is the honest reason a reader might reasonably
+prefer E for this specific pair of runs.
+
+### 16. Whether prioritization is causally justified
+
+**No.** Per the task's own gate, only A/B/C justify a later
+prioritization experiment; this task's evidence supports D.
+Implementing a first-attempt-priority scheme on this evidence would not
+be justified -- there is no measured mechanism by which it would help,
+and the one lever tested that removes retransmission's competing
+traffic (the causal probe itself) did not help either.
+
+### 17. Files changed
+
+`ros2_ws/src/rmw_fleetqox_cpp/src/rmw_pubsub.cpp`: (a) KEPT --
+`enqueue_ns`/`first_sendto_ns` added to `LossFunnelSendEvent`, populated
+unconditionally in `send_datagram_to_targets()`, exported by
+`rmw_fleetqox_cpp_loss_funnel_send_trace_json()` (commit `49e5215`);
+(b) REVERTED -- the diagnostic suppression mechanism (env-gated check in
+`send_retransmission_frame()`, `retransmission_diag_suppressed_`
+counter, `rmw_fleetqox_cpp_socket_retransmission_diag_suppressed()`
+accessor, `diag_epoch_ns_` member) was added (commit `59c901e`) and
+fully removed again (commit `42590cb`, a clean 93-line inverse of
+`59c901e`'s diff, confirmed via `git diff --stat`).
+`scripts/fleetqox_rmw_trace_endpoint.py`: a one-line addition to
+`fleetqox_transport_metrics()`'s counter-name tuple
+(`"retransmission_diag_suppressed"`), used only to read back the
+diagnostic counter during measurement -- reverted via `git checkout --`
+(never committed). No other production file touched. Scratch analysis
+scripts and raw run JSON live under
+`/tmp/.../scratchpad/retransmission_delay_probe/` (host-local, not
+committed).
+
+### 18. Tests (pass/fail counts at each checkpoint)
+
+Full suite (`docker run ... python3 -m pytest tests/ -q`), same 8
+pre-existing unrelated failures at every checkpoint:
+
+| Checkpoint | Result |
+|---|---|
+| Before this task (baseline, commit `87975e6`) | 888 passed, 8 failed |
+| After adding T_first_sendto/enqueue_ns instrumentation (`49e5215`) | 888 passed, 8 failed |
+| After adding the diagnostic suppression probe (`59c901e`) | 888 passed, 8 failed |
+| After reverting the diagnostic probe (`42590cb`) | 888 passed, 8 failed |
+
+Identical before and after every change -- baseline confirmed
+unchanged from the start of this task.
+
+### 19. Exactly one next step
+
+The two most-tested candidate mechanisms for FleetRMW's low
+fresh-deadline success (lifespan-based pruning, previous section;
+retransmission-airtime contention, this section) have now both been
+measured and classified as NOT the causal lever (BANDWIDTH_ONLY_TRADEOFF
+and D/NO_MEANINGFUL_INTERFERENCE respectively). Neither traffic-shaping
+angle has produced evidence justifying a prioritization or
+pruning-based optimization. The next task should either (a) re-run
+THIS EXACT causal probe (items 9-14) under confirmed healthy `sim_lag_s`
+(<10.0s) and 2-3 seeds, to close the confidence gap named in item 15
+before fully retiring the RETRANSMISSION_AIRTIME_CONTENTION hypothesis,
+or (b) if that repeat confirms D, pivot to a genuinely different
+mechanism class entirely -- e.g. whether the STALE class's own long
+network-delay tail (item 5: 27-54x FRESH's median) is explained by
+per-message AEAD/fragmentation CPU cost, ARP/peer-discovery
+re-resolution stalls (item 3's earlier-observed EMSGSIZE/ENETUNREACH
+retry path on a topic's very first message), or genuine Wi-Fi PHY-rate
+degradation under this node count -- none of which this task or its
+predecessor has yet measured directly.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
