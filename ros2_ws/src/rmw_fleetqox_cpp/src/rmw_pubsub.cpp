@@ -2983,12 +2983,6 @@ class LoopbackSocketTransport
 public:
   LoopbackSocketTransport()
   {
-    // Diagnostic-only probe epoch (see retransmission_diag_suppressed_'s
-    // doc comment) -- captured before start() so it reflects this
-    // transport singleton's own construction instant, the earliest
-    // reasonable in-process reference point for a bounded suppression
-    // window. TEMPORARY, reverted with the rest of the probe.
-    diag_epoch_ns_ = monotonic_timestamp_ns();
     start();
   }
 
@@ -3144,19 +3138,6 @@ public:
 
   rmw_ret_t send_retransmission_frame(const std::string & encoded_frame)
   {
-    // ---- BEGIN diagnostic-only probe (see retransmission_diag_suppressed_'s
-    // doc comment): gated entirely behind an env var this harness never
-    // sets in any non-diagnostic run. When active, suppresses BOTH the
-    // repair-plan and non-repair-plan retransmission branches below (this
-    // check runs before either) while leaving every first-attempt DATA
-    // send (send_data_frame() -> send_frame_with_qos(), never routed
-    // through this function) completely untouched. TEMPORARY, reverted
-    // via `git checkout --` after the diagnostic measurement.
-    if (retransmission_diag_suppression_active()) {
-      retransmission_diag_suppressed_.fetch_add(1, std::memory_order_relaxed);
-      return RMW_RET_UNSUPPORTED;
-    }
-    // ---- END diagnostic-only probe gate ----
     const auto data_frame = rmw_fleetqox_cpp::decode_data_frame(encoded_frame);
     const std::optional<FleetRepairPlanRule> repair_rule =
       data_frame.has_value() ? repair_plan_rule_for_frame(*data_frame) : std::nullopt;
@@ -3903,62 +3884,6 @@ public:
   {
     return repair_not_admitted_.load(std::memory_order_relaxed);
   }
-
-  // ---- BEGIN diagnostic-only probe: "RETRANSMISSION-DELAYS-FIRST-ATTEMPT"
-  // causal test (see docs/AUDIT_ACCEPTANCE_TRACKING.md, dated 24/09/2026).
-  // TEMPORARY -- reverted via `git checkout --` once the diagnostic
-  // measurement is complete; NOT a production feature (no prioritization,
-  // no permanent change to retransmission semantics). Gated entirely by
-  // an env var this harness never sets in any non-diagnostic run
-  // (FLEETQOX_RMW_DIAG_SUPPRESS_RETRANSMISSION_DATA_MS), so it is a no-op
-  // everywhere else, including the full pytest suite and every existing
-  // published Table IV/V/VI number.
-  //
-  // Format: "<start_ms>-<end_ms>", both relative to THIS transport
-  // singleton's own construction instant (diag_epoch_ns_, set in the
-  // constructor above) -- the earliest available in-process reference
-  // point, since the RMW layer has no access to the ns-3 simulation
-  // clock. All endpoints in one run are started by the harness within a
-  // narrow wall-clock window of each other, so this is a reasonable
-  // proxy for "simulation seconds" as the task's own example describes
-  // it, not an exact simulation-clock alignment -- documented as a
-  // judgment call in the write-up.
-  bool retransmission_diag_suppression_active() const
-  {
-    static const std::pair<std::int64_t, std::int64_t> window = [] {
-        const char * raw = std::getenv("FLEETQOX_RMW_DIAG_SUPPRESS_RETRANSMISSION_DATA_MS");
-        std::pair<std::int64_t, std::int64_t> parsed{-1, -1};
-        if (raw == nullptr) {
-          return parsed;
-        }
-        const std::string spec(raw);
-        const auto dash = spec.find('-');
-        if (dash == std::string::npos || dash == 0 || dash + 1 >= spec.size()) {
-          return parsed;
-        }
-        try {
-          const std::int64_t start_ms = std::stoll(spec.substr(0, dash));
-          const std::int64_t end_ms = std::stoll(spec.substr(dash + 1));
-          if (start_ms >= 0 && end_ms >= start_ms) {
-            parsed = {start_ms, end_ms};
-          }
-        } catch (...) {
-          // Malformed value: leave disabled (-1,-1) rather than guessing.
-        }
-        return parsed;
-      }();
-    if (window.first < 0) {
-      return false;
-    }
-    const std::int64_t elapsed_ms = (monotonic_timestamp_ns() - diag_epoch_ns_) / 1000000ll;
-    return elapsed_ms >= window.first && elapsed_ms <= window.second;
-  }
-
-  std::uint64_t retransmission_diag_suppressed() const
-  {
-    return retransmission_diag_suppressed_.load(std::memory_order_relaxed);
-  }
-  // ---- END diagnostic-only probe methods ----
 
   int repair_retransmission_budget() const
   {
@@ -9228,15 +9153,6 @@ private:
   std::atomic<std::uint64_t> repair_requests_coalesced_{0};
   std::atomic<std::uint64_t> repair_sequence_attempt_limit_exhausted_{0};
   std::atomic<std::uint64_t> repair_not_admitted_{0};
-  // ---- BEGIN diagnostic-only probe: "RETRANSMISSION-DELAYS-FIRST-ATTEMPT"
-  // causal test (see docs/AUDIT_ACCEPTANCE_TRACKING.md, dated 24/09/2026).
-  // TEMPORARY -- this whole block, its call site in
-  // send_retransmission_frame(), and the extern "C" accessor near the
-  // bottom of this file are reverted via `git checkout --` once the
-  // diagnostic measurement is complete. Not a production feature.
-  std::atomic<std::uint64_t> retransmission_diag_suppressed_{0};
-  std::int64_t diag_epoch_ns_{0};
-  // ---- END diagnostic-only probe member declarations ----
   std::atomic<size_t> adaptive_selected_peer_index_{0};
   std::int64_t adaptive_redundant_deadline_ns_{50000000ll};
   bool ready_{false};
@@ -16807,15 +16723,6 @@ std::uint64_t rmw_fleetqox_cpp_socket_repair_not_admitted()
 {
   return socket_transport().repair_not_admitted();
 }
-
-// ---- BEGIN diagnostic-only probe accessor (see
-// LoopbackSocketTransport::retransmission_diag_suppressed_'s doc comment
-// in the class body) -- TEMPORARY, reverted with the rest of the probe.
-std::uint64_t rmw_fleetqox_cpp_socket_retransmission_diag_suppressed()
-{
-  return socket_transport().retransmission_diag_suppressed();
-}
-// ---- END diagnostic-only probe accessor ----
 
 int rmw_fleetqox_cpp_socket_repair_retransmission_budget()
 {
