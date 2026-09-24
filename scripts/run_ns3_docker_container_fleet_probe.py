@@ -1262,6 +1262,7 @@ class ReferenceTopologyProbe:
         required_peer_ids_by_endpoint: dict[str, frozenset[str]] | None = None,
         zenoh_control_station_explicit_listen: bool = False,
         sustain_beacon_until_deadline: bool = False,
+        deadline_aware_retransmission_lifespan: bool = False,
     ) -> None:
         # required_peer_ids_by_endpoint: opt-in (default None), LAN's own
         # topology-aware readiness gate (see required_peers_from_trace()
@@ -1461,6 +1462,19 @@ class ReferenceTopologyProbe:
                 if sustain_beacon_until_deadline and rmw_implementation != "rmw_fleetqox_cpp"
                 else ""
             )
+            # Causal-experiment flag (see docs/AUDIT_ACCEPTANCE_TRACKING.md,
+            # "PRE-EXISTING LEDGER-PRUNING MECHANISM CAUSAL CHARACTERIZATION"):
+            # FleetRMW-only -- sets a QoS policy that only rmw_fleetqox_cpp's
+            # own retransmit ledger reads for this purpose; setting it for
+            # the other RMWs would change THEIR unrelated lifespan-based
+            # sample-expiry behavior instead. rmw_pubsub.cpp is completely
+            # unmodified -- this flag only changes what the HARNESS asks
+            # rclpy for at publisher-creation time.
+            deadline_aware_lifespan_flag = (
+                " --deadline-aware-retransmission-lifespan"
+                if deadline_aware_retransmission_lifespan and rmw_implementation == "rmw_fleetqox_cpp"
+                else ""
+            )
             inner = (
                 "source /opt/ros/jazzy/setup.bash && "
                 f"{rmw_setup}&& "
@@ -1487,7 +1501,8 @@ class ReferenceTopologyProbe:
                 f"--expected-peer-count={expected_peer_count}"
                 f"{required_peer_ids_flag}"
                 f"{skip_discovery_wait_flag}"
-                f"{sustain_beacon_flag} "
+                f"{sustain_beacon_flag}"
+                f"{deadline_aware_lifespan_flag} "
                 f"--summary-json=/work/{result_json} "
                 f"--discovery-diag-json=/work/{self._readiness_diag_files[i]} "
                 f"--ready-file=/work/{self._ready_files[i]} "
@@ -1958,6 +1973,7 @@ def run_probe(
     topology_aware_readiness: bool = False,
     sustain_beacon_until_deadline: bool = False,
     zenoh_control_station_explicit_listen: bool = False,
+    deadline_aware_retransmission_lifespan: bool = False,
 ) -> dict[str, Any]:
     # topology_aware_readiness / sustain_beacon_until_deadline: opt-in
     # (default False, exact prior behavior for every existing caller),
@@ -2122,6 +2138,7 @@ def run_probe(
             ),
             sustain_beacon_until_deadline=sustain_beacon_until_deadline,
             zenoh_control_station_explicit_listen=zenoh_control_station_explicit_listen,
+            deadline_aware_retransmission_lifespan=deadline_aware_retransmission_lifespan,
         )
         probe.wait_for_ready_then_start(ready_deadline_s=ready_deadline_s)
         # Read back on the SUCCESS path too (previously only read on

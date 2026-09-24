@@ -199,6 +199,7 @@ def fleetqox_loss_funnel_trace() -> dict[str, list[dict[str, Any]]]:
     """
     empty: dict[str, list[dict[str, Any]]] = {
         "send": [], "recv": [], "raw_recvfrom": [], "subscription_match": [],
+        "ledger_erasures": [],
     }
     if os.environ.get("RMW_IMPLEMENTATION") != "rmw_fleetqox_cpp":
         return empty
@@ -214,6 +215,17 @@ def fleetqox_loss_funnel_trace() -> dict[str, list[dict[str, Any]]]:
         ("recv", "rmw_fleetqox_cpp_loss_funnel_recv_trace_json"),
         ("raw_recvfrom", "rmw_fleetqox_cpp_loss_funnel_raw_recvfrom_trace_json"),
         ("subscription_match", "rmw_fleetqox_cpp_subscription_match_trace_json"),
+        # Ledger-removal classification (see
+        # docs/AUDIT_ACCEPTANCE_TRACKING.md, "PRE-EXISTING LEDGER-PRUNING
+        # MECHANISM CAUSAL CHARACTERIZATION") -- reads an ALREADY-EXISTING
+        # C++ accessor (rmw_pubsub.cpp's RetransmitLedgerErasureTraceEvent/
+        # rmw_fleetqox_cpp_retransmit_ledger_erasure_trace_json(), present
+        # since before this investigation) that was simply never wired
+        # into this Python layer before. One entry per erase() call on
+        # g_retransmit_ledger: {publisher_id, sequence, reason, wall_ns}
+        # with reason in {"acknowledged","lifespan_exceeded",
+        # "capacity_evicted","publisher_destroyed"}.
+        ("ledger_erasures", "rmw_fleetqox_cpp_retransmit_ledger_erasure_trace_json"),
     ):
         fn = getattr(library, symbol_name)
         fn.restype = ctypes.c_char_p
@@ -845,6 +857,35 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--deadline-aware-retransmission-lifespan",
+        action="store_true",
+        help=(
+            "Causal-experiment flag (see docs/AUDIT_ACCEPTANCE_TRACKING.md, "
+            "'PRE-EXISTING LEDGER-PRUNING MECHANISM CAUSAL CHARACTERIZATION' "
+            "and its predecessor 'DEADLINE-AWARE RETRANSMISSION "
+            "SUPPRESSION'): sets each outgoing publisher's QoS `lifespan` "
+            "to that TOPIC's own already-known, already-fixed deadline_ms "
+            "(constant per (dst, flow_class) -- see fleetqox/simulator.py's "
+            "per-FlowClass deadline_ms constants -- every trace row on one "
+            "topic shares the exact same deadline, so a per-publisher "
+            "constant faithfully represents this workload's real per-"
+            "message deadline). This does NOT invent a new deadline value "
+            "or tune an existing one -- it only exposes the SAME value "
+            "already present in the trace CSV via the standard ROS 2 QoS "
+            "channel. NOTE: this flag contains NO new suppression logic --"
+            " rmw_pubsub.cpp is completely unmodified by this flag; setting "
+            "lifespan alone activates a PRE-EXISTING, already-implemented "
+            "ledger-pruning mechanism (frame_exceeds_lifespan(), already "
+            "used for lazy eviction before this investigation existed). "
+            "ONLY applied when RMW_IMPLEMENTATION=rmw_fleetqox_cpp (checked "
+            "at runtime) -- setting a standard QoS policy unconditionally "
+            "would also change Fast DDS/CycloneDDS/Zenoh's own, unrelated "
+            "lifespan-based sample-expiry behavior, which this flag must "
+            "not touch. Opt-in, default False: every existing caller keeps "
+            "the exact prior (unset/infinite lifespan) behavior."
+        ),
+    )
+    parser.add_argument(
         "--discovery-only",
         action="store_true",
         help=(
@@ -921,7 +962,42 @@ def main() -> int:
         reliability=ReliabilityPolicy.RELIABLE,
     )
 
-    publishers = {topic: node.create_publisher(String, topic, qos) for topic in outgoing_topics}
+    # --deadline-aware-retransmission-lifespan (opt-in, see that flag's own
+    # help text): every trace row on one (dst, flow_class) topic shares the
+    # exact same deadline_ms (a fixed FlowClass constant, see
+    # fleetqox/simulator.py), so a per-publisher QoS `lifespan` faithfully
+    # represents this workload's real per-message deadline -- no new value
+    # invented, no existing deadline tuned, no rmw_pubsub.cpp change. Gated
+    # to FleetRMW specifically so Fast DDS/CycloneDDS/Zenoh's own,
+    # unrelated lifespan-based sample-expiry semantics are never touched.
+    deadline_aware_lifespan = (
+        args.deadline_aware_retransmission_lifespan
+        and os.environ.get("RMW_IMPLEMENTATION") == "rmw_fleetqox_cpp"
+    )
+    publishers: dict[str, "rclpy.publisher.Publisher"] = {}
+    if deadline_aware_lifespan:
+        from rclpy.duration import Duration
+
+        deadline_ms_by_topic: dict[str, float] = {}
+        for row in outgoing:
+            deadline_ms_by_topic.setdefault(
+                _topic_for(row["dst"], row["flow_class"]), float(row["deadline_ms"])
+            )
+        for topic in outgoing_topics:
+            topic_deadline_ms = deadline_ms_by_topic.get(topic)
+            topic_qos = (
+                QoSProfile(
+                    history=HistoryPolicy.KEEP_LAST,
+                    depth=64,
+                    reliability=ReliabilityPolicy.RELIABLE,
+                    lifespan=Duration(seconds=topic_deadline_ms / 1000.0),
+                )
+                if topic_deadline_ms is not None
+                else qos
+            )
+            publishers[topic] = node.create_publisher(String, topic, topic_qos)
+    else:
+        publishers = {topic: node.create_publisher(String, topic, qos) for topic in outgoing_topics}
 
     # Topic-based addressing already guarantees every message arriving on
     # one of incoming_topics is meant for this endpoint (only its own

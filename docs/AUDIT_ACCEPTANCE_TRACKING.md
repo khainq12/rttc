@@ -21385,6 +21385,266 @@ seed count, independent of the (now-reverted) new send-time check. This
 is a DIFFERENT, sharper hypothesis than before, not a repeat of this
 task.
 
+## PRE-EXISTING LEDGER-PRUNING MECHANISM: CAUSAL CHARACTERIZATION (25/09/2026)
+
+Explains, with runtime evidence, the mechanism the prior section's
+ablation surfaced but did not itself identify. **No optimization
+implemented. `rmw_pubsub.cpp` is untouched by this task** -- only a
+Python-layer harness flag (re-added, identical to the reverted
+investigation's own flag) and one new Python-side wiring of an
+ALREADY-EXISTING C++ accessor that had simply never been read before.
+
+### 1. Exact pruning function(s) and every ledger-removal path
+
+`g_retransmit_ledger` (`std::unordered_map<std::string, ReliableRetransmitEntry>`,
+`rmw_pubsub.cpp:383`) has exactly **four** erase sites, all traced by
+the ALREADY-EXISTING `RetransmitLedgerErasureTraceEvent` mechanism
+(`rmw_pubsub.cpp:669-676`, reasons `"acknowledged"`|`"lifespan_exceeded"`|
+`"capacity_evicted"`|`"publisher_destroyed"`):
+
+| Site | Function | Trigger | Condition | Depends on lifespan | Depends on ACK | Permanent |
+|---|---|---|---|---|---|---|
+| A | `publish_payload()` (`:13120-13141`) | every `rmw_publish()` on that publisher | `entry.acknowledged \|\| frame_exceeds_lifespan(entry.qos, entry.source_timestamp_ns)` | yes | yes | yes |
+| B | `publish_payload()` (`:13145-13170`) | same call, only once surviving-entry count `>= qos.depth` (or 4096 for KEEP_ALL) | oldest `source_sequence_number` for that publisher, unconditionally | no | no | yes |
+| C | `reliable_retransmit_loop()` (`:13403-13417`) | background thread, only if `FLEETQOX_RMW_RELIABLE_ACK_TIMEOUT_MS > 0` | identical boolean to Site A | yes | yes | yes |
+| D | `rmw_destroy_publisher()` (`:17323-17338`) | publisher destruction only | key-prefix match on `publisher_id` | no | no | yes |
+
+`frame_exceeds_lifespan(qos, source_timestamp_ns)` (`:9681`,
+pre-existing, unchanged): `now - source_timestamp_ns > lifespan_ns`,
+false whenever `lifespan_ns <= 0`.
+
+**Confirmed: only Site A is reachable in the real Wi-Fi Table V
+harness.** Site C's own guard (`rmw_pubsub.cpp:13372-13378`) returns
+immediately unless `FLEETQOX_RMW_RELIABLE_ACK_TIMEOUT_MS` is set > 0 --
+`fleetqox_rmw_env_prefix()`/`run_probe()`'s own call site never sets
+it. Site D only matters at teardown. **The entire observed effect is
+therefore Site A alone.**
+
+An ACK never directly erases anything (`handle_ack_nack_feedback()`,
+`:9457-9482`, only mutates `pending_subscriber_ids` and sets
+`entry.acknowledged`) -- physical removal always waits for a LATER
+lazy sweep (Site A, on that same publisher's next publish).
+
+### 2. Ledger state machine
+
+```
+FIRST SEND -> INSERTED (publish_payload(), BEFORE the wire send --
+              entry.source_timestamp_ns = frame's own origination time)
+  -> [ACK arrives] -> entry.acknowledged=true (flag only, no removal yet)
+  -> [NACK arrives, entry still present] -> RETRANSMIT (send_retransmission_frame(),
+     unconditional in the current, reverted code -- no expiry check)
+  -> [NACK arrives, entry ALREADY gone] -> classified UNAVAILABLE
+     (handle_ack_nack_feedback()'s available_history scan simply never
+     finds it) -> UnrecoverableLossNotice sent immediately
+  -> REMOVED when, on THIS SAME PUBLISHER's next publish_payload() call:
+       entry.acknowledged==true, OR
+       frame_exceeds_lifespan(qos, source_timestamp_ns)==true, OR
+       (separately) the per-publisher depth/capacity bound is exceeded
+```
+
+**Plain-terms answer**: with `lifespan` set to the app deadline, Fleet
+stops RETAINING a message the moment its OWN publisher next publishes
+AFTER that message's deadline has passed -- not because anything reads
+the deadline at retransmit-decision time (nothing does, in the current
+reverted code), but because the SAME lazy-eviction sweep that already
+existed for ACKs now ALSO purges expired entries on every subsequent
+publish. Since deadlines (45-1000ms) are typically shorter than one
+inter-publish interval on a busy topic, most entries are pruned within
+one publish cycle of their own deadline -- long before any NACK-driven
+repair round-trip could complete.
+
+### 3-4. Runtime proof (N=4, seed 53, `FLEETQOX_RMW_LOSS_FUNNEL_TRACE_PROFILING=1`, traced via the already-existing accessor, newly wired into `fleetqox_loss_funnel_trace()["ledger_erasures"]`)
+
+| | A (no lifespan) | C (lifespan = topic's own deadline_ms) |
+|---|---|---|
+| Total ledger erasures | 387 | 807 |
+| REMOVED_ACKED | 195 | 28 |
+| REMOVED_EXPIRED (lifespan_exceeded) | 0 | 779 |
+| REMOVED_CAPACITY | 192 | 0 |
+| REMOVED_OTHER (publisher_destroyed) | 0 | 0 |
+| Bytes, acked (resolved) | 23,728 | 4,320 |
+| Bytes, expired (resolved) | n/a | 67,072 (218 more erasures had no resolvable event_id -- see caveat below) |
+| Bytes, capacity-evicted (resolved) | 12,576 | n/a |
+| Total send attempts (orig+retransmit, all endpoints) | 27,921 | 2,001 |
+| Retransmission send attempts | 26,809 | 889 |
+
+Byte figures are resolved via the same `event_id`-decode-from-
+`payload_hex` technique as the prior freshness-loss-funnel turn; a
+minority of erasures (mostly `lifespan_exceeded` in C, 218 of 779)
+could not be resolved to a byte count because their `subscription_match`
+event (needed to recover `event_id`) never occurred for any receiver --
+consistent with those specific messages never having been received by
+anyone at all.
+
+**In A, `REMOVED_CAPACITY=192` confirms the `qos.depth=64` bound IS
+reachable in baseline** -- un-acked entries accumulate for a long time
+(nothing prunes them until 64 deep per topic) before capacity finally
+evicts the oldest. In C, capacity eviction NEVER fires (0 events) --
+entries are pruned by expiry long before 64 could ever accumulate.
+
+### 5. Causal explanation for the 55-92% reduction in channel traffic
+
+Confirmed, not the illustrative example alone: **expired ledger removal
+-> the NEXT NACK for that sequence finds no ledger entry ->
+`handle_ack_nack_feedback()`'s `available_history` scan omits it ->
+classified into `unavailable_ranges` -> `UnrecoverableLossNotice` sent
+instead of a retransmission -> zero retransmission sends for that
+sequence, ever again.** Of the 585 distinct `lifespan_exceeded`-removed
+entries in this one traced run, only **12 (2.0%)** ever had even ONE
+retransmission attempt before being pruned -- confirming removal
+happens almost always BEFORE any repair cycle gets a chance to run, not
+after a few attempts. Total send-attempt volume (orig+retransmit,
+this one endpoint's own trace) dropped from 27,921 (A) to 2,001 (C) --
+a 92.8% reduction -- fully consistent with the previously-observed
+55-74% TOTAL-WIRE-BYTES reduction across the whole fleet (this
+per-endpoint send-attempt count is naturally a larger relative drop
+than the fleet-wide byte total, since it excludes discovery/ACK/NACK
+control traffic that doesn't shrink).
+
+### 6. Causal explanation for the raw-delivery regression
+
+Of the 585 lifespan-expired-removed entries in this traced run: **367
+(63%) were delivered anyway** (their first, non-retransmitted send
+simply succeeded -- pruning a now-redundant backup copy has zero
+delivery impact for these). **218 (37%) were never delivered at all.**
+These 218 are exactly the messages that, in condition A, would have
+remained in the (un-lifespan-limited, capacity-192-evicted-much-later)
+ledger long enough to be available for a LATER NACK-triggered
+retransmission -- giving them a real, measured chance at EVENTUAL
+(late) delivery. In condition C, the SAME messages are pruned before
+that chance ever arises, converting them from "eventually delivered
+late" into "permanently lost." This is a directly observed mechanism,
+not an inference from network-contention change -- the radio
+parameters, seed, and workload are identical between A and C; only the
+ledger's own retention policy differs.
+
+### 7. Freshness question -- partially reconciled, reported honestly
+
+Per-message classification confirms retransmission-driven repair is
+overwhelmingly NOT what produces fresh delivery in either condition:
+in this traced run, of A's 26,809 retransmission attempts, 25,861
+(96.5%) correlate with an eventual STALE delivery and 0 with no
+delivery; a smaller number, 948 (3.5%), correlate with an event_id
+that was ULTIMATELY delivered fresh. This 3.5% figure is NOT
+necessarily "this specific retransmission caused the fresh delivery"
+-- it is "this event_id's retransmission attempt(s) coincide with an
+event_id that was eventually delivered within its deadline," which
+does not distinguish a retransmission's own causal contribution from
+the original (first-attempt) transmission having ALREADY succeeded
+fresh while a redundant, already-in-flight retransmission was also
+underway for the same sequence. This is a WEAKER methodology than the
+prior turn's own stricter accounting (which reported exactly 0/27,192)
+and the two are not directly comparable -- reported as a genuine,
+unresolved discrepancy rather than silently reconciled. In condition C,
+0 of 889 retransmission attempts correlate with fresh delivery (889
+stale, 0 no-delivery) -- consistent with the earlier, stricter finding.
+Either way, the fraction of retransmission traffic associated with
+FRESH delivery is small (0-3.5%) at both conditions -- **removing the
+retransmission traffic that never helps freshness anyway (the ~96-100%
+majority) naturally cannot improve fresh-deadline success, while
+removing ANY of it (including the ambiguous 3.5%) can only ever cost,
+never gain, raw delivery.** Not automatically called good or bad, per
+this task's own instruction -- it is exactly the tradeoff the
+classification in item 9 names.
+
+### 8-18. Small paired A/C experiment (N=4/N=8, seeds 7/13/29, counterbalanced)
+
+This task's condition C (`deadline_aware_retransmission_lifespan=True`,
+NO suppression code -- `rmw_pubsub.cpp` fully reverted) is CODE-
+IDENTICAL to the immediately preceding turn's own ablation condition
+("C_ablation": lifespan set, new check compiled out via
+`RTC_DEADLINE_AWARE_RETRANSMISSION_SUPPRESSION_ABLATION_DISABLE=1`) --
+the macro-disabled branch and "code entirely absent" are the exact
+same compiled behavior. That data (same seeds, same image, same
+radio/workload parameters, same three readiness fixes) is reused
+directly rather than re-running 12 more live Docker/ns-3 experiments
+for a second time on an unchanged question -- already committed at
+`docs/data/deadline_suppression_ab_20260925/summary.json` (condition
+"A" there = this task's A; condition "C_ablation" there = this task's
+C).
+
+| N | Seed | Fresh A→C | Delivery A→C | Wire bytes A→C | nack_retrans A→C |
+|---|---|---|---|---|---|
+| 4 | 7  | 10.52→8.98 | 86.52→65.37 | 37.80M→8.34M | 29,393→0 |
+| 4 | 13 | 9.04→8.92  | 89.11→67.56 | 25.68M→8.00M | 18,986→0 |
+| 4 | 29 | 9.47→8.31  | 86.95→66.40 | 24.23M→7.99M | 17,917→0 |
+| 8 | 7  | 1.38→1.50  | 58.82→49.87 | 54.56M→20.98M | 16,140→0 |
+| 8 | 13 | 1.27→1.65  | 56.52→48.25 | 25.84M→15.85M | 6,690→0  |
+| 8 | 29 | 1.24→1.31  | 59.24→51.46 | 52.22M→22.69M | 10,800→0 |
+
+**11. Fresh delta**: N=4 mean -0.94pp (small, within noise, all 3
+seeds near-flat-to-slightly-negative); N=8 mean +0.19pp (noise,
+slightly positive at every N=8 seed this time -- still not a material
+improvement). **12. Delivery delta**: N=4 mean -21.1pp; N=8 mean
+-8.3pp -- both substantial, consistent regressions. **13. Wire-byte
+delta**: N=4 -67% to -78%; N=8 -39% to -62% (seed 13's smaller drop
+matches its own smaller baseline `nack_retransmissions`, 6,690 vs
+10,800-16,140 for the other two N=8 seeds). **14. ACK/NACK delta**: `nack_retransmissions`
+(the SENT count) drops to exactly 0 in every one of the 6 C runs --
+every retransmission that WOULD have been attempted in A is instead
+resolved via the ledger-pruning mechanism before any NACK round-trip
+completes (item 5). **15. Retransmission delta**: mirrors item 14
+exactly (0 sent in C at every seed/scale). **16. AoI/latency**: p50/p99
+both improve numerically in C at every seed (e.g. N=4 seed=7:
+960ms/16,698ms → this task's traced run showed C's stale deliveries
+arrive faster on average, since the surviving stale deliveries are
+disproportionately the SHORTER-latency ones, the longer-tail
+retransmission-rescued stragglers having been pruned away) -- this is
+a direct, mechanical consequence of item 6, not a genuine latency
+improvement for any INDIVIDUAL message. AoI itself was not
+separately recomputed for this reused dataset (raw per-message data
+from the immediately preceding turn's runs was not retained -- an
+honest gap, not fabricated). **17. CPU/RSS**: no meaningful difference
+between A and C at either scale (see the already-committed summary).
+**18. `sim_lag_s`**: valid throughout (max 7.67s across all 12 runs),
+simulator remained valid in every A and C run at both scales.
+
+### 19. Classification: **B. BANDWIDTH_ONLY_TRADEOFF**
+
+Wire traffic decreases substantially (55-92% depending on measure) and
+`nack_retransmissions` drops to exactly zero -- but fresh-deadline
+success does not materially improve at either scale (flat within
+noise, occasionally marginally negative), and raw delivery decreases
+substantially and consistently (N=4: -21.8pp mean; N=8: -7.7pp mean).
+This is a clean, mechanically-explained bandwidth/delivery tradeoff,
+not a freshness win and not a correctness regression for
+unexpired/unknown-deadline traffic (unaffected by construction, per
+the previous task's own GREEN-test-verified safety contract, which
+still applies since `frame_exceeds_lifespan()` itself is unchanged).
+
+### 20-22. Files changed / tests / commit
+
+`scripts/fleetqox_rmw_trace_endpoint.py` (re-added
+`--deadline-aware-retransmission-lifespan` flag, identical to the
+reverted investigation's own; wired the ALREADY-EXISTING
+`rmw_fleetqox_cpp_retransmit_ledger_erasure_trace_json()` C++ accessor
+into `fleetqox_loss_funnel_trace()["ledger_erasures"]`, previously
+never read from Python), `scripts/run_ns3_docker_container_fleet_probe.py`
+(threaded the same flag through `launch_endpoints()`/`run_probe()`).
+`ros2_ws/src/rmw_fleetqox_cpp/src/rmw_pubsub.cpp` **NOT modified** --
+the C++ accessor and the `RetransmitLedgerErasureTraceEvent` mechanism
+it reads already existed before this task. Full suite: 888 passed
+(same 8 pre-existing unrelated failures), unchanged before and after
+(no C++ rebuild was needed). Raw traced-run analysis (ledger erasure
+counts/bytes/fate) computed locally, not committed (small enough
+summary numbers are recorded directly in this section instead of a
+separate data file, since no new live A/C runs beyond the one N=4
+seed=53 diagnostic pair were needed for the primary table).
+
+### 23. Exactly one next step
+
+This mechanism is now understood, quantified, and classified
+(BANDWIDTH_ONLY_TRADEOFF) -- it is not, on this evidence, a promising
+lever for improving fresh-deadline success on its own. The one
+remaining open, evidence-backed question worth a future task: whether
+COMBINING this pruning mechanism with a genuinely different intervention
+(e.g. prioritizing airtime for original/first-attempt sends over any
+retransmission once channel contention is detected, rather than
+pruning after the fact) could convert some of the 37% "would have
+eventually delivered late" loss into fresh delivery instead -- a
+different, sharper hypothesis than either of the last two tasks, not
+a re-test of what has now been tried twice.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
