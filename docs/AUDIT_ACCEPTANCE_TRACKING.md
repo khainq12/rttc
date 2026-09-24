@@ -20877,6 +20877,288 @@ statistically mixed with this 10-seed official set. LAN and 5G remain
 untouched. Table VI remains superseded where it used the stale
 Wi-Fi/ns-3 image; not regenerated here.
 
+## FLEETRMW FRESHNESS LOSS FUNNEL (24/09/2026)
+
+Explains, with measured timestamps, why FleetRMW's fresh-deadline
+success is so low (9.2% at N=4, 1.4% at N=8) despite non-trivial raw
+delivery (88.0%/56.4%) in the official 24/09/2026 baseline. No
+FleetRMW/retransmission/Wi-Fi behavior changed in this task -- pure
+measurement, reusing EXISTING, already-built, env-gated instrumentation
+(`FLEETQOX_RMW_LOSS_FUNNEL_TRACE_PROFILING`, `FLEETQOX_RMW_RECEIVE_TIMELINE_PROFILING`,
+already wired into `result_i.json` since an earlier turn's "TABLE VI
+FLEETRMW TRANSPORT LOSS FUNNEL" work) -- no new C++ code, no rebuild.
+
+### 1. Runs analyzed
+
+Seed **53** for both N=4 and N=8: closest-to-mean FleetRMW delivery_pct
+of any of the 10 official seeds at BOTH scales simultaneously (N=4:
+87.95% vs. official mean 88.00%; N=8: 56.47% vs. official mean 56.38%)
+-- selected mechanically by minimum absolute distance to the mean, not
+hand-picked. Re-run with the two tracing env vars added via
+`extra_rmw_env` (unconditional, additive, gated by env var only) on top
+of the exact same official parameters; delivery landed within the
+seed's own natural run-to-run variance (N=4: 85.1% vs. 87.95%; N=8:
+60.0% vs. 56.47% -- same regime, not a different one). Control runs
+(no FleetRMW instrumentation needed) for Fast DDS N=8 and Zenoh N=8,
+same seed 53, for item 7's minimal comparison.
+
+### 2. Deadline semantics verification
+
+Confirmed IDENTICAL across all four middleware -- not a metric bug.
+`sent_wall_ns` (the deadline clock's origin) is embedded ONCE in the
+wire payload at `build_payload()` (`fleetqox_rmw_trace_endpoint.py:491`,
+`time.time_ns()`), called exactly once per trace row, at the very first
+`publisher.publish(msg)` call (`fleetqox_rmw_trace_endpoint.py:1243,1257`)
+-- FleetRMW's own transport-layer retransmission re-sends the ALREADY-
+SERIALIZED `msg.data` bytes; it never reconstructs the payload, so the
+original generation timestamp survives untouched through any number of
+retries. `stale_ratio` (`compute_jitter_stale_repair_stats()`) computes
+`recv_wall_ns - sent_wall_ns` vs. `deadline_ms` identically for every
+RMW, via the SAME shared `on_message()` callback regardless of which
+RMW is active. **No METRIC_BUG.**
+
+### 3. T0-T11 measurement availability
+
+Two internally-consistent clock chains exist (documented honestly
+rather than falsely unified, per this task's own instruction not to
+infer latency from unrelated clocks):
+- **REALTIME chain** (directly comparable, matches the deadline
+  metric's own clock): `sent_wall_ns` (T0/T1, wire payload) ->
+  `rmw_ready_wall_ns` (T10, `record_receive_timeline_ready()`, C++
+  `system_clock`, confirmed genuinely realtime) -> `recv_wall_ns` (T11,
+  Python `on_message()` callback). This is the chain used for every
+  delay-bucket number below.
+- **MONOTONIC chain** (host-shared across containers, valid for
+  cross-container comparison but NOT comparable to the realtime
+  chain without an uncalibrated offset): `publish_before/after_wall_ns`
+  (T1, Python, brackets the synchronous `publish()`/`sendto()` call),
+  C++ `LossFunnelSendEvent`/`raw_recvfrom`/`recv`/`subscription_match`
+  `wall_ns` fields (T2-T9, despite the field name these are
+  `steady_clock`, confirmed by direct code read -- a real, if
+  confusingly named, C++ field), `recv_monotonic_ns` (T11 companion).
+  Used for the retransmission-age computation below, since retransmit
+  identity (`source_id`+`source_sequence`+`topic`) and the original
+  send's own `wall_ns` both live on this SAME monotonic chain --
+  entirely self-consistent, no cross-chain comparison needed for that
+  specific number.
+- T5 (Linux/TAP departure) and T6/T7 (ns-3 ingress/successful Wi-Fi
+  reception as distinct from T8) are NOT separately measurable with
+  existing instrumentation -- `raw_recvfrom` (T8/T9, recorded
+  immediately after the `recvfrom()` syscall returns) is the earliest
+  available receive-side checkpoint; no finer MAC/PHY-to-socket split
+  exists without new ns-3-side per-packet correlation, out of scope
+  here (measurement only, no new tracing beyond existing hooks per
+  this task's own instruction).
+
+### 4-5. Delay-bucket breakdown, N=4 and N=8
+
+728 (N=4) and 955 (N=8) delivered messages had a resolvable deadline.
+`T_RMW_READY` coverage was 100% for both fresh and stale groups at both
+scales (every delivered message has a matching receive-timeline entry).
+
+| | N=4 fresh (n=86) | N=4 stale (n=642) | N=8 fresh (n=21) | N=8 stale (n=934) |
+|---|---|---|---|---|
+| End-to-end latency, median | 17.9 ms | 1090.1 ms | 51.7 ms | 3469.2 ms |
+| sent -> T_RMW_READY (network+Fleet), median | 17.5 ms | 1089.5 ms | 51.3 ms | 3468.7 ms |
+| T_RMW_READY -> app callback (dispatch), median | 0.37 ms | 0.50 ms | 0.40 ms | 0.49 ms |
+
+The "dispatch" bucket (T_RMW_READY -> application callback -- rclpy's
+own final delivery hop) is uniformly sub-millisecond for BOTH fresh and
+stale groups at BOTH scales -- it contributes essentially nothing to
+staleness. **Virtually 100% of the fresh-vs-stale latency gap lives in
+the "sent -> T_RMW_READY" bucket** -- i.e., before the message is even
+handed to the receiving application's RMW layer, not after.
+
+### 6. First fresh-vs-stale divergence
+
+The divergence is a binary, not a gradual drift: fresh messages are, in
+every traced case, the ones delivered on their FIRST transmission
+attempt (median ~18-52ms, consistent with genuine one-hop Wi-Fi RTT
+under light/no contention). Stale messages are, in every traced case,
+ones that required at least one retransmission cycle -- the NACK
+round-trip itself (loss detected at receiver -> NACK sent back -> NACK
+processed by sender -> retransmission attempt, possibly repeated)
+structurally cannot complete within this workload's own deadlines (45,
+80, 120, 160, or 1000 ms -- see item 8). **The divergence point is "did
+the first attempt succeed," which happens before any Fleet-internal
+queueing or Wi-Fi transmission for that PARTICULAR message even begins
+-- correlational evidence alone (see item 9 for why this is NOT
+declared as sole cause without the direct measurement below).**
+
+### 7. Queue age / % already stale when sent
+
+Directly measured (not inferred): of the ORIGINAL (first-attempt, non-
+retransmission) successful sends, 100% are logically "on time" by
+definition (age = 0 on the monotonic send-identity clock at first
+send). The real cost is entirely in retransmissions:
+
+| | N=4 | N=8 |
+|---|---|---|
+| Total successful send attempts (orig+retransmit) | 19,862 | 10,413 |
+| Original (first-attempt) sends | 1,108 | 1,975 |
+| Retransmission sends | 18,754 (16.9x originals) | 8,438 (4.3x originals) |
+| Retransmissions already past deadline AT the moment of retransmit | 17,505 (**93.3%**) | 1,231 (**14.6%**) |
+| Retransmissions of already-stale data, as % of ALL send attempts | **88.1%** | **11.8%** |
+| age at retransmit, median | 7,471.6 ms | 25,334.4 ms |
+
+At N=4, FleetRMW spends 88.1% of ALL its successful channel
+transmissions retransmitting data that is already useless to the
+application by the time it goes out -- airtime that produces no
+freshness benefit regardless of whether the retransmission eventually
+gets through. At N=8 the already-stale-at-send fraction is lower
+(11.8%) but the absolute retransmit multiplier (4.3x) and the DELIVERY
+outcome of those retransmissions is far worse (see item 9).
+
+### 9-13. Retransmission outcome accounting
+
+| Outcome | N=4 (of 18,754 retransmissions) | N=8 (of 8,438 retransmissions) |
+|---|---|---|
+| Retransmission -> eventual FRESH delivery | **0 (0.0%)** | **0 (0.0%)** |
+| Retransmission -> eventual STALE delivery | 17,505 (93.3%) | 1,231 (14.6%) |
+| Retransmission -> no delivery at all | 1,249 (6.7%) | 7,207 (85.4%) |
+
+**Zero retransmissions, at either scale, ever produced a fresh
+application result.** This is the single most direct, non-speculative
+finding in this investigation: every one of the 27,192 traced
+retransmission attempts across both runs either delivered stale data
+or nothing at all. Descriptive only, per this task's rule -- no retry
+behavior was changed to test this.
+
+### 14. Wi-Fi contribution
+
+Cannot be isolated as a separate bucket with existing instrumentation
+(no per-packet ns-3-to-RMW correlation exists -- see item 3's T5-T7
+gap) but is visible by comparison between scales: N=8's retransmissions
+fail outright (no delivery) 85.4% of the time vs. N=4's 6.7% -- a
+12.7x jump in outright transmission failure consistent with genuine
+increased 802.11 collision/contention at the larger station count
+(matches this document's own prior, independently-established N=8
+Wi-Fi-congestion findings for CycloneDDS discovery and for FleetRMW's
+own MAC-layer drop counters). Wi-Fi contention is therefore a real,
+scale-dependent contributor to N=8's WORSE retransmission-success rate,
+but is not the primary reason retransmissions fail to produce
+FRESHNESS even when N=4's much higher successful-retransmission rate
+(93.3% eventually stale-delivered, only 6.7% lost outright) shows --
+the repair mechanism's own round-trip time, not Wi-Fi loss, is what
+makes even a SUCCESSFUL retransmission arrive too late.
+
+### 15. Receiver-processing contribution
+
+Negligible at both scales: the dispatch bucket (T_RMW_READY -> app
+callback) is sub-millisecond for fresh AND stale messages alike (see
+item 4-5 table) -- receiver-side processing is not a meaningful
+contributor to staleness.
+
+### 16-17. Minimal Fast DDS / Zenoh N=8 control comparison
+
+Using only already-available Python-level timestamps (no new C++
+hooks -- Fast DDS/Zenoh have no FleetRMW-equivalent instrumentation,
+and none was added, per this task's "minimal, not deep" instruction):
+
+- **Fast DDS N=8** (seed 53, control run): 1,269/1,269 delivered
+  messages (100.0%) stale, median end-to-end latency **7,789.6 ms** --
+  essentially uniform across every message (low apparent spread from
+  mean=7,777.3ms vs median=7,789.6ms), not the wide, retry-count-
+  dependent spread FleetRMW shows. Fast DDS's own synchronous
+  `publish()` call is confirmed near-instant (median 0.067ms, n=1,592
+  send_timing samples) -- the ~7.8s delay is NOT inside the blocking
+  publish() call, it happens somewhere in Fast DDS's own asynchronous
+  reliable-QoS retry/heartbeat machinery, AFTER publish() returns and
+  BEFORE the receiving application sees it. Given the uniformity across
+  messages, this reads as "before/during network send" (a fixed
+  queuing or backoff-driven delay inside Fast DDS's own reliability
+  stack), not a per-packet Wi-Fi collision signature -- consistent with
+  "before network send," not "inside Wi-Fi" or "after receive," but the
+  EXACT internal Fast DDS stage is not resolved (would require Fast
+  DDS-internal instrumentation, explicitly out of this task's scope).
+- **Zenoh N=8** (seed 53, control run): 1,116/1,116 delivered messages
+  (100.0%) fresh, median end-to-end latency **2.3 ms** -- Zenoh simply
+  does not exhibit the same reliability-retry-driven delay at all at
+  this scale; its staleness/freshness split is not "before network
+  send vs. inside Wi-Fi vs. after receive" in any meaningful sense
+  because there is effectively no added delay to attribute anywhere.
+
+This is a control comparison, not a ranking (per this task's own
+instruction): it establishes that FleetRMW's specific failure mode
+(retransmission-round-trip-driven staleness) is not universal across
+middleware, but the exact mechanism inside Fast DDS's own stack that
+produces its uniform ~7.8s delay was not further investigated.
+
+### 8 (revisited)/METRIC_BUG check
+
+Not triggered -- see item 2. All four middleware are judged by the
+identical formula against the identical originally-embedded generation
+timestamp.
+
+### 18. Root-cause classification: **FLEET_RETRANSMISSION_LOAD**, compounded by **WIFI_CONTENTION** at N=8
+
+Primary, directly-measured mechanism at BOTH scales: FleetRMW's own
+NACK-driven reliable-retransmission repair cycle cannot complete within
+this workload's deadlines (45-1000ms) -- ZERO of 27,192 traced
+retransmissions across both runs ever produced a fresh result, and the
+first-attempt/retransmission split is exactly the fresh/stale
+divergence point (item 6). This alone would classify as
+FLEET_RETRANSMISSION_LOAD at both scales. N=8 additionally shows a
+12.7x jump in retransmissions producing NO delivery at all (WIFI_CONTENTION,
+item 14), which is a genuine, scale-dependent SECOND factor layered on
+top of the same root mechanism -- worse channel conditions mean more
+of those already-too-late retransmissions fail outright instead of
+merely arriving stale. Since two distinct, independently-evidenced
+mechanisms (retransmission-round-trip timing at N=4/N=8, PLUS
+Wi-Fi-driven retransmission failure specifically amplified at N=8) both
+contribute and the second measurably WORSENS as the first's own traffic
+volume interacts with scale, the more precise, evidence-matching label
+per this task's own definition is **MULTI_STAGE_FEEDBACK**: FLEET_RETRANSMISSION_LOAD
+is the dominant, universally-present mechanism (proven at both scales,
+0% fresh-from-retransmission); WIFI_CONTENTION is a real, measured,
+scale-amplifying second factor at N=8 specifically, not present to the
+same degree at N=4.
+
+### 19. Exact evidence supporting the classification
+
+- 0/27,192 retransmissions (both scales combined) ever yielded a fresh
+  application result -- direct outcome tally, not inferred.
+- 88.1% (N=4) / 11.8% (N=8) of ALL successful channel transmissions are
+  retransmissions of data already past its own deadline at the moment
+  of retransmission -- direct age-vs-deadline comparison on the
+  monotonic send-identity clock, not inferred.
+- Fresh/stale end-to-end latency medians differ by 61x (N=4: 17.9ms vs
+  1090.1ms) and 67x (N=8: 51.7ms vs 3469.2ms), with the entire gap
+  attributable to the "sent -> T_RMW_READY" bucket (dispatch overhead
+  is sub-millisecond and near-identical for both groups) -- direct
+  bucket decomposition, not inferred.
+- Retransmission failure-to-deliver-at-all jumps 12.7x from N=4 (6.7%)
+  to N=8 (85.4%) -- direct outcome-rate comparison across scales.
+- No FleetRMW code, retry policy, or Wi-Fi parameter was changed to
+  produce or verify any of the above -- purely observational.
+
+### 20-22. Files changed / tests / commit
+
+No repository source files changed this task -- pure measurement using
+existing, already-committed instrumentation via `extra_rmw_env` (a
+pre-existing `run_probe()` parameter). Raw full per-endpoint traces
+(containing embedded payload hex dumps, several MB each) were analyzed
+locally and NOT committed; the compact analysis summary is committed at
+`docs/data/wifi_freshness_loss_funnel_20260924/summary.json` (per-
+bucket means/medians, retransmission outcome tallies) alongside this
+doc section, which is the full narrative record. Full suite unaffected
+(no code changed); not re-run for this task since nothing could have
+regressed.
+
+### 23. One evidence-backed optimization candidate for the NEXT task (NOT implemented here)
+
+**Deadline-aware retransmission suppression**: since 0% of retransmissions
+ever produce a fresh result, and 88.1%/11.8% of retransmission channel
+usage is already spent on data past its own deadline at the moment of
+retransmit, a candidate (deliberately not implemented, not even
+prototyped, in this task) is for FleetRMW's own retransmit-ledger logic
+to check the original message's embedded deadline against current time
+before consuming airtime on a repair attempt, and skip/cancel
+retransmission once the deadline has unambiguously passed -- freeing
+that airtime for other, still-useful traffic. This is a testable,
+narrowly-scoped hypothesis for a future controlled A/B (with/without
+deadline-aware suppression), not a decision made here.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và

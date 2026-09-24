@@ -1,0 +1,96 @@
+{
+  "N4": {
+    "n_fresh": 86,
+    "n_stale": 642,
+    "fresh_latency_ms": {
+      "n": 86,
+      "mean": 64.01270395348837,
+      "median": 17.905362500000003
+    },
+    "stale_latency_ms": {
+      "n": 642,
+      "mean": 2617.3428447897195,
+      "median": 1090.1454720000002
+    },
+    "fresh_network_plus_fleet_ms": {
+      "n": 86,
+      "mean": 63.52794701162791,
+      "median": 17.469443499999997
+    },
+    "stale_network_plus_fleet_ms": {
+      "n": 642,
+      "mean": 2616.75195638162,
+      "median": 1089.5193405
+    },
+    "fresh_dispatch_ms": {
+      "n": 86,
+      "mean": 0.48475694186046514,
+      "median": 0.3745235
+    },
+    "stale_dispatch_ms": {
+      "n": 642,
+      "mean": 0.5908884080996885,
+      "median": 0.5047835
+    },
+    "n_retransmissions": 18754,
+    "total_send_attempts": 19862,
+    "retransmit_outcomes": {
+      "fresh": 0,
+      "stale": 17505,
+      "no_delivery": 1249
+    },
+    "already_stale_at_retransmit": 17505,
+    "age_at_retransmit_ms": {
+      "n": 18754,
+      "mean": 9616.669559312786,
+      "median": 7471.5506675
+    }
+  },
+  "N8": {
+    "n_fresh": 21,
+    "n_stale": 934,
+    "fresh_latency_ms": {
+      "n": 21,
+      "mean": 109.47153366666667,
+      "median": 51.741679
+    },
+    "stale_latency_ms": {
+      "n": 934,
+      "mean": 8683.36454153105,
+      "median": 3469.246667
+    },
+    "fresh_network_plus_fleet_ms": {
+      "n": 21,
+      "mean": 108.98051471428572,
+      "median": 51.272642
+    },
+    "stale_network_plus_fleet_ms": {
+      "n": 934,
+      "mean": 8682.77026135653,
+      "median": 3468.716587
+    },
+    "fresh_dispatch_ms": {
+      "n": 21,
+      "mean": 0.4910189523809524,
+      "median": 0.401986
+    },
+    "stale_dispatch_ms": {
+      "n": 934,
+      "mean": 0.5942801745182013,
+      "median": 0.485669
+    },
+    "n_retransmissions": 8438,
+    "total_send_attempts": 10413,
+    "retransmit_outcomes": {
+      "fresh": 0,
+      "stale": 1231,
+      "no_delivery": 7207
+    },
+    "already_stale_at_retransmit": 1231,
+    "age_at_retransmit_ms": {
+      "n": 8438,
+      "mean": 23004.821739642568,
+      "median": 25334.3892725
+    }
+  }
+}
