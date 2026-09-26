@@ -2052,7 +2052,22 @@ def run_probe(
     sustain_beacon_until_deadline: bool = False,
     zenoh_control_station_explicit_listen: bool = False,
     deadline_aware_retransmission_lifespan: bool = False,
+    ns3_scheduler: str = "map",
 ) -> dict[str, Any]:
+    # ns3_scheduler: passed straight through to
+    # ReferenceTopologyProbe.start_ns3()'s same-named `scheduler` arg --
+    # see fleetqox_trace_replay_tap.cc's --scheduler doc comment. Default
+    # "map" reproduces this program's prior, unconfigured behavior byte-
+    # for-byte. Already exposed and proven (P2.1, docs/
+    # AUDIT_ACCEPTANCE_TRACKING.md "N=16 SERIOUS PERFORMANCE PASS") as a
+    # semantics-preserving, sim_lag_s-reducing option for Table VI's
+    # run_coordination_probe() (its own `ns3_scheduler` param) -- this
+    # only threads the SAME already-tested mechanism through to Table V's
+    # own call site, exactly as that investigation's own "Next step" for
+    # Direct/Gateway called for. A pure internal event-ordering data-
+    # structure choice: cannot change which events fire or their
+    # simulated-time order, so it cannot alter Wi-Fi/workload/Fleet
+    # semantics by construction -- only wall-clock speed.
     # topology_aware_readiness / sustain_beacon_until_deadline: opt-in
     # (default False, exact prior behavior for every existing caller),
     # added 24/09/2026 to investigate the corrected-image Wi-Fi readiness
@@ -2187,6 +2202,7 @@ def run_probe(
             mobility_speed=mobility_speed,
             ns3_seed=ns3_seed,
             ns3_run=ns3_run,
+            scheduler=ns3_scheduler,
         )
         if rmw_implementation == "rmw_zenoh_cpp":
             probe.start_zenoh_router()

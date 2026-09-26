@@ -880,26 +880,39 @@ class WifiReadinessRootCauseFixesTest(unittest.TestCase):
         )
 
 
-class RunProbeSchedulerPlumbingAbsentTest(unittest.TestCase):
-    """RED (P2.1, docs/AUDIT_ACCEPTANCE_TRACKING.md, "N=16 SERIOUS
-    PERFORMANCE PASS"): ns3::HeapScheduler was already proven a
-    semantics-preserving, sim_lag_s-reducing option for Table VI's
-    run_coordination_probe() (its own `ns3_scheduler` parameter) --
-    ReferenceTopologyProbe.start_ns3() has supported a `scheduler`
-    argument (default "map") since that pass. Table V's own run_probe()
-    never received the same plumbing: no `ns3_scheduler` parameter on
-    its signature, and its own `probe.start_ns3(...)` call site never
-    passes a `scheduler=` keyword at all -- proven here, literally, not
-    inferred. Every Table V Direct run is therefore silently locked to
-    the default `map` scheduler with no way to select `heap`, even
-    though the underlying ns-3/C++ support already exists and is
-    already proven safe elsewhere in this same codebase."""
+class RunProbeSchedulerPlumbingTest(unittest.TestCase):
+    """P2.1 (docs/AUDIT_ACCEPTANCE_TRACKING.md, "N=16 SERIOUS PERFORMANCE
+    PASS"): ns3::HeapScheduler was already proven a semantics-preserving,
+    sim_lag_s-reducing option -- ReferenceTopologyProbe.start_ns3() has
+    supported a `scheduler` argument (default "map") since that pass, and
+    it is already exposed on Table VI's own run_coordination_probe() as
+    `ns3_scheduler`. Table V's own run_probe() never received the same
+    plumbing: no `ns3_scheduler` parameter existed on its signature, and
+    its own `probe.start_ns3(...)` call site never passed a `scheduler=`
+    keyword at all -- so every Table V Direct run was silently locked to
+    the default `map` scheduler with no way to select `heap`, even though
+    the underlying ns-3/C++ support already existed and was already
+    proven safe elsewhere in this same codebase.
 
-    def test_run_probe_has_no_scheduler_parameter(self):
-        self.assertNotIn("ns3_scheduler", inspect.signature(run_probe).parameters)
+    RED (confirmed against the pre-fix source): `"ns3_scheduler" not in
+    inspect.signature(run_probe).parameters` and `"scheduler=" not in
+    inspect.getsource(run_probe)` -- both True, i.e. the capability was
+    completely absent. This test class asserts the FIXED state instead
+    (the RED state is, by definition, superseded the moment the fix
+    lands -- there is nothing left to regress-guard about pure absence
+    once the parameter exists)."""
 
-    def test_run_probe_never_passes_scheduler_to_start_ns3(self):
-        self.assertNotIn("scheduler=", inspect.getsource(run_probe))
+    def test_ns3_scheduler_parameter_exists_defaulting_to_map(self):
+        # Default "map" reproduces run_probe()'s own prior, unconfigured
+        # behavior byte-for-byte for every existing caller that never
+        # passes this new parameter.
+        params = inspect.signature(run_probe).parameters
+        self.assertIn("ns3_scheduler", params)
+        self.assertEqual(params["ns3_scheduler"].default, "map")
+
+    def test_run_probe_passes_ns3_scheduler_through_to_start_ns3(self):
+        source = inspect.getsource(run_probe)
+        self.assertIn("scheduler=ns3_scheduler", source)
 
 
 class ReferenceTopologyProbeStartNs3SchedulerCommandLineTest(unittest.TestCase):
