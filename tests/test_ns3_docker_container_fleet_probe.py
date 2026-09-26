@@ -3,6 +3,7 @@ import inspect
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts.run_ns3_docker_container_fleet_probe import (
     BASE_IP_PREFIX,
@@ -876,6 +877,72 @@ class WifiReadinessRootCauseFixesTest(unittest.TestCase):
         # lock-in above) regardless of whether the new flags are used.
         self.assertEqual(
             inspect.signature(run_probe).parameters["discovery_timeout_s"].default, 15.0
+        )
+
+
+class RunProbeSchedulerPlumbingAbsentTest(unittest.TestCase):
+    """RED (P2.1, docs/AUDIT_ACCEPTANCE_TRACKING.md, "N=16 SERIOUS
+    PERFORMANCE PASS"): ns3::HeapScheduler was already proven a
+    semantics-preserving, sim_lag_s-reducing option for Table VI's
+    run_coordination_probe() (its own `ns3_scheduler` parameter) --
+    ReferenceTopologyProbe.start_ns3() has supported a `scheduler`
+    argument (default "map") since that pass. Table V's own run_probe()
+    never received the same plumbing: no `ns3_scheduler` parameter on
+    its signature, and its own `probe.start_ns3(...)` call site never
+    passes a `scheduler=` keyword at all -- proven here, literally, not
+    inferred. Every Table V Direct run is therefore silently locked to
+    the default `map` scheduler with no way to select `heap`, even
+    though the underlying ns-3/C++ support already exists and is
+    already proven safe elsewhere in this same codebase."""
+
+    def test_run_probe_has_no_scheduler_parameter(self):
+        self.assertNotIn("ns3_scheduler", inspect.signature(run_probe).parameters)
+
+    def test_run_probe_never_passes_scheduler_to_start_ns3(self):
+        self.assertNotIn("scheduler=", inspect.getsource(run_probe))
+
+
+class ReferenceTopologyProbeStartNs3SchedulerCommandLineTest(unittest.TestCase):
+    """GREEN: proves the scheduler choice actually reaches the ns-3
+    process's own command line (not just a Python-side no-op parameter),
+    and that switching it changes NOTHING else about the invocation --
+    the same "pure internal event-ordering swap" guarantee already
+    established for Table VI (see --scheduler's own doc comment in
+    fleetqox_trace_replay_tap.cc)."""
+
+    def _captured_ns3_command(self, **start_ns3_kwargs) -> str:
+        probe = object.__new__(ReferenceTopologyProbe)
+        probe.num_robots = 8
+        probe.ns3sim_name = "fleetqox_test_ns3sim"
+        exec_d_calls: list[tuple] = []
+
+        def fake_docker(*args, **kwargs):
+            if args[:2] == ("exec", "-d"):
+                exec_d_calls.append(args)
+                return mock.Mock(returncode=0)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch(
+            "scripts.run_ns3_docker_container_fleet_probe.docker", side_effect=fake_docker
+        ), mock.patch("scripts.run_ns3_docker_container_fleet_probe.time.sleep"):
+            probe.start_ns3(sim_duration_s=20.0, **start_ns3_kwargs)
+        return exec_d_calls[0][-1]
+
+    def test_default_scheduler_is_map_on_the_actual_command_line(self):
+        self.assertIn("--scheduler=map", self._captured_ns3_command())
+
+    def test_explicit_map_reaches_the_ns3_command_line(self):
+        self.assertIn("--scheduler=map", self._captured_ns3_command(scheduler="map"))
+
+    def test_explicit_heap_reaches_the_ns3_command_line(self):
+        self.assertIn("--scheduler=heap", self._captured_ns3_command(scheduler="heap"))
+
+    def test_heap_changes_only_the_scheduler_flag_nothing_else(self):
+        map_cmd = self._captured_ns3_command(scheduler="map")
+        heap_cmd = self._captured_ns3_command(scheduler="heap")
+        self.assertEqual(
+            map_cmd.replace("--scheduler=map", "--scheduler=X"),
+            heap_cmd.replace("--scheduler=heap", "--scheduler=X"),
         )
 
 
