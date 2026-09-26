@@ -959,6 +959,24 @@ class ReferenceTopologyProbeStartNs3SchedulerCommandLineTest(unittest.TestCase):
         )
 
 
+class BuildNs3BinaryMonolibPlumbingAbsentTest(unittest.TestCase):
+    """RED (P2.8, docs/AUDIT_ACCEPTANCE_TRACKING.md, "MONOLIB INCREMENTAL
+    TEST"): ns3.41-monolib.so (an opt-in NS3_MONOLIB=ON build target)
+    cannot be used by ReferenceTopologyProbe.build_ns3_binary() unless
+    the driver's own link command is pointed at it explicitly -- ns-3's
+    own CMake never installs monolib for external pkg-config consumers
+    (source-verified: no install(TARGETS) call for it anywhere in ns-3
+    3.41's build tree). Proven here, literally: no such plumbing exists
+    yet."""
+
+    def test_build_ns3_binary_has_no_use_monolib_parameter(self):
+        params = inspect.signature(ReferenceTopologyProbe.build_ns3_binary).parameters
+        self.assertNotIn("use_monolib", params)
+
+    def test_run_probe_has_no_ns3_use_monolib_parameter(self):
+        self.assertNotIn("ns3_use_monolib", inspect.signature(run_probe).parameters)
+
+
 def _wifi_stats_line(sim_time_s: float, wall_elapsed_s: float) -> str:
     """One synthetic FLEETQOX_WIFI_STATS log line -- only the two fields
     the sim_lag_s fix actually reads (sim_time_s, wall_elapsed_s) need to
