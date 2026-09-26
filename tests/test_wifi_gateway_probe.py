@@ -16,6 +16,7 @@ import csv
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts.run_wifi_gateway_probe import (
     RELAY_TOPIC_SUFFIX,
@@ -27,6 +28,12 @@ from scripts.run_wifi_gateway_probe import (
 from scripts.fleetqox_rmw_gateway_endpoint import (
     load_all_rows,
     uplink_and_downlink_topics,
+)
+from scripts.run_ns3_docker_container_fleet_probe import (
+    MAX_HEALTHY_SIM_LAG_S,
+    ReferenceTopologyProbe,
+    corrected_sim_lag_s,
+    parse_wifi_stats,
 )
 from scripts.fleetqox_rmw_trace_endpoint import _topic_for, load_rows
 
@@ -208,6 +215,129 @@ class StaticEntriesTest(unittest.TestCase):
         )
         self.assertIn("10.60.0.3:9100", entries[0])
         self.assertIn("10.60.0.4:9100", entries[1])
+
+
+def _wifi_stats_line(sim_time_s: float, wall_elapsed_s: float) -> str:
+    """One synthetic FLEETQOX_WIFI_STATS log line -- same minimal shape as
+    test_ns3_docker_container_fleet_probe.py's own helper of the same
+    name (duplicated, not imported, to keep this file's tests
+    self-contained per its own module docstring)."""
+    return (
+        f'FLEETQOX_WIFI_STATS {{"sim_time_s":{sim_time_s},'
+        f'"wall_elapsed_s":{wall_elapsed_s},'
+        f'"sim_lag_s":{wall_elapsed_s - sim_time_s},'
+        f'"self_cpu_s":0.0,"self_rss_kb":0,"heavy_tracing":false}}'
+    )
+
+
+class GatewaySimLagSMeasurementBugTest(unittest.TestCase):
+    """The Gateway harness (run_wifi_gateway_probe.py's run_gateway_probe())
+    has its OWN copy of the sim_lag_s measurement bug already proven and
+    fixed for the Direct harness (see
+    docs/AUDIT_ACCEPTANCE_TRACKING.md, "SIM_LAG_S MEASUREMENT BUG
+    (26/09/2026)", and SimLagSMeasurementBugTest in
+    test_ns3_docker_container_fleet_probe.py). At the time this test was
+    written, run_wifi_gateway_probe.py still computed:
+
+        sim_lag_s = (
+            ns3_real_elapsed_s_at_log_read - wifi_stats["sim_time_s"]
+            if wifi_stats is not None and wifi_stats.get("sim_time_s") is not None
+            and ns3_real_elapsed_s_at_log_read is not None
+            else None
+        )
+
+    where `wifi_stats` is parse_wifi_stats()'s deliberately-EARLY,
+    target-based snapshot (correct for MAC/PHY-counter cross-run
+    consistency, wrong for lag -- see that function's own doc comment)
+    and `ns3_real_elapsed_s_at_log_read` is an out-of-band real-time
+    read taken well after that early snapshot -- two different
+    observation points, the identical structural defect already proven
+    for Direct.
+
+    Two independent RED proofs:
+
+    1) test_old_formula_reproduction_falsely_inflates_lag reproduces
+       that exact arithmetic against a synthetic log modeling a HEALTHY
+       run (early target snapshot, late real-time read) and shows it
+       crosses MAX_HEALTHY_SIM_LAG_S even though the simulator was never
+       behind -- while corrected_sim_lag_s() (Direct's already-fixed,
+       same-instant formula) correctly reports it healthy.
+
+    2) test_resource_usage_source_never_has_elapsed_s_key proves this
+       bug's PRESENT-DAY manifestation is actually worse than "falsely
+       inflates": ns3_real_elapsed_s_at_log_read is sourced from
+       ReferenceTopologyProbe.sample_ns3sim_resource_usage(), which only
+       ever returns "cpu_pct"/"rss_mb" (a `docker stats --format
+       "{{.CPUPerc}}\\t{{.MemUsage}}"` sample -- see that method's own
+       docstring). `.get("elapsed_s")` on that dict is therefore ALWAYS
+       None, so sim_lag_s is unconditionally None and simulator_invalid
+       unconditionally False for every real Gateway run today -- the
+       validity gate is silently disabled entirely, not merely
+       mis-measuring, until this is fixed."""
+
+    def test_old_formula_reproduction_falsely_inflates_lag(self):
+        # Same healthy-run shape as Direct's own proven-bug test: an
+        # EARLY target snapshot (sim_time=15, healthy ~2s lag) and a
+        # HEALTHY final snapshot (sim_time=30, still only ~2s lag) --
+        # the simulator never actually fell behind at any point.
+        log = "\n".join(
+            [
+                _wifi_stats_line(sim_time_s=5, wall_elapsed_s=5.02),
+                _wifi_stats_line(sim_time_s=10, wall_elapsed_s=10.75),
+                _wifi_stats_line(sim_time_s=15, wall_elapsed_s=17.06),  # target snapshot
+                _wifi_stats_line(sim_time_s=20, wall_elapsed_s=23.30),
+                _wifi_stats_line(sim_time_s=25, wall_elapsed_s=29.57),
+                _wifi_stats_line(sim_time_s=30, wall_elapsed_s=35.64),  # last/final snapshot
+            ]
+        )
+        wifi_stats = parse_wifi_stats(log, target_sim_time_s=15.0)
+        self.assertEqual(wifi_stats["sim_time_s"], 15)
+        # Models a late, end-of-run real-time read -- e.g. a docker-stats
+        # sample taken after the full run/drain/teardown, structurally
+        # analogous to Direct's own proven-buggy
+        # ns3_real_elapsed_s_at_log_read.
+        ns3_real_elapsed_s_at_log_read = 44.03
+
+        old_formula_result = (
+            ns3_real_elapsed_s_at_log_read - wifi_stats["sim_time_s"]
+            if wifi_stats is not None and wifi_stats.get("sim_time_s") is not None
+            and ns3_real_elapsed_s_at_log_read is not None
+            else None
+        )
+        self.assertGreater(
+            old_formula_result,
+            MAX_HEALTHY_SIM_LAG_S,
+            "the current Gateway formula must falsely exceed the validity "
+            "gate for this healthy-simulator shape -- that IS the bug",
+        )
+
+        corrected = corrected_sim_lag_s(log)
+        self.assertLessEqual(
+            corrected,
+            MAX_HEALTHY_SIM_LAG_S,
+            "the FIXED (Direct-equivalent) formula must correctly report "
+            "this run as healthy",
+        )
+        self.assertAlmostEqual(corrected, 35.64 - 30, places=6)
+
+    def test_resource_usage_source_never_has_elapsed_s_key(self):
+        probe = object.__new__(ReferenceTopologyProbe)
+        probe.ns3sim_name = "fleetqox_test_ns3sim"
+        fake_result = mock.Mock(stdout="45.20%\t120MiB / 500MiB\n")
+        with mock.patch(
+            "scripts.run_ns3_docker_container_fleet_probe.docker",
+            return_value=fake_result,
+        ):
+            usage = probe.sample_ns3sim_resource_usage()
+        self.assertIsNotNone(usage)
+        self.assertNotIn(
+            "elapsed_s",
+            usage,
+            "sample_ns3sim_resource_usage() has no 'elapsed_s' field -- "
+            "run_wifi_gateway_probe.py's ns3sim_resource_usage.get('elapsed_s') "
+            "is therefore ALWAYS None, making sim_lag_s/simulator_invalid "
+            "unconditionally None/False for every real Gateway run today",
+        )
 
 
 if __name__ == "__main__":
