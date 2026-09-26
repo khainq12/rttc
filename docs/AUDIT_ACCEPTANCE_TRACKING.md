@@ -22510,6 +22510,325 @@ have been simulator-valid the whole time, meaning the D classification
 revisited once measured against a metric that actually reflects ns-3's
 own real-time performance.
 
+## SIM_LAG_S MEASUREMENT BUG (26/09/2026): PERMANENT FIX, VALIDATED, RETRANSMISSION CAUSAL PROBE RE-MEASURED
+
+Full RED -> FIX -> GREEN cycle on `scripts/run_ns3_docker_container_fleet_probe.py`'s
+`sim_lag_s` metric (a **permanent, kept bugfix to shared harness
+infrastructure**, not a diagnostic-only add-then-revert probe), followed
+by re-running the "RETRANSMISSION-DELAYS-FIRST-ATTEMPT" causal probe
+against the corrected metric. No FleetRMW production code changed. No
+Wi-Fi/workload/ns-3 semantics changed. `MAX_HEALTHY_SIM_LAG_S` stays
+`10.0`, unchanged.
+
+### 1. Exact formula bug
+
+`run_probe()` (`scripts/run_ns3_docker_container_fleet_probe.py`, was
+lines 2267-2273 before this fix):
+```python
+sim_lag_s = (
+    ns3_real_elapsed_s_at_log_read - wifi_stats["sim_time_s"]
+    ...
+)
+```
+`wifi_stats` is `parse_wifi_stats()`'s TARGET-based snapshot -- the
+FIRST `FLEETQOX_WIFI_STATS` line reaching `wifi_stats_target_s()`
+(=`start_offset_ms/1000 + seconds + drain_s`, 15.0s for the pristine
+N=4 seed=53 config), deliberately chosen EARLY for MAC/PHY-counter
+cross-run consistency (that reason is legitimate and unaffected by this
+fix). `ns3_real_elapsed_s_at_log_read` is a Python-side wall-clock read
+taken AFTER the entire `sim_duration_s`-length run (30.0s) plus drain
+plus every endpoint's own shutdown has finished. The formula subtracts
+an EARLY snapshot's sim-time from an END-OF-RUN real-time reading --
+two different observation points, several/many real seconds apart --
+structurally inflating "lag" by roughly `(sim_duration_s -
+wifi_stats_target_s)` plus harness completion-polling variance,
+regardless of whether ns-3 was actually keeping pace (see the prior
+"LOCALIZE NS-3 WALL-CLOCK LAG" section for the original discovery, with
+exact numbers).
+
+### 2. RED
+
+`SimLagSMeasurementBugTest` (`tests/test_ns3_docker_container_fleet_probe.py`,
+commit `b4c8e2e`). `test_old_formula_reports_false_lag_from_mismatched_snapshots`
+reproduces the old formula's own arithmetic against a synthetic log
+modeling the observed pristine N=4 seed=53 shape (healthy ~2s lag
+throughout, target snapshot at sim_time=15, final snapshot at
+sim_time=30) and proves it crosses `MAX_HEALTHY_SIM_LAG_S` even though
+the simulator was never behind. The whole test class failed at IMPORT
+when committed (`corrected_sim_lag_s`/`parse_last_wifi_stats` did not
+exist yet) -- the identical RED signature `EffectiveNs3SimDurationSTest`'s
+own docstring documents for its own earlier bug fix in this same file.
+Confirmed live via `git stash` (running the new test file against the
+pre-fix source before the fix was written).
+
+### 3. Fix (why it needs no correction constant)
+
+Two new functions (`scripts/run_ns3_docker_container_fleet_probe.py`,
+commit `7896898`):
+- `parse_last_wifi_stats(ns3_log)`: the LAST available
+  `FLEETQOX_WIFI_STATS` snapshot (not the target-based one) -- for a
+  pacing measurement, the most RECENT same-instant reading is the right
+  choice, unlike the MAC/PHY counters, which have a real cross-run-
+  consistency reason to prefer an earlier, fixed point instead.
+- `corrected_sim_lag_s(ns3_log)`: `last["wall_elapsed_s"] -
+  last["sim_time_s"]` -- both fields read from the SAME snapshot line,
+  i.e. the SAME `PrintWifiStats()` call in `fleetqox_trace_replay_tap.cc`
+  (`wallElapsedS - simTimeS`, computed in that one C++ statement). This
+  is a same-instant subtraction using data ns-3 itself already produces
+  -- **not an offset applied to the old value, no `15`-style magic
+  constant, no new C++/ns-3 instrumentation** (per the design guidance:
+  "prefer existing authoritative ns-3 timing data"). `parse_wifi_stats()`'s
+  own target-based selection is completely unchanged and still used for
+  every MAC/PHY counter field -- only the LAG computation moves to a
+  different, correctly-paired source.
+
+**Provable property (not just observed, follows directly from the
+formulas)**: the OLD formula can never UNDER-report lag relative to the
+corrected one. `old = T_end - S_early`, `corrected = T_last - S_last`,
+and by construction `T_end >= T_last` (the log is read at or after the
+last snapshot's own real time) and `S_early <= S_last` (the target
+snapshot's sim-time is at or before the final snapshot's) --
+so `old - corrected = (T_end - T_last) + (S_last - S_early) >= 0`
+always. **Consequence for the historical audit (item 10 below): any
+run the OLD formula already called VALID (`sim_lag_s <= 10`) is
+mathematically guaranteed to still be valid under the corrected
+formula** (`corrected <= old <= 10`); only runs the old formula called
+INVALID need re-checking, since those (and only those) could be false
+positives.
+
+### 4. GREEN
+
+9/9 new scenarios in `SimLagSMeasurementBugTest` pass:
+`test_old_formula_reports_false_lag_from_mismatched_snapshots` (the RED
+case, now passing for the corrected side), `test_corrected_lag_uses_last_snapshot_not_target_snapshot`,
+`test_simulator_genuinely_behind_is_still_correctly_flagged_invalid`
+(the fix does not become an "always healthy" rubber stamp),
+`test_single_early_snapshot_target_and_last_coincide` (degenerate
+case), `test_different_sim_duration_and_stats_target_combinations` (4
+target/duration combinations, including a very long `sim_duration_s`),
+`test_validity_gate_constant_unchanged_by_this_fix`,
+`test_validity_decision_boundary_exact` (exactly at and just past
+10.0s), `test_no_snapshot_at_all_returns_none_not_a_false_zero`,
+`test_parse_wifi_stats_unaffected_by_this_fix`. Full suite: **897
+passed (888 + 9 new), same 8 pre-existing unrelated failures.**
+
+### 5. Pristine N=4 seed=53 validation (2 independent runs)
+
+| | run 1 | run 2 |
+|---|---|---|
+| OLD metric (`ns3_real_elapsed_s_at_log_read - target.sim_time_s`) | 20.30s | 20.28s |
+| CORRECTED metric (`last.wall_elapsed_s - last.sim_time_s`) | 5.72s | 5.87s |
+| ns-3's own internal lag (`last_wifi_stats["sim_lag_s"]`, same snapshot) | 5.7202s | 5.87409s |
+| `degraded` (corrected) | **False** | **False** |
+
+**Temporally consistent**: the corrected metric and ns-3's own
+already-computed field from the SAME snapshot agree to within floating-
+point precision (5.7202 vs 5.720199999999998; 5.87409 vs
+5.8740999999999985) -- exactly as expected, since they are now the
+literal same computation read two different ways. The pristine N=4
+seed=53 smoke probe, previously classified `SIMULATOR_BLOCKED`
+(unreachable validity) in the immediately preceding section, is **now
+correctly measured as VALID**.
+
+### 6. N=4 paired results (seeds 7/13/29, corrected sim_lag_s)
+
+A = normal retransmissions. B = `FLEETQOX_RMW_DIAG_SUPPRESS_RETRANSMISSION_DATA_MS="0-15000"`
+(same diagnostic mechanism as the prior two attempts, re-added for this
+measurement then reverted again -- see item 11).
+
+| seed | cond | sim_lag_s | valid | first-attempt fresh% | overall fresh% | delivery% | wire bytes | retransmissions |
+|---|---|---|---|---|---|---|---|---|
+| 7 | A | 6.31 | YES | 9.46 | 9.46 | 89.13 | 4,705,892 | 23,222 |
+| 7 | B | 0.02 | YES | 9.93 | 9.81 | 69.03 | 382,900 | 170 |
+| 13 | A | 5.18 | YES | 9.85 | 9.85 | 85.28 | 5,707,342 | 33,524 |
+| 13 | B | 0.02 | YES | 8.81 | 8.69 | 64.08 | 301,170 | 93 |
+| 29 | A | 6.77 | YES | 9.01 | 9.01 | 88.91 | 4,027,382 | 22,886 |
+| 29 | B | 0.01 | YES | 8.89 | 8.78 | 62.93 | 270,218 | 53 |
+
+**3/3 pairs valid.** First-attempt-fresh deltas (B-A): seed 7 **+0.47pp**,
+seed 13 **-1.04pp**, seed 29 **-0.12pp** (mean -0.23pp, no consistent
+sign, all within ~1pp -- noise, not improvement). Wire bytes: -91.9%,
+-94.7%, -93.3%. Retransmissions: 23,222->170, 33,524->93, 22,886->53
+(near-total suppression, confirming the mechanism engaged as intended).
+
+### 7. N=8 paired results (seeds 7/13/29, corrected sim_lag_s)
+
+| seed | cond | sim_lag_s | valid | first-attempt fresh% | overall fresh% | delivery% | wire bytes | retransmissions |
+|---|---|---|---|---|---|---|---|---|
+| 7 | A | 13.41 | NO | 1.56 | 1.56 | 58.89 | 2,915,176 | 9,686 |
+| 7 | B | 15.17 | NO | 1.56 | 1.56 | 55.32 | 3,186,252 | 12,439 |
+| 13 | A | 12.72 | NO | 1.65 | 1.65 | 59.76 | 2,125,720 | 9,504 |
+| 13 | B | 11.35 | NO | 1.27 | 1.27 | 48.89 | 1,107,270 | 1,115 |
+| 29 | A | 15.07 | NO | 1.31 | 1.31 | 61.73 | 2,139,954 | 10,696 |
+| 29 | B | 10.66 | NO | 1.31 | 1.31 | 50.78 | 834,828 | 1,149 |
+
+**0/3 pairs valid** -- but notably GENUINELY, MODESTLY invalid this
+time (10.7-15.2s, a real ~10-50% overshoot past the 10s gate), a
+completely different character from the old formula's 20-45s swings on
+the SAME scale. This reads as N=8 legitimately, if only moderately,
+exceeding this specific host's real-time simulation budget under
+current conditions -- not a metric artifact. Per this task's own
+instruction, these pairs are excluded from the causal comparison and
+reported here in full rather than omitted or silently re-run until
+"valid."
+
+### 8. Causal classification
+
+**N=4: NO_MEANINGFUL_RETRANSMISSION_INTERFERENCE.** Wire bytes and
+retransmission counts collapse by >90% under suppression, yet
+first-attempt-fresh success shows no consistent improvement (mean
+-0.23pp across 3 valid seeds, sign flips seed to seed) -- exactly the
+task's own stated criterion for this classification. **N=8: cannot be
+classified (SIMULATOR_BLOCKED at this scale)** -- 0/3 pairs met the
+validity gate even under the corrected metric, so N=8 provides no
+usable evidence either way this session.
+
+**Overall verdict for this investigation: NO_MEANINGFUL_RETRANSMISSION_INTERFERENCE**,
+established on N=4's full 3/3-valid-pair evidence (the only scale with
+usable data), with N=8 explicitly flagged as unresolved rather than
+folded into a single number that would overstate what was actually
+measured there.
+
+### 9. Prioritization justified: **NO**
+
+Per the task's own gate, only a MATERIAL first-attempt-fresh
+improvement under suppression would justify further prioritization
+work; N=4's clean, valid, 3-seed evidence shows none, and N=8 offers no
+evidence in either direction. No prioritization optimization was
+implemented (out of scope per this task's own instruction either way).
+
+### 10. Historical results affected by the metric bug -- audit (NOT re-validated)
+
+Per this task's own instruction: listed and caveated as "needs
+re-measurement to confirm," not retroactively declared valid or
+invalid. Scope note: `run_probe()`'s buggy formula was introduced
+16/09/2026 ("Bước 3 -- chuẩn hoá benchmark", inside the large "Điều tra
+riêng: bridge process rmw_fleetqox_cpp thật qua ns-3 TapBridge
+(11/09/2026)" section) and used by every subsequent `run_probe()`-based
+Table IV/V Wi-Fi Direct measurement through this fix (`7896898`,
+26/09/2026) -- roughly 10 real days and a large number of named result
+sections. Exhaustively re-deriving every individual number in a
+20,000+ line document was not attempted; the sections below are the
+ones this audit specifically identified as reporting a `sim_lag_s`-
+gated validity verdict.
+
+**Item 3's monotonicity property directly narrows this list**: any
+result the old formula already reported as VALID needs no
+re-verification (mathematically guaranteed to remain valid). Only
+results the old formula reported as INVALID/degraded are genuinely
+uncertain.
+
+- **Confirmed affected, RE-MEASURED BY THIS TASK**: the immediately
+  preceding "RETRANSMISSION-DELAYS-FIRST-ATTEMPT: VALID-SIM_LAG
+  RE-MEASUREMENT ATTEMPT (26/09/2026)" section's `SIMULATOR_BLOCKED`
+  classification (0/6 pairs valid under the old formula) -- items 5-6
+  above now show the SAME N=4 seeds are valid under the corrected
+  formula, and item 8's classification (NO_MEANINGFUL_RETRANSMISSION_INTERFERENCE)
+  supersedes it for N=4. N=8 remains unresolved (genuinely invalid
+  under BOTH formulas, for different reasons/magnitudes).
+- **Confirmed affected, qualitatively unchanged so far**: the
+  "RETRANSMISSION-DELAYS-FIRST-ATTEMPT CAUSAL PROBE (24/09/2026)"
+  section's classification D -- its own explicit caveat (degraded
+  sim_lag_s 24.8-45.7s under the old formula) is resolved for N=4 by
+  this task's fresh, definitively-valid measurement reaching the SAME
+  qualitative conclusion (no first-attempt-fresh improvement despite a
+  large wire-byte reduction) -- NOT because the old D-classification
+  data was itself re-validated, but because independent new valid data
+  agrees with it.
+- **NEEDS RE-MEASUREMENT, not yet attempted**: the original calibrating
+  N=16 example ("Bước 3", 16/09/2026: `sim_time_s=15` reached exactly
+  at 37s real time, old-formula lag=22.15s, `ns3sim` CPU 101.32%
+  saturated) -- this example's OWN pattern (target reached AT, not
+  comfortably past, with full CPU saturation) is plausibly a genuine
+  degradation rather than the early-vs-late-snapshot artifact this N=4
+  case exhibited, but that is inference, not proof -- flagged, not
+  assumed either way.
+- **NEEDS RE-MEASUREMENT, not yet attempted**: "TABLE V WI-FI RE-BASELINE
+  (23/09/2026)"'s N=16 result citing `sim_lag_s=17.22s` crossing the
+  threshold, and any other `INVALID_SIMULATOR`/degraded-flagged N=16 (or
+  higher-contention) rows in that section and "OFFICIAL TABLE V WI-FI
+  DIRECT BASELINE (24/09/2026)".
+- **Confirmed UNAFFECTED (old formula already reported VALID, hence
+  provably still valid per item 3)**: "WI-FI READINESS ROOT-CAUSE
+  (24/09/2026)"'s GREEN runs, "DEADLINE-AWARE RETRANSMISSION
+  SUPPRESSION (25/09/2026)"'s 12 runs (max old-formula `sim_lag_s`
+  reported under 10.0), "PRE-EXISTING LEDGER-PRUNING MECHANISM
+  (25/09/2026)"'s 12 runs (max 7.67s old formula) -- all remain exactly
+  as trustworthy as previously documented.
+- **Confirmed UNAFFECTED by a DIFFERENT code path entirely (never used
+  the buggy formula)**: the whole Table VI coordination-probe
+  investigation thread -- "N=8 REALTIME-LAG VALIDATION", "N=16 SCALE
+  VALIDATION", "N=16 CPU PROFILE", "N=16 SERIOUS PERFORMANCE PASS",
+  Phases 5-6. `run_coordination_probe()` never computed `sim_lag_s`
+  inline at all; its own downstream scripts
+  (`validate_table6_n16_scale.py`, `run_table6_n8_scheduler_ab.py`,
+  etc.) each independently implement the CORRECT pattern already
+  (`parse_wifi_stats(log)[-1]["sim_lag_s"]` -- last snapshot, ns-3's own
+  field) -- confirmed by direct source read, not inferred. LAN results
+  are unaffected for the same structural reason (no ns-3 Wi-Fi sim at
+  all).
+- **A SECOND, independent copy of the identical bug pattern, NOT fixed
+  by this task**: `scripts/run_wifi_gateway_probe.py` (lines ~589-595)
+  imports `parse_wifi_stats`/`wifi_stats_target_s`/`MAX_HEALTHY_SIM_LAG_S`
+  from this same module and re-implements the SAME broken formula
+  locally (`ns3_real_elapsed_s_at_log_read - wifi_stats["sim_time_s"]`)
+  rather than calling `run_probe()`. Any WIFI GATEWAY BENCHMARK section
+  that used this script (not audited line-by-line here, out of this
+  task's scope) should be treated as potentially affected the same way,
+  and would need the SAME fix (or a call to `corrected_sim_lag_s()`)
+  applied to that file separately.
+
+### 11. Files changed
+
+`scripts/run_ns3_docker_container_fleet_probe.py`: **KEPT, permanent**
+-- `_parse_all_wifi_stats_snapshots()` (shared helper, refactored out of
+`parse_wifi_stats()` with no behavior change), `parse_last_wifi_stats()`,
+`corrected_sim_lag_s()` (new), `sim_lag_s`'s computation site and the
+`wifi_stats`/`sim_lag_s`/`ns3_real_elapsed_s_at_log_read` return-dict
+comments (fixed), new `last_wifi_stats` return-dict field (additive).
+`tests/test_ns3_docker_container_fleet_probe.py`: **KEPT, permanent**
+-- `SimLagSMeasurementBugTest` (9 new tests) plus the corresponding
+import additions.
+`ros2_ws/src/rmw_fleetqox_cpp/src/rmw_pubsub.cpp` /
+`scripts/fleetqox_rmw_trace_endpoint.py`: diagnostic retransmission-
+suppression probe re-added a third time (`2e62f8b`, byte-identical to
+the twice-prior `59c901e`/`0a25a08`) then fully reverted again
+(`ba562ad`) -- **NOT kept**, matching the established add-then-revert
+pattern for this specific mechanism. Scratch scripts and raw run data
+under `/tmp/.../scratchpad/sim_lag_fix/` (host-local, not committed).
+
+### 12. Tests (pass/fail counts at each checkpoint)
+
+| Checkpoint | Result |
+|---|---|
+| Start of this task (= end of previous section, commit `f69aa65`) | 888 passed, 8 failed |
+| RED: `SimLagSMeasurementBugTest` added (`b4c8e2e`) | fails at import (proven RED) |
+| FIX + GREEN (`7896898`) | 897 passed (888+9), 8 failed |
+| Diagnostic probe re-added 3rd time (`2e62f8b`) | 897 passed, 8 failed |
+| Diagnostic probe reverted (`ba562ad`) | 897 passed, 8 failed |
+
+897/897+8 identical at every post-fix checkpoint -- no regressions
+introduced anywhere in this task.
+
+### 13. Commits (all pushed to `khainq12/rttc`)
+
+- `b4c8e2e` test(RED): prove sim_lag_s formula reports false lag from mismatched snapshots
+- `7896898` fix: sim_lag_s now compares timestamps from the SAME observation point
+- `2e62f8b` diag(TEMPORARY): re-add retransmission-DATA suppression probe (3rd time) for corrected-sim_lag_s re-measurement
+- `ba562ad` revert: remove retransmission-suppression probe after corrected-metric re-measurement
+
+(This doc-write-up commit follows as one more commit on top of `ba562ad`.)
+
+### 14. Exactly one next step
+
+Apply the identical fix (`corrected_sim_lag_s()`/`parse_last_wifi_stats()`,
+already written and tested in this same module) to
+`scripts/run_wifi_gateway_probe.py`'s own duplicated buggy formula
+(item 10's second bullet), then re-audit whichever WIFI GATEWAY
+BENCHMARK sections relied on it -- the identical false-invalidation
+risk this task just resolved for `run_probe()` likely applies there
+too, and has not yet been checked.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
