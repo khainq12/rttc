@@ -13,6 +13,7 @@ every existing caller's topic names unchanged).
 """
 
 import csv
+import inspect
 import tempfile
 import unittest
 from pathlib import Path
@@ -23,6 +24,7 @@ from scripts.run_wifi_gateway_probe import (
     CONTROL_STATION_NAME,
     _static_entries,
     required_peers_for_wifi_gateway,
+    run_wifi_gateway_probe,
     wifi_gateway_endpoint_list,
 )
 from scripts.fleetqox_rmw_gateway_endpoint import (
@@ -366,6 +368,63 @@ class GatewaySimLagSFixLockInTest(unittest.TestCase):
             "the old mismatched-observation-points formula must be gone",
         )
         self.assertIn("corrected_sim_lag_s(ns3_log_text)", source)
+
+
+class RunWifiGatewayProbeSchedulerPlumbingAbsentTest(unittest.TestCase):
+    """RED (P2.2, docs/AUDIT_ACCEPTANCE_TRACKING.md, "N=16 SERIOUS
+    PERFORMANCE PASS" / P2.1): ns3::HeapScheduler was already proven a
+    semantics-preserving, sim_lag_s-reducing option, exposed on Table
+    VI's run_coordination_probe() and, as of P2.1, on Table V Direct's
+    run_probe() (both as `ns3_scheduler`, default "map"). Gateway's own
+    run_wifi_gateway_probe() never received the same plumbing -- proven
+    here, literally, not inferred."""
+
+    def test_run_wifi_gateway_probe_has_no_scheduler_parameter(self):
+        self.assertNotIn(
+            "ns3_scheduler", inspect.signature(run_wifi_gateway_probe).parameters
+        )
+
+    def test_run_wifi_gateway_probe_never_passes_scheduler_to_start_ns3(self):
+        self.assertNotIn("scheduler=", inspect.getsource(run_wifi_gateway_probe))
+
+
+class GatewayStartNs3SchedulerCommandLineTest(unittest.TestCase):
+    """GREEN: proves the scheduler choice actually reaches the ns-3
+    process's own command line via Gateway's call site, and that
+    switching it changes NOTHING else about the invocation -- same
+    guarantee already established for Direct (P2.1) and Table VI."""
+
+    def _captured_ns3_command(self, **start_ns3_kwargs) -> str:
+        probe = object.__new__(ReferenceTopologyProbe)
+        probe.num_robots = 8
+        probe.ns3sim_name = "fleetqox_test_ns3sim"
+        exec_d_calls: list[tuple] = []
+
+        def fake_docker(*args, **kwargs):
+            if args[:2] == ("exec", "-d"):
+                exec_d_calls.append(args)
+                return mock.Mock(returncode=0)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch(
+            "scripts.run_ns3_docker_container_fleet_probe.docker", side_effect=fake_docker
+        ), mock.patch("scripts.run_ns3_docker_container_fleet_probe.time.sleep"):
+            probe.start_ns3(sim_duration_s=20.0, **start_ns3_kwargs)
+        return exec_d_calls[0][-1]
+
+    def test_default_scheduler_is_map_on_the_actual_command_line(self):
+        self.assertIn("--scheduler=map", self._captured_ns3_command())
+
+    def test_explicit_heap_reaches_the_ns3_command_line(self):
+        self.assertIn("--scheduler=heap", self._captured_ns3_command(scheduler="heap"))
+
+    def test_heap_changes_only_the_scheduler_flag_nothing_else(self):
+        map_cmd = self._captured_ns3_command(scheduler="map")
+        heap_cmd = self._captured_ns3_command(scheduler="heap")
+        self.assertEqual(
+            map_cmd.replace("--scheduler=map", "--scheduler=X"),
+            heap_cmd.replace("--scheduler=heap", "--scheduler=X"),
+        )
 
 
 if __name__ == "__main__":
