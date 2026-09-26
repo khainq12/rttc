@@ -22067,6 +22067,198 @@ retry path on a topic's very first message), or genuine Wi-Fi PHY-rate
 degradation under this node count -- none of which this task or its
 predecessor has yet measured directly.
 
+## RETRANSMISSION-DELAYS-FIRST-ATTEMPT: VALID-SIM_LAG RE-MEASUREMENT ATTEMPT (26/09/2026) -- SIMULATOR_BLOCKED
+
+Follow-up to the previous section's own explicitly-flagged caveat: that
+section's classification (D, NO_MEANINGFUL_INTERFERENCE) rested on
+runs with `sim_lag_s` 24.8-45.7s, far above
+`MAX_HEALTHY_SIM_LAG_S=10.0` (`run_ns3_docker_container_fleet_probe.py:144`).
+This task re-attempted the exact same causal probe (env-gated
+retransmission-DATA suppression, A=normal vs B=suppressed) with
+seeds 7/13/29 at N=4/N=8, requiring `sim_lag_s<=10.0` for BOTH legs of
+a pair before trusting it. **Result: 0/6 pairs valid.** Classification
+for this specific hypothesis is **SIMULATOR_BLOCKED**, not finalized as
+D -- reported honestly rather than reusing the earlier, already-flagged-
+as-uncertain result.
+
+### 1. Cause of the previous (and this run's) high `sim_lag_s`
+
+Checked existing data first, per the task's own hint, before running
+anything new: the prior turn's OWN "observational" runs (tracing ON,
+NO suppression env var set -- i.e. the suppression mechanism was never
+even invoked) already showed `sim_lag_s=24.8s` (N=4) and `37.0s` (N=8)
+-- degraded BEFORE the suppression mechanism was ever exercised. A
+quick no-tracing re-check from that same session showed `19.2s` at
+N=4 -- still degraded even with tracing off entirely.
+
+This task went one step further and settled the question directly:
+**rebuilt the exact pristine `rmw_pubsub.cpp` from commit `87975e6`
+(zero lines changed by either this task or its predecessor) and ran
+the identical N=4/seed=53 probe.** Result: `sim_lag_s=31.1s` with NO
+tracing at all, and `24.7s` with tracing on -- both far above 10s, and
+statistically indistinguishable from each other (well within the
+15-25s spread also seen across this session's *instrumented* runs).
+**This is decisive: completely unmodified, zero-diff production code
+degrades exactly the same amount as the instrumented/traced/diagnostic-
+probe code.** The two new unconditional `monotonic_timestamp_ns()`
+calls added in `49e5215` are vDSO `clock_gettime(CLOCK_MONOTONIC)`
+calls (`std::chrono::steady_clock::now()`, no syscall trap) -- even at
+tens of thousands of calls over a 30-70s run this is sub-millisecond of
+total added CPU time, nowhere near enough to explain a 15-30 SECOND
+gap. Host-level evidence at the time of testing: `free -h` showed
+1.7-1.75GiB of 2.0GiB swap in use (85-87% utilized) throughout this
+session, with `vmstat` showing the swapped pages sitting resident
+(not actively thrashing while idle, consistent with pressure spiking
+specifically during the burst of 5-9 simultaneous Docker containers +
+the ns-3 container that every probe run launches). **Conclusion:
+`sim_lag_s` degradation this session is an environmental/host
+condition (consistent with memory pressure during each probe run's
+container burst), NOT caused by any code from either this task or its
+predecessor.** No code fix was made or attempted, because there was
+nothing in FleetRMW's own code to fix -- confirmed by the pristine-code
+control, not inferred.
+
+### 2. Valid tracing configuration
+
+**Unchanged from the previous turn.** Since the root cause is proven
+environmental and not attributable to
+`FLEETQOX_RMW_LOSS_FUNNEL_TRACE_PROFILING` or the
+`enqueue_ns`/`first_sendto_ns` instrumentation (item 1's pristine-vs-
+instrumented comparison shows no meaningful difference), no overhead
+reduction was made to the measurement configuration -- doing so would
+not have addressed the actual cause and would have made the two
+conditions less directly comparable to the prior turn's data for no
+benefit. The diagnostic suppression mechanism
+(`FLEETQOX_RMW_DIAG_SUPPRESS_RETRANSMISSION_DATA_MS="0-15000"`,
+byte-identical re-add of the previous turn's reverted probe) and full
+loss-funnel tracing were both used exactly as before.
+
+### 3. Required measurements -- confirmed still working
+
+All required signals were confirmed present and computable from the
+same `run_probe()`/loss-funnel-trace pipeline used throughout this
+investigation: first-attempt fresh (own-outcome classification, see
+prior section's methodology), overall fresh (eventual-delivery-based,
+existing metric), raw delivery, retransmission send-event counts, wire
+bytes (approximated as bytes-per-send-event x count, first-attempt +
+retransmission), full send/receive timestamps (`enqueue_ns`,
+`first_sendto_ns`, `subscription_match` arrival), and `sim_lag_s`
+(read directly from `run_probe()`'s own top-level return value). No
+measurement gap was found -- the blocker is purely `sim_lag_s`
+validity, not missing instrumentation.
+
+### 4-5. Paired/counterbalanced re-run, N=4/N=8 x seeds 7/13/29 -- every pair reported, none omitted
+
+| N | seed | cond | sim_lag_s | valid | first-attempt fresh% | overall fresh% | delivery% | wire bytes (approx) | retransmission sends |
+|---|---|---|---|---|---|---|---|---|---|
+| 4 | 7  | A | 24.76 | **NO** | 9.81  | 9.81  | 89.01 | 4,862,500 | 26,088 |
+| 4 | 7  | B | 16.03 | **NO** | 10.64 | 10.64 | 66.19 | 285,496   | 54     |
+| 4 | 13 | A | 23.67 | **NO** | 10.20 | 10.20 | 86.10 | 3,884,118 | 19,496 |
+| 4 | 13 | B | 17.16 | **NO** | 10.08 | 10.08 | 66.16 | 267,714   | 45     |
+| 4 | 29 | A | 25.89 | **NO** | 10.85 | 10.85 | 90.42 | 6,236,562 | 40,106 |
+| 4 | 29 | B | 16.04 | **NO** | 9.58  | 9.35  | 64.09 | 297,168   | 84     |
+| 8 | 7  | A | 39.14 | **NO** | 1.75  | 1.75  | 58.57 | 2,556,078 | 7,554  |
+| 8 | 7  | B | 35.86 | **NO** | 1.44  | 1.38  | 59.45 | 1,564,644 | 4,018  |
+| 8 | 13 | A | 35.81 | **NO** | 1.46  | 1.46  | 52.83 | 1,645,680 | 3,298  |
+| 8 | 13 | B | 18.46 | **NO** | 1.84  | 1.84  | 45.77 | 1,054,806 | 1,262  |
+| 8 | 29 | A | 38.02 | **NO** | 1.31  | 1.31  | 59.30 | 1,999,152 | 9,755  |
+| 8 | 29 | B | 20.64 | **NO** | 1.87  | 1.80  | 48.48 | 979,198   | 1,327  |
+
+**0 of 6 pairs met the `sim_lag_s<=10.0` gate for both A and B.** Every
+pair is reported above exactly as measured -- none omitted, none
+silently replaced with a re-run.
+
+### Paired deltas (B minus A) for the valid pairs only
+
+**None -- there are no valid pairs.** No paired-delta table is
+reported, per the task's own instruction not to compute deltas from
+invalid data.
+
+(For transparency only, NOT as evidence toward classification, since
+both legs are invalid: the INVALID data's own direction is consistent
+with the previous turn's own invalid-but-directionally-similar
+finding -- wire bytes drop 92-96% at N=4 and 15-51% at N=8, while
+first-attempt-fresh% moves by at most ~1.3pp in either direction at
+either scale, with no consistent sign. This is NOT being used to
+support any classification -- it is noted only so a future reader does
+not need to re-derive it from the raw JSON to see that the invalid
+data does not obviously contradict the invalid data from the prior
+section either.)
+
+### 6. Classification: **SIMULATOR_BLOCKED**
+
+Per the task's own decision rule: "If valid runs cannot be obtained
+(across reasonable overhead-reduction attempts): classification =
+SIMULATOR_BLOCKED." Item 1 proves overhead-reduction would not have
+helped (pristine code is equally degraded), and items 4-5 show a full,
+honest attempt across every required (N, seed) combination still
+produced 0 valid pairs. This is the correct, evidence-backed
+classification -- neither RETRANSMISSION_AIRTIME_CONTENTION nor
+NO_MEANINGFUL_RETRANSMISSION_INTERFERENCE can be claimed from data that
+never met the stated validity bar, and the previous section's D
+classification is accordingly **not treated as final** by this task
+(though its OWN evidence -- the sub-millisecond, class-independent
+`first_send_wait` ruling out local blocking, which does NOT depend on
+`sim_lag_s` at all -- remains valid and unaffected, since that
+measurement is intrinsic to the RMW process and independent of whether
+ns-3 kept pace).
+
+### 7. Prioritization: **RETIRE for now (procedurally), not on the merits**
+
+Per the task's own instruction, STOP after classification -- no further
+optimization work follows from SIMULATOR_BLOCKED. This is a
+"we could not get a trustworthy verdict this session" outcome, not a
+positive finding that retransmission traffic is harmless or harmful;
+it should not be cited as evidence for or against a prioritization
+optimization. The one thing that IS reliably established (independent
+of `sim_lag_s`) is `first_send_wait`'s sub-millisecond, class-flat
+result from the previous section -- local mutex blocking remains ruled
+out regardless of this task's outcome.
+
+### 8. Files changed
+
+`ros2_ws/src/rmw_fleetqox_cpp/src/rmw_pubsub.cpp`: diagnostic
+suppression mechanism re-added byte-identical to the previous turn's
+reverted version (commit `0a25a08`), then fully reverted again
+(commit `2f98dbe`) -- net zero change to this file versus the state at
+the end of the previous section (`06a1366`). Same for
+`scripts/fleetqox_rmw_trace_endpoint.py`'s one-line diagnostic-counter
+wiring. **No production code differs from the previous section's end
+state.** Scratch analysis scripts and raw run JSON (12 new probe runs
+plus 2 pristine-baseline control runs) under
+`/tmp/.../scratchpad/retransmission_delay_probe/` (host-local, not
+committed).
+
+### 9. Tests
+
+| Checkpoint | Result |
+|---|---|
+| Start of this task (= end of previous section, commit `06a1366`) | 888 passed, 8 failed |
+| After re-adding the diagnostic probe (`0a25a08`) | 888 passed, 8 failed |
+| After reverting it again (`2f98dbe`) | 888 passed, 8 failed |
+
+Identical at every checkpoint -- unchanged from the start of this task.
+
+### 10. Commits (all pushed to `khainq12/rttc`)
+
+- `0a25a08` diag(TEMPORARY): re-add retransmission-DATA suppression probe for valid-sim_lag re-measurement
+- `2f98dbe` revert: remove re-added diagnostic retransmission-suppression probe
+
+(This doc-write-up commit itself follows as a third commit on top of `2f98dbe`.)
+
+### 11. Exactly one next step
+
+`sim_lag_s` validity for this exact Wi-Fi Table V harness (N=4/N=8,
+5-9 Docker containers + ns-3, ~30-70s per run) needs to be re-verified
+as achievable AT ALL on whatever host/session runs the next measurement
+attempt -- e.g. by running ONE pristine-code (`git stash`/no changes)
+N=4 smoke probe FIRST, before touching any instrumentation, and only
+proceeding with the causal-probe re-measurement if that smoke test
+alone comes in under `MAX_HEALTHY_SIM_LAG_S=10.0`. If a healthy host
+session is confirmed, re-run items 4-5 of this section exactly as
+designed (same seeds, same window, same script) -- no methodology
+changes are needed, only a host/session where ns-3 can keep pace.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
