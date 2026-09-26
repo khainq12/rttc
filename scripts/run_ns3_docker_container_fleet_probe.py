@@ -60,6 +60,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
 import shlex
 import shutil
@@ -983,12 +984,21 @@ class ReferenceTopologyProbe:
         log_path: str = "/tmp/ns3.log",
         scheduler: str = "map",
         realtime_hard_limit_s: float = 0.0,
+        stage_timing: bool = False,
     ) -> None:
         # scheduler/realtime_hard_limit_s: see fleetqox_trace_replay_tap.cc's
         # --scheduler/--realtimeHardLimitS doc comments -- defaults ("map",
         # 0.0) reproduce this harness's original, unchanged behavior byte
         # for byte (added for the "N=16 SERIOUS PERFORMANCE PASS"
         # investigation, docs/AUDIT_ACCEPTANCE_TRACKING.md).
+        # stage_timing: see fleetqox_trace_replay_tap.cc's --stageTiming doc
+        # comment -- default False reproduces unchanged behavior; added for
+        # the "LOCALIZE NS-3 WALL-CLOCK LAG" investigation
+        # (docs/AUDIT_ACCEPTANCE_TRACKING.md). NOT threaded through the
+        # top-level run_probe()/run_coordination_probe() functions (only
+        # scheduler/realtime_hard_limit_s are) -- deliberately narrower
+        # surface, since this flag is diagnostic-only for this one
+        # investigation, called directly by its own standalone script.
         cmd = (
             f"/tmp/fleetqox_tap_bridge --numRobots={self.num_robots} --tapPrefix=ftap "
             f"--simDuration={sim_duration_s:.12g} --numAps={num_aps} "
@@ -996,7 +1006,8 @@ class ReferenceTopologyProbe:
             f"--pathLossExponent={path_loss_exponent:.12g} --txPowerDbm={tx_power_dbm:.12g} "
             f"--rxSensitivityDbm={rx_sensitivity_dbm:.12g} --mobilitySpeed={mobility_speed:.12g} "
             f"--seed={ns3_seed} --run={ns3_run} --scheduler={shlex.quote(scheduler)} "
-            f"--realtimeHardLimitS={realtime_hard_limit_s:.12g} > {log_path} 2>&1"
+            f"--realtimeHardLimitS={realtime_hard_limit_s:.12g} "
+            f"--stageTiming={'true' if stage_timing else 'false'} > {log_path} 2>&1"
         )
         docker("exec", "-d", self.ns3sim_name, "bash", "-lc", cmd)
         time.sleep(NS3_ATTACH_WAIT_S)
@@ -2109,6 +2120,15 @@ def run_probe(
             mobility_speed=mobility_speed,
             ns3_seed=ns3_seed,
             ns3_run=ns3_run,
+            # Env-var-gated (not a new run_probe() parameter -- keeps this
+            # widely-used function's signature unchanged for every existing
+            # caller) pass-through to start_ns3()'s --stageTiming flag, for
+            # the "LOCALIZE NS-3 WALL-CLOCK LAG" investigation's own
+            # standalone measurement script only. Default unset ==
+            # unchanged behavior. See fleetqox_trace_replay_tap.cc's
+            # --stageTiming doc comment and
+            # docs/AUDIT_ACCEPTANCE_TRACKING.md.
+            stage_timing=os.environ.get("FLEETQOX_NS3_STAGE_TIMING") == "1",
         )
         if rmw_implementation == "rmw_zenoh_cpp":
             probe.start_zenoh_router()
