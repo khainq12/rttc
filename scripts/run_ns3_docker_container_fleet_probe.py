@@ -514,6 +514,28 @@ def wifi_stats_target_s(*, start_offset_ms: float, seconds: int, drain_s: float)
     return start_offset_ms / 1000.0 + max(seconds, 1) + drain_s
 
 
+def _parse_all_wifi_stats_snapshots(ns3_log: str) -> list[dict[str, Any]]:
+    """Every FLEETQOX_WIFI_STATS snapshot in the log, in print order,
+    each one a self-contained dict from a SINGLE PrintWifiStats() call
+    (i.e. every field inside one snapshot -- including sim_time_s and
+    wall_elapsed_s -- was sampled together, at the same instant, in
+    fleetqox_trace_replay_tap.cc). Shared by parse_wifi_stats() (which
+    picks ONE snapshot by simulated time, for MAC/PHY-counter cross-run
+    consistency) and parse_last_wifi_stats() (which picks the LAST one,
+    for sim_lag_s -- see that function's own doc comment for why these
+    two selection rules serve different, non-interchangeable purposes)."""
+    lines = [line for line in ns3_log.splitlines() if "FLEETQOX_WIFI_STATS" in line]
+    parsed: list[dict[str, Any]] = []
+    for line in lines:
+        json_part = line.split("FLEETQOX_WIFI_STATS", 1)[1].strip()
+        json_part = json_part.replace(",]", "]").replace(",}", "}")
+        try:
+            parsed.append(json.loads(json_part))
+        except json.JSONDecodeError:
+            continue
+    return parsed
+
+
 def parse_wifi_stats(ns3_log: str, target_sim_time_s: float) -> dict[str, Any] | None:
     """Pick a single FLEETQOX_WIFI_STATS snapshot by SIMULATED elapsed time
     (sim_time_s, printed by fleetqox_trace_replay_tap.cc's PrintWifiStats())
@@ -535,24 +557,80 @@ def parse_wifi_stats(ns3_log: str, target_sim_time_s: float) -> dict[str, Any] |
     WIFI_STATS_PRINT_PERIOD_S past ns-3's start if wait_for_completion()
     returned early). Falls back to the last available line (with
     degraded=True) if no line reaches the target -- should not happen
-    when the caller has waited long enough, but better than raising."""
-    lines = [line for line in ns3_log.splitlines() if "FLEETQOX_WIFI_STATS" in line]
-    if not lines:
-        return None
-    parsed: list[dict[str, Any]] = []
-    for line in lines:
-        json_part = line.split("FLEETQOX_WIFI_STATS", 1)[1].strip()
-        json_part = json_part.replace(",]", "]").replace(",}", "}")
-        try:
-            parsed.append(json.loads(json_part))
-        except json.JSONDecodeError:
-            continue
+    when the caller has waited long enough, but better than raising.
+
+    NOTE (see docs/AUDIT_ACCEPTANCE_TRACKING.md, "SIM_LAG_S MEASUREMENT
+    BUG"): this snapshot is the right one for MAC/PHY COUNTER fields
+    (mac_tx_total etc.) precisely BECAUSE it is deliberately EARLY/fixed
+    rather than "whatever real time happened to elapse" -- but that same
+    property makes its OWN sim_time_s the WRONG thing to pair with an
+    end-of-run real-elapsed-time measurement for lag purposes. Use
+    parse_last_wifi_stats()/corrected_sim_lag_s() for sim_lag_s, never
+    this function's return value's sim_time_s combined with a
+    later-measured wall-clock reading."""
+    parsed = _parse_all_wifi_stats_snapshots(ns3_log)
     if not parsed:
         return None
     for snapshot in parsed:
         if snapshot.get("sim_time_s", 0.0) >= target_sim_time_s:
             return snapshot
     return {**parsed[-1], "degraded_no_snapshot_reached_target": True}
+
+
+def parse_last_wifi_stats(ns3_log: str) -> dict[str, Any] | None:
+    """The LAST FLEETQOX_WIFI_STATS snapshot in the log (None if none
+    parsed) -- deliberately NOT the target-based selection
+    parse_wifi_stats() uses. For a LAG/pacing measurement ("how far
+    behind real time has the simulator's wall-clock pacing fallen",
+    MAX_HEALTHY_SIM_LAG_S's own docstring), the most RECENT available
+    same-instant (wall_elapsed_s, sim_time_s) pair is the right answer --
+    unlike the MAC/PHY counters, there is no cross-run-consistency reason
+    to prefer an earlier, fixed point for this specific field. This
+    snapshot reflects ns-3's own state as of (at most) one
+    WIFI_STATS_PRINT_PERIOD_S before the process was read/killed -- the
+    freshest observation this kill-based architecture can offer (see
+    PrintWifiStats()'s own comment in fleetqox_trace_replay_tap.cc)."""
+    parsed = _parse_all_wifi_stats_snapshots(ns3_log)
+    return parsed[-1] if parsed else None
+
+
+def corrected_sim_lag_s(ns3_log: str) -> float | None:
+    """THE FIX for the sim_lag_s measurement bug (see
+    docs/AUDIT_ACCEPTANCE_TRACKING.md "SIM_LAG_S MEASUREMENT BUG (26/09/2026)"
+    for the full RED/FIX/GREEN writeup). The OLD, buggy computation was
+    `ns3_real_elapsed_s_at_log_read - wifi_stats["sim_time_s"]`: a
+    Python-side wall-clock read taken AFTER THE ENTIRE RUN (workload +
+    drain + every endpoint's own shutdown) finished, minus the
+    SIMULATED time of parse_wifi_stats()'s deliberately-EARLY, TARGET-
+    based snapshot (chosen for MAC/PHY-counter cross-run consistency --
+    see that function's own doc comment) -- two timestamps from
+    DIFFERENT observation points, several/many real seconds apart. That
+    mismatch structurally inflates the reported "lag" by roughly however
+    much real time elapsed running the REST of the simulation after the
+    early snapshot, entirely independent of whether ns-3 was actually
+    keeping pace with real time -- confirmed with exact numbers (two
+    independent pristine N=4 seed=53 runs, official metric 20.3-29.0s
+    while ns-3's own internally-consistent lag never exceeded 6.5s) in
+    that doc section.
+
+    The fix: read wall_elapsed_s AND sim_time_s from the SAME snapshot
+    line (parse_last_wifi_stats() -- the most recent available, i.e. the
+    freshest same-instant pair this kill-based architecture can offer),
+    and subtract them directly. Both numbers come from ONE
+    fleetqox_trace_replay_tap.cc PrintWifiStats() call
+    (`wallElapsedS - simTimeS`, computed in that same C++ statement), so
+    there is no cross-process/cross-timestamp mismatch left to inflate
+    anything -- and no correction constant of any kind: this is a
+    same-instant subtraction, not an offset applied to the old broken
+    value."""
+    last = parse_last_wifi_stats(ns3_log)
+    if last is None:
+        return None
+    wall_elapsed_s = last.get("wall_elapsed_s")
+    sim_time_s = last.get("sim_time_s")
+    if wall_elapsed_s is None or sim_time_s is None:
+        return None
+    return wall_elapsed_s - sim_time_s
 
 
 def compute_coordination_metrics(endpoint_results: dict[str, Any]) -> dict[str, Any]:
@@ -2264,13 +2342,18 @@ def run_probe(
     stats_target_s = wifi_stats_target_s(
         start_offset_ms=start_offset_ms, seconds=seconds, drain_s=drain_s
     )
-    sim_lag_s = (
-        ns3_real_elapsed_s_at_log_read - wifi_stats["sim_time_s"]
-        if wifi_stats is not None
-        and wifi_stats.get("sim_time_s") is not None
-        and ns3_real_elapsed_s_at_log_read is not None
-        else None
-    )
+    # FIXED 26/09/2026 (see docs/AUDIT_ACCEPTANCE_TRACKING.md, "SIM_LAG_S
+    # MEASUREMENT BUG"): previously computed as
+    # `ns3_real_elapsed_s_at_log_read - wifi_stats["sim_time_s"]` -- an
+    # end-of-run Python wall-clock read minus an EARLY, target-based
+    # snapshot's sim-time, two different observation points. See
+    # corrected_sim_lag_s()'s own doc comment for the full mechanism and
+    # why this fix needs no correction constant. `wifi_stats` (the
+    # target-based snapshot) is UNCHANGED for every other use in this
+    # function (MAC/PHY counters, degraded_no_snapshot_reached_target) --
+    # only the lag computation itself moves to the last-available,
+    # same-instant-paired snapshot.
+    sim_lag_s = corrected_sim_lag_s(ns3_log_text) if ns3_log_text else None
     degraded = (
         status != "ok"
         or wifi_stats is None
@@ -2299,7 +2382,17 @@ def run_probe(
         ),
         "ns3_log": ns3_log_text,
         "wifi_stats": wifi_stats,
+        # Retained for backward-compatible/diagnostic visibility only --
+        # no longer used to compute sim_lag_s (see that field's own
+        # comment below and corrected_sim_lag_s()'s doc comment for why
+        # mixing this end-of-run read with wifi_stats["sim_time_s"] was
+        # the bug).
         "ns3_real_elapsed_s_at_log_read": ns3_real_elapsed_s_at_log_read,
+        # The LAST available FLEETQOX_WIFI_STATS snapshot (not the
+        # target-based `wifi_stats` above) -- exposed so a caller can
+        # independently verify sim_lag_s's own same-instant provenance
+        # without re-parsing ns3_log. See parse_last_wifi_stats().
+        "last_wifi_stats": parse_last_wifi_stats(ns3_log_text) if ns3_log_text else None,
         "ns3sim_resource_usage": ns3sim_resource_usage,
         # degraded=True means: do NOT interpret this run's latency/MAC
         # numbers as representative of normal network behavior -- the
@@ -2309,11 +2402,12 @@ def run_probe(
         # BEFORE trusting latency_stats_ms from any run at meaningful N.
         "degraded": degraded,
         "sim_stats_target_s": stats_target_s,
-        # Real seconds elapsed beyond what sim_time_s has actually
-        # covered, at the moment the log was read -- None if wifi_stats
-        # itself is unavailable (e.g. a failed run). Comparable across
-        # different target/margin configs, unlike the raw
-        # ns3_real_elapsed_s_at_log_read/sim_time_s pair alone.
+        # How far behind real time ns-3's own realtime clock had fallen,
+        # as of the LAST available FLEETQOX_WIFI_STATS snapshot (fixed
+        # 26/09/2026 -- see corrected_sim_lag_s()'s doc comment; this
+        # used to mix an end-of-run wall-clock read with an earlier
+        # snapshot's sim-time, which is no longer done). None if no
+        # snapshot was ever printed (e.g. a failed run).
         "sim_lag_s": sim_lag_s,
         "latency_stats_ms": compute_latency_stats_ms(endpoint_results),
         "jitter_stale_repair_stats": compute_jitter_stale_repair_stats(endpoint_results),
