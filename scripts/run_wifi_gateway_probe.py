@@ -210,6 +210,7 @@ def run_wifi_gateway_probe(
     discovery_timeout_s: float = 15.0,
     disable_gateway: bool = False,
     fleetqox_static_subscriptions: bool = True,
+    ns3_scheduler: str = "map",
 ) -> dict[str, Any]:
     """disable_gateway=False (default): normal run. disable_gateway=True
     is the Phase 3 no-bypass-test knob -- everything is wired and
@@ -224,7 +225,18 @@ def run_wifi_gateway_probe(
     before/after comparison -- kept as an explicit, named parameter
     (same pattern as disable_gateway) rather than a one-off hack, since
     it is exactly the variable STEP 2/STEP 3 of this investigation
-    compares."""
+    compares.
+
+    ns3_scheduler: passed straight through to
+    ReferenceTopologyProbe.start_ns3()'s same-named `scheduler` arg --
+    see fleetqox_trace_replay_tap.cc's --scheduler doc comment. Default
+    "map" reproduces this program's prior, unconfigured behavior byte-
+    for-byte. Mirrors run_probe()'s own ns3_scheduler parameter (P2.2,
+    docs/AUDIT_ACCEPTANCE_TRACKING.md, "N=16 SERIOUS PERFORMANCE PASS" /
+    P2.1) -- a pure internal event-ordering data-structure choice that
+    cannot change which events fire or their simulated-time order, so
+    it cannot alter Wi-Fi/workload/Fleet semantics, only wall-clock
+    speed."""
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     run_id = output_dir.name.lstrip(".")
@@ -286,7 +298,10 @@ def run_wifi_gateway_probe(
             probe.rigger_name, probe.endpoint_container_names[0], control_container_name
         )
         probe.build_ns3_binary()
-        probe.start_ns3(sim_duration_s=float(seconds) + start_offset_ms / 1000.0 + drain_s + 5.0)
+        probe.start_ns3(
+            sim_duration_s=float(seconds) + start_offset_ms / 1000.0 + drain_s + 5.0,
+            scheduler=ns3_scheduler,
+        )
 
         gateway_wifi_ip = probe.ips["gateway"]
         # STEP 3 (continued): FleetRMW's static_mode has NO discovery

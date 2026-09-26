@@ -370,22 +370,23 @@ class GatewaySimLagSFixLockInTest(unittest.TestCase):
         self.assertIn("corrected_sim_lag_s(ns3_log_text)", source)
 
 
-class RunWifiGatewayProbeSchedulerPlumbingAbsentTest(unittest.TestCase):
-    """RED (P2.2, docs/AUDIT_ACCEPTANCE_TRACKING.md, "N=16 SERIOUS
-    PERFORMANCE PASS" / P2.1): ns3::HeapScheduler was already proven a
-    semantics-preserving, sim_lag_s-reducing option, exposed on Table
-    VI's run_coordination_probe() and, as of P2.1, on Table V Direct's
+class RunWifiGatewayProbeSchedulerPlumbingTest(unittest.TestCase):
+    """P2.2 (docs/AUDIT_ACCEPTANCE_TRACKING.md, "N=16 SERIOUS PERFORMANCE
+    PASS" / P2.1): ns3::HeapScheduler was already proven a semantics-
+    preserving, sim_lag_s-reducing option, exposed on Table VI's
+    run_coordination_probe() and, as of P2.1, on Table V Direct's
     run_probe() (both as `ns3_scheduler`, default "map"). Gateway's own
-    run_wifi_gateway_probe() never received the same plumbing -- proven
-    here, literally, not inferred."""
+    run_wifi_gateway_probe() never received the same plumbing -- mirrors
+    P2.1's exact fix for Gateway's own start_ns3() call site."""
 
-    def test_run_wifi_gateway_probe_has_no_scheduler_parameter(self):
-        self.assertNotIn(
-            "ns3_scheduler", inspect.signature(run_wifi_gateway_probe).parameters
-        )
+    def test_ns3_scheduler_parameter_exists_defaulting_to_map(self):
+        params = inspect.signature(run_wifi_gateway_probe).parameters
+        self.assertIn("ns3_scheduler", params)
+        self.assertEqual(params["ns3_scheduler"].default, "map")
 
-    def test_run_wifi_gateway_probe_never_passes_scheduler_to_start_ns3(self):
-        self.assertNotIn("scheduler=", inspect.getsource(run_wifi_gateway_probe))
+    def test_run_wifi_gateway_probe_passes_ns3_scheduler_through_to_start_ns3(self):
+        source = inspect.getsource(run_wifi_gateway_probe)
+        self.assertIn("scheduler=ns3_scheduler", source)
 
 
 class GatewayStartNs3SchedulerCommandLineTest(unittest.TestCase):
