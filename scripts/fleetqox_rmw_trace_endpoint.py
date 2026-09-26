@@ -107,12 +107,6 @@ def fleetqox_transport_metrics() -> dict[str, Any]:
         "send_datagram_full_success_calls",
         "send_datagram_targets_attempted",
         "send_datagram_targets_skipped",
-        # ---- BEGIN diagnostic-only probe metric (see rmw_pubsub.cpp's
-        # retransmission_diag_suppressed_ doc comment, "RETRANSMISSION-
-        # DELAYS-FIRST-ATTEMPT" investigation) -- TEMPORARY, reverted with
-        # the rest of the probe.
-        "retransmission_diag_suppressed",
-        # ---- END diagnostic-only probe metric ----
     )
     # Global (not per-socket) loss-funnel counters -- different ctypes
     # export naming (no "_socket_" infix), see rmw_pubsub.cpp's
