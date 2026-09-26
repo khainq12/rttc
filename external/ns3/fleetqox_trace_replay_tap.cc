@@ -134,180 +134,6 @@ constexpr std::size_t kMaxRxDropReasons = 32;
 bool g_heavyTracing = false;
 std::chrono::steady_clock::time_point g_wallClockStart;
 
-// ---- BEGIN diagnostic-only stage-timing probe ("LOCALIZE NS-3 WALL-CLOCK
-// LAG" investigation, see docs/AUDIT_ACCEPTANCE_TRACKING.md). TEMPORARY --
-// gated behind --stageTiming (default false, so this program's behavior
-// and cost with it off are byte-for-byte identical to before this probe).
-// Records a wall-clock timestamp (steady_clock, elapsed ns since
-// g_wallClockStart) at each of the 5 ALREADY-CONNECTED trace-callback
-// firings (MacTx/MacTxDrop/MacRx/MacRxDrop/PhyTxBegin) into ONE merged,
-// time-ordered timeline (not 5 separate per-stage vectors): ns-3's
-// event-driven model runs one event handler to completion before
-// dispatching the next, so the wall-clock GAP from one traced event to
-// the NEXT traced event (of any type) is the closest available proxy,
-// from OUTSIDE ns-3's library, for "wall-clock cost incurred handling
-// that first event and advancing to the next one" -- attributed to the
-// FIRST event's own stage. This is an honest approximation, not a clean
-// per-stage isolation: the gap also includes ns-3's own event-dispatch/
-// scheduling overhead, any TapBridge forward+write() that runs
-// synchronously inside the same call chain (WifiMac hands a received
-// frame toward the bridge as part of the same synchronous callback that
-// fires MacRx), and RealtimeSimulatorImpl's own per-event realtime-sync
-// bookkeeping -- none of which have their own trace sources this driver
-// can hook without patching ns-3 library source (a fundamentally larger
-// change, see the accompanying doc section for why that was not
-// attempted). Documented explicitly rather than presenting false
-// precision. All 5 callbacks already fire ONLY on the single ns-3
-// simulation thread (TapBridge's own read() happens on a separate
-// FdReader thread, but the actual frame-forwarding callback that would
-// touch Wifi trace sources is marshaled onto the main thread via
-// Simulator::ScheduleWithContext before it runs) -- the mutex below
-// guards the push itself (defensive correctness, matching the existing
-// g_macEventLogMutex precedent a few lines below), not cross-thread
-// re-ordering, so timeline entries are trusted to already be in
-// chronological (wall-clock) order without re-sorting.
-bool g_stageTiming = false;
-std::mutex g_stageTimingMutex;
-enum StageTag : uint8_t
-{
-  kStageMacTx = 0,
-  kStageMacTxDrop = 1,
-  kStageMacRx = 2,
-  kStageMacRxDrop = 3,
-  kStagePhyTxBegin = 4,
-  kStageCount = 5
-};
-std::vector<std::pair<int64_t, uint8_t>> g_stageTimeline; // (wall_ns, stage), time-ordered
-std::vector<std::pair<double, double>> g_fineLagSamples;  // (sim_time_s, wall_elapsed_s)
-
-inline void
-RecordStageEvent(StageTag stage)
-{
-  if (!g_stageTiming)
-  {
-    return;
-  }
-  int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                      std::chrono::steady_clock::now() - g_wallClockStart)
-                      .count();
-  std::lock_guard<std::mutex> lock(g_stageTimingMutex);
-  g_stageTimeline.emplace_back(nowNs, static_cast<uint8_t>(stage));
-}
-
-void
-FineLagSample()
-{
-  if (!g_stageTiming)
-  {
-    return;
-  }
-  // 0.5s cadence (real AND simulated, tied together by
-  // RealtimeSimulatorImpl) -- 10x finer than PrintWifiStats' existing 5s
-  // cadence, purely for the "sim_lag_s progression over time" measurement
-  // this investigation asked for; does not replace or alter
-  // PrintWifiStats in any way.
-  Simulator::Schedule(Seconds(0.5), &FineLagSample);
-  double wallElapsedS =
-      std::chrono::duration<double>(std::chrono::steady_clock::now() - g_wallClockStart).count();
-  double simTimeS = Simulator::Now().GetSeconds();
-  std::lock_guard<std::mutex> lock(g_stageTimingMutex);
-  g_fineLagSamples.emplace_back(simTimeS, wallElapsedS);
-}
-
-double
-PercentileOfSorted(const std::vector<int64_t>& sortedVals, double p)
-{
-  if (sortedVals.empty())
-  {
-    return -1.0;
-  }
-  std::size_t idx = static_cast<std::size_t>(p * static_cast<double>(sortedVals.size() - 1));
-  return static_cast<double>(sortedVals[idx]);
-}
-
-void
-DumpStageTimingSummary()
-{
-  if (!g_stageTiming)
-  {
-    return;
-  }
-  static const char* kStageNames[kStageCount] = {
-      "mac_tx", "mac_tx_drop", "mac_rx", "mac_rx_drop", "phy_tx_begin"};
-  std::vector<std::pair<int64_t, uint8_t>> timeline;
-  std::vector<std::pair<double, double>> lagSnapshot;
-  {
-    // Copy under lock (cheap relative to the run's own event-processing
-    // cost -- see the overhead-control measurement in the doc write-up),
-    // then compute gaps/percentiles OUTSIDE the lock so this periodic
-    // dump (called from PrintWifiStats' existing 5s cadence) never blocks
-    // the main thread's own future RecordStageEvent() pushes for longer
-    // than the copy itself takes.
-    std::lock_guard<std::mutex> lock(g_stageTimingMutex);
-    timeline = g_stageTimeline;
-    lagSnapshot = g_fineLagSamples;
-  }
-  std::vector<int64_t> gapsByStage[kStageCount];
-  int64_t totalByStage[kStageCount] = {0, 0, 0, 0, 0};
-  uint64_t countByStage[kStageCount] = {0, 0, 0, 0, 0};
-  for (std::size_t k = 0; k + 1 < timeline.size(); ++k)
-  {
-    uint8_t stage = timeline[k].second;
-    if (stage >= kStageCount)
-    {
-      continue;
-    }
-    int64_t gap = timeline[k + 1].first - timeline[k].first;
-    gapsByStage[stage].push_back(gap);
-    totalByStage[stage] += gap;
-    ++countByStage[stage];
-  }
-  // Every timeline entry is one EVENT of that stage (countByStage above
-  // only counts entries that have a following event to form a gap with,
-  // i.e. total events minus at most 1 per stage at the very end of the
-  // recorded window) -- report the TRUE per-stage event count separately
-  // so "number of events per stage" (this investigation's own explicit
-  // requirement) is exact, not off-by-the-trailing-event.
-  uint64_t trueCountByStage[kStageCount] = {0, 0, 0, 0, 0};
-  for (const auto& entry : timeline)
-  {
-    if (entry.second < kStageCount)
-    {
-      ++trueCountByStage[entry.second];
-    }
-  }
-  std::cout << "FLEETQOX_STAGE_TIMING {\"stages\":[";
-  for (std::size_t i = 0; i < kStageCount; ++i)
-  {
-    std::vector<int64_t> sorted = gapsByStage[i];
-    std::sort(sorted.begin(), sorted.end());
-    int64_t maxGap = sorted.empty() ? -1 : sorted.back();
-    if (i != 0)
-    {
-      std::cout << ",";
-    }
-    std::cout << "{\"stage\":\"" << kStageNames[i] << "\","
-              << "\"event_count\":" << trueCountByStage[i] << ","
-              << "\"gap_sample_count\":" << countByStage[i] << ","
-              << "\"total_gap_wall_ns\":" << totalByStage[i] << ","
-              << "\"p50_gap_ns\":" << PercentileOfSorted(sorted, 0.50) << ","
-              << "\"p95_gap_ns\":" << PercentileOfSorted(sorted, 0.95) << ","
-              << "\"p99_gap_ns\":" << PercentileOfSorted(sorted, 0.99) << ","
-              << "\"max_gap_ns\":" << maxGap << "}";
-  }
-  std::cout << "],\"fine_lag_samples\":[";
-  for (std::size_t i = 0; i < lagSnapshot.size(); ++i)
-  {
-    if (i != 0)
-    {
-      std::cout << ",";
-    }
-    std::cout << "[" << lagSnapshot[i].first << "," << lagSnapshot[i].second << "]";
-  }
-  std::cout << "]}" << std::endl;
-}
-// ---- END diagnostic-only stage-timing probe globals/helpers ----
-
 double
 SelfCpuSeconds()
 {
@@ -705,7 +531,6 @@ FlushMacEventLog()
 void
 MacTxTrace(std::string who, Ptr<const Packet> packet)
 {
-  RecordStageEvent(kStageMacTx);
   g_macTxTotal.fetch_add(1, std::memory_order_relaxed);
   // Cheap (O(1) arithmetic, no string/extraction work) byte counter --
   // unconditional, for the "N=8 REALTIME-LAG VALIDATION" investigation's
@@ -726,7 +551,6 @@ MacTxTrace(std::string who, Ptr<const Packet> packet)
 void
 MacTxDropTrace(std::string who, Ptr<const Packet> packet)
 {
-  RecordStageEvent(kStageMacTxDrop);
   g_macTxDropTotal.fetch_add(1, std::memory_order_relaxed);
   LogMacEvent("mac_tx_drop", who, packet);
 }
@@ -734,7 +558,6 @@ MacTxDropTrace(std::string who, Ptr<const Packet> packet)
 void
 MacRxTrace(std::string who, Ptr<const Packet> packet)
 {
-  RecordStageEvent(kStageMacRx);
   g_macRxTotal.fetch_add(1, std::memory_order_relaxed);
   g_macRxBytes.fetch_add(packet->GetSize(), std::memory_order_relaxed);
   LogMacEvent("rx", who, packet);
@@ -743,7 +566,6 @@ MacRxTrace(std::string who, Ptr<const Packet> packet)
 void
 MacRxDropTrace(std::string who, Ptr<const Packet> packet)
 {
-  RecordStageEvent(kStageMacRxDrop);
   g_macRxDropTotal.fetch_add(1, std::memory_order_relaxed);
   LogMacEvent("mac_rx_drop", who, packet);
 }
@@ -751,7 +573,6 @@ MacRxDropTrace(std::string who, Ptr<const Packet> packet)
 void
 PhyTxBeginTrace(std::string /* who */, Ptr<const Packet> /* packet */, double /* txPowerW */)
 {
-  RecordStageEvent(kStagePhyTxBegin);
   g_phyTxBeginTotal.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -936,9 +757,6 @@ PrintWifiStats(uint32_t totalStations, uint32_t numAps)
   // Flush any buffered per-packet MAC timeline lines on the same safe
   // cadence/thread as this function -- see g_macEventLogLines' comment.
   FlushMacEventLog();
-  // Same kill-safe periodic-dump cadence, for the stage-timing probe (see
-  // DumpStageTimingSummary's own comment) -- no-op unless --stageTiming.
-  DumpStageTimingSummary();
   // sim_time_s lets the orchestrator pick a snapshot by SIMULATED elapsed
   // time instead of blindly taking "whichever line happened to be last
   // before the process got killed" -- the latter varies run-to-run purely
@@ -1171,16 +989,6 @@ main(int argc, char* argv[])
       "safety, not a performance change) -- see "
       "docs/AUDIT_ACCEPTANCE_TRACKING.md.",
       realtimeHardLimitS);
-  cmd.AddValue(
-      "stageTiming",
-      "TEMPORARY, diagnostic-only (see DumpStageTimingSummary's own doc "
-      "comment and docs/AUDIT_ACCEPTANCE_TRACKING.md's \"LOCALIZE NS-3 "
-      "WALL-CLOCK LAG\" investigation): record a wall-clock timestamp at "
-      "every MacTx/MacTxDrop/MacRx/MacRxDrop/PhyTxBegin trace firing into "
-      "an in-memory timeline, and sample sim_lag_s every 0.5s instead of "
-      "the default 5s. Default false: with this off, behavior and cost "
-      "are byte-for-byte identical to before this probe existed.",
-      g_stageTiming);
   cmd.Parse(argc, argv);
   if (layout != "grid" && layout != "circle")
   {
@@ -1687,15 +1495,6 @@ main(int argc, char* argv[])
   if (g_heavyTracing)
   {
     Simulator::Schedule(Seconds(2.0), &PrintQueueBacklog);
-  }
-  if (g_stageTiming)
-  {
-    // Reserve upfront (see DumpStageTimingSummary's own comment on
-    // expected event volume) so normal operation never pays a
-    // reallocation cost mid-run -- one-time, at startup, not per-event.
-    g_stageTimeline.reserve(400000);
-    g_fineLagSamples.reserve(400);
-    Simulator::Schedule(Seconds(0.5), &FineLagSample);
   }
 
   Simulator::Stop(Seconds(simDuration));
