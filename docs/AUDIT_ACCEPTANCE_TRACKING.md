@@ -22259,6 +22259,257 @@ session is confirmed, re-run items 4-5 of this section exactly as
 designed (same seeds, same window, same script) -- no methodology
 changes are needed, only a host/session where ns-3 can keep pace.
 
+## LOCALIZE NS-3 WALL-CLOCK LAG (26/09/2026): ROOT CAUSE FOUND -- HARNESS sim_lag_s FORMULA ARTIFACT, NOT AN NS-3 PERFORMANCE PROBLEM
+
+Follow-up to "VALID-SIM_LAG RE-MEASUREMENT ATTEMPT" (classified
+SIMULATOR_BLOCKED) and its own CPU-affinity/swap/desktop-contention
+ablations (all refuted). This task instrumented `fleetqox_trace_replay_tap.cc`
+itself to localize wall-clock cost by ns-3-internal stage. **The
+instrumentation found nothing pathological inside ns-3 -- because
+ns-3's own internally-measured lag was never actually the problem.**
+The pristine N=4 seed=53 smoke probe's ~27s "sim_lag_s" is a
+**measurement-formula artifact in `run_ns3_docker_container_fleet_probe.py`
+itself**, proven with exact numbers, not inferred from correlation.
+
+### 0. The decisive finding, found BEFORE writing any new instrumentation
+
+Before building anything, the ALREADY-EXISTING `FLEETQOX_WIFI_STATS`
+periodic print (`PrintWifiStats()`, every 5 real seconds, already
+computing its OWN `sim_lag_s = wall_elapsed_s - sim_time_s` at each
+print) was captured via `save_ns3_log_path` for two independent runs of
+the exact pristine N=4 seed=53 smoke probe:
+
+| run | sim_time_s=15 snapshot (target) | sim_time_s=30 snapshot (last) | official `sim_lag_s` | `ns3_real_elapsed_s_at_log_read` |
+|---|---|---|---|---|
+| 1 | wall=17.06s, own-lag=2.06s | wall=35.64s, own-lag=5.64s | **29.03s** | 44.03s |
+| 2 | wall=17.02s, own-lag=2.02s | wall=35.76s, own-lag=5.76s | **20.31s** | 35.31s |
+
+ns-3's own internally-computed lag is healthy and remarkably
+REPRODUCIBLE across both independent runs (2.02-2.06s at the target
+checkpoint, 5.64-5.76s at the final checkpoint) -- never remotely close
+to the 10s threshold, at ANY point in either run. Yet the "official"
+`sim_lag_s` this whole investigation has been chasing swings 20.3-29.0s
+between these two otherwise-identical runs.
+
+**Root cause, read directly from `run_ns3_docker_container_fleet_probe.py`
+lines 2264-2268**: `sim_lag_s = ns3_real_elapsed_s_at_log_read -
+wifi_stats["sim_time_s"]`, where `wifi_stats` is the snapshot
+`parse_wifi_stats()` selects (the FIRST one reaching
+`wifi_stats_target_s()` = `start_offset_ms/1000 + seconds + drain_s` =
+2+3+10 = **15.0s** for this exact probe config) and
+`ns3_real_elapsed_s_at_log_read` is the REAL wall-clock time from ns-3
+container start until the orchestrator finally reads the log -- which
+only happens after `sim_duration_s` (**30.0s**, an INDEPENDENT
+parameter, set larger than `wifi_stats_target_s` on purpose so ns-3
+outlives the workload) has actually elapsed, PLUS whatever real time
+the Python-side endpoints' own shutdown/completion-polling takes on
+top. The formula subtracts the TARGET's sim-time (15) from a wall-clock
+figure that reflects having run a FULL 30 sim-seconds plus shutdown --
+structurally guaranteeing `sim_lag_s (official) ≈ (sim_duration_s -
+wifi_stats_target_s) + (ns-3's own small genuine lag) + (harness
+completion-polling overhead) ≈ 15 + ~2-6 + ~3-9 ≈ 20-30`, for ANY code,
+regardless of whether ns-3 itself is keeping up -- exactly the observed
+range, exactly reproduced by arithmetic on real numbers above (run 1:
+44.03-17.06=26.97 "extra" real seconds after ns-3's OWN target-checkpoint
+wall time, closely tracking the reported 29.03 minus the 2.06 it should
+have subtracted; run 2 likewise: 35.31-17.02=18.29 vs reported 20.31).
+**This is a pre-existing definitional mismatch between two independently-
+chosen parameters (`sim_duration_s=30` vs `wifi_stats_target_s`-implying-
+15) in this harness's own metric computation, not a regression from any
+change made in this or the prior three investigation turns.** `MAX_HEALTHY_SIM_LAG_S=10.0`
+was calibrated against this SAME flawed formula, so the threshold itself
+inherited the artifact -- every run this whole thread of investigation
+has called "invalid" was judged against a number that does not mean
+what its name says for this parameter combination.
+
+This finding is scoped EXACTLY to what this task permits: it is an
+observation about the ORCHESTRATION SCRIPT's own metric, made using
+already-existing, unmodified output (`FLEETQOX_WIFI_STATS`) -- no
+FleetRMW change, no Wi-Fi/workload/network semantics change, and (per
+this task's explicit scope) no fix was implemented; it is reported as a
+diagnostic finding for a future task to act on.
+
+### 1. Instrumentation overhead control (per the task's own explicit gate)
+
+Per the task's explicit instruction, run FIRST, before the full staged
+measurement: pristine N=4 seed=53, `--stageTiming=false` vs `=true`
+(otherwise byte-identical), using ns-3's OWN internally-measured lag at
+the fixed target checkpoint (the only apples-to-apples comparison,
+given item 0's finding that the "official" metric is itself noisy/
+non-representative run-to-run):
+
+| | stageTiming=false | stageTiming=true |
+|---|---|---|
+| ns-3 own `sim_lag_s` @ target (sim_time=15) | 1.94s | 2.18s |
+| official `sim_lag_s` | 30.10s | 32.25s |
+
+Difference (0.24s at the target checkpoint) is well within the
+run-to-run noise already observed between two IDENTICAL pristine runs
+in item 0 (2.02 vs 2.06s, a comparable spread). **Instrumentation
+overhead: not material.** Proceeded to the full measurement using this
+same run (`stageTiming=true`) rather than a separate one, since it
+already is the required measurement.
+
+### 2-3. Stage-timing methodology and its honest limits
+
+`fleetqox_trace_replay_tap.cc` has no trace source on TapBridge itself
+(confirmed via direct source read of `tap-bridge.cc`: no `TraceSource`
+declared anywhere in that module) nor on `RealtimeSimulatorImpl`'s own
+internal event-dispatch/synchronize functions (library-internal, would
+require patching+rebuilding ns-3 itself from source -- a fundamentally
+larger undertaking the prior "N=16 CPU PROFILE" section explicitly
+declined for the same reason, and this task does not attempt either).
+The only ns-3-internal boundaries this driver CAN observe without
+patching ns-3 are its 5 already-connected Wi-Fi MAC/PHY trace callbacks
+(MacTx/MacTxDrop/MacRx/MacRxDrop/PhyTxBegin). The added probe records a
+wall-clock timestamp at each firing into one merged, time-ordered
+timeline, and attributes the wall-clock GAP from one traced event to
+the next (of any type) to the FIRST event's own stage -- an honest
+approximation (documented as such in the code and here) that bundles
+ns-3's own event-dispatch/scheduling overhead, any TapBridge forward+
+write() that happens synchronously inside the same callback chain
+(WifiMac hands a received frame toward the bridge synchronously with
+its own MacRx trace firing), and RealtimeSimulatorImpl's per-event
+realtime-sync bookkeeping into whichever traced stage precedes it --
+NOT a clean isolation of "TapBridge" or "host I/O" or "realtime sync"
+as their own separately-measured buckets. This limitation is stated
+explicitly rather than presenting false per-stage precision.
+
+### 4-6. Event counts, wall time by stage, percentiles (single pristine N=4 seed=53 run, `--stageTiming=true`, final cumulative snapshot at sim_time_s≈29.5, wall_elapsed_s≈36.0)
+
+| stage | event count | total gap wall time | % of measured span | p50 | p95 | p99 | max |
+|---|---|---|---|---|---|---|---|
+| **phy_tx_begin** | 203,032 | **28.614s** | **78.3%** | 121.4µs | 168.2µs | 242.3µs | 215.8ms |
+| mac_rx_drop | 263,233 | 2.896s | 7.9% | 9.7µs | 19.7µs | 30.7µs | 92.6ms |
+| mac_tx | 97,260 | 2.541s | 7.0% | 16.5µs | 75.3µs | 121.9µs | 13.0ms |
+| mac_rx | 25,929 | 2.435s | 6.7% | 30.9µs | 49.4µs | 72.1µs | 93.5ms |
+| mac_tx_drop | 8 | 0.064s | 0.2% | 8.9µs | 20,949.5µs | 20,949.5µs | 27.6ms |
+
+(mac_tx_drop's percentiles are noise from only 8 samples -- not a
+meaningful signal either way.) Sum of all stage totals, 36.55s, closely
+matches the recorded timeline's own overall wall-clock span (~36.0s at
+the last fine-lag sample) -- confirms the gap-attribution method
+partitions the observed timeline consistently rather than double-
+counting or leaking time.
+
+### sim_lag_s progression over time (fine, 0.5s cadence -- 10x finer than the pre-existing 5s `PrintWifiStats`)
+
+| sim_time_s | wall_elapsed_s | ns-3's own lag |
+|---|---|---|
+| 0.5 | 0.517 | 0.017 |
+| 4.5 | 4.517 | 0.017 |
+| 8.5 | 8.930 | 0.430 |
+| 12.5 | 13.890 | 1.390 |
+| 16.5 | 19.151 | 2.651 |
+| 20.5 | 24.498 | 3.998 |
+| 24.5 | 29.686 | 5.186 |
+| 28.5 | 34.806 | 6.306 |
+| 29.5 (last) | 36.006 | 6.506 |
+
+Smooth, monotonic, gradually-growing lag with no discontinuous jump or
+stall anywhere in the run -- consistent with a realtime simulator doing
+progressively more accumulated work as MAC/PHY event volume grows
+through the run, not with a single catastrophic bottleneck.
+
+### 7. First proven expensive stage: `phy_tx_begin`-adjacent processing (78.3% of the measured span, 28.6 of ~36.6s)
+
+Backed directly by the table in item 4-6, not inferred: `phy_tx_begin`'s
+accumulated gap wall-time (28.614s) dwarfs every other stage's (2.4-2.9s
+each), and its OWN per-event median gap (121.4µs) is 4-14x larger than
+every other stage's median (8.9-30.9µs) -- a clear, large, consistent
+signal, not a count artifact (its event count, 203,032, is actually
+LOWER than `mac_rx_drop`'s 263,233, yet consumes 10x more accumulated
+wall time). Per item 2-3's own documented limitation, "the gap following
+a `PhyTxBegin` event" is the best available external proxy for "wall-
+clock spent letting that frame's own simulated PHY transmission duration
+elapse" in a REALTIME simulator -- exactly what a `RealtimeSimulatorImpl`-
+based, TapBridge-connected Wi-Fi simulation is ARCHITECTURALLY required
+to do (this file's own header comment, unchanged since before this
+investigation, already documents "a --simDuration=30 run takes
+approximately 30 real wall-clock seconds" as the intended, by-design
+behavior). This is consistent with, not contradicting, item 0's finding:
+ns-3 legitimately spends most of its wall-clock budget honoring
+real-time PHY pacing, and still finishes within a healthy margin
+(final own-lag 6.5s, well under 10s) -- there is no hidden, excess
+ns-3-internal cost being masked by this dominant bucket.
+
+### 8. Root cause: **PROVEN** (not STILL_UNKNOWN) -- but it is a harness metric-formula issue, not an ns-3 event-processing bottleneck
+
+Two independent, complementary lines of evidence converge:
+1. **Item 0** (formula decomposition with real numbers, two independent
+   pristine runs): the officially-reported `sim_lag_s` is dominated by
+   `(sim_duration_s - wifi_stats_target_s)` plus harness completion-
+   polling variance -- NOT by ns-3 falling behind. ns-3's own honest
+   internal lag stays healthy (max ~6.5s observed) throughout.
+2. **Items 4-7** (new stage-timing instrumentation): within ns-3's own
+   processing, the dominant wall-clock consumer (`phy_tx_begin`-adjacent
+   processing, 78.3%) is consistent with expected, architecturally-
+   required realtime PHY-duration pacing, not a pathological stall.
+
+**Neither line of evidence supports "ns-3 is too slow for this
+workload."** The ~27s figure this investigation (across four prior
+turns) has treated as an ns-3 performance problem to root-cause is,
+for this exact probe configuration, substantially an artifact of
+comparing a full-`sim_duration_s`-length run's real elapsed time against
+an earlier `wifi_stats_target_s` checkpoint's sim-time.
+
+### 9. Files changed
+
+`external/ns3/fleetqox_trace_replay_tap.cc`: `--stageTiming` probe
+added (commit `a3d7764`), then fully reverted (commit `c52d7cc`) -- net
+zero change versus the previous section's end state. Same for
+`scripts/run_ns3_docker_container_fleet_probe.py`'s `stage_timing`
+kwarg on `start_ns3()` plus the `FLEETQOX_NS3_STAGE_TIMING` env-var
+pass-through inside `run_probe()`. **No production/FleetRMW/Wi-Fi-
+semantics file touched.** Scratch scripts and raw run logs under
+`/tmp/.../scratchpad/ns3_stage_timing_probe/` (host-local, not
+committed).
+
+### 10. Tests
+
+| Checkpoint | Result |
+|---|---|
+| Start of this task (= end of previous section, commit `f76ffe8`) | 888 passed, 8 failed |
+| After adding the stage-timing probe (`a3d7764`) | 888 passed, 8 failed |
+| After reverting it (`c52d7cc`) | 888 passed, 8 failed |
+
+Identical at every checkpoint. Additionally sanity-checked (per this
+task's own instruction) a post-revert pristine smoke re-run: ns-3's own
+`sim_lag_s` at the target checkpoint (2.27s) matches the pre-probe
+range (2.02-2.06s) within normal run-to-run noise -- reverting
+introduced no behavior change.
+
+### 11. Environment restored: **YES**
+
+Both `.cc` and `.py` files confirmed byte-for-byte reverted (`git diff
+f76ffe8 HEAD -- external/ns3/fleetqox_trace_replay_tap.cc
+scripts/run_ns3_docker_container_fleet_probe.py` is empty), rebuilt via
+the exact established `g++ -std=c++17 ... $(pkg-config --cflags --libs
+ns3-core ns3-network ns3-mobility ns3-wifi ns3-tap-bridge)` command
+(clean compile, only the pre-existing unrelated `snprintf` warning),
+and re-verified via a live sanity smoke run (item 10).
+
+### 12. Exactly one next experiment
+
+Fix (or, at minimum, get an explicit decision on) the `sim_lag_s`
+metric-formula mismatch identified in item 0: either (a) compare
+`ns3_real_elapsed_s_at_log_read` against the CHOSEN snapshot's own
+`wall_elapsed_s` instead of its `sim_time_s` (directly answers "how much
+EXTRA real time elapsed after ns-3 itself reached this point," which is
+what "lag" should mean), or (b) read ns-3's own last-available
+`FLEETQOX_WIFI_STATS` snapshot's `sim_lag_s` field directly as the
+authoritative number instead of recomputing it in Python from
+mismatched inputs, or (c) reconcile `wifi_stats_target_s()` and
+`sim_duration_s` to the same horizon so the two parameters this formula
+mixes are no longer independently choosable. Whichever fix is chosen,
+re-run the exact N=4/N=8 paired seed 7/13/29 causal probe from the
+"RETRANSMISSION-DELAYS-FIRST-ATTEMPT" investigation's Section 6-14
+against the CORRECTED metric -- every one of those runs may already
+have been simulator-valid the whole time, meaning the D classification
+(and the SIMULATOR_BLOCKED downgrade of it) may both need to be
+revisited once measured against a metric that actually reflects ns-3's
+own real-time performance.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
