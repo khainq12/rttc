@@ -836,23 +836,57 @@ class ReferenceTopologyProbe:
                 *self._mount_args(), self.image, "sleep infinity",
             )
 
-    def build_ns3_binary(self, extra_ns3_source_lines: str = "", use_monolib: bool = False) -> None:
+    def build_ns3_binary(
+        self,
+        extra_ns3_source_lines: str = "",
+        use_monolib: bool = False,
+        ns3_build_profile: str = "release",
+    ) -> None:
         # use_monolib (P2.8, docs/AUDIT_ACCEPTANCE_TRACKING.md "MONOLIB
         # INCREMENTAL TEST"): default False reproduces this method's
         # prior link command byte-for-byte in effect (same --cflags,
         # same --libs modules, just split into two pkg-config
         # invocations instead of one combined call -- pkg-config's own
         # --cflags/--libs output is independent per flag, so this is not
-        # a behavior change). True links against ns3.41-monolib.so (a
-        # single shared library containing every enabled module, built
-        # opt-in via NS3_MONOLIB=ON -- see that CMake option's own
-        # description) INSTEAD of the separate per-module libraries,
-        # while keeping the SAME --cflags/include paths (unaffected by
-        # monolib -- headers live in the same place either way). Purely
-        # a link-target choice: fleetqox_trace_replay_tap.cc itself is
-        # never modified, so this cannot change simulation semantics.
+        # a behavior change). True links against ns3's monolib (a single
+        # shared library containing every enabled module, built opt-in
+        # via NS3_MONOLIB=ON) INSTEAD of the separate per-module
+        # libraries, while keeping the SAME --cflags/include paths
+        # (unaffected by monolib -- headers live in the same place
+        # either way). Purely a link-target choice: fleetqox_trace_replay_tap.cc
+        # itself is never modified, so this cannot change simulation
+        # semantics.
+        #
+        # ns3_build_profile (P2.11, docs/AUDIT_ACCEPTANCE_TRACKING.md
+        # "MONOLIB PROFILE-SUFFIX FIX"): ns-3 3.41's own CMake
+        # (build-support/macros-and-definitions.cmake's process_options())
+        # renames EVERY versioned library target with a build_profile
+        # suffix that is empty for "release" but "-optimized" for
+        # "optimized" (the profile NS3_NATIVE_OPTIMIZATIONS=ON switches
+        # to, under CMAKE_BUILD_TYPE=Release) -- so monolib's actual
+        # installed filename depends on which CMake configuration built
+        # the image this runs against, not on anything this harness can
+        # discover safely by matching a wildcard (a wildcard match would
+        # silently pick whichever monolib happens to exist, which is
+        # exactly the failure mode this parameter exists to prevent).
+        # Default "release" reproduces the prior (P2.8) hardcoded
+        # behavior exactly. Only "release" and "optimized" are known,
+        # real ns-3 3.41 profile-suffix values for THIS harness's own
+        # build recipe (CMAKE_BUILD_TYPE=Release always, so "debug"'s
+        # own separate suffix never applies here) -- any other value is
+        # a caller error, rejected immediately rather than silently
+        # falling back to a guessed library name.
+        _monolib_target_by_profile = {
+            "release": "ns3.41-monolib",
+            "optimized": "ns3.41-monolib-optimized",
+        }
+        if ns3_build_profile not in _monolib_target_by_profile:
+            raise ValueError(
+                f"ns3_build_profile must be one of {sorted(_monolib_target_by_profile)}, "
+                f"got {ns3_build_profile!r}"
+            )
         ns3_link_flags = (
-            "-lns3.41-monolib"
+            f"-l{_monolib_target_by_profile[ns3_build_profile]}"
             if use_monolib
             else "$(pkg-config --libs ns3-core ns3-network ns3-mobility "
             "ns3-wifi ns3-tap-bridge)"
@@ -2074,6 +2108,7 @@ def run_probe(
     deadline_aware_retransmission_lifespan: bool = False,
     ns3_scheduler: str = "map",
     ns3_use_monolib: bool = False,
+    ns3_build_profile: str = "release",
 ) -> dict[str, Any]:
     # ns3_use_monolib: passed straight through to
     # ReferenceTopologyProbe.build_ns3_binary()'s same-named `use_monolib`
@@ -2082,6 +2117,14 @@ def run_probe(
     # unchanged. True requires an image built with NS3_MONOLIB=ON (not
     # the production default) -- a diagnostic-only knob, never a
     # production default itself.
+    # ns3_build_profile: passed straight through to
+    # ReferenceTopologyProbe.build_ns3_binary()'s same-named arg (P2.11,
+    # docs/AUDIT_ACCEPTANCE_TRACKING.md "MONOLIB PROFILE-SUFFIX FIX") --
+    # only meaningful when ns3_use_monolib=True. Default "release"
+    # reproduces P2.8's original hardcoded monolib filename unchanged;
+    # "optimized" is required when the image was built with
+    # NS3_NATIVE_OPTIMIZATIONS=ON (which renames every ns-3 library
+    # target). Any other value raises immediately -- no silent fallback.
     # ns3_scheduler: passed straight through to
     # ReferenceTopologyProbe.start_ns3()'s same-named `scheduler` arg --
     # see fleetqox_trace_replay_tap.cc's --scheduler doc comment. Default
@@ -2212,7 +2255,7 @@ def run_probe(
     readiness_diagnostics: dict[str, Any] = {}
     try:
         probe.start_containers()
-        probe.build_ns3_binary(use_monolib=ns3_use_monolib)
+        probe.build_ns3_binary(use_monolib=ns3_use_monolib, ns3_build_profile=ns3_build_profile)
         probe.wire_network()
         # Recorded right before launch so the elapsed-time check below is
         # conservative (a few seconds of container-exec/attach overhead

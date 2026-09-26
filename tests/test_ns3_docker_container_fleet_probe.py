@@ -1039,24 +1039,71 @@ class BuildNs3BinaryMonolibCommandLineTest(unittest.TestCase):
         self.assertIn("external/ns3/fleetqox_trace_replay_tap.cc", monolib_cmd)
 
 
-class BuildNs3BinaryMonolibProfileSuffixAbsentTest(unittest.TestCase):
-    """RED (P2.11, docs/AUDIT_ACCEPTANCE_TRACKING.md, "MONOLIB
-    PROFILE-SUFFIX FIX"): ns-3 3.41's own CMake renames EVERY versioned
-    library target with a build_profile suffix -- empty for "release",
-    "-optimized" for "optimized" (the profile NS3_NATIVE_OPTIMIZATIONS=ON
-    switches to under CMAKE_BUILD_TYPE=Release). P2.10 proved a
-    hardcoded "-lns3.41-monolib" link flag silently fails (the artifact
-    is actually named libns3.41-monolib-optimized.so) the moment a
-    caller tries to combine use_monolib=True with a native-optimized
-    image. Proven here, literally: no such profile-awareness exists
-    yet."""
+class BuildNs3BinaryMonolibProfileSuffixTest(unittest.TestCase):
+    """P2.11 (docs/AUDIT_ACCEPTANCE_TRACKING.md, "MONOLIB PROFILE-SUFFIX
+    FIX"): ns-3 3.41's own CMake renames EVERY versioned library target
+    with a build_profile suffix -- empty for "release", "-optimized"
+    for "optimized" (the profile NS3_NATIVE_OPTIMIZATIONS=ON switches to
+    under CMAKE_BUILD_TYPE=Release). P2.10 proved a hardcoded
+    "-lns3.41-monolib" link flag silently fails (the artifact is
+    actually named libns3.41-monolib-optimized.so) the moment a caller
+    tries to combine use_monolib=True with a native-optimized image.
+    ns3_build_profile makes this explicit and rejects anything it does
+    not recognize outright -- no wildcard discovery, no silent
+    fallback."""
 
-    def test_build_ns3_binary_has_no_ns3_build_profile_parameter(self):
+    def test_default_build_profile_is_release(self):
         params = inspect.signature(ReferenceTopologyProbe.build_ns3_binary).parameters
-        self.assertNotIn("ns3_build_profile", params)
+        self.assertIn("ns3_build_profile", params)
+        self.assertEqual(params["ns3_build_profile"].default, "release")
 
-    def test_run_probe_has_no_ns3_build_profile_parameter(self):
-        self.assertNotIn("ns3_build_profile", inspect.signature(run_probe).parameters)
+    def test_run_probe_has_ns3_build_profile_defaulting_to_release(self):
+        params = inspect.signature(run_probe).parameters
+        self.assertIn("ns3_build_profile", params)
+        self.assertEqual(params["ns3_build_profile"].default, "release")
+
+    def test_run_probe_passes_ns3_build_profile_through(self):
+        source = inspect.getsource(run_probe)
+        self.assertIn("ns3_build_profile=ns3_build_profile", source)
+
+    def test_release_profile_links_release_monolib_name(self):
+        probe = object.__new__(ReferenceTopologyProbe)
+        probe.ns3sim_name = "fleetqox_test_ns3sim"
+        with mock.patch(
+            "scripts.run_ns3_docker_container_fleet_probe.docker",
+            return_value=mock.Mock(returncode=0, stdout="", stderr=""),
+        ):
+            probe.build_ns3_binary(use_monolib=True, ns3_build_profile="release")
+
+    def test_optimized_profile_links_optimized_monolib_name(self):
+        probe = object.__new__(ReferenceTopologyProbe)
+        probe.ns3sim_name = "fleetqox_test_ns3sim"
+        calls: list[tuple] = []
+
+        def fake_docker(*args, **kw):
+            calls.append(args)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch(
+            "scripts.run_ns3_docker_container_fleet_probe.docker", side_effect=fake_docker
+        ):
+            probe.build_ns3_binary(use_monolib=True, ns3_build_profile="optimized")
+        cmd = [c for c in calls if c[:2] == ("exec", probe.ns3sim_name)][0][-1]
+        self.assertIn("-lns3.41-monolib-optimized", cmd)
+        # The release-profile flag must not appear as a DIFFERENT,
+        # additional token alongside the optimized one -- exactly one
+        # link flag is ever inserted, and it must be the optimized name.
+        self.assertEqual(cmd.count("-lns3.41-monolib"), 1)
+
+    def test_unknown_profile_raises_immediately_no_silent_fallback(self):
+        probe = object.__new__(ReferenceTopologyProbe)
+        probe.ns3sim_name = "fleetqox_test_ns3sim"
+        with mock.patch(
+            "scripts.run_ns3_docker_container_fleet_probe.docker"
+        ) as fake_docker:
+            with self.assertRaises(ValueError):
+                probe.build_ns3_binary(use_monolib=True, ns3_build_profile="bogus")
+            fake_docker.assert_not_called()
 
 
 def _wifi_stats_line(sim_time_s: float, wall_elapsed_s: float) -> str:
