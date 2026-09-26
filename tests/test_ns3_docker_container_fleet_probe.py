@@ -7,6 +7,7 @@ from pathlib import Path
 from scripts.run_ns3_docker_container_fleet_probe import (
     BASE_IP_PREFIX,
     LAN_DISCOVERY_WATCHDOG_S,
+    MAX_HEALTHY_SIM_LAG_S,
     NS3_SIM_DURATION_DRAIN_MARGIN_S,
     RMW_PORT,
     STATIC_SUBSCRIPTION_TYPE_NAME,
@@ -16,11 +17,14 @@ from scripts.run_ns3_docker_container_fleet_probe import (
     compute_graph_join_failures,
     compute_jitter_stale_repair_stats,
     compute_latency_stats_ms,
+    corrected_sim_lag_s,
     effective_ns3_sim_duration_s,
     endpoint_list,
     fleetqox_coordination_rmw_env_prefix,
     fleetqox_rmw_env_prefix,
     parse_docker_mem_usage_mb,
+    parse_last_wifi_stats,
+    parse_wifi_stats,
     required_peers_from_trace,
     run_coordination_probe,
     run_lan_probe,
@@ -873,6 +877,206 @@ class WifiReadinessRootCauseFixesTest(unittest.TestCase):
         self.assertEqual(
             inspect.signature(run_probe).parameters["discovery_timeout_s"].default, 15.0
         )
+
+
+def _wifi_stats_line(sim_time_s: float, wall_elapsed_s: float) -> str:
+    """One synthetic FLEETQOX_WIFI_STATS log line -- only the two fields
+    the sim_lag_s fix actually reads (sim_time_s, wall_elapsed_s) need to
+    be realistic; the rest of a real line's fields are irrelevant to
+    this test and omitted."""
+    return (
+        f'FLEETQOX_WIFI_STATS {{"sim_time_s":{sim_time_s},'
+        f'"wall_elapsed_s":{wall_elapsed_s},'
+        f'"sim_lag_s":{wall_elapsed_s - sim_time_s},'
+        f'"self_cpu_s":0.0,"self_rss_kb":0,"heavy_tracing":false}}'
+    )
+
+
+class SimLagSMeasurementBugTest(unittest.TestCase):
+    """PROVEN BUG (see docs/AUDIT_ACCEPTANCE_TRACKING.md, "SIM_LAG_S
+    MEASUREMENT BUG (26/09/2026)"): run_probe()'s old sim_lag_s formula
+    was `ns3_real_elapsed_s_at_log_read - wifi_stats["sim_time_s"]` --
+    an end-of-run Python wall-clock read (taken after the FULL
+    sim_duration_s-length run, plus every endpoint's own drain/shutdown)
+    minus the SIMULATED time of parse_wifi_stats()'s deliberately-EARLY,
+    target-based snapshot (chosen for MAC/PHY-counter cross-run
+    consistency, an unrelated and still-valid reason -- see that
+    function's own doc comment). Two timestamps from DIFFERENT
+    observation points, several/many real seconds apart -- structurally
+    inflating "lag" by roughly the real time it took to run the rest of
+    the simulation after that early snapshot, regardless of whether ns-3
+    was actually keeping pace. Confirmed live: two independent pristine
+    N=4 seed=53 runs showed the old formula swinging 20.3-29.0s while
+    ns-3's own internally-consistent (same-instant) lag never exceeded
+    6.5s in either run.
+
+    RED: test_old_formula_reports_false_lag_from_mismatched_snapshots
+    below reproduces the OLD formula's own arithmetic (not a re-import --
+    that code path no longer exists in this file, replaced by the fix)
+    against a synthetic log modeling exactly this run shape (early
+    target snapshot, healthy final snapshot, large end-of-run real-time
+    read) and proves it crosses MAX_HEALTHY_SIM_LAG_S even though the
+    simulator was never actually behind. Confirmed by literally running
+    this test class against the pre-fix source (via `git stash`) before
+    the fix was applied: it failed at IMPORT (corrected_sim_lag_s/
+    parse_last_wifi_stats did not exist yet), the same RED signature
+    EffectiveNs3SimDurationSTest's own docstring documents for its own
+    prior bug fix.
+
+    FIX: corrected_sim_lag_s() reads wall_elapsed_s AND sim_time_s from
+    the SAME snapshot line (parse_last_wifi_stats() -- the most recent
+    available, i.e. freshest same-instant pair this kill-based
+    architecture can offer) and subtracts them directly. No correction
+    constant of any kind -- this is a same-instant subtraction using an
+    authoritative source ns-3 itself already produces (PrintWifiStats()'s
+    own `wallElapsedS - simTimeS`), not an offset applied to the old
+    broken value."""
+
+    def test_old_formula_reports_false_lag_from_mismatched_snapshots(self):
+        # Models the exact observed pristine N=4 seed=53 shape: an EARLY
+        # target snapshot (sim_time=15, healthy 2s lag) and a HEALTHY
+        # final snapshot (sim_time=30, still only 2s lag) -- the
+        # simulator never fell behind at any point. The old formula used
+        # an end-of-run real-elapsed read (44.0s, modeling
+        # ns3_real_elapsed_s_at_log_read after the full run + drain +
+        # shutdown) combined with the EARLY snapshot's sim_time_s (15).
+        log = "\n".join(
+            [
+                _wifi_stats_line(sim_time_s=5, wall_elapsed_s=5.02),
+                _wifi_stats_line(sim_time_s=10, wall_elapsed_s=10.75),
+                _wifi_stats_line(sim_time_s=15, wall_elapsed_s=17.06),  # target snapshot
+                _wifi_stats_line(sim_time_s=20, wall_elapsed_s=23.30),
+                _wifi_stats_line(sim_time_s=25, wall_elapsed_s=29.57),
+                _wifi_stats_line(sim_time_s=30, wall_elapsed_s=35.64),  # last/final snapshot
+            ]
+        )
+        target_snapshot = parse_wifi_stats(log, target_sim_time_s=15.0)
+        self.assertEqual(target_snapshot["sim_time_s"], 15)
+        ns3_real_elapsed_s_at_log_read = 44.03  # modeled end-of-run Python read
+
+        old_formula_result = ns3_real_elapsed_s_at_log_read - target_snapshot["sim_time_s"]
+        self.assertGreater(
+            old_formula_result,
+            MAX_HEALTHY_SIM_LAG_S,
+            "the old formula must falsely exceed the validity gate for this "
+            "healthy-simulator shape -- that IS the proven bug",
+        )
+
+        corrected = corrected_sim_lag_s(log)
+        self.assertLessEqual(
+            corrected,
+            MAX_HEALTHY_SIM_LAG_S,
+            "the FIXED formula must correctly report this run as healthy",
+        )
+        self.assertAlmostEqual(corrected, 35.64 - 30, places=6)
+
+    def test_corrected_lag_uses_last_snapshot_not_target_snapshot(self):
+        # Direct proof the fix reads a DIFFERENT snapshot than
+        # parse_wifi_stats()'s target-based pick, on purpose.
+        log = "\n".join(
+            [
+                _wifi_stats_line(sim_time_s=15, wall_elapsed_s=17.06),
+                _wifi_stats_line(sim_time_s=30, wall_elapsed_s=32.5),
+            ]
+        )
+        target_snapshot = parse_wifi_stats(log, target_sim_time_s=15.0)
+        last_snapshot = parse_last_wifi_stats(log)
+        self.assertEqual(target_snapshot["sim_time_s"], 15)
+        self.assertEqual(last_snapshot["sim_time_s"], 30)
+        self.assertAlmostEqual(corrected_sim_lag_s(log), 32.5 - 30, places=6)
+
+    def test_simulator_genuinely_behind_is_still_correctly_flagged_invalid(self):
+        # The fix must not become a "always healthy" rubber stamp -- a
+        # run where the LAST snapshot itself shows real, growing lag
+        # (wall-clock consistently outpacing sim-time) must still fail
+        # the validity gate.
+        log = "\n".join(
+            [
+                _wifi_stats_line(sim_time_s=5, wall_elapsed_s=6.0),
+                _wifi_stats_line(sim_time_s=10, wall_elapsed_s=14.0),
+                _wifi_stats_line(sim_time_s=15, wall_elapsed_s=25.0),
+                _wifi_stats_line(sim_time_s=20, wall_elapsed_s=38.0),
+            ]
+        )
+        corrected = corrected_sim_lag_s(log)
+        self.assertGreater(corrected, MAX_HEALTHY_SIM_LAG_S)
+        self.assertAlmostEqual(corrected, 38.0 - 20.0, places=6)
+
+    def test_single_early_snapshot_target_and_last_coincide(self):
+        # When the target-reaching snapshot IS the only (hence also the
+        # last) snapshot available, the old and new approaches must
+        # agree -- this is the degenerate case where the bug never had
+        # room to manifest, a sanity check that the fix doesn't change
+        # behavior when there is nothing to mismatch.
+        log = _wifi_stats_line(sim_time_s=15, wall_elapsed_s=15.5)
+        target_snapshot = parse_wifi_stats(log, target_sim_time_s=15.0)
+        last_snapshot = parse_last_wifi_stats(log)
+        self.assertEqual(target_snapshot["sim_time_s"], last_snapshot["sim_time_s"])
+        self.assertAlmostEqual(corrected_sim_lag_s(log), 0.5, places=6)
+
+    def test_different_sim_duration_and_stats_target_combinations(self):
+        # The fix must hold regardless of how far apart
+        # wifi_stats_target_s() and the run's actual sim_duration_s are
+        # -- the old bug's magnitude scaled with exactly this gap, so a
+        # fix that merely shrinks the gap (rather than removing the
+        # mismatched-observation-point problem entirely) would still
+        # show a residual, duration-dependent error.
+        for target_s, last_sim_time_s, last_wall_elapsed_s in (
+            (15.0, 30.0, 30.5),  # small gap, healthy
+            (15.0, 90.0, 91.0),  # large gap (long sim_duration_s), still healthy
+            (30.0, 30.0, 30.2),  # target == last snapshot
+            (5.0, 120.0, 121.5),  # very early target, very long run, still healthy
+        ):
+            with self.subTest(
+                target_s=target_s,
+                last_sim_time_s=last_sim_time_s,
+                last_wall_elapsed_s=last_wall_elapsed_s,
+            ):
+                log = "\n".join(
+                    [
+                        _wifi_stats_line(sim_time_s=target_s, wall_elapsed_s=target_s + 0.5),
+                        _wifi_stats_line(
+                            sim_time_s=last_sim_time_s, wall_elapsed_s=last_wall_elapsed_s
+                        ),
+                    ]
+                )
+                corrected = corrected_sim_lag_s(log)
+                self.assertAlmostEqual(
+                    corrected, last_wall_elapsed_s - last_sim_time_s, places=6
+                )
+                # None of these healthy scenarios should ever cross the
+                # gate regardless of how large the target/duration gap is
+                # -- proving the fix's correctness does not degrade as
+                # that gap grows (unlike the old formula).
+                self.assertLessEqual(corrected, MAX_HEALTHY_SIM_LAG_S)
+
+    def test_validity_gate_constant_unchanged_by_this_fix(self):
+        # This fix corrects WHAT is measured, not the threshold it is
+        # judged against -- the task's own explicit constraint.
+        self.assertEqual(MAX_HEALTHY_SIM_LAG_S, 10.0)
+
+    def test_validity_decision_boundary_exact(self):
+        # <=10s validity decision, exercised at and around the boundary.
+        healthy_log = _wifi_stats_line(sim_time_s=20.0, wall_elapsed_s=30.0)  # exactly 10.0
+        self.assertLessEqual(corrected_sim_lag_s(healthy_log), MAX_HEALTHY_SIM_LAG_S)
+        unhealthy_log = _wifi_stats_line(sim_time_s=20.0, wall_elapsed_s=30.001)  # 10.001
+        self.assertGreater(corrected_sim_lag_s(unhealthy_log), MAX_HEALTHY_SIM_LAG_S)
+
+    def test_no_snapshot_at_all_returns_none_not_a_false_zero(self):
+        self.assertIsNone(corrected_sim_lag_s(""))
+        self.assertIsNone(corrected_sim_lag_s("some unrelated ns-3 log output\n"))
+
+    def test_parse_wifi_stats_unaffected_by_this_fix(self):
+        # The target-based selection used for MAC/PHY counter consistency
+        # must be completely untouched by this fix -- only the LAG
+        # computation changes which snapshot it reads.
+        log = "\n".join(
+            [
+                _wifi_stats_line(sim_time_s=15, wall_elapsed_s=17.06),
+                _wifi_stats_line(sim_time_s=30, wall_elapsed_s=35.64),
+            ]
+        )
+        self.assertEqual(parse_wifi_stats(log, target_sim_time_s=15.0)["sim_time_s"], 15)
 
 
 if __name__ == "__main__":
