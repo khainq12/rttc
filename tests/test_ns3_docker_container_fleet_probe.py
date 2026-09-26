@@ -1039,6 +1039,26 @@ class BuildNs3BinaryMonolibCommandLineTest(unittest.TestCase):
         self.assertIn("external/ns3/fleetqox_trace_replay_tap.cc", monolib_cmd)
 
 
+class BuildNs3BinaryMonolibProfileSuffixAbsentTest(unittest.TestCase):
+    """RED (P2.11, docs/AUDIT_ACCEPTANCE_TRACKING.md, "MONOLIB
+    PROFILE-SUFFIX FIX"): ns-3 3.41's own CMake renames EVERY versioned
+    library target with a build_profile suffix -- empty for "release",
+    "-optimized" for "optimized" (the profile NS3_NATIVE_OPTIMIZATIONS=ON
+    switches to under CMAKE_BUILD_TYPE=Release). P2.10 proved a
+    hardcoded "-lns3.41-monolib" link flag silently fails (the artifact
+    is actually named libns3.41-monolib-optimized.so) the moment a
+    caller tries to combine use_monolib=True with a native-optimized
+    image. Proven here, literally: no such profile-awareness exists
+    yet."""
+
+    def test_build_ns3_binary_has_no_ns3_build_profile_parameter(self):
+        params = inspect.signature(ReferenceTopologyProbe.build_ns3_binary).parameters
+        self.assertNotIn("ns3_build_profile", params)
+
+    def test_run_probe_has_no_ns3_build_profile_parameter(self):
+        self.assertNotIn("ns3_build_profile", inspect.signature(run_probe).parameters)
+
+
 def _wifi_stats_line(sim_time_s: float, wall_elapsed_s: float) -> str:
     """One synthetic FLEETQOX_WIFI_STATS log line -- only the two fields
     the sim_lag_s fix actually reads (sim_time_s, wall_elapsed_s) need to
