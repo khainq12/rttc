@@ -61,9 +61,11 @@ from scripts.run_ns3_docker_container_fleet_probe import (  # noqa: E402
     ReferenceTopologyProbe,
     build_static_subscriptions,
     container_pid,
+    corrected_sim_lag_s,
     docker,
     endpoint_list,
     fleetqox_rmw_env_prefix,
+    parse_last_wifi_stats,
     parse_wifi_stats,
     rigger_run,
     station_mac,
@@ -586,12 +588,19 @@ def run_wifi_gateway_probe(
         docker("rm", "-f", control_container_name, check=False)
         probe.teardown()
 
-    sim_lag_s = (
-        ns3_real_elapsed_s_at_log_read - wifi_stats["sim_time_s"]
-        if wifi_stats is not None and wifi_stats.get("sim_time_s") is not None
-        and ns3_real_elapsed_s_at_log_read is not None
-        else None
-    )
+    # FIXED (duplicate of Direct's own SIM_LAG_S MEASUREMENT BUG fix, see
+    # docs/AUDIT_ACCEPTANCE_TRACKING.md "SIM_LAG_S MEASUREMENT BUG
+    # (26/09/2026)" and corrected_sim_lag_s()'s own doc comment):
+    # previously computed as `ns3_real_elapsed_s_at_log_read -
+    # wifi_stats["sim_time_s"]` -- an out-of-band real-time read (from
+    # ns3sim_resource_usage, itself never actually populated with an
+    # "elapsed_s" key by sample_ns3sim_resource_usage(), so this was
+    # ALWAYS None in practice) minus the EARLY, target-based snapshot's
+    # sim-time -- two different observation points. `wifi_stats` (the
+    # target-based snapshot) is UNCHANGED for every other use in this
+    # function -- only the lag computation itself moves to the last-
+    # available, same-instant-paired snapshot, exactly like Direct.
+    sim_lag_s = corrected_sim_lag_s(ns3_log_text) if ns3_log_text else None
     simulator_invalid = sim_lag_s is not None and sim_lag_s > MAX_HEALTHY_SIM_LAG_S
 
     return {
@@ -608,6 +617,15 @@ def run_wifi_gateway_probe(
         "gateway_result": gateway_result,
         "ns3_log": ns3_log_text,
         "wifi_stats": wifi_stats,
+        # Retained for backward-compatible/diagnostic visibility only --
+        # no longer used to compute sim_lag_s (see that field's own
+        # comment above).
+        "ns3_real_elapsed_s_at_log_read": ns3_real_elapsed_s_at_log_read,
+        # The LAST available FLEETQOX_WIFI_STATS snapshot (not the
+        # target-based `wifi_stats` above) -- exposed so a caller can
+        # independently verify sim_lag_s's own same-instant provenance,
+        # same as Direct. See parse_last_wifi_stats().
+        "last_wifi_stats": parse_last_wifi_stats(ns3_log_text) if ns3_log_text else None,
         "sim_lag_s": sim_lag_s,
         "simulator_invalid": simulator_invalid,
         "disable_gateway": disable_gateway,

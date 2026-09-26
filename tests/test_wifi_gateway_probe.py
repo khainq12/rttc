@@ -33,6 +33,7 @@ from scripts.run_ns3_docker_container_fleet_probe import (
     MAX_HEALTHY_SIM_LAG_S,
     ReferenceTopologyProbe,
     corrected_sim_lag_s,
+    parse_last_wifi_stats,
     parse_wifi_stats,
 )
 from scripts.fleetqox_rmw_trace_endpoint import _topic_for, load_rows
@@ -338,6 +339,33 @@ class GatewaySimLagSMeasurementBugTest(unittest.TestCase):
             "is therefore ALWAYS None, making sim_lag_s/simulator_invalid "
             "unconditionally None/False for every real Gateway run today",
         )
+
+
+class GatewaySimLagSFixLockInTest(unittest.TestCase):
+    """GREEN lock-in: run_wifi_gateway_probe.py's sim_lag_s must be
+    computed via Direct's own already-proven corrected_sim_lag_s()/
+    parse_last_wifi_stats() (imported, not reimplemented) -- guards
+    against a future edit silently reintroducing a local formula that
+    could drift from the one proven correct for Direct."""
+
+    def test_gateway_module_uses_directs_own_fix_functions_by_identity(self):
+        import scripts.run_wifi_gateway_probe as gw
+
+        self.assertIs(gw.corrected_sim_lag_s, corrected_sim_lag_s)
+        self.assertIs(gw.parse_last_wifi_stats, parse_last_wifi_stats)
+
+    def test_gateway_source_no_longer_mixes_observation_points(self):
+        import inspect
+
+        import scripts.run_wifi_gateway_probe as gw
+
+        source = inspect.getsource(gw.run_wifi_gateway_probe)
+        self.assertNotIn(
+            'ns3_real_elapsed_s_at_log_read - wifi_stats["sim_time_s"]',
+            source,
+            "the old mismatched-observation-points formula must be gone",
+        )
+        self.assertIn("corrected_sim_lag_s(ns3_log_text)", source)
 
 
 if __name__ == "__main__":
