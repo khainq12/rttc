@@ -959,22 +959,84 @@ class ReferenceTopologyProbeStartNs3SchedulerCommandLineTest(unittest.TestCase):
         )
 
 
-class BuildNs3BinaryMonolibPlumbingAbsentTest(unittest.TestCase):
-    """RED (P2.8, docs/AUDIT_ACCEPTANCE_TRACKING.md, "MONOLIB INCREMENTAL
+class BuildNs3BinaryMonolibPlumbingTest(unittest.TestCase):
+    """P2.8 (docs/AUDIT_ACCEPTANCE_TRACKING.md, "MONOLIB INCREMENTAL
     TEST"): ns3.41-monolib.so (an opt-in NS3_MONOLIB=ON build target)
     cannot be used by ReferenceTopologyProbe.build_ns3_binary() unless
     the driver's own link command is pointed at it explicitly -- ns-3's
     own CMake never installs monolib for external pkg-config consumers
     (source-verified: no install(TARGETS) call for it anywhere in ns-3
-    3.41's build tree). Proven here, literally: no such plumbing exists
-    yet."""
+    3.41's build tree). `use_monolib` (default False) is the minimal,
+    opt-in link-target switch this fix adds; True requires an image
+    actually built with NS3_MONOLIB=ON (not the production default) --
+    it never changes fleetqox_trace_replay_tap.cc itself."""
 
-    def test_build_ns3_binary_has_no_use_monolib_parameter(self):
+    def test_use_monolib_parameter_exists_defaulting_to_false(self):
         params = inspect.signature(ReferenceTopologyProbe.build_ns3_binary).parameters
-        self.assertNotIn("use_monolib", params)
+        self.assertIn("use_monolib", params)
+        self.assertFalse(params["use_monolib"].default)
 
-    def test_run_probe_has_no_ns3_use_monolib_parameter(self):
-        self.assertNotIn("ns3_use_monolib", inspect.signature(run_probe).parameters)
+    def test_run_probe_has_ns3_use_monolib_defaulting_to_false(self):
+        params = inspect.signature(run_probe).parameters
+        self.assertIn("ns3_use_monolib", params)
+        self.assertFalse(params["ns3_use_monolib"].default)
+
+    def test_run_probe_passes_ns3_use_monolib_through(self):
+        source = inspect.getsource(run_probe)
+        self.assertIn("use_monolib=ns3_use_monolib", source)
+
+
+class BuildNs3BinaryMonolibCommandLineTest(unittest.TestCase):
+    """GREEN: proves the link command ReferenceTopologyProbe.build_ns3_binary()
+    actually executes changes ONLY the library-link target when
+    use_monolib is toggled -- the compile flags (--cflags, i.e. include
+    paths) are identical either way, and the default (False) command's
+    module set is unchanged from before this fix."""
+
+    def _captured_build_command(self, **kwargs) -> str:
+        probe = object.__new__(ReferenceTopologyProbe)
+        probe.ns3sim_name = "fleetqox_test_ns3sim"
+        calls: list[tuple] = []
+
+        def fake_docker(*args, **kw):
+            calls.append(args)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch(
+            "scripts.run_ns3_docker_container_fleet_probe.docker", side_effect=fake_docker
+        ):
+            probe.build_ns3_binary(**kwargs)
+        exec_calls = [c for c in calls if c[:2] == ("exec", probe.ns3sim_name)]
+        return exec_calls[0][-1]
+
+    def test_default_links_against_the_original_per_module_libraries(self):
+        cmd = self._captured_build_command()
+        self.assertIn(
+            "pkg-config --libs ns3-core ns3-network ns3-mobility ns3-wifi ns3-tap-bridge",
+            cmd,
+        )
+        self.assertNotIn("-lns3.41-monolib", cmd)
+
+    def test_use_monolib_true_links_against_monolib_instead(self):
+        cmd = self._captured_build_command(use_monolib=True)
+        self.assertIn("-lns3.41-monolib", cmd)
+        self.assertNotIn(
+            "pkg-config --libs ns3-core ns3-network ns3-mobility ns3-wifi ns3-tap-bridge",
+            cmd,
+        )
+
+    def test_cflags_are_identical_regardless_of_use_monolib(self):
+        default_cmd = self._captured_build_command()
+        monolib_cmd = self._captured_build_command(use_monolib=True)
+        cflags_call = "pkg-config --cflags ns3-core ns3-network ns3-mobility ns3-wifi ns3-tap-bridge"
+        self.assertIn(cflags_call, default_cmd)
+        self.assertIn(cflags_call, monolib_cmd)
+
+    def test_driver_source_file_unchanged_by_either_link_target(self):
+        default_cmd = self._captured_build_command()
+        monolib_cmd = self._captured_build_command(use_monolib=True)
+        self.assertIn("external/ns3/fleetqox_trace_replay_tap.cc", default_cmd)
+        self.assertIn("external/ns3/fleetqox_trace_replay_tap.cc", monolib_cmd)
 
 
 def _wifi_stats_line(sim_time_s: float, wall_elapsed_s: float) -> str:

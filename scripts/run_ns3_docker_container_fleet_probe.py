@@ -836,13 +836,33 @@ class ReferenceTopologyProbe:
                 *self._mount_args(), self.image, "sleep infinity",
             )
 
-    def build_ns3_binary(self, extra_ns3_source_lines: str = "") -> None:
+    def build_ns3_binary(self, extra_ns3_source_lines: str = "", use_monolib: bool = False) -> None:
+        # use_monolib (P2.8, docs/AUDIT_ACCEPTANCE_TRACKING.md "MONOLIB
+        # INCREMENTAL TEST"): default False reproduces this method's
+        # prior link command byte-for-byte in effect (same --cflags,
+        # same --libs modules, just split into two pkg-config
+        # invocations instead of one combined call -- pkg-config's own
+        # --cflags/--libs output is independent per flag, so this is not
+        # a behavior change). True links against ns3.41-monolib.so (a
+        # single shared library containing every enabled module, built
+        # opt-in via NS3_MONOLIB=ON -- see that CMake option's own
+        # description) INSTEAD of the separate per-module libraries,
+        # while keeping the SAME --cflags/include paths (unaffected by
+        # monolib -- headers live in the same place either way). Purely
+        # a link-target choice: fleetqox_trace_replay_tap.cc itself is
+        # never modified, so this cannot change simulation semantics.
+        ns3_link_flags = (
+            "-lns3.41-monolib"
+            if use_monolib
+            else "$(pkg-config --libs ns3-core ns3-network ns3-mobility "
+            "ns3-wifi ns3-tap-bridge)"
+        )
         build_cmd = (
             "set -e\n"
             "g++ -std=c++17 external/ns3/fleetqox_trace_replay_tap.cc "
             "-o /tmp/fleetqox_tap_bridge "
-            "$(pkg-config --cflags --libs ns3-core ns3-network ns3-mobility "
-            "ns3-wifi ns3-tap-bridge)\n"
+            "$(pkg-config --cflags ns3-core ns3-network ns3-mobility "
+            f"ns3-wifi ns3-tap-bridge) {ns3_link_flags}\n"
             # Same tap-creator baked-path symlink fix as
             # run_ns3_docker_wifi_tap_rmw_probe.py's build_shell_script --
             # see that file's comment for the full history of why this is
@@ -2053,7 +2073,15 @@ def run_probe(
     zenoh_control_station_explicit_listen: bool = False,
     deadline_aware_retransmission_lifespan: bool = False,
     ns3_scheduler: str = "map",
+    ns3_use_monolib: bool = False,
 ) -> dict[str, Any]:
+    # ns3_use_monolib: passed straight through to
+    # ReferenceTopologyProbe.build_ns3_binary()'s same-named `use_monolib`
+    # arg (P2.8, docs/AUDIT_ACCEPTANCE_TRACKING.md "MONOLIB INCREMENTAL
+    # TEST"). Default False reproduces this method's prior link command
+    # unchanged. True requires an image built with NS3_MONOLIB=ON (not
+    # the production default) -- a diagnostic-only knob, never a
+    # production default itself.
     # ns3_scheduler: passed straight through to
     # ReferenceTopologyProbe.start_ns3()'s same-named `scheduler` arg --
     # see fleetqox_trace_replay_tap.cc's --scheduler doc comment. Default
@@ -2184,7 +2212,7 @@ def run_probe(
     readiness_diagnostics: dict[str, Any] = {}
     try:
         probe.start_containers()
-        probe.build_ns3_binary()
+        probe.build_ns3_binary(use_monolib=ns3_use_monolib)
         probe.wire_network()
         # Recorded right before launch so the elapsed-time check below is
         # conservative (a few seconds of container-exec/attach overhead
