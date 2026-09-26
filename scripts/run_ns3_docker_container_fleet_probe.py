@@ -857,40 +857,50 @@ class ReferenceTopologyProbe:
         # itself is never modified, so this cannot change simulation
         # semantics.
         #
-        # ns3_build_profile (P2.11, docs/AUDIT_ACCEPTANCE_TRACKING.md
-        # "MONOLIB PROFILE-SUFFIX FIX"): ns-3 3.41's own CMake
-        # (build-support/macros-and-definitions.cmake's process_options())
-        # renames EVERY versioned library target with a build_profile
-        # suffix that is empty for "release" but "-optimized" for
-        # "optimized" (the profile NS3_NATIVE_OPTIMIZATIONS=ON switches
-        # to, under CMAKE_BUILD_TYPE=Release) -- so monolib's actual
-        # installed filename depends on which CMake configuration built
-        # the image this runs against, not on anything this harness can
-        # discover safely by matching a wildcard (a wildcard match would
-        # silently pick whichever monolib happens to exist, which is
-        # exactly the failure mode this parameter exists to prevent).
-        # Default "release" reproduces the prior (P2.8) hardcoded
+        # ns3_build_profile (P2.11/P2.12, docs/AUDIT_ACCEPTANCE_TRACKING.md
+        # "MONOLIB PROFILE-SUFFIX FIX" / "TAP-CREATOR PROFILE-SUFFIX FIX"):
+        # ns-3 3.41's own CMake (build-support/macros-and-definitions.cmake's
+        # process_options()) renames EVERY versioned library AND
+        # executable target with a build_profile suffix that is empty
+        # for "release" but "-optimized" for "optimized" (the profile
+        # NS3_NATIVE_OPTIMIZATIONS=ON switches to, under
+        # CMAKE_BUILD_TYPE=Release) -- so both monolib's installed
+        # filename AND the TapBridge tap-creator helper's installed
+        # filename depend on which CMake configuration built the image
+        # this runs against, not on anything this harness can discover
+        # safely by matching a wildcard (a wildcard match would silently
+        # pick whichever monolib/tap-creator happens to exist, which is
+        # exactly the failure mode this parameter exists to prevent --
+        # P2.12 proved this precise failure: the pre-existing tap-creator
+        # symlink-fix's baked-path regex was anchored to match ONLY
+        # "...tap-creator" and silently found nothing under "optimized",
+        # where the real baked path is "...tap-creator-optimized",
+        # leaving TapBridge's own execlp() unable to find its helper).
+        # Default "release" reproduces the prior (P2.8/P2.11) hardcoded
         # behavior exactly. Only "release" and "optimized" are known,
         # real ns-3 3.41 profile-suffix values for THIS harness's own
         # build recipe (CMAKE_BUILD_TYPE=Release always, so "debug"'s
         # own separate suffix never applies here) -- any other value is
         # a caller error, rejected immediately rather than silently
-        # falling back to a guessed library name.
-        _monolib_target_by_profile = {
-            "release": "ns3.41-monolib",
-            "optimized": "ns3.41-monolib-optimized",
+        # falling back to a guessed library/executable name.
+        _ns3_build_profile_suffix = {
+            "release": "",
+            "optimized": "-optimized",
         }
-        if ns3_build_profile not in _monolib_target_by_profile:
+        if ns3_build_profile not in _ns3_build_profile_suffix:
             raise ValueError(
-                f"ns3_build_profile must be one of {sorted(_monolib_target_by_profile)}, "
+                f"ns3_build_profile must be one of {sorted(_ns3_build_profile_suffix)}, "
                 f"got {ns3_build_profile!r}"
             )
+        _profile_suffix = _ns3_build_profile_suffix[ns3_build_profile]
         ns3_link_flags = (
-            f"-l{_monolib_target_by_profile[ns3_build_profile]}"
+            f"-lns3.41-monolib{_profile_suffix}"
             if use_monolib
             else "$(pkg-config --libs ns3-core ns3-network ns3-mobility "
             "ns3-wifi ns3-tap-bridge)"
         )
+        tap_creator_name = f"ns3.41-tap-creator{_profile_suffix}"
+        tap_bridge_so_name = f"libns3.41-tap-bridge{_profile_suffix}.so"
         build_cmd = (
             "set -e\n"
             "g++ -std=c++17 external/ns3/fleetqox_trace_replay_tap.cc "
@@ -901,11 +911,19 @@ class ReferenceTopologyProbe:
             # run_ns3_docker_wifi_tap_rmw_probe.py's build_shell_script --
             # see that file's comment for the full history of why this is
             # needed (the .so's baked-in helper-binary path doesn't match
-            # where it's actually installed in this image).
-            "TAPCREATOR_REAL=$(find /usr -iname '*tap-creator*' -type f 2>/dev/null | head -1)\n"
-            "TAPCREATOR_SO=$(find /usr -iname 'libns3*tap-bridge*' 2>/dev/null | head -1)\n"
+            # where it's actually installed in this image). Both the
+            # real-binary search and the baked-path regex are exact,
+            # profile-specific matches (P2.12) -- never a generic
+            # "*tap-creator*"/"tap-creator$" wildcard that could silently
+            # pick the wrong profile's artifact if more than one existed.
+            f"TAPCREATOR_REAL=$(find /usr -iname '{tap_creator_name}' -type f 2>/dev/null | head -1)\n"
+            'if [ -z "$TAPCREATOR_REAL" ]; then\n'
+            f'  echo "ERROR: expected tap-creator helper {tap_creator_name!r} not found" >&2\n'
+            "  exit 1\n"
+            "fi\n"
+            f"TAPCREATOR_SO=$(find /usr -iname '{tap_bridge_so_name}' -type f 2>/dev/null | head -1)\n"
             "TAPCREATOR_BAKED=$(strings \"$TAPCREATOR_SO\" 2>/dev/null | "
-            "grep -E '/.*tap-creator$' | head -1)\n"
+            f"grep -E '/.*{tap_creator_name}$' | head -1)\n"
             "if [ -n \"$TAPCREATOR_BAKED\" ] && [ ! -e \"$TAPCREATOR_BAKED\" ]; then\n"
             "  mkdir -p \"$(dirname \"$TAPCREATOR_BAKED\")\" && "
             "ln -sf \"$TAPCREATOR_REAL\" \"$TAPCREATOR_BAKED\"\n"

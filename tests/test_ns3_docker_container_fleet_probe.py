@@ -1106,8 +1106,8 @@ class BuildNs3BinaryMonolibProfileSuffixTest(unittest.TestCase):
             fake_docker.assert_not_called()
 
 
-class BuildNs3BinaryTapCreatorProfileSuffixAbsentTest(unittest.TestCase):
-    """RED (P2.12, docs/AUDIT_ACCEPTANCE_TRACKING.md, "TAP-CREATOR
+class BuildNs3BinaryTapCreatorProfileSuffixTest(unittest.TestCase):
+    """P2.12 (docs/AUDIT_ACCEPTANCE_TRACKING.md, "TAP-CREATOR
     PROFILE-SUFFIX FIX"): live-proven root cause -- under
     NS3_NATIVE_OPTIMIZATIONS=ON (ns-3's own "optimized" build profile),
     the TapBridge tap-creator helper is ALSO installed with a
@@ -1119,10 +1119,13 @@ class BuildNs3BinaryTapCreatorProfileSuffixAbsentTest(unittest.TestCase):
     nothing, so no symlink was created, and TapBridge's own execlp()
     failed with ENOENT (live-reproduced: "TapBridge::CreateTap(): Back
     from execlp(), status = -1 errno = No such file or directory").
-    Proven here, literally: even passing ns3_build_profile="optimized"
-    (already a valid, accepted value for monolib's own sake since
-    P2.11) does nothing for the tap-creator search -- it stays the
-    generic, profile-blind wildcard."""
+
+    This reuses the SAME already-validated `ns3_build_profile` state
+    build_ns3_binary() already takes for monolib (P2.11) -- one
+    validated profile now drives both the monolib link target AND the
+    tap-creator helper name, both derived from the same
+    ns-3-CMake-accurate {release: "", optimized: "-optimized"} suffix
+    map, not two independently-maintained guesses."""
 
     def _captured_build_command(self, **kwargs) -> str:
         probe = object.__new__(ReferenceTopologyProbe)
@@ -1139,15 +1142,45 @@ class BuildNs3BinaryTapCreatorProfileSuffixAbsentTest(unittest.TestCase):
             probe.build_ns3_binary(**kwargs)
         return [c for c in calls if c[:2] == ("exec", probe.ns3sim_name)][0][-1]
 
-    def test_optimized_profile_still_uses_the_generic_wildcard(self):
-        cmd = self._captured_build_command(ns3_build_profile="optimized")
-        self.assertIn("*tap-creator*", cmd)
-        self.assertNotIn("tap-creator-optimized", cmd)
+    def test_release_profile_searches_for_the_bare_tap_creator_name(self):
+        cmd = self._captured_build_command(ns3_build_profile="release")
+        self.assertIn("ns3.41-tap-creator", cmd)
+        self.assertNotIn("ns3.41-tap-creator-optimized", cmd)
+        # Exact match, not the old generic wildcard.
+        self.assertNotIn("*tap-creator*", cmd)
 
-    def test_optimized_profile_baked_regex_still_bare(self):
+    def test_optimized_profile_searches_for_the_optimized_tap_creator_name(self):
         cmd = self._captured_build_command(ns3_build_profile="optimized")
-        self.assertIn("/.*tap-creator$", cmd)
-        self.assertNotIn("tap-creator-optimized$", cmd)
+        self.assertIn("ns3.41-tap-creator-optimized", cmd)
+
+    def test_release_baked_path_regex_does_not_match_optimized_suffix(self):
+        cmd = self._captured_build_command(ns3_build_profile="release")
+        # The regex anchor itself must be exact-per-profile: release's
+        # own grep pattern must not also accept an "-optimized" tail.
+        self.assertIn("ns3.41-tap-creator$", cmd)
+        self.assertNotIn("ns3.41-tap-creator-optimized$", cmd)
+
+    def test_optimized_baked_path_regex_requires_the_optimized_suffix(self):
+        cmd = self._captured_build_command(ns3_build_profile="optimized")
+        self.assertIn("ns3.41-tap-creator-optimized$", cmd)
+
+    def test_unknown_profile_raises_before_any_tap_creator_search(self):
+        probe = object.__new__(ReferenceTopologyProbe)
+        probe.ns3sim_name = "fleetqox_test_ns3sim"
+        with mock.patch(
+            "scripts.run_ns3_docker_container_fleet_probe.docker"
+        ) as fake_docker:
+            with self.assertRaises(ValueError):
+                probe.build_ns3_binary(ns3_build_profile="bogus")
+            fake_docker.assert_not_called()
+
+    def test_missing_tap_creator_binary_fails_loudly_not_silently(self):
+        # The generated script itself must check TAPCREATOR_REAL is
+        # non-empty and exit non-zero rather than proceeding to a
+        # symlink/build step with an empty/wrong path.
+        cmd = self._captured_build_command(ns3_build_profile="optimized")
+        self.assertIn('if [ -z "$TAPCREATOR_REAL" ]', cmd)
+        self.assertIn("exit 1", cmd)
 
 
 def _wifi_stats_line(sim_time_s: float, wall_elapsed_s: float) -> str:
