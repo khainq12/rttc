@@ -23009,6 +23009,103 @@ Dockerfile/runtime packaging change, not an ns-3 source diff --
 recorded here per this file's own stated purpose as the audit trail;
 see the chat-delivered final report for the full itemized accounting.
 
+### 6. Correction round: MR !1946 audit + wider upstream series (27/09/2026)
+
+User correction: the prior "NOT_FOUND" verdict on "wifi: use vector
+instead of list in PhyEntity" undersold what was found -- MR !1946
+exists (queried directly via the GitLab API: `state=opened`,
+`merge_commit_sha=null`) but was never merged into any branch, which
+is why no commit ever showed up in `git log`. Re-audited it and a
+wider named series from the same author/area with the same rigor:
+
+- **!1946** (PhyEntity `m_modeList`: `std::list`→`std::vector`):
+  implemented independently (the actual open MR's diff could not be
+  fetched verbatim, only summarized, so this was authored fresh from
+  the same idea and verified safe: `m_modeList` is populated once via
+  `emplace_back()` in each concrete PhyEntity subclass's constructor
+  and never mutated afterwards; all reads are `IsModeSupported()`'s
+  linear scan, `GetNumModes()`, and range-based `begin()/end()`
+  iteration, all container-agnostic). 6 fresh A/B pairs against
+  `jazzy-exp7-tcmalloc`: -1.96%, -3.10%, -0.51%, -2.58%, +14.55%,
+  +4.97%. Mean +1.9%, median -1.2%, 4/6 favorable but the 2
+  unfavorable pairs are large enough that more sampling widened the
+  disagreement instead of resolving it. **INCONCLUSIVE** -- not
+  committed.
+- **!2040/!2159/!2197/!2198/!2214** (pass `unordered_map`/
+  `WifiConstPsduMap`/`WifiTxVector`/`vector<bool>` by const
+  reference): the highest-value part of this family --
+  `FrameExchangeManager::Receive()`'s `RxOkCallback` typedef and
+  `WifiPhy::NotifyMonitorSniffRx/Tx` -- was implemented and tested
+  (const-ref eliminates a `WifiTxVector` struct copy AND a
+  heap-allocated `std::vector<bool>` copy on every successfully
+  received PSDU, unconditionally). Required also fixing 8 unrelated
+  test/example files' now-mismatched callback registrations to get a
+  correctness build; those didn't apply cleanly against our tree
+  (version skew) and were skipped in favor of verifying the actual
+  *production* recipe (`NS3_TESTS=OFF`) compiles clean, which it does.
+  5 fresh A/B pairs: -8.8%, +4.87%, -5.01%, +5.66%, -16.4%. Mean -3.9%
+  but 2/5 unfavorable with large swings. **INCONCLUSIVE** -- not
+  committed, despite a strong a priori mechanistic case (this is the
+  same "heap allocation avoidance" story that made tcmalloc such a
+  large win elsewhere) -- most likely explanation is that tcmalloc
+  (already KEEP) makes small allocations cheap enough that avoiding
+  one more of them per reception no longer clears this host's noise
+  floor.
+- **!2130** ("wifi,lte: Avoid expensive divisions and multiplications"):
+  re-audited beyond the single wifi commit found previously
+  (`26b3fd9c0`) -- confirmed via `git log` around the same date that
+  the wifi contribution to this series is exactly that one commit
+  (SpectrumWifi-only `wifi-spectrum-value-helper.cc`, never touched by
+  Yans); the `lte:`/`spectrum:` sibling commits in the same series are
+  different modules entirely. **IRRELEVANT** confirmed, not reopened
+  further.
+- **!830** ("Reduce allocs"): also unmerged (GitLab API:
+  `state=opened`). Fetched its diff -- the two Wi-Fi-relevant hunks
+  (`interference-helper.cc`'s `nis->find(band)->second` binding via
+  `const auto&`/`.cbegin()`, and `table-based-error-rate-model.cc`'s
+  `GetMcsForMode()` extracting `mode.GetModulationClass()`/
+  `GetCodeRate()`/`GetConstellationSize()` into locals) are **already
+  present verbatim** in our ns-3.41 tree (confirmed directly against
+  the same source already read in sections 2-3 above) -- apparently
+  independently re-implemented and merged by someone else even though
+  this specific MR never landed. **ALREADY_PRESENT**, nothing to do.
+- **Issue #280** ("Performance left on the table", closed 2021, the
+  "repeated `Simulator::Now()`/Time construction in WiFi" item):
+  the specific function it named, `WifiMacQueue::TtlExceeded()`,
+  already takes `now` as a precomputed parameter threaded down from
+  its caller rather than calling `Simulator::Now()` internally --
+  confirmed by reading the current implementation and its caller in
+  `block-ack-manager.cc`. **ALREADY_PRESENT**.
+- A discovered-along-the-way candidate not on the original list,
+  **`7cefbaed6`** ("eliminate unnecessary dBm-W conversions in
+  WifiPhy"): `WifiPhy::GetRxSensitivity()` did a `WToDbm()` round-trip
+  (a `std::log10` call) on every single call, purely to undo a
+  `DbmToW()` conversion made once at configuration time; confirmed hot
+  via its two production call sites (`YansWifiChannel::Receive()`,
+  `SpectrumWifiPhy`'s own threshold check), both firing once per
+  potential-receiver per transmission. 5 fresh A/B pairs: -10.69%,
+  -1.56%, -12.59%, +9.02%, +9.98%. Mean -1.2%, 3/5 favorable but the
+  running mean crossed zero repeatedly as pairs accumulated.
+  **INCONCLUSIVE** -- not committed, despite eliminating a genuinely
+  expensive transcendental function call from a real per-packet path;
+  same likely explanation as above (tcmalloc already absorbed the
+  allocation-adjacent costs this host's variance is sensitive to, and
+  a single `log10` call is apparently too cheap on its own to clear
+  the noise floor).
+
+No further commits resulted from this correction round -- the
+accepted configuration remains exactly what section 5 above
+describes (`0001`+`0002`+`0003`+`0005`+`0006` + tcmalloc). Current
+seed=7 corrected `sim_lag_s`, sampled across roughly 20 fresh A/B
+baseline measurements taken over the course of this round: ranges
+14.15s-16.92s, no clear trend, i.e. the *baseline itself* (unchanged
+across this whole round) has an intrinsic measurement spread of about
+±10% on this host -- this is the actual reason every small-effect
+candidate this round landed on INCONCLUSIVE rather than KEEP or
+REVERT: a real effect smaller than roughly ±10% is not reliably
+distinguishable from this host's own noise floor without a much
+larger number of paired repetitions than was practical to run here.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
