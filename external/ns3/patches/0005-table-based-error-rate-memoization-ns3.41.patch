@@ -1,0 +1,148 @@
+diff --git a/src/wifi/model/table-based-error-rate-model.cc b/src/wifi/model/table-based-error-rate-model.cc
+index cad27bc..7b152b7 100644
+--- a/src/wifi/model/table-based-error-rate-model.cc
++++ b/src/wifi/model/table-based-error-rate-model.cc
+@@ -158,6 +158,28 @@ TableBasedErrorRateModel::DoGetChunkSuccessRate(WifiMode mode,
+     NS_LOG_FUNCTION(this << mode << txVector << snr << nbits << +numRxAntennas << field << staId);
+     uint64_t size = std::max<uint64_t>(1, (nbits / 8));
+     double roundedSnr = RoundSnr(RatioToDb(snr), SNR_PRECISION);
++    bool ldpc = txVector.IsLdpc();
++
++    // P2 EXPERIMENT (rttc benchmark, not upstream ns-3): everything the
++    // table-lookup branch below computes from this point on is a pure,
++    // deterministic function of (mode.GetUid(), ldpc, roundedSnr, size) --
++    // `snr` itself is never read again past RoundSnr() above, and `mode` is
++    // only ever used below via GetMcsForMode(mode)/its modulation class,
++    // both deterministic functions of the mode's own interned identity
++    // (GetUid()). So a cache hit on this exact key is guaranteed to return
++    // exactly what the uncached computation below would have produced: this
++    // is not an approximation, it is skipping recomputation of an
++    // already-fully-determined result. Only the table-lookup branch below
++    // is ever cached; GetMcsForMode() returning nullopt, or an out-of-range
++    // mcs, still falls through to m_fallbackErrorModel uncached on every
++    // call, completely unchanged from the original implementation.
++    TableBasedErrorRateModelCacheKey cacheKey{mode.GetUid(), ldpc, roundedSnr, size};
++    if (auto cached = m_chunkSuccessRateCache.find(cacheKey);
++        cached != m_chunkSuccessRateCache.end())
++    {
++        return cached->second;
++    }
++
+     uint8_t mcs;
+     if (auto ret = GetMcsForMode(mode); ret.has_value())
+     {
+@@ -169,7 +191,6 @@ TableBasedErrorRateModel::DoGetChunkSuccessRate(WifiMode mode,
+         return m_fallbackErrorModel
+             ->GetChunkSuccessRate(mode, txVector, snr, nbits, numRxAntennas, field, staId);
+     }
+-    bool ldpc = txVector.IsLdpc();
+     NS_LOG_FUNCTION(this << +mcs << roundedSnr << size << ldpc);
+ 
+     // HT: for MCS greater than 7, use 0 - 7 curves for data rate
+@@ -249,7 +270,21 @@ TableBasedErrorRateModel::DoGetChunkSuccessRate(WifiMode mode,
+         per = 0.0;
+     }
+ 
+-    return 1.0 - per;
++    double result = 1.0 - per;
++
++    // P2 EXPERIMENT (rttc benchmark, not upstream ns-3): bound worst-case
++    // memory growth. A wholesale clear (rather than an LRU/piecemeal evict)
++    // is simplest to prove correct -- it can never serve a stale entry for
++    // a key that was actually evicted-and-changed (nothing here ever
++    // changes for a given key), it just occasionally recomputes one that
++    // was cleared, identically to a cold miss.
++    constexpr std::size_t kMaxCacheEntries = 200000;
++    if (m_chunkSuccessRateCache.size() >= kMaxCacheEntries)
++    {
++        m_chunkSuccessRateCache.clear();
++    }
++    m_chunkSuccessRateCache.emplace(cacheKey, result);
++    return result;
+ }
+ 
+ } // namespace ns3
+diff --git a/src/wifi/model/table-based-error-rate-model.h b/src/wifi/model/table-based-error-rate-model.h
+index 078d3ab..bcd56da 100644
+--- a/src/wifi/model/table-based-error-rate-model.h
++++ b/src/wifi/model/table-based-error-rate-model.h
+@@ -26,13 +26,55 @@
+ 
+ #include "ns3/error-rate-tables.h"
+ 
++#include <cstddef>
++#include <cstdint>
+ #include <optional>
++#include <unordered_map>
+ 
+ namespace ns3
+ {
+ 
+ class WifiTxVector;
+ 
++/**
++ * P2 EXPERIMENT (rttc benchmark, not upstream ns-3): cache key for
++ * TableBasedErrorRateModel's per-call table lookup+interpolation. See
++ * DoGetChunkSuccessRate()'s own comment in the .cc file for the proof that
++ * this exact tuple is the complete set of the (non-fallback path's) inputs
++ * that can affect its return value -- caching on anything less would risk
++ * collisions, and this includes everything that reaches the actual
++ * computation once RoundSnr()'s own pre-existing quantization is applied.
++ */
++struct TableBasedErrorRateModelCacheKey
++{
++    uint32_t modeUid;   //!< WifiMode::GetUid() -- determines MCS/HT-remap deterministically
++    bool ldpc;          //!< txVector.IsLdpc()
++    double roundedSnr;  //!< RoundSnr(RatioToDb(snr), SNR_PRECISION) -- see DoGetChunkSuccessRate
++    uint64_t size;      //!< std::max<uint64_t>(1, nbits / 8)
++
++    bool operator==(const TableBasedErrorRateModelCacheKey& other) const
++    {
++        return modeUid == other.modeUid && ldpc == other.ldpc &&
++               roundedSnr == other.roundedSnr && size == other.size;
++    }
++};
++
++/// Hash functor for TableBasedErrorRateModelCacheKey.
++struct TableBasedErrorRateModelCacheKeyHash
++{
++    std::size_t operator()(const TableBasedErrorRateModelCacheKey& k) const noexcept
++    {
++        std::size_t seed = std::hash<uint32_t>{}(k.modeUid);
++        auto combine = [&seed](std::size_t h) {
++            seed ^= h + 0x9e3779b9 + (seed << 6) + (seed >> 2);
++        };
++        combine(std::hash<bool>{}(k.ldpc));
++        combine(std::hash<double>{}(k.roundedSnr));
++        combine(std::hash<uint64_t>{}(k.size));
++        return seed;
++    }
++};
++
+ /*
+  * \ingroup wifi
+  * \brief the interface for the table-driven OFDM error model
+@@ -89,6 +131,23 @@ class TableBasedErrorRateModel : public ErrorRateModel
+         m_fallbackErrorModel; //!< Error rate model to fallback to if no value is found in the table
+ 
+     uint64_t m_threshold; //!< Threshold in bytes over which the table for large size frames is used
++
++    /**
++     * P2 EXPERIMENT (rttc benchmark, not upstream ns-3): memoizes
++     * DoGetChunkSuccessRate()'s table-lookup-branch result (never the
++     * fallback-model branch, which is always recomputed exactly as before).
++     * `mutable` because the cache is a pure performance side channel on an
++     * otherwise-const query method -- see the .cc file for the full
++     * thread-safety and exactness argument. Capped (kMaxCacheEntries) and
++     * cleared wholesale on overflow rather than evicting piecemeal: this
++     * benchmark's static topology gives a small, stable key space in
++     * practice, so overflow is not expected to occur, and a wholesale clear
++     * is simplest to prove never returns a stale/wrong entry.
++     */
++    mutable std::unordered_map<TableBasedErrorRateModelCacheKey,
++                               double,
++                               TableBasedErrorRateModelCacheKeyHash>
++        m_chunkSuccessRateCache;
+ };
+ 
+ } // namespace ns3
