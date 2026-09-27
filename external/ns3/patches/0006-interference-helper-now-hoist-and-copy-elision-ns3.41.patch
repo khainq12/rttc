@@ -1,0 +1,50 @@
+diff --git a/src/wifi/model/interference-helper.cc b/src/wifi/model/interference-helper.cc
+index 746f4a0..01fce8b 100644
+--- a/src/wifi/model/interference-helper.cc
++++ b/src/wifi/model/interference-helper.cc
+@@ -441,11 +441,18 @@ InterferenceHelper::CalculateNoiseInterferenceW(Ptr<Event> event,
+     double noiseInterferenceW = firstPower_it->second;
+     auto niIt = m_niChanges.find(band);
+     NS_ABORT_IF(niIt == m_niChanges.end());
++    // P2 BACKPORT (upstream 88e449556, "wifi: avoid calling Now() in
++    // InterferenceHelper::CalculateNoiseInterferenceW()", 2024-04-07, post-3.41):
++    // Simulator::Now() cannot change across this synchronous loop (nothing in
++    // the loop body advances simulation time), so calling it once per
++    // iteration recomputed the exact same value every time. Hoisted to a
++    // single call before the loop.
++    const auto now = Simulator::Now();
+     auto it = niIt->second.find(event->GetStartTime());
+     double muMimoPowerW = (event->GetPpdu()->GetType() == WIFI_PPDU_TYPE_UL_MU)
+                               ? CalculateMuMimoPowerW(event, band)
+                               : 0.0;
+-    for (; it != niIt->second.end() && it->first < Simulator::Now(); ++it)
++    for (; it != niIt->second.end() && it->first < now; ++it)
+     {
+         if (IsSameMuMimoTransmission(event, it->second.GetEvent()) &&
+             (event != it->second.GetEvent()))
+@@ -467,14 +474,23 @@ InterferenceHelper::CalculateNoiseInterferenceW(Ptr<Event> event,
+     {
+         ;
+     }
+-    NiChanges ni;
++    // P2 BACKPORT (upstream 90f347116, "wifi: Avoid unnecessary copy in
++    // InterferenceHelper::CalculateNoiseInterferenceW", 2025-06-06, post-3.41):
++    // build the NiChanges entry directly in its final map slot instead of
++    // building a local `ni` and then copying the whole thing into `nis` via
++    // insert(). Safe here specifically because every call site in this file
++    // (CalculatePayloadSnrPer/CalculateSnr/CalculatePhyHeaderSnrPer) always
++    // passes a freshly-default-constructed, empty `nis` -- so nis[band]
++    // (create-if-absent) and the original nis.insert({band, ni})
++    // (no-op-if-band-already-present) are observationally identical for
++    // every actual call in this codebase; verified by reading all 3 callers.
++    auto& ni = nis[band];
+     ni.emplace(event->GetStartTime(), NiChange(0, event));
+     while (++it != niIt->second.end() && it->second.GetEvent() != event)
+     {
+         ni.insert(*it);
+     }
+     ni.emplace(event->GetEndTime(), NiChange(0, event));
+-    nis.insert({band, ni});
+     NS_ASSERT_MSG(noiseInterferenceW >= 0.0,
+                   "CalculateNoiseInterferenceW returns negative value " << noiseInterferenceW);
+     return noiseInterferenceW;
