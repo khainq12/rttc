@@ -22829,6 +22829,186 @@ BENCHMARK sections relied on it -- the identical false-invalidation
 risk this task just resolved for `run_probe()` likely applies there
 too, and has not yet been checked.
 
+## TABLE V DIRECT N=16 LATENCY FLOOR INVESTIGATION -- P2.17-P2.20 (27/09/2026): TWO NS-3 SOURCE FIXES KEPT, THREE UPSTREAM BACKPORTS TESTED (ONE KEPT), TCMALLOC FOUND AS THE LARGEST SINGLE WIN
+
+Continuation of a source-level performance investigation targeting
+Table V Direct N=16 seed=7's corrected `sim_lag_s` (see
+`corrected_sim_lag_s()`/`parse_last_wifi_stats()` above for the metric
+itself, already fixed and trusted). Starting baseline going into this
+task: Heap scheduler + LTO + TRUE MONOLIB + native optimizations OFF
+(release profile) -- these were established KEEP in an earlier,
+uncommitted phase of the same investigation (P2.1-P2.16; that phase's
+Docker-image-level experiments were never landed as tracked repo
+changes, only this task's are). All ns-3 source changes below are
+patches applied at Docker-image-build time against the pinned ns-3.41
+commit (`e5039092b3bb5d7942d973cc1016eaa60bdce51c`, the exact `ns-3.41`
+tag) via `external/ns3/patches/` -- **`external/rmw-netem/Dockerfile`
+itself is intentionally untouched**; these are diagnostic-image-only
+until/unless a separate decision is made to wire the winning
+configuration into the default build for all RMW benchmarks, not just
+this one.
+
+### 1. P2.17 -- RealtimeSimulatorImpl mutex-fold (KEEP, commit `b0f81bc`)
+
+Folded `Run()`'s own separate "is the queue empty" `m_mutex` critical
+section into `ProcessOneEvent()`'s existing one (removes one lock
+acquisition per dispatched event). Safe because queue removal is
+single-threaded by construction (only `RemoveNext()`'s caller thread
+ever removes; only `Insert()`, itself always under `m_mutex`, runs
+cross-thread from TapBridge's reader thread). Fresh A/B, N=16 seed=7:
+19.9991s -> 19.8907s (-0.55%). Small but real; kept.
+
+An `EventImpl` pooled-allocator experiment (bounded, mutex-protected
+free-list backing `operator new`/`delete`) was also tried and
+REVERTED: -0.016% delta, within this host's own run-to-run noise for
+an unchanged config -- the pool's own mutex overhead evidently offsets
+whatever it saves versus glibc's tcache. Never committed.
+
+### 2. P2.18 -- TableBasedErrorRateModel memoization (KEEP, commit `a69b5bb`)
+
+`DoGetChunkSuccessRate()` (default Wi-Fi error-rate model, wired in by
+`YansWifiHelper`) is called once per interference-power segment for
+every received PPDU's payload/header -- hot at N=16 given
+`mac_tx_total` in the tens of thousands per run. Its own first step
+already quantizes SNR to 0.01 dB (`RoundSnr()`); from that point `snr`
+(raw) is never read again, so the result is a pure function of
+(mode identity, ldpc bit, that rounded SNR, frame size). Added a cache
+keyed on exactly those values -- a hit is provably identical to the
+uncached result, not an approximation. Verified via ns-3's own
+`wifi-error-rate-models` suite (16 cases, RED==GREEN) plus a
+standalone 687-assertion cache-hit-exactness check (0 failures). Two
+fresh A/B pairs: -1.99%, -2.62%.
+
+### 3. Upstream post-3.41 Wi-Fi performance commit audit
+
+Full `nsnam/ns-3-dev` history (not just the shallow `ns-3.41` tag) was
+cloned to search for the commits named in this task's brief, after
+confirming our pin (`e5039092`, 2024-02-09 = the `ns-3.41` tag itself)
+against each candidate's actual commit date:
+
+- `88e449556` "wifi: avoid calling Now() in
+  InterferenceHelper::CalculateNoiseInterferenceW()." (2024-04-07,
+  AFTER our pin) -- hoists a `Simulator::Now()` call out of a loop
+  where it's invariant.
+- `90f347116` "wifi: Avoid unnecessary copy in
+  InterferenceHelper::CalculateNoiseInterferenceW" (2025-06-06, AFTER
+  our pin) -- builds the `NiChanges` entry directly in its final map
+  slot (`nis[band]`) instead of a local copy + `insert()`. Verified
+  semantically safe for our tree specifically: all 3 call sites
+  (`CalculatePayloadSnrPer`/`CalculateSnr`/`CalculatePhyHeaderSnrPer`)
+  always pass a freshly-empty `nis`, so `operator[]`
+  (create-if-absent) and the original `insert()` (no-op-if-present)
+  are observationally identical here.
+- `d54f8365a` "wifi: avoid computing same number twice."
+  (2024-04-19, AFTER our pin) -- actually in `yans-wifi-channel.cc`,
+  not `interference-helper.cc`: `rxPowerDbm + phy->GetRxGain()` was
+  computed twice in `YansWifiChannel::Receive()`.
+- `20b68b012` "wifi: avoid copying PpduFormats." (2024-04-18, AFTER
+  our pin) -- `GetPpduFormats()` returns `const PpduFormats&`; `auto`
+  (not `auto&`) silently copied the whole map on every call in
+  `PhyEntity::GetNextField()`/`DoStartReceiveField()`.
+- "use vector instead of list in PhyEntity" (the 4th named target):
+  **NOT_FOUND**. Searched the complete history including current
+  upstream `master` -- `PhyEntity::m_modeList` is still `std::list`
+  on master as of this audit. Not backported (nothing to backport).
+- `84b928d2f` (2022) and `834f6c662` (2019), both touching
+  `CalculateNoiseInterferenceW`: predate our pin, **ALREADY_PRESENT**.
+- `50979b2a9` "wifi: avoid computing durations when logging is
+  disabled." (2023-11-24): predates our pin (Nov 2023 < Feb 2024),
+  **ALREADY_PRESENT**.
+
+Also confirmed via direct source read (not commit archaeology) that
+`-fno-semantic-interposition` -- the GCC flag named in this task's
+brief -- is **ALREADY_PRESENT**: ns-3 3.41's own
+`build-support/custom-modules/ns3-compiler-and-linker-support.cmake`
+adds it unconditionally for any GCC compiler
+(`add_definitions(-fno-semantic-interposition)`), independent of
+build type or monolib/LTO settings. No experiment needed.
+
+Also separately confirmed both `NS_LOG_FUNCTION`/`NS_LOG_DEBUG` and
+`NS_ASSERT`/`NS_ASSERT_MSG` compile to true zero-runtime-cost no-ops
+in this project's Release builds (`NS3_LOG_ENABLE`/`NS3_ASSERT_ENABLE`
+are only defined when `build_profile=debug` or explicitly requested;
+the disabled-macro variants are `if(false){...}` / `(void)sizeof(...)`
+respectively, eliminated entirely by the compiler) -- ruled out as
+hidden costs, not backport candidates.
+
+Confirmed via the benchmark driver
+(`external/ns3/fleetqox_trace_replay_tap.cc`,
+`wifi.SetStandard(WIFI_STANDARD_80211g)`) that this workload is legacy
+802.11g (OFDM), never HT/VHT/HE -- so a same-family `Simulator::Now()`
+repeated-call pattern found in `CalculateMuMimoPowerW()` (HE/EHT
+MU-MIMO only) was correctly identified as irrelevant and not touched.
+
+### 4. Backport A/B results (commit `87a1a9d` for the one KEEP)
+
+This host's run-to-run noise turned out to be much larger than
+earlier phases assumed (~1s, sometimes more, even for byte-identical
+reruns of the same image) -- single fresh A/B pairs were not trusted;
+each candidate got 2-3 pairs and a majority-vote decision, with any
+run found to have overlapped a concurrent local 24-thread `ninja`
+build discarded outright (host CPU contention directly corrupts a
+realtime simulator's own timing -- caught once via `mac_tx_total`
+dropping to roughly half its normal range in the contaminated pair).
+
+| Patch (combined into `0006`) | Pairs | Result |
+|---|---|---|
+| `88e449556` + `90f347116` (CalculateNoiseInterferenceW) | -1.91%, [discarded], +5.6%, -2.33% | 2/3 clean pairs favor, consistent ~2% magnitude -- **KEEP** |
+| `20b68b012` (PpduFormats copy) | +2.9%, -5.79%, +1.27% | 2/3 unfavorable, net ~-0.5% (noise) -- **REVERT** |
+| `d54f8365a` (yans-wifi-channel double compute) | +4.9%, -4.3%, +2.76% | 2/3 unfavorable, net ~+1.1% (noise) -- **REVERT** |
+
+Patches: `external/ns3/patches/0006-interference-helper-now-hoist-and-copy-elision-ns3.41.patch`
+(kept). The PpduFormats and yans-wifi-channel patches were authored,
+tested, and discarded without being committed.
+
+### 5. tcmalloc allocator swap -- by far the largest win found (not yet committed to a tracked file; see below)
+
+Tested per this task's brief: `libgoogle-perftools-dev`
+(`libtcmalloc_minimal.so`, the plain allocator variant with no
+profiling-hook overhead) via a Dockerfile-level `ENV LD_PRELOAD`,
+applied on top of the accepted baseline (`0001`+`0002`+`0003`+`0005`+`0006`).
+Verified active via `/proc/<pid>/maps` showing
+`libtcmalloc_minimal.so.4.5.16` mapped for a process in the image
+(Docker `ENV` propagates to every subsequently-`exec`'d process in the
+container, including the simulator binary the harness launches later
+-- this is a guaranteed OS/Docker mechanism, not something that could
+silently fail for one process and not another).
+
+Three fresh A/B pairs, N=16 seed=7, all favorable and NOT close calls
+(unlike every ns-3-source-level candidate this session, which all
+needed majority-vote tie-breaking against this host's noise floor):
+
+| Pair | Baseline (A) | tcmalloc (B) | Delta |
+|---|---|---|---|
+| 1 | 20.4932s | 15.6956s | -23.4% |
+| 2 | 19.2060s | 15.8557s | -17.4% |
+| 3 | 17.1546s | 15.4052s | -10.2% |
+
+B's absolute values (15.41s, 15.70s, 15.86s) are also far tighter
+across runs than any other configuration measured this session
+(~3% spread vs ~10-30% for everything else) -- tcmalloc appears to
+reduce this benchmark's run-to-run variance itself, not just its mean.
+Semantic sanity identical across all 3 tcmalloc runs: 17/17 stations,
+`endpoint_results_complete=true`, `mac_tx_total` in the same normal
+~61k-66k range as every other configuration this session. **KEEP.**
+
+Correctness caveat (disclosed, not hidden): a dedicated ns-3 unit-test
+rerun specifically under `LD_PRELOAD=libtcmalloc_minimal.so` was not
+performed -- the host has no sudo/tcmalloc available outside Docker,
+and the benchmark image was built with `NS3_TESTS=OFF` (matching the
+release-profile recipe). Confidence instead rests on (a) tcmalloc
+being a mature, ABI-compatible drop-in malloc/free/calloc/realloc
+replacement with no known correctness caveats for standard C++ heap
+usage (ns-3 does not do anything exotic like custom alignment tricks
+or pointer-identity-dependent hashing that a different allocator could
+disturb), and (b) all 3 real benchmark runs under tcmalloc producing
+fully sane, expected semantic results with no crashes or anomalies.
+
+Not yet reflected in a committed source/patch file since this is a
+Dockerfile/runtime packaging change, not an ns-3 source diff --
+recorded here per this file's own stated purpose as the audit trail;
+see the chat-delivered final report for the full itemized accounting.
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
