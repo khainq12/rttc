@@ -1,0 +1,85 @@
+diff --git a/src/core/model/realtime-simulator-impl.cc b/src/core/model/realtime-simulator-impl.cc
+index 526bfa8..36f335a 100644
+--- a/src/core/model/realtime-simulator-impl.cc
++++ b/src/core/model/realtime-simulator-impl.cc
+@@ -204,6 +204,34 @@ RealtimeSimulatorImpl::ProcessOneEvent()
+ 
+         {
+             std::unique_lock lock{m_mutex};
++
++            // P2 EXPERIMENT (rttc benchmark, not upstream ns-3): fold
++            // RealtimeSimulatorImpl::Run()'s own separate
++            // "std::unique_lock lock{m_mutex}; if (!m_events->IsEmpty())"
++            // critical section into this one instead of taking m_mutex a
++            // second, distinct time for the same logical check. Safe
++            // because m_events is only ever mutated by Insert() (from
++            // Schedule()/ScheduleWithContext(), always itself under
++            // m_mutex, from any thread including a TapBridge reader
++            // thread) and RemoveNext() (only ever called from this same
++            // single dispatching thread, inside this same lock, never
++            // concurrently). So once this thread observes the queue
++            // non-empty under m_mutex, no other thread can make it empty
++            // again -- the removal side is single-threaded by
++            // construction, matching NextTs()'s own pre-existing
++            // NS_ASSERT_MSG precondition. Result: exactly one fewer
++            // m_mutex acquisition per Run() loop iteration; Run() no
++            // longer takes the lock at all, it just calls
++            // ProcessOneEvent() unconditionally.
++            if (m_events->IsEmpty())
++            {
++                uint64_t tsNowEmpty = m_synchronizer->GetCurrentRealtime();
++                lock.unlock();
++                // 1e9 ns == Run()'s own prior fixed wait-when-idle constant.
++                m_synchronizer->Synchronize(tsNowEmpty, 1000000000);
++                return;
++            }
++
+             //
+             // Since we are in realtime mode, the time to delay has got to be the
+             // difference between the current realtime and the timestamp of the next
+@@ -433,36 +461,17 @@ RealtimeSimulatorImpl::Run()
+     m_running = true;
+     m_synchronizer->SetOrigin(m_currentTs);
+ 
+-    // Sleep until signalled
+-    uint64_t tsNow = 0;
+-    uint64_t tsDelay = 1000000000; // wait time of 1 second (in nanoseconds)
+-
++    // P2 EXPERIMENT (rttc benchmark, not upstream ns-3): the
++    // queue-non-empty check this loop used to perform under its own,
++    // separate m_mutex critical section is now folded into
++    // ProcessOneEvent()'s own first critical section (see that
++    // function's own comment) -- ProcessOneEvent() itself now handles
++    // the "nothing to do, sleep" case (including the same fixed 1-second
++    // idle-wait constant previously held here) and returns immediately
++    // in that case, so this loop can simply call it unconditionally.
+     while (!m_stop)
+     {
+-        bool process = false;
+-        {
+-            std::unique_lock lock{m_mutex};
+-
+-            if (!m_events->IsEmpty())
+-            {
+-                process = true;
+-            }
+-            else
+-            {
+-                // Get current timestamp while holding the critical section
+-                tsNow = m_synchronizer->GetCurrentRealtime();
+-            }
+-        }
+-
+-        if (process)
+-        {
+-            ProcessOneEvent();
+-        }
+-        else
+-        {
+-            // Sleep until signalled and re-check event queue
+-            m_synchronizer->Synchronize(tsNow, tsDelay);
+-        }
++        ProcessOneEvent();
+     }
+ 
+     //
