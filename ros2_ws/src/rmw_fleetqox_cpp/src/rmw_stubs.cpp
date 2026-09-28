@@ -658,6 +658,20 @@ std::int64_t monotonic_timestamp_ns()
   return std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
 }
 
+// Wall-clock (CLOCK_REALTIME) twin of monotonic_timestamp_ns() -- see the
+// identical helper's doc comment in rmw_pubsub.cpp. Used for ServiceFrame's
+// wire-visible source_timestamp_ns and the lifespan check against it, since
+// a service request/response crosses a client/server process boundary
+// (potentially a different physical host) where steady_clock readings from
+// two different processes have no defined relationship. Local-only timing
+// (schedule_service_request_repair's retry pacing, which already uses its
+// own independent steady_clock::now() calls) is untouched by this.
+std::int64_t wall_clock_timestamp_ns()
+{
+  const auto now = std::chrono::system_clock::now().time_since_epoch();
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+}
+
 std::int64_t qos_duration_ns(const rmw_time_t & duration)
 {
   if (duration.sec == 0 && duration.nsec == 0) {
@@ -679,7 +693,12 @@ std::int64_t qos_duration_ns(const rmw_time_t & duration)
 
 bool service_frame_exceeds_lifespan(const rmw_fleetqox_cpp::ServiceFrame & frame)
 {
-  return rmw_fleetqox_cpp::service_frame_expired(frame, monotonic_timestamp_ns());
+  // frame.source_timestamp_ns is wall_clock_timestamp_ns()-based (see the
+  // three ServiceFrame construction sites below); "now" must be read from
+  // the same clock domain, since this frame was very likely built by a
+  // different process (the client, for a request; the server, for a
+  // response).
+  return rmw_fleetqox_cpp::service_frame_expired(frame, wall_clock_timestamp_ns());
 }
 
 bool drop_if_expired_service_frame(const rmw_fleetqox_cpp::ServiceFrame & frame)
@@ -2846,7 +2865,7 @@ rmw_ret_t rmw_send_request(
     data->endpoint_id,
     "",
     next_sequence,
-    monotonic_timestamp_ns(),
+    wall_clock_timestamp_ns(),
     qos_duration_ns(data->qos.lifespan),
     payload,
     data->domain_id};
@@ -2916,7 +2935,11 @@ rmw_ret_t rmw_take_response(
     return RMW_RET_UNSUPPORTED;
   }
   request_header->source_timestamp = frame.source_timestamp_ns;
-  request_header->received_timestamp = monotonic_timestamp_ns();
+  // wall_clock_timestamp_ns(): keeps this in the same clock domain as
+  // source_timestamp (now wall-clock-based) -- see the identical comment on
+  // message_info->received_timestamp in rmw_pubsub.cpp for why, and for the
+  // caveat that this alone does not establish cross-host latency accuracy.
+  request_header->received_timestamp = wall_clock_timestamp_ns();
   fill_request_id(data->endpoint_gid, frame.sequence_id, &request_header->request_id);
   *taken = true;
   trace_service_event("take_response", data, &frame);
@@ -2961,7 +2984,7 @@ rmw_ret_t rmw_fleetqox_cpp_send_malformed_response(
     client_endpoint_id,
     data->endpoint_id,
     request_header->sequence_number,
-    monotonic_timestamp_ns(),
+    wall_clock_timestamp_ns(),
     qos_duration_ns(data->qos.lifespan),
     std::vector<std::uint8_t>{0xff},
     data->domain_id};
@@ -3240,7 +3263,8 @@ rmw_ret_t rmw_take_request(
   const std::array<std::uint8_t, RMW_GID_STORAGE_SIZE> client_gid =
     endpoint_gid_from_id(frame.client_endpoint_id);
   request_header->source_timestamp = frame.source_timestamp_ns;
-  request_header->received_timestamp = monotonic_timestamp_ns();
+  // See the identical comment in rmw_take_response() above.
+  request_header->received_timestamp = wall_clock_timestamp_ns();
   fill_request_id(client_gid, frame.sequence_id, &request_header->request_id);
   {
     std::lock_guard<std::mutex> lock(g_service_bus_mutex);
@@ -3306,7 +3330,7 @@ rmw_ret_t rmw_send_response(
     client_endpoint_id,
     data->endpoint_id,
     request_header->sequence_number,
-    monotonic_timestamp_ns(),
+    wall_clock_timestamp_ns(),
     qos_duration_ns(data->qos.lifespan),
     payload,
     data->domain_id};

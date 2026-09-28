@@ -11,13 +11,26 @@
 namespace rmw_fleetqox_cpp
 {
 
-constexpr const char * kDataFrameSchemaVersion = "fleetrmw.data_frame.v1";
+// v1 -> v2: source_timestamp_ns's underlying clock changed from
+// steady_clock (CLOCK_MONOTONIC) to system_clock (CLOCK_REALTIME) -- see
+// wall_clock_timestamp_ns() in rmw_pubsub.cpp/rmw_stubs.cpp. The on-wire
+// byte layout of this (JSON/"v1"-magic) encoding is unchanged; only the
+// semantic meaning of the timestamp value is different, so the version is
+// bumped to make a v1/v2 peer mismatch an explicit decode rejection
+// (json_has_string_value(... "schema_version" ...) already gates on this
+// string) instead of a silent cross-clock-domain misinterpretation.
+// NOTE: the compact_v1 and static_min_v1 binary encodings of DataFrame
+// (kDataFrameCompactV1Magic/kDataFrameStaticMinV1Magic) carry no equivalent
+// version marker and are NOT protected by this bump -- see P2.6 audit notes.
+constexpr const char * kDataFrameSchemaVersion = "fleetrmw.data_frame.v2";
 constexpr const char * kAckNackSchemaVersion = "fleetrmw.ack_nack.v1";
 constexpr const char * kUnrecoverableLossNoticeSchemaVersion =
   "fleetrmw.unrecoverable_loss_notice.v1";
 constexpr const char * kRouteAdvertisementSchemaVersion = "fleetrmw.route_advertisement.v1";
 constexpr const char * kGraphAdvertisementSchemaVersion = "fleetrmw.graph_advertisement.v1";
-constexpr const char * kServiceFrameSchemaVersion = "fleetrmw.service_frame.v1";
+// v1 -> v2: same source_timestamp_ns clock-domain change as
+// kDataFrameSchemaVersion above.
+constexpr const char * kServiceFrameSchemaVersion = "fleetrmw.service_frame.v2";
 constexpr const char * kActionFrameSchemaVersion = "fleetrmw.action_frame.v1";
 constexpr const char * kDataFrameMagic = "FRMW1\n";
 

@@ -966,7 +966,15 @@ void reset_pooled_retransmit_entry(
   entry.domain_id = domain_id;
   entry.source_sequence_number = source_sequence_number;
   entry.source_timestamp_ns = source_timestamp_ns;
-  entry.last_send_ns = source_timestamp_ns;
+  // Deliberately NOT reusing source_timestamp_ns here: it is now
+  // wall_clock_timestamp_ns()-based (see publish_payload()) so that lifespan
+  // checks against entry.source_timestamp_ns are meaningful cross-host.
+  // last_send_ns paces reliable_retransmit_loop()'s own retry timer purely
+  // within THIS process, so it must stay on monotonic_timestamp_ns() --
+  // mixing clock domains here would make every retransmission-due
+  // computation (`now - entry.last_send_ns`) compare a wall-clock reading
+  // against a steady_clock one.
+  entry.last_send_ns = monotonic_timestamp_ns();
   entry.timeout_retransmissions = 0;
   entry.reliable = reliable;
   // See the identical comment at the original construction site: not
@@ -1179,6 +1187,7 @@ void record_subscription_message_lost_locked(
   std::vector<EventCallbackNotification> * callbacks);
 std::string retransmit_ledger_key(const std::string & publisher_id, std::uint64_t sequence);
 std::int64_t monotonic_timestamp_ns();
+std::int64_t wall_clock_timestamp_ns();
 const rosidl_typesupport_introspection_c__MessageMembers * introspection_c_members(
   const rosidl_message_type_support_t * type_support);
 const rosidl_typesupport_introspection_cpp::MessageMembers * introspection_cpp_members(
@@ -9631,6 +9640,22 @@ std::int64_t monotonic_timestamp_ns()
   return std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
 }
 
+// Wall-clock (CLOCK_REALTIME) twin of monotonic_timestamp_ns(), used
+// specifically for values that cross a process/host boundary on the wire
+// (DataFrame/ServiceFrame source_timestamp_ns and the lifespan checks
+// against it). steady_clock has an arbitrary per-boot epoch with no defined
+// relationship across processes -- let alone separate physical hosts -- so
+// subtracting one process's steady_clock reading from another's is not a
+// measure of elapsed time at all, only of two unrelated numbers. Any local,
+// same-process timing (retransmission retry pacing, discovery heartbeats,
+// liveliness/deadline bookkeeping) must keep using monotonic_timestamp_ns()
+// -- it is immune to NTP steps, which system_clock is not.
+std::int64_t wall_clock_timestamp_ns()
+{
+  const auto now = std::chrono::system_clock::now().time_since_epoch();
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+}
+
 const std::string & local_robot_id()
 {
   static const std::string robot_id = []() {
@@ -9666,7 +9691,15 @@ bool frame_exceeds_lifespan(const rmw_qos_profile_t & qos, std::int64_t source_t
   if (lifespan_ns <= 0 || source_timestamp_ns <= 0) {
     return false;
   }
-  const std::int64_t now = monotonic_timestamp_ns();
+  // source_timestamp_ns is wall_clock_timestamp_ns()-based (see
+  // publish_payload()) precisely because this function is called both from
+  // the publisher checking its own previously-sent frames AND from a
+  // subscriber checking a frame that just arrived over the wire -- the
+  // latter can be a different process, or a different physical host
+  // entirely. steady_clock has no cross-process meaning at all, so "now"
+  // must be read from the same wall-clock domain the frame was stamped
+  // with.
+  const std::int64_t now = wall_clock_timestamp_ns();
   return now > source_timestamp_ns && now - source_timestamp_ns > lifespan_ns;
 }
 
@@ -13091,7 +13124,15 @@ rmw_ret_t publish_payload(FleetQoxPublisherData * data, const std::vector<std::u
   std::lock_guard<std::mutex> publish_lock(data->publish_mutex);
   std::vector<EventCallbackNotification> deadline_callbacks;
   const auto source_sequence = data->next_source_sequence++;
+  // now_ns (steady_clock) drives every LOCAL-only use below (deadline-miss
+  // tracking, last_publish_ns, liveliness assertion) -- none of that ever
+  // leaves this process, so steady_clock's NTP-step immunity is exactly
+  // what's wanted. wall_now_ns (system_clock) is used ONLY for the frame's
+  // wire-visible source_timestamp_ns, which a remote peer's lifespan check
+  // will compare against ITS OWN clock -- see wall_clock_timestamp_ns()'s
+  // comment for why that comparison is meaningless under steady_clock.
   const std::int64_t now_ns = monotonic_timestamp_ns();
+  const std::int64_t wall_now_ns = wall_clock_timestamp_ns();
   const bool profiling = publish_stage_profiling_enabled();
   const std::int64_t stage_t0 = profiling ? monotonic_timestamp_ns() : 0;
   const rmw_fleetqox_cpp::DataFrame frame{
@@ -13099,7 +13140,7 @@ rmw_ret_t publish_payload(FleetQoxPublisherData * data, const std::vector<std::u
     data->topic_name,
     data->publisher_id,
     source_sequence,
-    now_ns,
+    wall_now_ns,
     payload,
     data->domain_id,
     data->type_name,
@@ -13124,7 +13165,7 @@ rmw_ret_t publish_payload(FleetQoxPublisherData * data, const std::vector<std::u
       frame.robot_id + "|" + frame.publisher_id, kStaticMinV1TopicHashSeed));
     rmw_fleetqox_cpp::encode_data_frame_static_min_v1_append(
       topic_key_hash, publisher_hash, static_cast<std::uint32_t>(source_sequence),
-      now_ns, payload, data->frame_json_scratch);
+      wall_now_ns, payload, data->frame_json_scratch);
   } else if (compact_v1_data_frame_encoding_enabled()) {
     rmw_fleetqox_cpp::encode_data_frame_compact_v1_append(frame, data->frame_json_scratch);
   } else {
@@ -14701,7 +14742,17 @@ rmw_ret_t take_payload(
     if (message_info != nullptr) {
       *message_info = rmw_get_zero_initialized_message_info();
       message_info->source_timestamp = decoded_frame->source_timestamp_ns;
-      message_info->received_timestamp = monotonic_timestamp_ns();
+      // wall_clock_timestamp_ns(), not monotonic_timestamp_ns(): keeps this
+      // in the same clock domain as source_timestamp above (now
+      // wall-clock-based) so an application computing
+      // received_timestamp - source_timestamp gets a coherent value instead
+      // of subtracting two unrelated clock readings. This does NOT by
+      // itself establish that the result is an accurate cross-host latency
+      // measurement -- that additionally requires the two hosts' wall
+      // clocks to be reasonably synchronized (e.g. via NTP), which is
+      // outside this RMW's control and has not been independently verified
+      // here.
+      message_info->received_timestamp = wall_clock_timestamp_ns();
       message_info->publication_sequence_number =
         decoded_frame->source_sequence_number;
       {
