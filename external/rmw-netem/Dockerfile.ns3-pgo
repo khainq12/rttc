@@ -1,0 +1,138 @@
+ARG ROS_IMAGE=ros:jazzy-ros-base
+FROM ${ROS_IMAGE}
+
+ARG AIOQUIC_DEB_VERSION=0.9.25-3build2
+ARG PSYCOPG_DEB_VERSION=3.1.17-2
+
+# Same TapBridge/missing-header fixes as external/rmw-netem/Dockerfile
+# (see that file's own comments for the full rationale). This is a
+# SEPARATE Dockerfile, not a modification of the original, so the plain
+# baseline image remains unaffected.
+ARG NS3_VERSION=ns-3.41
+
+SHELL ["/bin/bash", "-lc"]
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        iproute2 \
+        build-essential \
+        cmake \
+        ninja-build \
+        git \
+        libgnutls28-dev \
+        libngtcp2-dev \
+        libngtcp2-crypto-gnutls-dev \
+        libnghttp3-dev \
+        ngtcp2-client \
+        ngtcp2-server \
+        openssl \
+        pkg-config \
+        libgsl-dev \
+        libxml2-dev \
+        libsqlite3-dev \
+        libssl-dev \
+        libgoogle-perftools-dev \
+        python3-aioquic=${AIOQUIC_DEB_VERSION} \
+        python3-psycopg=${PSYCOPG_DEB_VERSION} \
+        python3-colcon-common-extensions \
+        ros-jazzy-geometry-msgs \
+        ros-jazzy-nav-msgs \
+        ros-jazzy-nav2-behaviors \
+        ros-jazzy-nav2-behavior-tree \
+        ros-jazzy-nav2-bt-navigator \
+        ros-jazzy-nav2-controller \
+        ros-jazzy-nav2-dwb-controller \
+        ros-jazzy-nav2-lifecycle-manager \
+        ros-jazzy-nav2-msgs \
+        ros-jazzy-nav2-navfn-planner \
+        ros-jazzy-nav2-planner \
+        ros-jazzy-rmf-fleet-msgs \
+        ros-jazzy-rmf-task-msgs \
+        ros-jazzy-rmf-traffic-msgs \
+        ros-jazzy-rmw-cyclonedds-cpp \
+        ros-jazzy-rosidl-default-generators \
+        ros-jazzy-rosidl-default-runtime \
+        ros-jazzy-sensor-msgs \
+        ros-jazzy-std-msgs \
+        ros-jazzy-std-srvs \
+        ros-jazzy-tf2-msgs \
+        ros-jazzy-tinyxml2-vendor \
+    && rm -rf /var/lib/apt/lists/*
+
+# accepted configuration (see docs/AUDIT_ACCEPTANCE_TRACKING.md, sections
+# "TABLE V DIRECT N=16 LATENCY FLOOR INVESTIGATION" and "N16 REALTIME:
+# GCC PGO"): patches 0001+0002+0003+0005+0006, NS3_MONOLIB +
+# NS3_LINK_TIME_OPTIMIZATION, native OFF, tcmalloc LD_PRELOAD. Layered
+# with an opt-in PGO instrumentation/use pass via NS3_PGO_MODE, one of:
+#   none      (default) -- accepted configuration, no PGO
+#   generate  -- adds -fprofile-generate, writes .gcda under
+#                NS3_PGO_PROFILE_DIR (must be bind-mounted at RUNTIME,
+#                not during this build, for a training run to persist
+#                profile data back to the host)
+#   use       -- adds -fprofile-use -fprofile-correction, reading
+#                .gcda from ./pgo_profile_data in the build context
+#                (COPY'd in below -- populate it from a prior
+#                NS3_PGO_MODE=generate build's training run before
+#                invoking this mode)
+ARG NS3_BUILD_JOBS=4
+ARG NS3_PGO_MODE=none
+ARG NS3_PGO_PROFILE_DIR=/work/pgo_profile_data
+COPY external/ns3/patches/0001-tap-bridge-disable-use-local-address-autolearn-ns3.41.patch /tmp/ns3-tap-bridge-fix.patch
+COPY external/ns3/patches/0002-wifi-phy-state-helper-missing-algorithm-header-ns3.41.patch /tmp/ns3-missing-header-fix.patch
+COPY external/ns3/patches/0003-realtime-simulator-fold-run-lock-into-processoneevent-ns3.41.patch /tmp/ns3-p2.17-mutex-fold.patch
+COPY external/ns3/patches/0005-table-based-error-rate-memoization-ns3.41.patch /tmp/ns3-p2.18-error-rate-memo.patch
+COPY external/ns3/patches/0006-interference-helper-now-hoist-and-copy-elision-ns3.41.patch /tmp/ns3-p2.19-interference-hoist.patch
+# Always present (possibly empty) so the profile-use COPY never fails
+# regardless of NS3_PGO_MODE; only meaningful contents when a prior
+# generate-mode training run has populated pgo_profile_data/.
+COPY pgo_profile_data /pgo_profile_data
+RUN git clone --branch "${NS3_VERSION}" --depth 1 https://gitlab.com/nsnam/ns-3-dev.git /tmp/ns3-src \
+    && cd /tmp/ns3-src \
+    && git apply /tmp/ns3-tap-bridge-fix.patch /tmp/ns3-missing-header-fix.patch \
+    && git apply /tmp/ns3-p2.17-mutex-fold.patch \
+    && git apply /tmp/ns3-p2.18-error-rate-memo.patch \
+    && git apply /tmp/ns3-p2.19-interference-hoist.patch \
+    && rm -rf scratch/nested-subdir \
+    && case "${NS3_PGO_MODE}" in \
+         none) PGO_FLAGS="" ;; \
+         generate) PGO_FLAGS="-fprofile-generate -fprofile-dir=${NS3_PGO_PROFILE_DIR}" ;; \
+         use) PGO_FLAGS="-fprofile-use -fprofile-correction -fprofile-dir=/pgo_profile_data -Wno-error=coverage-mismatch -Wno-error=missing-profile" ;; \
+         *) echo "unknown NS3_PGO_MODE=${NS3_PGO_MODE}" >&2; exit 1 ;; \
+       esac \
+    && cmake -S . -B build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DNS3_EXAMPLES=OFF \
+        -DNS3_TESTS=OFF \
+        -DNS3_ENABLED_MODULES='applications;bridge;core;csma;internet;mobility;network;point-to-point;tap-bridge;wifi' \
+        -DNS3_MONOLIB=ON \
+        -DNS3_LINK_TIME_OPTIMIZATION=ON \
+        -DCMAKE_CXX_FLAGS="${PGO_FLAGS}" \
+        -DCMAKE_EXE_LINKER_FLAGS="${PGO_FLAGS}" \
+        -DCMAKE_SHARED_LINKER_FLAGS="${PGO_FLAGS}" \
+    && cmake --build build -j "${NS3_BUILD_JOBS}" 2>&1 | tee /tmp/ns3_build.log \
+    && cmake --install build \
+    && cp build/lib/libns3.41-monolib.so /usr/lib/x86_64-linux-gnu/libns3.41-monolib.so \
+    && ldconfig \
+    && ldconfig -p | grep monolib \
+    && mkdir -p /work \
+    && cd / && rm -rf /tmp/ns3-tap-bridge-fix.patch /tmp/ns3-missing-header-fix.patch /tmp/ns3-p2.17-mutex-fold.patch /tmp/ns3-p2.18-error-rate-memo.patch /tmp/ns3-p2.19-interference-hoist.patch
+# NOTE: /tmp/ns3-src is intentionally NOT removed here (unlike the plain
+# baseline Dockerfile) when NS3_PGO_MODE=generate, so the build log and
+# source tree remain available for provenance/debugging; the image is
+# only ever used for one training run, not shipped as a general-purpose
+# runtime image. Callers on a disk budget may prune it with a downstream
+# `docker build --squash` or manual `rm -rf /tmp/ns3-src` layer if needed.
+
+RUN apt-get update \
+    && (apt-get install -y --no-install-recommends ros-jazzy-rmw-zenoh-cpp || true) \
+    && rm -rf /var/lib/apt/lists/*
+
+# tcmalloc (accepted configuration): plain allocator, no profiling-hook
+# overhead. LD_PRELOAD applies process-wide inside this image only.
+ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so
+
+WORKDIR /work
+ENV PYTHONPATH=/work
+
+ENTRYPOINT ["/bin/bash", "-lc"]

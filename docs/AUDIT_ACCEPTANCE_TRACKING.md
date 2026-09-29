@@ -23222,6 +23222,146 @@ artifacts are regenerable build output, not committed).
 None (documentation-only entry in this file; no source/patch commit,
 consistent with section 5's tcmalloc precedent above).
 
+## P2 FINAL CLOSEOUT: REPRODUCIBLE PGO PIPELINE + OFFICIAL N16 VALIDATION (28/09/2026) -- P2 REMAINS ACTIVE
+
+The PGO finding above was based on scratch/ephemeral Dockerfiles and a
+3-seed confirmation (7, 13, 29 -- the same 3 seeds this project's other
+N16 studies call the "baseline" subset). This closeout (a) formalizes
+PGO into a reproducible, committed pipeline and (b) validates it against
+the project's actual predeclared 20-seed list, not a favorable subset.
+
+### 1. Reproducible PGO pipeline added
+`external/rmw-netem/Dockerfile.ns3-pgo` (single Dockerfile, `NS3_PGO_MODE`
+build-arg: `none`/`generate`/`use`) + `scripts/build_pgo_ns3_image.py`
+(orchestrates: profile-generate build -> N16 seed=7 training run ->
+verify non-trivial `.gcda` for all 8 hot objects (fails loudly if
+missing/undersized) -> profile-use build -> verify zero missing-profile/
+mismatch warnings for those same 8 hot objects (fails loudly otherwise)
+-> tag final image). No hidden scratch state: both phases build from a
+fresh `git clone` of ns-3.41 with the same accepted patches
+(0001/0002/0003/0005/0006), `NS3_MONOLIB`+LTO, native OFF, tcmalloc.
+
+### 2. Clean-build proof
+Ran with `--clean` (removed all prior `pgo_profile_data/` and PGO images
+first): `python3 scripts/build_pgo_ns3_image.py --final-tag
+localhost/fleetrmw/rmw-netem:jazzy-pgo --clean`. Completed successfully
+from a genuinely empty starting state.
+
+### 3. Proof profiles generated
+592 `.gcda` files, all 8 hot objects present with non-trivial size
+(script's own automated check, not a manual eyeball this time).
+
+### 4. Proof hot objects consumed profiles
+Zero missing-profile/mismatch warnings for any of the 8 hot objects
+(script's automated grep); 7 harmless warnings for unrelated
+scratch/bench/introspection files not exercised by this workload, same
+set as the original finding.
+
+### 5. Final image digest
+`localhost/fleetrmw/rmw-netem:jazzy-pgo`,
+`sha256:9f93c2389b7cc5905004166c41b9fafd6591feab8a7c0379c11db78ee6eed6f4`.
+
+### 6. Official N16 table
+Official 20-seed list, verbatim from
+`scripts/run_lan_n16_paired_20seed_experiment.py`'s `SEEDS_20`
+(`PRIOR_10_SEED_LIST + NEXT_10_PRIMES_AFTER_101`) -- not invented for
+this closeout. Same workload/config as every other N16 measurement this
+session (`num_robots=16, policy=fifo, seconds=3, sim_duration_s=20.0,
+rmw_fleetqox_cpp, ns3_scheduler=heap, ns3_use_monolib=True,
+ns3_build_profile=release`). One run per seed (the existing 20-seed
+protocol's own retry policy is for the *separate* LAN-netem experiment
+track, not this ns-3/TapBridge track -- no retries/substitutions applied
+here; every seed's result below is its one and only attempt).
+
+| seed | corrected sim_lag_s | internal lag_s | diff | valid (<=10.0)? | assoc | complete |
+|---|---|---|---|---|---|---|
+| 7   | 8.7569  | 8.7569  | 0.0 | YES | 17/17 | yes |
+| 13  | 8.9326  | 8.9326  | 0.0 | YES | 17/17 | yes |
+| 29  | 9.1023  | 9.1023  | 0.0 | YES | 17/17 | yes |
+| 41  | 9.1653  | 9.1653  | 0.0 | YES | 17/17 | yes |
+| 53  | 8.0881  | 8.0881  | 0.0 | YES | 17/17 | yes |
+| 67  | 8.4296  | 8.4296  | 0.0 | YES | 17/17 | yes |
+| 79  | 9.0808  | 9.0808  | 0.0 | YES | 17/17 | yes |
+| 89  | 9.1036  | 9.1036  | 0.0 | YES | 17/17 | yes |
+| 97  | 9.4824  | 9.4824  | 0.0 | YES | 17/17 | yes |
+| 101 | 9.6041  | 9.6041  | 0.0 | YES | 17/17 | yes |
+| 103 | 9.2457  | 9.2457  | 0.0 | YES | 17/17 | yes |
+| 107 | 9.4460  | 9.4460  | 0.0 | YES | 17/17 | yes |
+| 109 | 8.7120  | 8.7120  | 0.0 | YES | 17/17 | yes |
+| 113 | 9.4691  | 9.4691  | 0.0 | YES | 17/17 | yes |
+| **127** | **10.2608** | **10.2608** | 0.0 | **NO** | 17/17 | yes |
+| 131 | 8.2601  | 8.2601  | 0.0 | YES | 17/17 | yes |
+| 137 | 8.6089  | 8.6089  | 0.0 | YES | 17/17 | yes |
+| **139** | **10.3814** | **10.3814** | 0.0 | **NO** | 17/17 | yes |
+| 149 | 9.2629  | 9.2629  | 0.0 | YES | 17/17 | yes |
+| 151 | 9.0438  | 9.0438  | 0.0 | YES | 17/17 | yes |
+
+"Internal lag" is computed identically to "corrected sim_lag_s"
+(`wall_elapsed_s - sim_time_s` from the same snapshot) -- this session's
+earlier "sim_lag_s measurement bug" fix made these the same quantity by
+construction; there is no longer a separate raw/uncorrected figure to
+contrast against, so `diff` is 0.0 for every run by definition, not a new
+finding.
+
+### 7. Valid: 18/20 (90%)
+
+### 8. Invalid runs, listed explicitly
+- **seed 127: 10.2608s** -- exceeds the 10.0s gate by 0.2608s. Not a
+  borderline/noise case.
+- **seed 139: 10.3814s** -- exceeds the 10.0s gate by 0.3814s. Not a
+  borderline/noise case.
+
+Both runs otherwise fully sane (17/17 association,
+`endpoint_results_complete=true`, `mac_tx_total` in the same normal range
+as every valid run) -- these are gate violations on lag specifically, not
+crashes or semantic anomalies. No run was rerun/substituted; both
+invalid results are reported as-is, exactly once.
+
+### 9. PGO improvement conclusion (**Claim A: TRUE**)
+PGO causally and repeatably improves N16 performance. 18/20 official
+seeds land at 8.09-9.61s, a regime the unmodified accepted baseline never
+reached across dozens of measurements this session (baseline range
+throughout: ~13.58-17.69s). The original 3-seed interleaved A/B (-35% to
+-49%, zero overlap between 6 baseline and 6 PGO values) is corroborated,
+not contradicted, by this larger sample.
+
+### 10. N16 validity conclusion (**Claim B: FALSE**)
+The project's predeclared per-run `sim_lag_s <= 10.0` validity
+requirement is **not** satisfied across the official 20-seed set: 2/20
+(10%) fail it, by a clear, non-borderline margin (+0.26s, +0.38s). Claim
+A being true does not make Claim B true -- they are evaluated
+separately, as required.
+
+### 11. P2 status: **ACTIVE**
+Classification: **PGO_RECOVERED_MOST_N16_RUNS_BUT_VALIDITY_NOT_STABLE**.
+P2 cannot be closed as DONE: the project's own N16 validity gate, applied
+per-run and without averaging or excusing near-misses, is violated by
+2 of 20 official seeds even under the best configuration found this
+session (PGO + accepted baseline). No further optimization was attempted
+per this task's explicit scope.
+
+**The one blocker**: 2 of the 20 official N16 seeds (127, 139) exceed the
+10.0s corrected-sim_lag validity gate under the PGO-optimized accepted
+configuration (10.26s, 10.38s respectively) -- PGO materially reduces but
+does not eliminate all instances of gate violation across the full
+official seed set.
+
+### 12. Files changed
+`external/rmw-netem/Dockerfile.ns3-pgo` (new), `scripts/build_pgo_ns3_image.py`
+(new), `.gitignore` (added `pgo_profile_data/` and the two build-log
+files -- regenerable build artifacts, not committed), this document.
+
+### 13. Tests
+No unit/integration test suite applies to a Docker-build/config change;
+verification is the automated in-pipeline checks (profile-data presence
+and non-triviality per hot object; zero missing-profile/mismatch
+warnings per hot object) plus the 20-seed official semantic/validity
+table above (17/17 association and `endpoint_results_complete=true` in
+all 20 runs).
+
+### 14. Commit
+Pending (this closeout).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và

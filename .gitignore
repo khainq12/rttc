@@ -21,3 +21,9 @@ ubsan*.log
 .multihost_vm/
 .ns3-build-tmp/
 .tcpdump_portable/
+# PGO training profile data (regenerable via
+# scripts/build_pgo_ns3_image.py) and its build logs -- build artifacts,
+# not source.
+/pgo_profile_data/
+/pgo_generate_build.log
+/pgo_use_build.log
