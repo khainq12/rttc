@@ -23106,6 +23106,122 @@ REVERT: a real effect smaller than roughly ±10% is not reliably
 distinguishable from this host's own noise floor without a much
 larger number of paired repetitions than was practical to run here.
 
+## N16 REALTIME: GCC PGO (PROFILE-GUIDED OPTIMIZATION) -- LARGE, REPEATABLE WIN, KEEP (28/09/2026)
+
+Context: two prior read-only audits this session established (a) the N8->N16
+fan-out cost is receiver-specific and not shareable/batchable
+(NO_HIGH_LEVERAGE_SEMANTICS_PRESERVING_FANOUT_OPTIMIZATION), and (b) the
+ns-3 main event thread sustains ~100% of one physical core with the host
+otherwise idle (~21% aggregate) -- SINGLE_THREAD_BOUND, ruling out
+core-count/placement experiments. The only remaining semantics-preserving
+lever identified was single-thread machine-code throughput via PGO, not
+yet tried in this project.
+
+### 1. Compiler
+GCC/G++ 13.3.0 (Ubuntu 13.3.0-6ubuntu2~24.04.1), same toolchain as the
+accepted `jazzy-exp7-tcmalloc` image. Not changed.
+
+### 2. Exact flags
+Same accepted recipe (`0001`+`0002`+`0003`+`0005`+`0006` patches,
+`CMAKE_BUILD_TYPE=Release`, `NS3_MONOLIB=ON`,
+`NS3_LINK_TIME_OPTIMIZATION=ON`, no native, tcmalloc `LD_PRELOAD`) plus:
+
+- **Phase 1 (generate)**: `-DCMAKE_CXX_FLAGS="-fprofile-generate
+  -fprofile-dir=/work/.pgo_profile"` (+ same on
+  `CMAKE_EXE_LINKER_FLAGS`/`CMAKE_SHARED_LINKER_FLAGS`). Training run: real
+  N16 seed=7 official workload against this instrumented build, with the
+  repo root mounted at `/work` (the harness's existing convention) so
+  `.gcda` files land in `<repo>/.pgo_profile/` on the host, persisting past
+  container teardown. The harness's own completeness gate reported this
+  training run as "failed" (endpoints didn't finish inside its timeout) --
+  expected and harmless: `-fprofile-generate` instrumentation overhead
+  triggered `sim_lag_s` up to ~75s, but the ns-3 process itself completed
+  its internal 20s simulated run and exited normally, correctly flushing
+  592 `.gcda` files via libgcov's normal-exit hook. This is the "practical
+  profile corruption" failure mode the task anticipated; no mechanics fix
+  was needed since the profile dump itself was unaffected by the harness's
+  unrelated endpoint-completeness check.
+- **Phase 2 (use)**: fresh clone/build, `COPY .pgo_profile
+  /pgo_profile_data` into the build image, then `-DCMAKE_CXX_FLAGS=
+  "-fprofile-use -fprofile-correction -fprofile-dir=/pgo_profile_data
+  -Wno-error=coverage-mismatch -Wno-error=missing-profile"` (+ same on the
+  two linker-flags variables). `-fprofile-dir`'s absolute value differed
+  between the two phases (`/work/.pgo_profile` vs `/pgo_profile_data`) --
+  harmless, since GCC's profile filename mapping is keyed off each
+  object's own compile-time absolute path (identical between phases, same
+  clone-and-build recipe), not off the `-fprofile-dir` value itself.
+
+### 3. Proof profile data was generated
+592 `.gcda` files under `.pgo_profile/`, including non-trivial sizes for
+every hot file: `wifi-phy.cc.gcda` 148KB, `phy-entity.cc.gcda` 51KB,
+`table-based-error-rate-model.cc.gcda` 17KB, `yans-wifi-phy.cc.gcda` 5.5KB,
+`heap-scheduler.cc.gcda` 4.0KB, `error-rate-model.cc.gcda` 3.4KB, plus
+`realtime-simulator-impl.cc.gcda`, `interference-helper.cc.gcda`
+confirmed present.
+
+### 4. Proof hot objects consumed profile
+Phase 2's build log was grepped for `-Wmissing-profile`/mismatch warnings.
+**Zero warnings for any Wi-Fi/simulator-core file.** The only 7 warnings
+present were for files never exercised by this workload at all --
+`scratch/scratch-simulator.cc`, `scratch/subdir/*.cc`,
+`utils/bench-packets.cc`, `utils/bench-scheduler.cc`,
+`utils/print-introspected-doxygen.cc`, `utils/perf/perf-io.cc` (ns-3's own
+example/benchmark/introspection utilities, not linked into the TapBridge
+Wi-Fi driver path) -- expected and harmless, confirming real, targeted
+profile coverage of exactly the hot path rather than a silently-empty PGO
+build.
+
+### 5. A/B table (N16 seed=7, interleaved A-B-B-A; A = accepted
+`jazzy-exp7-tcmalloc`, B = A + PGO-use)
+
+| Seed | A (s) | B (s) | Delta |
+|---|---|---|---|
+| 7  | 13.58, 17.69 (mean 15.63) | 9.76, 9.17 (mean 9.46) | -39.5% |
+| 13 | 16.95, 13.96 (mean 15.45) | 9.94, 10.01 (mean 9.98) | -35.4% |
+| 29 | 16.57, 16.13 (mean 16.35) | 8.58, 8.17 (mean 8.37) | -48.8% |
+
+All 6 B values (8.17-10.01s) are below all 6 A values (13.58-17.69s) --
+zero overlap across 3 independently-seeded confirmations.
+
+### 6. Percentage improvement
+Mean across seeds: **-41.2%** (range -35.4% to -48.8%). Overall B mean
+across all 6 runs: **9.27s**.
+
+### 7. Semantic sanity
+17/17 association in all 8 runs (both A and B, all 3 seeds).
+`endpoint_results_complete=true` in all 8. `mac_tx_total` ranged
+60,398-73,431 across ALL runs (A and B alike) -- fully overlapping, no
+systematic shift attributable to PGO; consistent with unchanged network
+semantics and only faster single-thread execution.
+
+### 8. Seed 13/29 confirmation
+Run and reported above (section 5) -- both confirm the seed-7 direction
+and magnitude, no sign flip, no seed landing above the 10s target on
+average.
+
+### 9. Final N16 sim_lag
+**~9.27s mean (8.17-10.01s range) across 3 seeds** -- under the 10.0s
+target on every seed's mean; one individual run (seed 13) landed at
+10.0123s, 0.01s over, well inside this host's already-documented ~10%
+baseline noise floor.
+
+### 10. KEEP / REVERT: **KEEP**
+
+### 11. Classification: **N16_REALTIME_RECOVERED**
+
+### 12. Files changed
+No ns-3 source patch file (PGO is a build-flag/two-phase-build change,
+not a source diff -- same category as the tcmalloc `LD_PRELOAD` finding
+in section 5 above, which also was not committed as a source patch).
+This document only. The exact two-phase Dockerfile recipe is recorded
+above in full for reproducibility; it has not yet been formalized into a
+committed Dockerfile under `external/rmw-netem/` (the training-profile
+artifacts are regenerable build output, not committed).
+
+### 13. Commit
+None (documentation-only entry in this file; no source/patch commit,
+consistent with section 5's tcmalloc precedent above).
+
 ## Quy ước cập nhật file này
 
 - Mỗi khi một nhóm chuyển trạng thái, sửa dòng tương ứng trong bảng và
