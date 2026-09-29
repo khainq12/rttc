@@ -434,6 +434,18 @@ ament_target_dependencies(fleetrmw_lifespan_message_lost_probe
   rmw
 )
 
+add_executable(fleetrmw_lifespan_fresh_and_expired_probe
+  src/lifespan_fresh_and_expired_probe.cpp
+)
+target_compile_features(fleetrmw_lifespan_fresh_and_expired_probe PRIVATE cxx_std_17)
+target_link_libraries(fleetrmw_lifespan_fresh_and_expired_probe
+  ${PROJECT_NAME}
+)
+ament_target_dependencies(fleetrmw_lifespan_fresh_and_expired_probe
+  rcutils
+  rmw
+)
+
 add_executable(fleetrmw_remote_qos_best_available_probe
   src/remote_qos_best_available_probe.cpp
 )
@@ -1511,6 +1523,7 @@ install(
     fleetrmw_manual_by_node_liveliness_probe
     fleetrmw_remote_manual_by_node_liveliness_probe
     fleetrmw_lifespan_message_lost_probe
+    fleetrmw_lifespan_fresh_and_expired_probe
     fleetrmw_remote_qos_best_available_probe
     fleetrmw_destination_order_probe
     fleetrmw_partition_probe

@@ -314,7 +314,16 @@ std::optional<DataFrame> decode_data_frame(const std::string & payload);
 // without needing every one of decode_data_frame's ~15 call sites
 // touched -- the JSON path remains byte-for-byte unchanged as the
 // default; this is purely additive.
-constexpr const char * kDataFrameCompactV1Magic = "FRMWC1\n";
+// v1 -> v2: same source_timestamp_ns clock-domain change as
+// kDataFrameSchemaVersion (see above) -- MONOTONIC -> REALTIME. This
+// magic carries no separate schema_version string (unlike the JSON
+// encoding), so the version bump IS the compatibility mechanism: an old
+// peer's "FRMWC1" frames no longer match this constant and fail to
+// decode (payload.rfind(magic, 0) == 0 in decode_data_frame_compact_v1()
+// below), and a new peer's "FRMWC2" frames are equally unrecognized by
+// old code still matching "FRMWC1" -- both directions fail closed
+// rather than silently misinterpreting the timestamp's clock domain.
+constexpr const char * kDataFrameCompactV1Magic = "FRMWC2\n";
 
 void encode_data_frame_compact_v1_append(const DataFrame & frame, std::string & out);
 
@@ -343,7 +352,8 @@ std::optional<DataFrame> decode_data_frame_compact_v1(const std::string & payloa
 // FLEETQOX_RMW_STATIC_MODE, whose whole premise (every peer already knows
 // the full (topic, subscriber) map ahead of time) is what makes omitting
 // the topic string from the wire safe to do at all.
-constexpr const char * kDataFrameStaticMinV1Magic = "FRMWM1\n";
+// v1 -> v2: same rationale as kDataFrameCompactV1Magic above.
+constexpr const char * kDataFrameStaticMinV1Magic = "FRMWM2\n";
 
 // A topic/type/domain identity a process already knows locally (as either
 // a local subscription's own registration, or a publisher's own static

@@ -123,6 +123,12 @@ constexpr const char * kIdentifier = "rmw_fleetqox_cpp";
 constexpr const char * kTypeErasedTypeSupportIdentifier = "rmw_fleetqox_cpp_type_erased_probe";
 constexpr std::uint32_t kTypeErasedDescriptorSchemaVersion = 1;
 
+// Forward-declared here (ahead of their definitions much further down this
+// translation unit) because reset_pooled_retransmit_entry(), below, needs
+// monotonic_timestamp_ns() before that point.
+std::int64_t monotonic_timestamp_ns();
+std::int64_t wall_clock_timestamp_ns();
+
 struct FleetQoxPublisherData
 {
   rcutils_allocator_t allocator;
