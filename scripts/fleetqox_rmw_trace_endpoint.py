@@ -904,6 +904,7 @@ def main() -> int:
 
     import rclpy
     import rclpy.publisher
+    from rclpy._rclpy_pybind11 import RCLError
     from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
     from std_msgs.msg import String
 
@@ -1127,7 +1128,23 @@ def main() -> int:
             if beacon_pub is not None:
                 now = time.monotonic()
                 if now - last_beacon_sent >= 0.1:
-                    beacon_pub.publish(beacon_msg)
+                    try:
+                        beacon_pub.publish(beacon_msg)
+                    except RCLError:
+                        # Transient startup race (see docs/
+                        # AUDIT_ACCEPTANCE_TRACKING.md "TABLE IV STATIC
+                        # TOPOLOGY VERIFICATION"): a peer whose UDP socket
+                        # hasn't finished binding yet at the exact instant
+                        # this beacon fires raises ECONNREFUSED through
+                        # rclpy as RCLError, which would otherwise crash
+                        # this whole endpoint process before it ever gets
+                        # a chance to retry. Swallow and retry on the next
+                        # 0.1s tick instead -- a genuinely unreachable
+                        # peer still fails every retry up to
+                        # discovery_deadline and is correctly reported as
+                        # not converged; this only rescues the transient,
+                        # all-processes-starting-at-once case.
+                        pass
                     last_beacon_sent = now
             # spin_once() services only ONE ready wait-set entity per call, so
             # drain everything ready each iteration rather than relying on one

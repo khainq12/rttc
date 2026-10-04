@@ -135,6 +135,7 @@ def run_one(
     image: str,
     seconds: int = 3,
     policy: str = "fifo",
+    verify_static_topology: bool = False,
 ) -> dict[str, Any]:
     output_dir = (output_root / f"{rmw_impl}_{discovery_mode}_n{num_robots}_seed{seed}").resolve()
     result = run_lan_probe(
@@ -146,6 +147,7 @@ def run_one(
         seed=seed,
         rmw_implementation=rmw_impl,
         discovery_mode=discovery_mode,
+        verify_static_topology=verify_static_topology,
     )
     endpoints = endpoint_list(num_robots)
     trace_path = ROOT / result["trace"]
@@ -245,6 +247,7 @@ def main() -> int:
             r = run_one(
                 name, rmw_impl, discovery_mode, 2, 13,
                 args.output_root / "sanity", args.image,
+                verify_static_topology=(rmw_impl == "rmw_fleetqox_cpp"),
             )
             report["sanity"].append(r)
             print(json.dumps({
@@ -266,6 +269,7 @@ def main() -> int:
                 r = run_one(
                     name, rmw_impl, discovery_mode, 16, seed,
                     args.output_root / "main", args.image,
+                    verify_static_topology=(rmw_impl == "rmw_fleetqox_cpp"),
                 )
                 report["main"].append(r)
                 print(json.dumps({

@@ -467,19 +467,45 @@ def compute_jitter_stale_repair_stats(endpoint_results: dict[str, Any]) -> dict[
 
 
 def compute_graph_join_failures(endpoint_results: dict[str, Any]) -> dict[str, Any] | None:
-    """Count endpoints whose discovery beacon (see
-    fleetqox_rmw_trace_endpoint.py's --expected-peer-count) did NOT reach
-    its full expected peer count within --discovery-timeout-s -- i.e. the
-    paper's "Graph/Join failures" column (Bảng IV). Returns None when no
-    endpoint ran the beacon at all (discovery_expected_peers is 0/absent
-    for every one, e.g. an all-rmw_fleetqox_cpp run -- static mode has no
-    discovery step by design, so "join failure" isn't a meaningful concept
-    there, not simply zero of them)."""
+    """Count endpoints that did NOT observe every peer their OWN workload
+    actually requires within --discovery-timeout-s -- i.e. the paper's
+    "Graph/Join failures" column (Bảng IV), evaluated against the
+    VERIFIED REQUIRED TOPOLOGY (see docs/AUDIT_ACCEPTANCE_TRACKING.md,
+    "TABLE IV STATIC TOPOLOGY VERIFICATION").
+
+    Prefers discovery_required_peer_ids/discovery_peers_seen_ids (a
+    SUBSET check against each endpoint's own actual required peers --
+    the same quantity discovery_converged() itself gates readiness on)
+    when present. Falls back to the OLDER full-mesh count check
+    (discovery_peers_seen >= discovery_expected_peers, i.e. --expected-
+    peer-count) only for callers that never pass required_peer_ids at
+    all (e.g. Wi-Fi's run_probe(), which has no topology-aware mode) --
+    this fallback is NOT equivalent to the subset check (it demands
+    N-1, full mesh, regardless of what the workload actually needs) and
+    must not be used to interpret a topology-aware run's failure rate.
+
+    Returns None when no endpoint ran a beacon at all (neither field
+    present for any endpoint) -- e.g. an all-rmw_fleetqox_cpp run WITHOUT
+    verify_static_topology: static mode has no discovery step by design,
+    so "join failure" isn't a meaningful concept there, not simply zero
+    of them."""
     total_with_beacon = 0
     failures = 0
     per_endpoint: dict[str, Any] = {}
     for endpoint, result in endpoint_results.items():
         if not result:
+            continue
+        required_ids = result.get("discovery_required_peer_ids")
+        if required_ids is not None:
+            seen_ids = set(result.get("discovery_peers_seen_ids") or [])
+            expected = len(required_ids)
+            if expected <= 0:
+                continue
+            total_with_beacon += 1
+            seen = len(set(required_ids) & seen_ids)
+            failed = not (set(required_ids) <= seen_ids)
+            failures += int(failed)
+            per_endpoint[endpoint] = {"peers_seen": seen, "expected_peers": expected, "failed": failed}
             continue
         expected = result.get("discovery_expected_peers") or 0
         if expected <= 0:
@@ -1413,7 +1439,34 @@ class ReferenceTopologyProbe:
         zenoh_control_station_explicit_listen: bool = False,
         sustain_beacon_until_deadline: bool = False,
         deadline_aware_retransmission_lifespan: bool = False,
+        verify_static_topology: bool = False,
     ) -> None:
+        # verify_static_topology: opt-in (default False, preserving every
+        # existing caller's behavior byte-for-byte). Table IV fairness fix
+        # (see docs/AUDIT_ACCEPTANCE_TRACKING.md, "TABLE IV DISCOVERY
+        # FAIRNESS AUDIT"): rmw_fleetqox_cpp's static mode previously
+        # ALWAYS paired with --skip-discovery-wait, which makes
+        # discovery_converged() return True unconditionally with ZERO
+        # observation -- not a measured convergence, a declared one. This
+        # flag decouples "use static peer config for addressing" (the
+        # FLEETQOX_RMW_STATIC_MODE/STATIC_SUBSCRIPTIONS env vars below,
+        # UNCHANGED) from "skip the readiness-verification loop" (now
+        # conditional on this flag). When True, FleetRMW endpoints run the
+        # SAME discovery_converged() check as every other RMW -- since
+        # expected_peer_count stays 0 and required_peer_ids_by_endpoint is
+        # still never passed for rmw_fleetqox_cpp (see that branch's own
+        # comment below), beacon_pub stays None, so this lands on the
+        # existing (previously dead) subscription-count fallback: ready
+        # only once every one of THIS endpoint's own declared publishers
+        # reports get_subscription_count() > 0 -- a standard, middleware-
+        # neutral rclpy/RMW API, backed in rmw_fleetqox_cpp by
+        # rmw_fleetqox_cpp_graph_subscription_count() (rmw_graph.cpp),
+        # which counts remote subscribers ONLY via real GraphAdvertisement
+        # messages actually received over the wire, not static config
+        # echo -- see rmw_graph.cpp's add_topic_endpoint_locked() callers.
+        # This is exactly "the actual required communication topology":
+        # whichever peers THIS endpoint's own workload-declared publishers
+        # need, not an artificial full-mesh beacon.
         # required_peer_ids_by_endpoint: opt-in (default None), LAN's own
         # topology-aware readiness gate (see required_peers_from_trace()
         # and docs/AUDIT_ACCEPTANCE_TRACKING.md, "LAN READINESS GATE:
@@ -1454,6 +1507,29 @@ class ReferenceTopologyProbe:
                     f"{STATIC_SUBSCRIPTION_TYPE_NAME}"
                     for dst, flow_class in (static_subscriptions or {}).get(endpoint, [])
                 ]
+                # verify_static_topology (see this method's own docstring
+                # note): additive static-subscription entries, same wire
+                # format as the real app topics above, just for the
+                # shared "/fleetqox_trace/_discovery_probe" beacon topic
+                # every OTHER RMW already uses for readiness verification
+                # (fleetqox_rmw_trace_endpoint.py's beacon_pub/
+                # discovery_peers_seen) -- one entry per REQUIRED peer
+                # (not full mesh), so FleetRMW's own static-mode transport
+                # actually routes the beacon the same way it routes real
+                # app traffic, instead of relying on any graph/discovery-
+                # layer introspection API (confirmed empirically unusable
+                # under STATIC_MODE: send_graph_advertisement()/
+                # send_graph_heartbeat() are no-ops by design under it --
+                # see rmw_pubsub.cpp -- so rmw_publisher_count_matched_
+                # subscriptions() never populates for a remote peer no
+                # matter how long one waits). Does not touch the real
+                # workload's own static_subscription_entries above.
+                if verify_static_topology and required_peer_ids_by_endpoint is not None:
+                    static_subscription_entries.extend(
+                        f"{self.ips[peer]}:{RMW_PORT}|0|/fleetqox_trace/_discovery_probe|"
+                        f"{STATIC_SUBSCRIPTION_TYPE_NAME}"
+                        for peer in sorted(required_peer_ids_by_endpoint.get(endpoint, frozenset()))
+                    )
                 env_prefix = fleetqox_rmw_env_prefix(
                     endpoint, peers, static_mode, static_subscription_entries, extra_rmw_env
                 )
@@ -1587,7 +1663,13 @@ class ReferenceTopologyProbe:
             # meaningfully, so the loop never broke out early; see
             # docs/AUDIT_ACCEPTANCE_TRACKING.md "FleetRMW N/A" for the
             # ~15.1s artifact this replaces with a real near-zero number).
-            skip_discovery_wait_flag = " --skip-discovery-wait" if static_mode else ""
+            # verify_static_topology overrides this (see this method's own
+            # docstring note above) -- opt-in, re-enables the fallback
+            # loop to get an OBSERVED convergence/timeout instead of a
+            # declared one.
+            skip_discovery_wait_flag = (
+                " --skip-discovery-wait" if static_mode and not verify_static_topology else ""
+            )
             # LAN topology-aware readiness (opt-in, see this method's own
             # docstring param note): only applies to the standard,
             # beacon-based RMWs -- FleetRMW's static mode has no
@@ -1599,7 +1681,9 @@ class ReferenceTopologyProbe:
             # left absent for it rather than implying a check that
             # cannot happen.
             required_peer_ids_flag = ""
-            if required_peer_ids_by_endpoint is not None and rmw_implementation != "rmw_fleetqox_cpp":
+            if required_peer_ids_by_endpoint is not None and (
+                rmw_implementation != "rmw_fleetqox_cpp" or verify_static_topology
+            ):
                 required = required_peer_ids_by_endpoint.get(endpoint, frozenset())
                 required_peer_ids_flag = f" --required-peer-ids={shlex.quote(','.join(sorted(required)))}"
             # PROVEN BUG FIX (see --sustain-beacon-until-deadline's own
@@ -1609,7 +1693,9 @@ class ReferenceTopologyProbe:
             # required_peer_ids_flag above).
             sustain_beacon_flag = (
                 " --sustain-beacon-until-deadline"
-                if sustain_beacon_until_deadline and rmw_implementation != "rmw_fleetqox_cpp"
+                if sustain_beacon_until_deadline and (
+                    rmw_implementation != "rmw_fleetqox_cpp" or verify_static_topology
+                )
                 else ""
             )
             # Causal-experiment flag (see docs/AUDIT_ACCEPTANCE_TRACKING.md,
@@ -2018,6 +2104,31 @@ class ReferenceTopologyProbe:
                 tx_bytes = int(lines[idx + 1].split()[0])
         return rx_bytes + tx_bytes
 
+    def lan_byte_counter(self, iface: str = "eth0") -> int:
+        """RX+TX byte counter for the representative station's own eth0
+        (control_station == endpoints[0], same representative-station
+        scope/convention as tap_byte_counter()), for run_lan_probe()'s
+        Table IV "discovery bytes" column. wire_network_lan() gives every
+        endpoint its OWN eth0 inside its OWN container netns (no shared
+        ns3sim-hosted tap exists in this profile -- see that method's
+        docstring), so unlike tap_byte_counter() this reads from
+        endpoints[0]'s own container, not ns3sim. Same before/after-delta
+        bracketing technique, same RX+TX parse logic, same honest
+        inclusion of pre-app ARP/ND noise as real control-plane cost."""
+        result = docker(
+            "exec", self.endpoint_container_names[0], "bash", "-lc", f"ip -s link show {iface}",
+            check=False,
+        )
+        rx_bytes = tx_bytes = 0
+        lines = result.stdout.splitlines()
+        for idx, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith("RX:") and idx + 1 < len(lines):
+                rx_bytes = int(lines[idx + 1].split()[0])
+            elif stripped.startswith("TX:") and idx + 1 < len(lines):
+                tx_bytes = int(lines[idx + 1].split()[0])
+        return rx_bytes + tx_bytes
+
     def sample_resource_usage(self) -> dict[str, dict[str, float]]:
         """One-shot `docker stats --no-stream` snapshot of CPU%/RSS for
         EVERY endpoint container at once (Bảng IV's "CPU (%)"/"RSS (MB)"
@@ -2127,6 +2238,7 @@ def run_probe(
     ns3_scheduler: str = "map",
     ns3_use_monolib: bool = False,
     ns3_build_profile: str = "release",
+    verify_static_topology: bool = False,
 ) -> dict[str, Any]:
     # ns3_use_monolib: passed straight through to
     # ReferenceTopologyProbe.build_ns3_binary()'s same-named `use_monolib`
@@ -2322,6 +2434,7 @@ def run_probe(
             sustain_beacon_until_deadline=sustain_beacon_until_deadline,
             zenoh_control_station_explicit_listen=zenoh_control_station_explicit_listen,
             deadline_aware_retransmission_lifespan=deadline_aware_retransmission_lifespan,
+            verify_static_topology=verify_static_topology,
         )
         probe.wait_for_ready_then_start(ready_deadline_s=ready_deadline_s)
         # Read back on the SUCCESS path too (previously only read on
@@ -2806,6 +2919,7 @@ def run_lan_probe(
     discovery_mode: str = "default",
     capacity_packets_per_second: int | None = None,
     capacity_airtime_ns_per_second: int | None = None,
+    verify_static_topology: bool = False,
 ) -> dict[str, Any]:
     """Bảng V's "LAN" network profile -- see wire_network_lan()'s
     docstring for what this represents (an ideal switched network, no
@@ -2880,6 +2994,7 @@ def run_lan_probe(
     error_text = ""
     endpoint_results: dict[str, Any] = {}
     resource_usage: dict[str, dict[str, float]] = {}
+    discovery_bytes_eth0: int | None = None
     try:
         probe.start_containers()
         probe.wire_network_lan()
@@ -2887,6 +3002,7 @@ def run_lan_probe(
             probe.start_zenoh_router()
         if rmw_implementation == "rmw_fastrtps_cpp" and discovery_mode == "discovery_server":
             probe.start_fastdds_discovery_server()
+        discovery_bytes_before = probe.lan_byte_counter()
         probe.launch_endpoints(
             trace_container_path=trace_container_path,
             policy=policy,
@@ -2903,8 +3019,15 @@ def run_lan_probe(
             required_peer_ids_by_endpoint=required_peer_ids_by_endpoint,
             zenoh_control_station_explicit_listen=True,
             sustain_beacon_until_deadline=True,
+            verify_static_topology=verify_static_topology,
         )
         probe.wait_for_ready_then_start(ready_deadline_s=ready_deadline_s)
+        # Snapshot right as the shared start-gate releases -- same
+        # convention as run_probe()'s discovery_bytes_ftap0: every
+        # endpoint has finished its own discovery by this point, so this
+        # delta is the control-plane cost paid before any application
+        # data flows.
+        discovery_bytes_eth0 = probe.lan_byte_counter() - discovery_bytes_before
         # No sim_duration_s to time a mid-run sample against here (no
         # ns-3 process) -- the real send window is the same
         # start_offset_ms + seconds/2 as run_probe() uses, timed off the
@@ -2956,6 +3079,7 @@ def run_lan_probe(
         "discovery_convergence_max_s": (
             max(discovery_convergence_samples_s) if discovery_convergence_samples_s else None
         ),
+        "discovery_bytes_eth0": discovery_bytes_eth0,
         "resource_usage": resource_usage,
         "cpu_pct_mean": (sum(cpu_samples) / len(cpu_samples)) if cpu_samples else None,
         "rss_mb_mean": (sum(rss_samples) / len(rss_samples)) if rss_samples else None,
