@@ -23371,3 +23371,148 @@ Pending (this closeout).
 - Nếu phát hiện một claim tưởng đã đóng nhưng thực ra chưa đủ bằng chứng,
   hạ trạng thái xuống lại và ghi rõ lý do (đừng tự chấp nhận "coi như
   xong" nếu chưa có replay được bằng chứng cụ thể).
+
+## TABLE V WI-FI SETUP WATCHDOG -- DEADLOCK-PROTECTION-ONLY DERIVATION (PRE-CONVERGED METHODOLOGY)
+
+Context: the Table V Wi-Fi fairness work established that FleetRMW's
+static mode previously declared readiness with zero observation
+(`--skip-discovery-wait`), fixed via an opt-in `verify_static_topology`
+flag reusing the same beacon-based observational check every other
+middleware already uses. Once all four methods ran under that same
+real, observational readiness check, Fast DDS and CycloneDDS failed to
+converge within `discovery_timeout_s=15.0` at N=16 (Fast DDS: 12/16
+required peers seen; CycloneDDS: 0/16). This section freezes the
+methodology for interpreting and bounding that readiness phase BEFORE
+any further rerun.
+
+### Pre-converged interpretation (binding)
+
+The Table V Wi-Fi comparison measures **data-plane performance after
+every required communication edge is verified usable**, not discovery
+speed. Different middlewares may legitimately take very different
+amounts of setup time (e.g. FleetRMW ready at 7s, Zenoh at 9s, Fast DDS
+at 60s, CycloneDDS at 90s) -- this is acceptable for the MAIN
+comparison provided each method's own measured workload window starts
+only after its own verified readiness. Readiness/setup duration is
+recorded only as supplementary bootstrap information and must never be
+mixed into latency, delivery, stale ratio, jitter, repair
+amplification, or CPU/RSS.
+
+### Verified-ready condition (unchanged, already correct)
+
+All four middlewares share one identical, observational mechanism:
+`discovery_converged()`'s `required_peer_ids <= peers_seen_ids` check,
+fed by `required_peers_from_trace()` (workload-derived star topology --
+`control_station <-> each robot it actually exchanges a flow with`,
+never full mesh) and real receipt of a beacon message over the shared
+`/fleetqox_trace/_discovery_probe` topic -- which only succeeds once
+each peer's own real middleware-level discovery/matching has actually
+completed (Fast DDS's SEDP match via Discovery Server, CycloneDDS's
+SPDP match via static peers, Zenoh's gossip/router session, FleetRMW's
+transport match via `verify_static_topology`). A positive condition,
+never a sleep or an assumed-ready default. No change needed here.
+
+### Setup watchdog: deadlock protection only, NOT a performance threshold
+
+`READINESS_WATCHDOG_S` frozen to **60.0** = 2 x CycloneDDS 0.10.5's own
+documented default `SPDPInterval` (30s, cited from the installed
+`ddsi_cfgelems.h`, same citation as the LAN watchdog derivation).
+
+Derivation: CycloneDDS's official docs describe an accelerated
+burst-response on new-peer-join layered on top of the flat, documented
+30s SPDPInterval -- the plain 30s-per-cycle bound is specifically what
+applies when that accelerated burst message itself is lost. Wi-Fi's
+simulated channel is lossy, unlike LAN's zero-loss environment (where
+a 1.5x single-cycle margin, i.e. 45.0, was already proven sufficient
+for all four middlewares at N=2/N=4) -- a single 30s cycle gives a
+required pair exactly ONE announce opportunity, with no guaranteed
+recovery if it is dropped on the lossy channel. A second full cycle
+guarantees a second, independent periodic announce for that same pair,
+regardless of whether the first (burst or plain) was lost. Hence 60.0
+= 2 x 30s, not a 1.5x margin multiplier.
+
+Deliberately NOT N-multiplied: SPDP is a broadcast mechanism, so the
+star hub's need to hear from every required peer is bounded by the
+SAME per-pair worst case, not a linear function of how many peers it
+has -- no protocol evidence supports scaling this constant by N.
+Deliberately NOT extended to a 3rd cycle (90.0): a 3rd cycle would only
+add protection against a SECOND consecutive lost announce for the same
+pair, a compounding-loss scenario with no documented loss-rate
+evidence here to justify singling out. 2 cycles has a concrete,
+protocol-mechanical justification; a 3rd would be padding without an
+equally concrete one.
+
+Identical for all four middlewares, identical for N=8/16/32, frozen
+BEFORE any rerun at this value -- not selected by observing a pass/fail
+outcome at 60.0 (no run at 60.0 had occurred when this was set).
+Replaces `run_probe()`'s own `discovery_timeout_s` default only;
+`run_coordination_probe()` (Table VI) and `run_nr_probe()` (5G) keep
+their original 15.0 default untouched.
+
+**Shared readiness epoch: deliberately NOT reintroduced.** A prior
+investigation ("LAN LIFECYCLE-FAIRNESS INVESTIGATION", see above in
+this document) already built and live-A/B-tested this exact mechanism
+for these same three middlewares and found it ineffective (0/5 vs 0/5
+for all three) and in one CycloneDDS case actively worse (3
+simultaneous failing endpoints vs at most 1 without it). No new
+evidence is presented here that the combination with
+`sustain_beacon_until_deadline` changes that conclusion -- reintroducing
+it without such evidence would not be a benchmark-correctness fix.
+
+### Classification of Fast DDS/CycloneDDS N=16 behavior at the time of this freeze
+
+| Method | missing @ 15s watchdog | missing @ 45s watchdog |
+|---|---|---|
+| Fast DDS | 4/16 | 2/16 |
+| CycloneDDS | 16/16 (0 seen) | 12/16 (4 seen) |
+
+**SLOW_BUT_PROGRESSING**, not STUCK: both show real, substantial
+movement as the window grows -- the opposite signature from this
+project's own previously-documented genuine deadlock (the
+beacon-starvation bug: 45 real seconds of total silence, zero messages
+received the entire window). Only two time-points were available at
+the time of this freeze (15s, 45s); an eventual plateau short of full
+convergence cannot be ruled out from this alone and would require
+either a longer single observation with periodic internal progress
+logging, or an additional data point -- flagged as a gap, not
+guessed past.
+
+### Deterministic sim_duration_s formula (frozen)
+
+New helper `effective_wifi_sim_duration_s()` (mirrors
+`effective_ns3_sim_duration_s()`'s own explicit-value-always-wins
+pattern):
+
+```
+sim_duration_s = READINESS_WATCHDOG_S          # worst-case setup, not best-case
+                + start_offset_ms / 1000.0      # pre-send delay
+                + seconds                        # workload duration
+                + drain_s                        # post-send drain
+                + NS3_SIM_DURATION_DRAIN_MARGIN_S # REUSED Table VI constant (60.0), not a new number
+```
+
+For the planned N=16 seed=7 campaign (`start_offset_ms=2000,
+seconds=3, drain_s=10`): 60.0 + 2.0 + 3 + 10 + 60.0 = **135.0s**.
+Wired as `run_probe()`'s new default when `sim_duration_s` is omitted
+(previously a required argument with no default -- every existing
+caller already passed an explicit value, so this is purely additive).
+
+### Files changed
+
+`scripts/run_ns3_docker_container_fleet_probe.py`: `READINESS_WATCHDOG_S`
+45.0 -> 60.0 (with full derivation comment), new
+`effective_wifi_sim_duration_s()` helper, `run_probe()`'s `sim_duration_s`
+changed from required to optional (auto-derived when omitted).
+`tests/test_ns3_docker_container_fleet_probe.py`: updated
+`WifiReadinessWatchdogTest` for the new derivation and value, new
+`EffectiveWifiSimDurationSTest`. Full suite: 105/105 passing.
+
+### Next experiment (not run in this pass)
+
+N=16, seed=7, all four middleware, same Avis PGO image, same
+topology-aware required-peer verification, same
+`sustain_beacon_until_deadline`, same per-middleware discovery config
+(Fast DDS discovery_server / CycloneDDS static_peers / Zenoh router /
+FleetRMW static peers + `verify_static_topology`), `discovery_timeout_s`
+now defaulting to the frozen 60.0, `sim_duration_s` now defaulting to
+the derived 135.0. No shared epoch. No N=32. No 5G. No Table VI.

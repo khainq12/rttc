@@ -1,15 +1,23 @@
 import csv
 import inspect
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
+from scripts import fleetqox_rmw_trace_endpoint
+from scripts.fleetqox_rmw_trace_endpoint import (
+    append_beacon_trace_event,
+    build_discovery_diagnostic,
+    write_discovery_diagnostic_atomic,
+)
 from scripts.run_ns3_docker_container_fleet_probe import (
     BASE_IP_PREFIX,
     LAN_DISCOVERY_WATCHDOG_S,
     MAX_HEALTHY_SIM_LAG_S,
     NS3_SIM_DURATION_DRAIN_MARGIN_S,
+    READINESS_WATCHDOG_S,
     RMW_PORT,
     STATIC_SUBSCRIPTION_TYPE_NAME,
     ReferenceTopologyProbe,
@@ -20,6 +28,7 @@ from scripts.run_ns3_docker_container_fleet_probe import (
     compute_latency_stats_ms,
     corrected_sim_lag_s,
     effective_ns3_sim_duration_s,
+    effective_wifi_sim_duration_s,
     endpoint_list,
     fleetqox_coordination_rmw_env_prefix,
     fleetqox_rmw_env_prefix,
@@ -835,14 +844,14 @@ class LanReadinessWatchdogTest(unittest.TestCase):
         default = inspect.signature(run_lan_probe).parameters["discovery_timeout_s"].default
         self.assertEqual(default, LAN_DISCOVERY_WATCHDOG_S)
 
-    def test_wifi_table_vi_and_5g_defaults_are_untouched(self):
-        # Strict rule: do not touch Wi-Fi/5G, and Table VI is a
-        # different benchmark (coordination, not Table V) -- none of
-        # these were audited here, so none of them may have silently
-        # picked up the new LAN-specific watchdog value.
-        self.assertEqual(
-            inspect.signature(run_probe).parameters["discovery_timeout_s"].default, 15.0
-        )
+    def test_table_vi_and_5g_defaults_are_untouched(self):
+        # Strict rule: do not touch Table VI/5G -- Table VI is a
+        # different benchmark (coordination, not Table V), and 5G was
+        # not audited here, so neither may have silently picked up
+        # either evidence-derived watchdog value. (Wi-Fi's own
+        # run_probe() default is now READINESS_WATCHDOG_S -- see
+        # WifiReadinessWatchdogTest below -- deliberately NOT asserted
+        # here anymore.)
         self.assertEqual(
             inspect.signature(run_coordination_probe).parameters["discovery_timeout_s"].default,
             15.0,
@@ -850,6 +859,102 @@ class LanReadinessWatchdogTest(unittest.TestCase):
         self.assertEqual(
             inspect.signature(run_nr_probe).parameters["discovery_timeout_s"].default, 15.0
         )
+
+
+class WifiReadinessWatchdogTest(unittest.TestCase):
+    """PROVEN (see docs/AUDIT_ACCEPTANCE_TRACKING.md, "TABLE V WI-FI
+    TIMEOUT PROVENANCE AUDIT AND WATCHDOG FREEZE" / "TABLE V WI-FI SETUP
+    WATCHDOG -- DEADLOCK-PROTECTION-ONLY DERIVATION"): run_probe()'s old
+    fixed discovery_timeout_s=15.0 had no scientific justification
+    (same git-history founding-commit origin as the old LAN default,
+    independently re-confirmed) and is HALF of CycloneDDS 0.10.5's own
+    documented default SPDPInterval (30s). First frozen to 45.0 (LAN's
+    own 1.5x-margin derivation, reused as-is), then superseded by LIVE
+    Avis N=16 evidence showing Fast DDS/CycloneDDS still making real
+    progress (missing-required-peer counts shrinking, not flat) at
+    45.0 -- i.e. a pure deadlock-protection watchdog should sit further
+    out than that. Re-derived to 60.0 = 2 x CycloneDDS's documented 30s
+    SPDPInterval: a single cycle gives a required pair exactly ONE
+    announce opportunity, with no guaranteed recovery if it is lost on
+    Wi-Fi's lossy simulated channel (unlike LAN's zero-loss
+    environment, where the 1.5x single-cycle margin was sufficient); a
+    second full cycle guarantees a second, independent opportunity.
+    Deliberately NOT N-multiplied (SPDP is broadcast, not pairwise-
+    serialized) and deliberately NOT extended to a 3rd cycle (no
+    documented loss-rate evidence to justify protecting against two
+    consecutive lost announces for the same pair) -- not selected based
+    on observed pass/fail outcome at 60.0 specifically. A dedicated,
+    explicitly-tested shared-readiness-epoch mechanism was considered
+    and NOT adopted here: a prior investigation ("LAN LIFECYCLE-
+    FAIRNESS INVESTIGATION") already built and live-A/B-tested it for
+    these same three middlewares and found it ineffective (0/5 vs 0/5
+    for all three) and in one CycloneDDS case actively worse (3
+    simultaneous failing endpoints vs at most 1) -- adopting it here
+    without new evidence that the combination with
+    sustain_beacon_until_deadline changes that conclusion would not be
+    a benchmark-correctness fix, it would be reintroducing a mechanism
+    already shown not to help."""
+
+    def test_wifi_watchdog_covers_two_full_cyclonedds_spdp_cycles(self):
+        cyclonedds_documented_default_spdp_interval_s = 30.0
+        self.assertEqual(
+            READINESS_WATCHDOG_S, 2 * cyclonedds_documented_default_spdp_interval_s
+        )
+
+    def test_wifi_watchdog_is_no_longer_the_unjustified_old_default(self):
+        self.assertNotEqual(READINESS_WATCHDOG_S, 15.0)
+
+    def test_wifi_watchdog_exceeds_lans_single_cycle_margin(self):
+        # Deliberately NOT equal to LAN's own 45.0 anymore -- Wi-Fi's
+        # lossy channel justifies a stronger, two-full-cycle guarantee
+        # that LAN's zero-loss environment didn't need. Divergence from
+        # LAN here is intentional, not an oversight.
+        self.assertGreater(READINESS_WATCHDOG_S, LAN_DISCOVERY_WATCHDOG_S)
+
+    def test_run_probe_uses_the_frozen_watchdog_by_default(self):
+        default = inspect.signature(run_probe).parameters["discovery_timeout_s"].default
+        self.assertEqual(default, READINESS_WATCHDOG_S)
+
+
+class EffectiveWifiSimDurationSTest(unittest.TestCase):
+    """PROVEN (see docs/AUDIT_ACCEPTANCE_TRACKING.md, "TABLE V WI-FI
+    SETUP WATCHDOG -- DEADLOCK-PROTECTION-ONLY DERIVATION"): the
+    sim_duration_s budget for a Wi-Fi run must cover the FULL readiness
+    watchdog (worst case, not best case -- different methods may
+    legitimately need very different amounts of it) plus the actual
+    workload phase, or ns-3 can shut down mid-setup for a still-
+    legitimately-converging method before any workload data ever
+    flows -- the exact bug found and fixed earlier this task. Mirrors
+    effective_ns3_sim_duration_s()'s own explicit-value-always-wins
+    pattern; reuses that SAME function's NS3_SIM_DURATION_DRAIN_MARGIN_S
+    constant for the safety margin rather than inventing a new one."""
+
+    def test_explicit_value_always_wins(self):
+        self.assertEqual(
+            effective_wifi_sim_duration_s(
+                sim_duration_s=12.5, discovery_timeout_s=READINESS_WATCHDOG_S,
+                start_offset_ms=2000.0, seconds=3, drain_s=10.0,
+            ),
+            12.5,
+        )
+
+    def test_derived_value_includes_full_watchdog_and_drain_margin(self):
+        derived = effective_wifi_sim_duration_s(
+            sim_duration_s=None, discovery_timeout_s=READINESS_WATCHDOG_S,
+            start_offset_ms=2000.0, seconds=3, drain_s=10.0,
+        )
+        expected = (
+            READINESS_WATCHDOG_S + 2.0 + 3 + 10.0 + NS3_SIM_DURATION_DRAIN_MARGIN_S
+        )
+        self.assertEqual(derived, expected)
+        self.assertEqual(derived, 135.0)
+
+    def test_reuses_table_vi_margin_constant_not_a_new_number(self):
+        derived = effective_wifi_sim_duration_s(
+            sim_duration_s=None, discovery_timeout_s=0.0,
+            start_offset_ms=0.0, seconds=0, drain_s=0.0,
+        )
+        self.assertEqual(derived, NS3_SIM_DURATION_DRAIN_MARGIN_S)
 
 
 class WifiReadinessRootCauseFixesTest(unittest.TestCase):
@@ -871,12 +976,19 @@ class WifiReadinessRootCauseFixesTest(unittest.TestCase):
         self.assertFalse(params["zenoh_control_station_explicit_listen"].default)
 
     def test_discovery_timeout_s_default_unchanged_by_this_fix(self):
-        # The three fixes are harness/config correctness fixes, not a
-        # timing change -- discovery_timeout_s must stay exactly as it
-        # was (15.0, matching LanReadinessWatchdogTest's own Wi-Fi
-        # lock-in above) regardless of whether the new flags are used.
+        # The three fixes here are harness/config correctness fixes,
+        # not a timing change -- this test only asserts THEY don't
+        # touch discovery_timeout_s, whatever its current value is.
+        # Superseded by WifiReadinessWatchdogTest (see
+        # docs/AUDIT_ACCEPTANCE_TRACKING.md, "TABLE V WI-FI TIMEOUT
+        # PROVENANCE AUDIT AND WATCHDOG FREEZE"): the 15.0 this test
+        # used to lock in was itself later proven unjustified and
+        # frozen to READINESS_WATCHDOG_S by a SEPARATE, later fix --
+        # asserting against that frozen value here, not re-asserting
+        # the now-superseded 15.0.
         self.assertEqual(
-            inspect.signature(run_probe).parameters["discovery_timeout_s"].default, 15.0
+            inspect.signature(run_probe).parameters["discovery_timeout_s"].default,
+            READINESS_WATCHDOG_S,
         )
 
 
@@ -1381,6 +1493,550 @@ class SimLagSMeasurementBugTest(unittest.TestCase):
             ]
         )
         self.assertEqual(parse_wifi_stats(log, target_sim_time_s=15.0)["sim_time_s"], 15)
+
+
+class BeaconTraceDiagnosticTest(unittest.TestCase):
+    """PROVEN (see docs/AUDIT_ACCEPTANCE_TRACKING.md, "TABLE V WI-FI
+    N=16 LOSS-FUNNEL DIAGNOSTIC"): observation-only instrumentation --
+    adds zero new publishes, changes no beacon cadence/QoS/network/
+    middleware config. Default off for every existing caller."""
+
+    def test_no_op_when_path_is_none(self):
+        with tempfile.TemporaryDirectory() as d:
+            marker = Path(d) / "should_not_exist.jsonl"
+            append_beacon_trace_event(None, "robot_0000", "alive")
+            self.assertFalse(marker.exists())
+
+    def test_appends_one_durable_json_line_per_event(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "trace.jsonl"
+            append_beacon_trace_event(path, "robot_0000", "alive")
+            append_beacon_trace_event(path, "robot_0000", "publish_attempt")
+            append_beacon_trace_event(path, "robot_0000", "receive", sender="control_station")
+            lines = path.read_text().splitlines()
+            self.assertEqual(len(lines), 3)
+            records = [json.loads(line) for line in lines]
+            self.assertEqual(records[0]["event"], "alive")
+            self.assertEqual(records[2]["sender"], "control_station")
+            for record in records:
+                self.assertIn("monotonic", record)
+
+    def test_launch_endpoints_beacon_trace_defaults_to_disabled(self):
+        default = inspect.signature(ReferenceTopologyProbe.launch_endpoints).parameters[
+            "beacon_trace"
+        ].default
+        self.assertFalse(default)
+
+    def test_run_probe_beacon_trace_defaults_to_disabled(self):
+        default = inspect.signature(run_probe).parameters["beacon_trace"].default
+        self.assertFalse(default)
+
+
+class LaunchOrderTest(unittest.TestCase):
+    """CYCLONE DDS LAUNCH-ORDER CAUSAL TEST (see
+    docs/AUDIT_ACCEPTANCE_TRACKING.md): launch_order is opt-in (default
+    None), mirroring launch_coordination_endpoints()'s own identical
+    parameter -- None must reproduce launch_endpoints()'s prior fixed
+    0..N-1 order byte-for-byte (condition A, control_station first,
+    unchanged default). A non-default order (condition B, e.g.
+    control_station launched last) must change ONLY the wall-clock
+    SEQUENCE of docker exec -d calls -- every per-endpoint command's
+    CONTENT (peer XML, QoS env, static subscriptions, etc.) must stay
+    identical to what the same index produces under condition A."""
+
+    def _captured_exec_d_order_and_commands(self, *, launch_order):
+        endpoints = endpoint_list(2)  # control_station, robot_0000, robot_0001
+        probe = object.__new__(ReferenceTopologyProbe)
+        probe.endpoints = endpoints
+        probe.num_robots = 2
+        probe.rigger_name = "fleetqox_test_rigger"
+        probe.endpoint_container_names = [f"fleetqox_test_{e}" for e in endpoints]
+        probe.ips = {e: f"{BASE_IP_PREFIX}{i + 2}" for i, e in enumerate(endpoints)}
+        probe._launch_timeline = []
+        exec_d_calls: list[tuple] = []
+
+        def fake_docker(*args, **kwargs):
+            if args[:2] == ("exec", "-d"):
+                exec_d_calls.append(args)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch(
+            "scripts.run_ns3_docker_container_fleet_probe.docker", side_effect=fake_docker
+        ):
+            probe.launch_endpoints(
+                trace_container_path="/work/trace.csv",
+                policy="fifo",
+                start_offset_ms=2000.0,
+                drain_s=10.0,
+                discovery_timeout_s=60.0,
+                static_mode=False,
+                static_subscriptions=None,
+                extra_rmw_env=None,
+                results_dir_container="results_test",
+                start_wait_timeout_s=60.0,
+                rmw_implementation="rmw_cyclonedds_cpp",
+                discovery_mode="static_peers",
+                launch_order=launch_order,
+            )
+        # Map container-name -> the exec -d call's own command string
+        # (last positional arg), keyed by ORIGINAL endpoint index so
+        # ordering and content can be checked independently.
+        by_container = {call[2]: call[-1] for call in exec_d_calls}
+        launched_order = [probe.endpoint_container_names.index(call[2]) for call in exec_d_calls]
+        commands_by_index = {
+            i: by_container[probe.endpoint_container_names[i]] for i in range(len(endpoints))
+        }
+        return launched_order, commands_by_index
+
+    def test_default_none_preserves_existing_0_to_n_minus_1_order(self):
+        order, _ = self._captured_exec_d_order_and_commands(launch_order=None)
+        self.assertEqual(order, [0, 1, 2])
+
+    def test_explicit_0_to_n_minus_1_matches_the_default(self):
+        order, _ = self._captured_exec_d_order_and_commands(launch_order=[0, 1, 2])
+        self.assertEqual(order, [0, 1, 2])
+
+    def test_control_station_last_changes_only_the_order(self):
+        # Condition B: control_station (index 0) launched LAST instead of
+        # first -- robot_0000, robot_0001, then control_station.
+        order_b, commands_b = self._captured_exec_d_order_and_commands(launch_order=[1, 2, 0])
+        self.assertEqual(order_b, [1, 2, 0])
+        order_a, commands_a = self._captured_exec_d_order_and_commands(launch_order=None)
+        self.assertEqual(order_a, [0, 1, 2])
+        # GREEN: the per-index COMMAND CONTENT must be byte-for-byte
+        # identical between A and B -- only the launch SEQUENCE (asserted
+        # above) differs. This is what proves launch_order cannot be
+        # silently changing peer lists/QoS/env alongside the order.
+        self.assertEqual(commands_a, commands_b)
+
+    def test_launch_endpoints_launch_order_defaults_to_none(self):
+        default = inspect.signature(ReferenceTopologyProbe.launch_endpoints).parameters[
+            "launch_order"
+        ].default
+        self.assertIsNone(default)
+
+    def test_run_probe_launch_order_defaults_to_none(self):
+        default = inspect.signature(run_probe).parameters["launch_order"].default
+        self.assertIsNone(default)
+
+    def test_run_probe_passes_launch_order_through(self):
+        source = inspect.getsource(run_probe)
+        self.assertIn("launch_order=launch_order", source)
+
+
+class ReadinessTimeoutSnapshotTest(unittest.TestCase):
+    """READINESS-TIMEOUT DIAGNOSTIC SNAPSHOT (see
+    docs/AUDIT_ACCEPTANCE_TRACKING.md): preserves per-endpoint readiness
+    state even when the orchestrator's watchdog kills a process
+    mid-discovery-loop, before it ever reaches the pre-existing final
+    write. Diagnostic-only -- changes no readiness criteria, DDS
+    config, beacon rate, network, workload, or watchdog."""
+
+    def _common_kwargs(self, **overrides):
+        kwargs = dict(
+            endpoint="robot_0000",
+            required_peers={"control_station"},
+            peers_seen=set(),
+            converged=False,
+            beacon_active=True,
+            skip_discovery_wait=False,
+            expected_peer_count=1,
+            discovery_timeout_s=60.0,
+            discovery_convergence_s=0.0,
+            peer_first_seen_s={},
+        )
+        kwargs.update(overrides)
+        return kwargs
+
+    # --- initial snapshot ---
+    def test_initial_snapshot_is_final_false_zero_elapsed(self):
+        diag = build_discovery_diagnostic(
+            **self._common_kwargs(is_final=False, snapshot_elapsed_s=0.0)
+        )
+        self.assertFalse(diag["is_final"])
+        self.assertEqual(diag["snapshot_elapsed_s"], 0.0)
+        self.assertEqual(diag["peers_seen"], [])
+        self.assertEqual(diag["missing_peers"], ["control_station"])
+
+    # --- periodic snapshot ---
+    def test_periodic_snapshot_mid_convergence(self):
+        diag = build_discovery_diagnostic(
+            **self._common_kwargs(
+                endpoint="control_station",
+                required_peers={"robot_0000", "robot_0001", "robot_0002"},
+                peers_seen={"robot_0000"},
+                expected_peer_count=3,
+                discovery_convergence_s=24.0,
+                peer_first_seen_s={"robot_0000": 12.3},
+                is_final=False,
+                snapshot_elapsed_s=24.0,
+            )
+        )
+        self.assertFalse(diag["is_final"])
+        self.assertEqual(diag["snapshot_elapsed_s"], 24.0)
+        self.assertEqual(diag["missing_peers"], ["robot_0001", "robot_0002"])
+        self.assertEqual(diag["peer_first_seen_s"], {"robot_0000": 12.3})
+
+    # --- final snapshot ---
+    def test_final_snapshot_defaults_to_is_final_true_snapshot_elapsed_none(self):
+        diag = build_discovery_diagnostic(
+            **self._common_kwargs(
+                peers_seen={"control_station"},
+                converged=True,
+                discovery_convergence_s=5.2,
+                peer_first_seen_s={"control_station": 5.1},
+            )
+        )
+        self.assertTrue(diag["is_final"])
+        self.assertIsNone(diag["snapshot_elapsed_s"])
+
+    def test_final_write_call_site_passes_is_final_true_explicitly(self):
+        source = inspect.getsource(fleetqox_rmw_trace_endpoint)
+        self.assertIn("is_final=True,", source)
+        self.assertIn("snapshot_elapsed_s=discovery_convergence_s,", source)
+
+    def test_existing_output_shape_unaffected_except_the_new_keys(self):
+        # is_final/snapshot_elapsed_s (READINESS-TIMEOUT DIAGNOSTIC
+        # SNAPSHOT) + lifecycle (STARTUP TIMELINE INSTRUMENTATION) --
+        # three additive keys total, nothing removed or renamed.
+        diag = build_discovery_diagnostic(
+            endpoint="e", required_peers=set(), peers_seen=set(), converged=True,
+            beacon_active=False, skip_discovery_wait=True, expected_peer_count=0,
+            discovery_timeout_s=60.0, discovery_convergence_s=0.0, peer_first_seen_s={},
+        )
+        self.assertEqual(
+            set(diag.keys()),
+            {
+                "endpoint", "required_peers", "peers_seen", "missing_peers", "converged",
+                "beacon_active", "skip_discovery_wait", "expected_peer_count",
+                "discovery_timeout_s", "discovery_convergence_s", "peer_first_seen_s",
+                "is_final", "snapshot_elapsed_s", "lifecycle",
+            },
+        )
+
+    # --- missing vs empty data ---
+    def test_missing_file_vs_empty_peers_seen_are_distinguishable(self):
+        with tempfile.TemporaryDirectory() as d:
+            never_written = Path(d) / "readiness_diag_9.json"
+            self.assertFalse(never_written.exists())  # MISSING -- no observation at all
+            written_empty = Path(d) / "readiness_diag_10.json"
+            write_discovery_diagnostic_atomic(
+                written_empty,
+                build_discovery_diagnostic(
+                    **self._common_kwargs(
+                        endpoint="robot_0009", discovery_convergence_s=2.0,
+                        is_final=False, snapshot_elapsed_s=2.0,
+                    )
+                ),
+            )
+            self.assertTrue(written_empty.exists())  # ZERO PEERS OBSERVED, not missing
+            self.assertEqual(json.loads(written_empty.read_text())["peers_seen"], [])
+
+    # --- atomic replacement ---
+    def test_atomic_replacement_leaves_no_temp_files_and_valid_json(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "readiness_diag_0.json"
+            for elapsed in (0.0, 2.0, 4.0):
+                write_discovery_diagnostic_atomic(
+                    path,
+                    build_discovery_diagnostic(
+                        **self._common_kwargs(
+                            endpoint="control_station", discovery_convergence_s=elapsed,
+                            is_final=False, snapshot_elapsed_s=elapsed,
+                        )
+                    ),
+                )
+            self.assertEqual(list(Path(d).glob("*.tmp*")), [])
+            self.assertEqual(json.loads(path.read_text())["snapshot_elapsed_s"], 4.0)
+
+    # --- forced termination before final write ---
+    def test_forced_termination_before_final_write_still_leaves_a_snapshot(self):
+        # A periodic snapshot is written, then the process is treated as
+        # killed -- no final write ever happens. The file on disk must
+        # still reflect the last periodic state, explicitly marked
+        # NOT final (never read as "the exact state at 60s").
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "readiness_diag_3.json"
+            write_discovery_diagnostic_atomic(
+                path,
+                build_discovery_diagnostic(
+                    **self._common_kwargs(
+                        endpoint="robot_0003", discovery_convergence_s=58.0,
+                        is_final=False, snapshot_elapsed_s=58.0,
+                    )
+                ),
+            )
+            # (no final write call here -- simulates a SIGKILL at this point)
+            survived = json.loads(path.read_text())
+            self.assertFalse(survived["is_final"])
+            self.assertEqual(survived["snapshot_elapsed_s"], 58.0)
+            self.assertEqual(survived["missing_peers"], ["control_station"])
+
+    # --- default-off behavior ---
+    def test_periodic_discovery_snapshot_cli_flag_is_store_true(self):
+        source = inspect.getsource(fleetqox_rmw_trace_endpoint)
+        self.assertIn('"--periodic-discovery-snapshot"', source)
+        self.assertIn('action="store_true"', source)
+
+    def test_launch_endpoints_periodic_discovery_snapshot_defaults_to_disabled(self):
+        default = inspect.signature(ReferenceTopologyProbe.launch_endpoints).parameters[
+            "periodic_discovery_snapshot"
+        ].default
+        self.assertFalse(default)
+
+    def test_run_probe_periodic_discovery_snapshot_defaults_to_disabled(self):
+        default = inspect.signature(run_probe).parameters["periodic_discovery_snapshot"].default
+        self.assertFalse(default)
+
+    def test_run_probe_passes_periodic_discovery_snapshot_through(self):
+        source = inspect.getsource(run_probe)
+        self.assertIn("periodic_discovery_snapshot=periodic_discovery_snapshot", source)
+
+    def _captured_launch_endpoints_commands(self, *, periodic_discovery_snapshot):
+        endpoints = endpoint_list(1)
+        probe = object.__new__(ReferenceTopologyProbe)
+        probe.endpoints = endpoints
+        probe.num_robots = 1
+        probe.rigger_name = "fleetqox_test_rigger"
+        probe.endpoint_container_names = [f"fleetqox_test_{e}" for e in endpoints]
+        probe.ips = {e: f"{BASE_IP_PREFIX}{i + 2}" for i, e in enumerate(endpoints)}
+        probe._launch_timeline = []
+        exec_d_calls: list[tuple] = []
+
+        def fake_docker(*args, **kwargs):
+            if args[:2] == ("exec", "-d"):
+                exec_d_calls.append(args)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch(
+            "scripts.run_ns3_docker_container_fleet_probe.docker", side_effect=fake_docker
+        ):
+            probe.launch_endpoints(
+                trace_container_path="/work/trace.csv",
+                policy="fifo",
+                start_offset_ms=2000.0,
+                drain_s=10.0,
+                discovery_timeout_s=60.0,
+                static_mode=False,
+                static_subscriptions=None,
+                extra_rmw_env=None,
+                results_dir_container="results_test",
+                start_wait_timeout_s=60.0,
+                rmw_implementation="rmw_cyclonedds_cpp",
+                discovery_mode="static_peers",
+                periodic_discovery_snapshot=periodic_discovery_snapshot,
+            )
+        return [call[-1] for call in exec_d_calls]
+
+    def test_default_off_produces_no_flag_on_the_command_line(self):
+        cmds = self._captured_launch_endpoints_commands(periodic_discovery_snapshot=False)
+        self.assertTrue(cmds)
+        self.assertTrue(all("--periodic-discovery-snapshot" not in c for c in cmds))
+
+    def test_enabled_adds_the_flag_to_every_endpoint_command(self):
+        cmds = self._captured_launch_endpoints_commands(periodic_discovery_snapshot=True)
+        self.assertTrue(cmds)
+        self.assertTrue(all("--periodic-discovery-snapshot" in c for c in cmds))
+
+    def test_enabling_changes_only_that_one_flag_nothing_else(self):
+        off_cmds = self._captured_launch_endpoints_commands(periodic_discovery_snapshot=False)
+        on_cmds = self._captured_launch_endpoints_commands(periodic_discovery_snapshot=True)
+        stripped_on_cmds = [c.replace(" --periodic-discovery-snapshot", "") for c in on_cmds]
+        self.assertEqual(stripped_on_cmds, off_cmds)
+
+
+class StartupTimelineInstrumentationTest(unittest.TestCase):
+    """CYCLONE DDS STARTUP TIMELINE INSTRUMENTATION (see
+    docs/AUDIT_ACCEPTANCE_TRACKING.md): wall-clock (time.time(),
+    cross-process-comparable) lifecycle timestamps layered onto the
+    existing periodic-snapshot mechanism. Diagnostic-only -- changes no
+    readiness criteria, beacon cadence, DDS config, or teardown
+    behavior."""
+
+    def _lifecycle_sample(self, **overrides):
+        base = {
+            "process_entry_wall_time": 1_700_000_000.0,
+            "rclpy_init_start_wall_time": 1_700_000_000.1,
+            "rclpy_init_done_wall_time": 1_700_000_000.4,
+            "pubsub_init_done_wall_time": 1_700_000_000.5,
+            "discovery_start_wall_time": 1_700_000_000.5,
+            "first_beacon_published_wall_time": None,
+            "snapshot_written_wall_time": 1_700_000_002.5,
+        }
+        base.update(overrides)
+        return base
+
+    # --- timestamp fields and units ---
+    def test_lifecycle_field_defaults_to_none(self):
+        diag = build_discovery_diagnostic(
+            endpoint="e", required_peers=set(), peers_seen=set(), converged=True,
+            beacon_active=False, skip_discovery_wait=True, expected_peer_count=0,
+            discovery_timeout_s=60.0, discovery_convergence_s=0.0, peer_first_seen_s={},
+        )
+        self.assertIsNone(diag["lifecycle"])
+
+    def test_lifecycle_field_carries_wall_clock_floats_or_none(self):
+        lifecycle = self._lifecycle_sample()
+        diag = build_discovery_diagnostic(
+            endpoint="robot_0000", required_peers={"control_station"}, peers_seen=set(),
+            converged=False, beacon_active=True, skip_discovery_wait=False,
+            expected_peer_count=1, discovery_timeout_s=60.0, discovery_convergence_s=5.0,
+            peer_first_seen_s={}, is_final=False, snapshot_elapsed_s=5.0, lifecycle=lifecycle,
+        )
+        self.assertEqual(diag["lifecycle"], lifecycle)
+        for key, value in diag["lifecycle"].items():
+            self.assertTrue(value is None or isinstance(value, float), key)
+
+    def test_lifecycle_uses_wall_clock_not_monotonic_units(self):
+        # discovery_convergence_s/snapshot_elapsed_s stay monotonic-
+        # relative (small numbers, seconds since THIS endpoint's own
+        # start); lifecycle values are wall-clock epoch seconds (large
+        # numbers, comparable across processes) -- must never collapse
+        # into the same basis.
+        diag = build_discovery_diagnostic(
+            endpoint="robot_0000", required_peers={"control_station"}, peers_seen=set(),
+            converged=False, beacon_active=True, skip_discovery_wait=False,
+            expected_peer_count=1, discovery_timeout_s=60.0, discovery_convergence_s=5.0,
+            peer_first_seen_s={}, is_final=False, snapshot_elapsed_s=5.0,
+            lifecycle=self._lifecycle_sample(),
+        )
+        self.assertLess(diag["snapshot_elapsed_s"], 60.0)
+        self.assertGreater(diag["lifecycle"]["process_entry_wall_time"], 1e8)
+
+    # --- correct ordering of lifecycle events ---
+    def test_capture_order_in_source_matches_lifecycle_contract(self):
+        source = inspect.getsource(fleetqox_rmw_trace_endpoint)
+        order = [
+            'lifecycle_state: dict[str, float | None] = {"process_entry_wall_time": time.time()}',
+            'lifecycle_state["rclpy_init_start_wall_time"] = time.time()',
+            'lifecycle_state["rclpy_init_done_wall_time"] = time.time()',
+            'lifecycle_state["pubsub_init_done_wall_time"] = time.time()',
+            'lifecycle_state["discovery_start_wall_time"] = time.time()',
+        ]
+        positions = [source.index(s) for s in order]
+        self.assertEqual(positions, sorted(positions))
+
+    # --- missing timestamps represented as UNKNOWN ---
+    def test_first_beacon_published_is_none_until_observed(self):
+        lifecycle = self._lifecycle_sample(first_beacon_published_wall_time=None)
+        self.assertIsNone(lifecycle["first_beacon_published_wall_time"])
+        encoded = json.dumps(lifecycle)
+        self.assertIn('"first_beacon_published_wall_time": null', encoded)
+
+    # --- default-off behavior ---
+    def test_lifecycle_timeline_cli_flag_is_store_true(self):
+        source = inspect.getsource(fleetqox_rmw_trace_endpoint)
+        self.assertIn('"--lifecycle-timeline"', source)
+
+    def test_launch_endpoints_lifecycle_timeline_defaults_to_disabled(self):
+        default = inspect.signature(ReferenceTopologyProbe.launch_endpoints).parameters[
+            "lifecycle_timeline"
+        ].default
+        self.assertFalse(default)
+
+    def test_run_probe_lifecycle_timeline_defaults_to_disabled(self):
+        default = inspect.signature(run_probe).parameters["lifecycle_timeline"].default
+        self.assertFalse(default)
+
+    def test_run_probe_passes_lifecycle_timeline_through(self):
+        source = inspect.getsource(run_probe)
+        self.assertIn("lifecycle_timeline=lifecycle_timeline", source)
+
+    def _captured_launch_endpoints_commands(self, *, lifecycle_timeline):
+        endpoints = endpoint_list(1)
+        probe = object.__new__(ReferenceTopologyProbe)
+        probe.endpoints = endpoints
+        probe.num_robots = 1
+        probe.rigger_name = "fleetqox_test_rigger"
+        probe.endpoint_container_names = [f"fleetqox_test_{e}" for e in endpoints]
+        probe.ips = {e: f"{BASE_IP_PREFIX}{i + 2}" for i, e in enumerate(endpoints)}
+        probe._launch_timeline = []
+        exec_d_calls: list[tuple] = []
+
+        def fake_docker(*args, **kwargs):
+            if args[:2] == ("exec", "-d"):
+                exec_d_calls.append(args)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch(
+            "scripts.run_ns3_docker_container_fleet_probe.docker", side_effect=fake_docker
+        ):
+            probe.launch_endpoints(
+                trace_container_path="/work/trace.csv",
+                policy="fifo",
+                start_offset_ms=2000.0,
+                drain_s=10.0,
+                discovery_timeout_s=60.0,
+                static_mode=False,
+                static_subscriptions=None,
+                extra_rmw_env=None,
+                results_dir_container="results_test",
+                start_wait_timeout_s=60.0,
+                rmw_implementation="rmw_cyclonedds_cpp",
+                discovery_mode="static_peers",
+                lifecycle_timeline=lifecycle_timeline,
+            )
+        return [call[-1] for call in exec_d_calls], probe._launch_timeline
+
+    def test_default_off_produces_no_flag_but_still_records_launch_timeline_in_memory(self):
+        cmds, timeline = self._captured_launch_endpoints_commands(lifecycle_timeline=False)
+        self.assertTrue(cmds)
+        self.assertTrue(all("--lifecycle-timeline" not in c for c in cmds))
+        # Always recorded in memory regardless of the flag (cheap) --
+        # only PERSISTING to disk is gated, at the run_probe() layer.
+        self.assertEqual(len(timeline), 2)
+
+    def test_enabled_adds_the_flag_to_every_endpoint_command(self):
+        cmds, timeline = self._captured_launch_endpoints_commands(lifecycle_timeline=True)
+        self.assertTrue(all("--lifecycle-timeline" in c for c in cmds))
+        self.assertEqual(len(timeline), 2)
+
+    def test_launch_timeline_entries_have_issued_before_or_at_returned(self):
+        _, timeline = self._captured_launch_endpoints_commands(lifecycle_timeline=True)
+        for entry in timeline:
+            self.assertLessEqual(
+                entry["launch_cmd_issued_wall_time"], entry["launch_cmd_returned_wall_time"]
+            )
+
+    # --- no change to readiness criteria ---
+    def test_first_beacon_capture_sits_after_publish_and_before_convergence_check(self):
+        source = inspect.getsource(fleetqox_rmw_trace_endpoint)
+        publish_pos = source.index("beacon_pub.publish(beacon_msg)")
+        first_beacon_capture_pos = source.index(
+            'lifecycle_state["first_beacon_published_wall_time"] = time.time()'
+        )
+        converged_pos = source.index("this_endpoint_converged = False")
+        self.assertLess(publish_pos, first_beacon_capture_pos)
+        self.assertLess(first_beacon_capture_pos, converged_pos)
+
+    # --- no change to beacon publication behavior ---
+    def test_first_beacon_capture_does_not_alter_the_publish_call_itself(self):
+        source = inspect.getsource(fleetqox_rmw_trace_endpoint)
+        self.assertIn("beacon_pub.publish(beacon_msg)", source)
+        self.assertIn(
+            'if lifecycle_state.get("first_beacon_published_wall_time") is None:', source
+        )
+
+    # --- correct timestamp persistence after forced termination ---
+    def test_lifecycle_survives_forced_termination_before_final_write(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "readiness_diag_5.json"
+            lifecycle = self._lifecycle_sample(first_beacon_published_wall_time=1_700_000_000.6)
+            write_discovery_diagnostic_atomic(
+                path,
+                build_discovery_diagnostic(
+                    endpoint="robot_0005", required_peers={"control_station"}, peers_seen=set(),
+                    converged=False, beacon_active=True, skip_discovery_wait=False,
+                    expected_peer_count=1, discovery_timeout_s=60.0, discovery_convergence_s=58.0,
+                    peer_first_seen_s={}, is_final=False, snapshot_elapsed_s=58.0,
+                    lifecycle=lifecycle,
+                ),
+            )
+            # (no final write here -- simulates a SIGKILL at this point)
+            survived = json.loads(path.read_text())
+            self.assertFalse(survived["is_final"])
+            self.assertEqual(survived["lifecycle"], lifecycle)
+            self.assertIsNotNone(survived["lifecycle"]["first_beacon_published_wall_time"])
 
 
 if __name__ == "__main__":

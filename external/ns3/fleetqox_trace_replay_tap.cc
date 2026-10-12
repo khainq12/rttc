@@ -477,6 +477,191 @@ ExtractEventId(Ptr<const Packet> packet, std::string& eventId)
   return false;
 }
 
+// Opt-in, default-OFF beacon-identity recognizer, "CANDIDATE 3" design
+// (see docs/AUDIT_ACCEPTANCE_TRACKING.md): ExtractEventId() above only
+// ever matches FleetRMW's own sidecar_packet_frame envelope -- it NEVER
+// fires for Fast DDS/Cyclone DDS traffic (neither middleware uses that
+// envelope), so it cannot identify the existing readiness beacon
+// (scripts/fleetqox_rmw_trace_endpoint.py's "/fleetqox_trace/_discovery_probe"
+// std_msgs/String topic, payload = the sender's own endpoint label, e.g.
+// "robot_0005") for the two middlewares this diagnostic needs.
+//
+// A PRIOR version of this recognizer (raw byte scan of EVERY MacTx/
+// MacTxDrop/MacRx/MacRxDrop/PhyTxBegin/PhyRxDrop event, logging one line
+// per match to an unbounded buffer) FAILED its own N=16 perturbation
+// gate: 85% of its ~4.4M scan attempts came from MacRxDrop/PhyRxDrop
+// alone, and the resulting CopyData+search cost measurably pushed the
+// realtime simulator behind wall-clock (sim_lag_s went from ~-6s to
+// +5..+15s). This version fixes that:
+//   1. No scanning at all on MacRxDrop/PhyRxDrop -- those stages keep
+//      their pre-existing aggregate-only counters (mac_rx_drop_total/
+//      phy_rx_drop_total), unattributed, exactly as before this
+//      recognizer ever existed.
+//   2. A cheap, VALIDATED packet-size pre-filter (kBeaconSizeMinBytes/
+//      kBeaconSizeMaxBytes below) gates the CopyData+search on the
+//      remaining MacTx/PhyTxBegin/MacRx stages -- see that constant's
+//      own comment for the measured evidence behind the band.
+//   3. Per-match results go into BOUNDED (who x sender x stage) atomic
+//      counters (g_beaconCounters), not an unbounded per-event buffer --
+//      a fixed, startup-sized allocation, never growing with packet
+//      count.
+//
+// SENDER-LEVEL ATTRIBUTION ONLY, not same-packet identity: the beacon's
+// std_msgs/String payload carries only the sender's name, no sequence
+// number or nonce, so every beacon a given sender emits is byte-for-byte
+// identical at this level. This can show "sender-attributed beacon
+// traffic from X reached Y's MAC/PHY" in aggregate; it CANNOT show that
+// one specific MacTx event is the same physical packet as one specific
+// MacRx event. Do not read per-stage counts as a 1:1 packet trace.
+//
+// KNOWN LIMITATION, still not fixed here (would require parsing RTPS
+// wire structure): a station's label is plausibly also its Docker
+// hostname, and some DDS implementations embed the hostname in their own
+// periodic SPDP participant-announcement traffic -- unrelated to the
+// application-level beacon this recognizer targets. The size pre-filter
+// reduces but does not provably eliminate this risk; see
+// --beaconRecognize's own AddValue text.
+bool g_beaconRecognize = false;
+std::vector<std::string> g_beaconIdentities;
+
+// Measured directly from a known-good N=2 run for BOTH middlewares (see
+// docs/AUDIT_ACCEPTANCE_TRACKING.md "CANDIDATE 3 BEACON SIZE
+// CALIBRATION"): genuine beacon frames clustered tightly at 188/192 bytes
+// for Fast DDS and 144/148 bytes for Cyclone DDS (the 4-byte gap in each
+// pair is the CDR-padded length difference between "control_station" and
+// a "robot_NNNN" label). The small number of other matches in that same
+// calibration run (both middlewares) sat at 352 bytes or larger -- more
+// than 1.5x this band's upper edge -- so [140, 200] comfortably separates
+// genuine beacon-sized traffic from that leftover noise for both
+// middlewares without excluding either one's genuine frames. NOT a
+// guess: re-derive by rerunning that calibration if the endpoint script's
+// label format ever changes.
+constexpr uint32_t kBeaconSizeMinBytes = 140;
+constexpr uint32_t kBeaconSizeMaxBytes = 200;
+
+enum : std::size_t
+{
+  kBeaconStageMacTx = 0,
+  kBeaconStagePhyTxBegin = 1,
+  kBeaconStageMacRx = 2,
+  kNumBeaconStages = 3,
+};
+std::vector<std::atomic<uint64_t>> g_beaconCounters;
+uint32_t g_beaconCounterStations = 0;
+
+void
+InitBeaconCounters(uint32_t totalStations)
+{
+  g_beaconCounterStations = totalStations;
+  g_beaconCounters = std::vector<std::atomic<uint64_t>>(
+      static_cast<std::size_t>(totalStations) * totalStations * kNumBeaconStages);
+}
+
+inline std::size_t
+BeaconCounterIndex(uint32_t whoIdx, uint32_t senderIdx, std::size_t stage)
+{
+  return (static_cast<std::size_t>(whoIdx) * g_beaconCounterStations + senderIdx) * kNumBeaconStages
+         + stage;
+}
+
+bool
+RecognizeBeaconSender(Ptr<const Packet> packet, std::string& sender)
+{
+  uint32_t size = packet->GetSize();
+  // Cheap O(1) pre-filter -- see kBeaconSizeMinBytes/kBeaconSizeMaxBytes's
+  // own comment. Skips CopyData + the per-identity substring search
+  // below entirely for anything outside the validated band; this is what
+  // makes running on MacTx/MacRx/PhyTxBegin safe at N=16 scale (see this
+  // recognizer's own file-header comment for the design that failed
+  // without it).
+  if (size < kBeaconSizeMinBytes || size > kBeaconSizeMaxBytes)
+  {
+    return false;
+  }
+  std::vector<uint8_t> buf(size);
+  packet->CopyData(buf.data(), size);
+  for (const auto& id : g_beaconIdentities)
+  {
+    auto it = std::search(buf.begin(), buf.end(), id.begin(), id.end());
+    if (it != buf.end())
+    {
+      sender = id;
+      return true;
+    }
+  }
+  return false;
+}
+
+void
+RecordBeaconAttribution(std::size_t stage, const std::string& who, Ptr<const Packet> packet)
+{
+  // Single gating point, same pattern as LogMacEvent's own --heavyTracing
+  // gate below -- skipping here (before CopyData) is what makes
+  // --beaconRecognize=false truly free.
+  if (!g_beaconRecognize)
+  {
+    return;
+  }
+  std::string sender;
+  if (!RecognizeBeaconSender(packet, sender))
+  {
+    return;
+  }
+  auto whoIt = std::find(g_beaconIdentities.begin(), g_beaconIdentities.end(), who);
+  auto senderIt = std::find(g_beaconIdentities.begin(), g_beaconIdentities.end(), sender);
+  if (whoIt == g_beaconIdentities.end() || senderIt == g_beaconIdentities.end())
+  {
+    return;
+  }
+  uint32_t whoIdx = static_cast<uint32_t>(std::distance(g_beaconIdentities.begin(), whoIt));
+  uint32_t senderIdx = static_cast<uint32_t>(std::distance(g_beaconIdentities.begin(), senderIt));
+  g_beaconCounters[BeaconCounterIndex(whoIdx, senderIdx, stage)].fetch_add(1, std::memory_order_relaxed);
+}
+
+// Printed on the SAME periodic cadence as PrintWifiStats' other aggregate
+// counters (see that function's own comment on why: the orchestrator
+// often kills this process before it reaches a natural end-of-program,
+// which is exactly what happens for the invalid_readiness runs this
+// recognizer exists to diagnose -- a true shutdown-only hook would print
+// nothing for precisely those runs). Still "aggregated, not per-event":
+// one bounded, fixed-size snapshot read per print, not a per-packet
+// write.
+void
+PrintBeaconCounters()
+{
+  if (!g_beaconRecognize)
+  {
+    return;
+  }
+  static const char* kStageNames[kNumBeaconStages] = {"mac_tx", "phy_tx_begin", "mac_rx"};
+  std::cout << "FLEETQOX_BEACON_COUNTERS {\"entries\":[";
+  bool first = true;
+  for (uint32_t whoIdx = 0; whoIdx < g_beaconCounterStations; ++whoIdx)
+  {
+    for (uint32_t senderIdx = 0; senderIdx < g_beaconCounterStations; ++senderIdx)
+    {
+      for (std::size_t stage = 0; stage < kNumBeaconStages; ++stage)
+      {
+        uint64_t count = g_beaconCounters[BeaconCounterIndex(whoIdx, senderIdx, stage)].load();
+        if (count == 0)
+        {
+          continue;
+        }
+        if (!first)
+        {
+          std::cout << ",";
+        }
+        first = false;
+        std::cout << "{\"who\":\"" << g_beaconIdentities[whoIdx] << "\","
+                  << "\"sender\":\"" << g_beaconIdentities[senderIdx] << "\","
+                  << "\"stage\":\"" << kStageNames[stage] << "\","
+                  << "\"count\":" << count << "}";
+      }
+    }
+  }
+  std::cout << "]}" << std::endl;
+}
+
 void
 LogMacEvent(const std::string& kind, const std::string& who, Ptr<const Packet> packet)
 {
@@ -546,6 +731,7 @@ MacTxTrace(std::string who, Ptr<const Packet> packet)
     g_macTxLarge.fetch_add(1, std::memory_order_relaxed);
   }
   LogMacEvent("tx", who, packet);
+  RecordBeaconAttribution(kBeaconStageMacTx, who, packet);
 }
 
 void
@@ -553,6 +739,12 @@ MacTxDropTrace(std::string who, Ptr<const Packet> packet)
 {
   g_macTxDropTotal.fetch_add(1, std::memory_order_relaxed);
   LogMacEvent("mac_tx_drop", who, packet);
+  // No beacon-recognizer call here -- deliberately removed (see this
+  // recognizer's file-header comment): kept aggregate-only, matching
+  // MacRxDrop/PhyRxDrop below, since this stage's volume is low enough
+  // (tens of events, not millions) to never have been the N=16 cost
+  // driver, but per-packet attribution here was never required by the
+  // loss-funnel's own report format either.
 }
 
 void
@@ -561,6 +753,7 @@ MacRxTrace(std::string who, Ptr<const Packet> packet)
   g_macRxTotal.fetch_add(1, std::memory_order_relaxed);
   g_macRxBytes.fetch_add(packet->GetSize(), std::memory_order_relaxed);
   LogMacEvent("rx", who, packet);
+  RecordBeaconAttribution(kBeaconStageMacRx, who, packet);
 }
 
 void
@@ -568,12 +761,20 @@ MacRxDropTrace(std::string who, Ptr<const Packet> packet)
 {
   g_macRxDropTotal.fetch_add(1, std::memory_order_relaxed);
   LogMacEvent("mac_rx_drop", who, packet);
+  // No beacon-recognizer call here -- deliberately removed. This was the
+  // single largest cost driver in the prior design (~68% of all scan
+  // attempts at N=16): MacRxDrop fires millions of times, and per-packet
+  // sender attribution on drops was never needed -- the existing
+  // mac_rx_drop_total aggregate counter already answers "was there drop
+  // activity" at the same confidence level the loss-funnel report uses
+  // (MIXED-UNATTRIBUTABLE), for free.
 }
 
 void
-PhyTxBeginTrace(std::string /* who */, Ptr<const Packet> /* packet */, double /* txPowerW */)
+PhyTxBeginTrace(std::string who, Ptr<const Packet> packet, double /* txPowerW */)
 {
   g_phyTxBeginTotal.fetch_add(1, std::memory_order_relaxed);
+  RecordBeaconAttribution(kBeaconStagePhyTxBegin, who, packet);
 }
 
 void
@@ -586,6 +787,10 @@ PhyRxDropTrace(std::string who, Ptr<const Packet> packet, WifiPhyRxfailureReason
     g_phyRxDropByReason[idx].fetch_add(1, std::memory_order_relaxed);
   }
   LogMacEvent("phy_rx_drop:" + std::to_string(idx), who, packet);
+  // No beacon-recognizer call here -- deliberately removed, same
+  // rationale as MacRxDrop above (~17% of the prior design's scan
+  // attempts; aggregate phy_rx_drop_total/phy_rx_drop_by_reason already
+  // cover this stage).
 }
 
 void
@@ -757,6 +962,10 @@ PrintWifiStats(uint32_t totalStations, uint32_t numAps)
   // Flush any buffered per-packet MAC timeline lines on the same safe
   // cadence/thread as this function -- see g_macEventLogLines' comment.
   FlushMacEventLog();
+  // Bounded-counter snapshot print, same cadence -- see
+  // PrintBeaconCounters' own comment for why this stays periodic rather
+  // than shutdown-only.
+  PrintBeaconCounters();
   // sim_time_s lets the orchestrator pick a snapshot by SIMULATED elapsed
   // time instead of blindly taking "whichever line happened to be last
   // before the process got killed" -- the latter varies run-to-run purely
@@ -960,6 +1169,33 @@ main(int argc, char* argv[])
       "instrumentation overhead, not FleetRMW/network load, caused the "
       "measured ns-3 realtime lag).",
       g_heavyTracing);
+  cmd.AddValue(
+      "beaconRecognize",
+      "Opt-in (default false), INDEPENDENT of --heavyTracing: CANDIDATE 3 "
+      "design (see docs/AUDIT_ACCEPTANCE_TRACKING.md). Applies a "
+      "VALIDATED packet-size pre-filter (kBeaconSizeMinBytes/"
+      "kBeaconSizeMaxBytes, measured from a known-good run, not guessed) "
+      "before scanning the EXISTING MacTx/MacRx/PhyTxBegin hooks for one "
+      "of this run's known station-label strings (e.g. \"robot_0005\"), "
+      "to identify scripts/fleetqox_rmw_trace_endpoint.py's existing "
+      "readiness-beacon traffic for middlewares (Fast DDS/Cyclone DDS) "
+      "that ExtractEventId() above can never match. Deliberately does "
+      "NOT scan MacTxDrop/MacRxDrop/PhyRxDrop (an earlier version did, "
+      "failed its own N=16 perturbation gate -- those 3 stages were 85% "
+      "of its scan volume). Results accumulate into BOUNDED (who x "
+      "sender x stage) in-memory counters, printed periodically, not one "
+      "line per matched packet. SENDER-LEVEL attribution only -- the "
+      "beacon payload carries no sequence number, so this cannot prove "
+      "same-packet identity between a TX and an RX event, only that "
+      "sender-attributed traffic reached a given station's MAC/PHY. Does "
+      "NOT add or modify any network packet, does NOT require "
+      "--heavyTracing. The size pre-filter reduces but does not provably "
+      "eliminate the risk of matching unrelated traffic that happens to "
+      "embed the same ASCII substring (e.g. SPDP participant-name "
+      "announcements if a station's Docker hostname matches its label) "
+      "-- see docs/AUDIT_ACCEPTANCE_TRACKING.md for the required "
+      "correctness check before trusting this flag's output.",
+      g_beaconRecognize);
   std::string schedulerType = "map";
   cmd.AddValue(
       "scheduler",
@@ -1094,6 +1330,10 @@ main(int argc, char* argv[])
     stationEndpointLabels.push_back(suffix);
   }
   const uint32_t totalStations = static_cast<uint32_t>(stationEndpointLabels.size());
+  // Populated once, regardless of --beaconRecognize -- see
+  // RecognizeBeaconSender's comment above.
+  g_beaconIdentities = stationEndpointLabels;
+  InitBeaconCounters(totalStations);
 
   std::vector<std::string> stationTapNames;
   for (uint32_t i = 0; i < totalStations; ++i)

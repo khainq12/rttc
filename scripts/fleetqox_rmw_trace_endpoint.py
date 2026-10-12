@@ -394,6 +394,9 @@ def build_discovery_diagnostic(
     discovery_timeout_s: float,
     discovery_convergence_s: float,
     peer_first_seen_s: dict[str, float],
+    is_final: bool = True,
+    snapshot_elapsed_s: float | None = None,
+    lifecycle: dict[str, float | None] | None = None,
 ) -> dict[str, Any]:
     """Table IV/V IDENTITY-level readiness diagnostic -- mirrors
     fleetqox_coordination_endpoint.py's own build_discovery_diagnostic()
@@ -403,6 +406,24 @@ def build_discovery_diagnostic(
     docs/AUDIT_ACCEPTANCE_TRACKING.md, "WI-FI READINESS ROOT-CAUSE
     (24/09/2026)"). Pure function, no clock/rclpy -- unit-testable in
     isolation, same pattern as discovery_converged() below.
+
+    is_final / snapshot_elapsed_s (READINESS-TIMEOUT DIAGNOSTIC SNAPSHOT,
+    see docs/AUDIT_ACCEPTANCE_TRACKING.md): is_final defaults to True so
+    every PRE-EXISTING call site (this file's own final write below,
+    fleetqox_coordination_endpoint.py's identical function) is
+    byte-for-byte unaffected except for gaining this one additive key.
+    is_final=False marks a periodic, IN-PROGRESS snapshot taken while
+    the endpoint was still inside its discovery wait loop -- NOT a
+    final, authoritative outcome (the loop had not yet broken when this
+    was written; discovery could still converge, or time out, AFTER
+    this snapshot was taken). snapshot_elapsed_s records time-since-
+    discovery_start AT THE MOMENT this specific snapshot was written --
+    for a periodic/initial snapshot this is strictly less than the
+    eventual discovery_convergence_s (or discovery_timeout_s, if it
+    never converges); for the final write the two are equal by
+    construction. Do not read an is_final=False snapshot as "the exact
+    state at --discovery-timeout-s" -- it is only ever "the state as of
+    snapshot_elapsed_s seconds in," whatever that happened to be.
     """
     missing = sorted(required_peers - peers_seen)
     return {
@@ -417,7 +438,29 @@ def build_discovery_diagnostic(
         "discovery_timeout_s": discovery_timeout_s,
         "discovery_convergence_s": discovery_convergence_s,
         "peer_first_seen_s": dict(peer_first_seen_s),
+        "is_final": is_final,
+        "snapshot_elapsed_s": snapshot_elapsed_s,
+        "lifecycle": lifecycle,
     }
+
+
+def write_discovery_diagnostic_atomic(path: Path, diagnostic: dict[str, Any]) -> None:
+    """Crash-safe write for build_discovery_diagnostic()'s output --
+    see docs/AUDIT_ACCEPTANCE_TRACKING.md "READINESS-TIMEOUT DIAGNOSTIC
+    SNAPSHOT". A plain write_text() can be interrupted mid-write by a
+    SIGKILL (which cannot be caught, so no Python-level cleanup can run)
+    and leave a truncated/corrupt JSON file behind, indistinguishable
+    from "the harness wrote garbage" rather than "no observation yet".
+    write to a per-process temp file in the SAME directory (so the
+    final os.replace() is an atomic rename on the same filesystem, not
+    a cross-filesystem copy) then atomically rename over the real path
+    -- the real path either still holds the PREVIOUS valid snapshot or
+    the new one, never a partial one, regardless of when a kill signal
+    arrives."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp{os.getpid()}")
+    tmp_path.write_text(json.dumps(diagnostic))
+    os.replace(tmp_path, path)
 
 
 def discovery_converged(
@@ -483,6 +526,23 @@ def discovery_converged(
             return required_peer_ids <= peers_seen_ids
         return peers_seen >= expected_peer_count
     return subscription_fallback_ok
+
+
+def append_beacon_trace_event(
+    beacon_trace_path: Path | None, endpoint: str, event: str, **fields: Any
+) -> None:
+    """DIAGNOSTIC ONLY (see --beacon-trace-json's own help text): no-op
+    when beacon_trace_path is None (every existing caller). Appends one
+    JSON line, each with its own open/write/flush/close for durability
+    against this process being killed moments later -- purely narrates
+    an event that already happened, never triggers one."""
+    if beacon_trace_path is None:
+        return
+    record = {"endpoint": endpoint, "event": event, "monotonic": time.monotonic(), **fields}
+    with open(beacon_trace_path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, default=str) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def build_payload(row: dict[str, str], target_bytes: int) -> str:
@@ -636,6 +696,14 @@ def run_receive_idle_drain_loop(
 
 
 def main() -> int:
+    # CYCLONE DDS STARTUP TIMELINE INSTRUMENTATION (see
+    # docs/AUDIT_ACCEPTANCE_TRACKING.md): always captured (one cheap
+    # time.time() call, mirrors g_wallClockStart's own unconditional
+    # capture in fleetqox_trace_replay_tap.cc) -- whether this, and the
+    # other lifecycle timestamps captured below, are ever SURFACED in a
+    # diagnostic write depends entirely on --lifecycle-timeline (parsed
+    # below); capturing here costs nothing regardless.
+    lifecycle_state: dict[str, float | None] = {"process_entry_wall_time": time.time()}
     parser = argparse.ArgumentParser()
     parser.add_argument("--trace", type=Path, required=True)
     parser.add_argument(
@@ -740,6 +808,78 @@ def main() -> int:
             "docs/AUDIT_ACCEPTANCE_TRACKING.md, 'WI-FI READINESS "
             "ROOT-CAUSE'); default None preserves prior behavior exactly "
             "(no file written) for every existing caller."
+        ),
+    )
+    parser.add_argument(
+        "--periodic-discovery-snapshot",
+        action="store_true",
+        help=(
+            "Opt-in (default False), INDEPENDENT of --discovery-diag-json "
+            "being set (a no-op unless it is). READINESS-TIMEOUT "
+            "DIAGNOSTIC SNAPSHOT (see docs/AUDIT_ACCEPTANCE_TRACKING.md): "
+            "the existing --discovery-diag-json write only ever happens "
+            "AFTER this endpoint's own discovery loop exits -- an "
+            "endpoint killed by the orchestrator's watchdog WHILE still "
+            "inside that loop (e.g. because it was launched later than "
+            "others and its own internal --discovery-timeout-s deadline "
+            "falls after the orchestrator's) leaves zero diagnostic "
+            "behind. When set, writes an initial snapshot immediately "
+            "after discovery state is set up (before entering the wait "
+            "loop) and then an updated snapshot every 2 seconds during "
+            "the loop, each with is_final=False, so the LAST snapshot "
+            "written before any kill survives on disk regardless of how "
+            "the process dies. Uses the exact same "
+            "build_discovery_diagnostic() fields already computed for "
+            "the final write -- no new readiness state, only MORE "
+            "FREQUENT persistence of state that already exists. Default "
+            "False reproduces this script's exact prior behavior (only "
+            "the single final write, is_final=True) for every existing "
+            "caller."
+        ),
+    )
+    parser.add_argument(
+        "--lifecycle-timeline",
+        action="store_true",
+        help=(
+            "Opt-in (default False). CYCLONE DDS STARTUP TIMELINE "
+            "INSTRUMENTATION (see docs/AUDIT_ACCEPTANCE_TRACKING.md): "
+            "when set, includes a 'lifecycle' block (wall-clock, i.e. "
+            "time.time(), NOT time.monotonic() -- comparable across "
+            "processes/containers unlike every other timestamp in this "
+            "diagnostic) in every --discovery-diag-json write (initial, "
+            "periodic, and final), covering process entry, rclpy init "
+            "start/done, publisher/subscriber init done, discovery_start, "
+            "first beacon publication (None until observed), and the "
+            "wall-clock moment each snapshot itself was written. No new "
+            "network traffic, no change to beacon cadence, no change to "
+            "discovery_converged()'s inputs -- purely additive "
+            "observation of state that already exists. Default False "
+            "omits the 'lifecycle' key entirely (None), reproducing "
+            "this script's exact prior behavior."
+        ),
+    )
+    parser.add_argument(
+        "--beacon-trace-json",
+        type=Path,
+        default=None,
+        help=(
+            "DIAGNOSTIC ONLY, observation-only (see "
+            "docs/AUDIT_ACCEPTANCE_TRACKING.md, 'TABLE V WI-FI N=16 "
+            "LOSS-FUNNEL DIAGNOSTIC'): when set, appends one JSON line "
+            "per EXISTING beacon event this endpoint already produces -- "
+            "process-alive (right after beacon_pub/sub creation), each "
+            "existing 0.1s-gated publish attempt and its success/"
+            "RCLError outcome, and each existing on_beacon() receive "
+            "callback invocation -- to this path. Adds ZERO new "
+            "publishes, does not change the 0.1s beacon cadence, does "
+            "not touch discovery_timeout_s/sustain-beacon/QoS/topic/"
+            "any middleware config -- purely narrates events that were "
+            "already going to happen. Each line is written with its own "
+            "open/write/flush/close so a line already appended survives "
+            "even if this process is killed moments later (same "
+            "durability property as --ready-file). Default None "
+            "preserves prior behavior exactly (nothing written) for "
+            "every existing caller."
         ),
     )
     parser.add_argument(
@@ -924,6 +1064,7 @@ def main() -> int:
         {_topic_for(row["dst"], row["flow_class"]) for row in outgoing}
     )
 
+    lifecycle_state["rclpy_init_start_wall_time"] = time.time()
     rclpy.init()
     node_name = "fleetqox_trace_endpoint_" + "".join(
         ch if ch.isalnum() else "_" for ch in args.endpoint
@@ -957,6 +1098,7 @@ def main() -> int:
 
     rclpy.publisher.Publisher.publish = _publish_suppressing_parameter_events
     node = rclpy.create_node(node_name, start_parameter_services=False)
+    lifecycle_state["rclpy_init_done_wall_time"] = time.time()
     qos = QoSProfile(
         history=HistoryPolicy.KEEP_LAST,
         depth=64,
@@ -1080,17 +1222,23 @@ def main() -> int:
         beacon_pub = node.create_publisher(String, beacon_topic, beacon_qos)
         beacon_msg = String()
         beacon_msg.data = args.endpoint
+        append_beacon_trace_event(args.beacon_trace_json, args.endpoint, "alive")
 
         beacon_raw_seen: list[str] = []
 
         def on_beacon(msg: String) -> None:
             beacon_raw_seen.append(msg.data)
+            append_beacon_trace_event(
+                args.beacon_trace_json, args.endpoint, "receive", sender=msg.data
+            )
             if msg.data != args.endpoint:  # a beacon can loop back on some RMWs
                 if msg.data not in discovery_peers_seen:
                     discovery_peer_first_seen_monotonic[msg.data] = time.monotonic()
                 discovery_peers_seen.add(msg.data)
 
         node.create_subscription(String, beacon_topic, on_beacon, beacon_qos)
+
+    lifecycle_state["pubsub_init_done_wall_time"] = time.time()
 
     # Shared readiness epoch (opt-in, see --created-barrier-dir's own
     # help text): this endpoint's node/publishers/subscriptions/beacon
@@ -1119,17 +1267,84 @@ def main() -> int:
         created_barrier_wait_s = time.monotonic() - barrier_start
 
     discovery_start = time.monotonic()
+    lifecycle_state["discovery_start_wall_time"] = time.time()
     discovery_deadline = discovery_start + args.discovery_timeout_s
     last_beacon_sent = 0.0
     subscription_fallback_converged = False
     converged_at: float | None = None
+    # READINESS-TIMEOUT DIAGNOSTIC SNAPSHOT (see
+    # docs/AUDIT_ACCEPTANCE_TRACKING.md): hoisted once here (pure
+    # function of already-parsed args, no side effects) so the initial/
+    # periodic snapshots below and the existing final write share the
+    # IDENTICAL expression -- no change to what gets computed, only to
+    # WHEN it gets persisted to disk.
+    required_peers_for_diag = required_peer_ids if required_peer_ids is not None else frozenset()
+    # Reuses PrintQueueBacklog's existing 2.0s cadence
+    # (fleetqox_trace_replay_tap.cc) -- not a new, separately-justified
+    # number.
+    DIAG_SNAPSHOT_INTERVAL_S = 2.0
+    last_diag_snapshot_written = 0.0
+
+    def _current_lifecycle() -> dict[str, float | None] | None:
+        # CYCLONE DDS STARTUP TIMELINE INSTRUMENTATION: opt-in surfacing
+        # only -- lifecycle_state itself is always populated (cheap), but
+        # this returns None (the field this diagnostic has always had,
+        # via build_discovery_diagnostic()'s own default) unless
+        # --lifecycle-timeline was explicitly passed, so every existing
+        # caller's diagnostic output is unaffected.
+        if not args.lifecycle_timeline:
+            return None
+        return dict(lifecycle_state, snapshot_written_wall_time=time.time())
+
+    def _write_discovery_snapshot(elapsed_s: float) -> None:
+        # Gated on --discovery-diag-json too (same contract as the
+        # existing final write below): --periodic-discovery-snapshot
+        # alone is a no-op if no diagnostic path was ever requested.
+        if args.discovery_diag_json is None:
+            return
+        write_discovery_diagnostic_atomic(
+            args.discovery_diag_json,
+            build_discovery_diagnostic(
+                endpoint=args.endpoint,
+                required_peers=set(required_peers_for_diag),
+                peers_seen=set(discovery_peers_seen),
+                converged=False,
+                beacon_active=beacon_pub is not None,
+                skip_discovery_wait=args.skip_discovery_wait,
+                expected_peer_count=args.expected_peer_count,
+                discovery_timeout_s=args.discovery_timeout_s,
+                discovery_convergence_s=elapsed_s,
+                peer_first_seen_s={
+                    peer: round(t - discovery_start, 3)
+                    for peer, t in discovery_peer_first_seen_monotonic.items()
+                },
+                is_final=False,
+                snapshot_elapsed_s=elapsed_s,
+                lifecycle=_current_lifecycle(),
+            ),
+        )
+
+    if args.periodic_discovery_snapshot:
+        # Initial snapshot: taken immediately after discovery state
+        # (discovery_start/deadline, beacon_pub/sub, required_peer_ids)
+        # is set up, BEFORE entering the wait loop below -- covers the
+        # endpoint being killed before it ever reaches a periodic tick.
+        _write_discovery_snapshot(0.0)
     if not args.skip_discovery_wait:
         while time.monotonic() < discovery_deadline:
             if beacon_pub is not None:
                 now = time.monotonic()
                 if now - last_beacon_sent >= 0.1:
+                    append_beacon_trace_event(
+                        args.beacon_trace_json, args.endpoint, "publish_attempt"
+                    )
                     try:
                         beacon_pub.publish(beacon_msg)
+                        if lifecycle_state.get("first_beacon_published_wall_time") is None:
+                            lifecycle_state["first_beacon_published_wall_time"] = time.time()
+                        append_beacon_trace_event(
+                            args.beacon_trace_json, args.endpoint, "publish_ok"
+                        )
                     except RCLError:
                         # Transient startup race (see docs/
                         # AUDIT_ACCEPTANCE_TRACKING.md "TABLE IV STATIC
@@ -1144,7 +1359,10 @@ def main() -> int:
                         # discovery_deadline and is correctly reported as
                         # not converged; this only rescues the transient,
                         # all-processes-starting-at-once case.
-                        pass
+                        append_beacon_trace_event(
+                            args.beacon_trace_json, args.endpoint, "publish_fail",
+                            exception="RCLError",
+                        )
                     last_beacon_sent = now
             # spin_once() services only ONE ready wait-set entity per call, so
             # drain everything ready each iteration rather than relying on one
@@ -1171,6 +1389,11 @@ def main() -> int:
             ):
                 this_endpoint_converged = True
                 subscription_fallback_converged = True
+            if args.periodic_discovery_snapshot:
+                now2 = time.monotonic()
+                if now2 - last_diag_snapshot_written >= DIAG_SNAPSHOT_INTERVAL_S:
+                    _write_discovery_snapshot(now2 - discovery_start)
+                    last_diag_snapshot_written = now2
             if this_endpoint_converged:
                 if converged_at is None:
                     converged_at = time.monotonic()
@@ -1239,28 +1462,29 @@ def main() -> int:
         # other endpoints' identities, so "missing_peers" can't be
         # computed there; peers_seen + expected_peer_count still tell
         # the full story for that mode.
-        required_peers_for_diag = (
-            required_peer_ids if required_peer_ids is not None else frozenset()
-        )
-        args.discovery_diag_json.parent.mkdir(parents=True, exist_ok=True)
-        args.discovery_diag_json.write_text(
-            json.dumps(
-                build_discovery_diagnostic(
-                    endpoint=args.endpoint,
-                    required_peers=set(required_peers_for_diag),
-                    peers_seen=set(discovery_peers_seen),
-                    converged=converged,
-                    beacon_active=beacon_pub is not None,
-                    skip_discovery_wait=args.skip_discovery_wait,
-                    expected_peer_count=args.expected_peer_count,
-                    discovery_timeout_s=args.discovery_timeout_s,
-                    discovery_convergence_s=discovery_convergence_s,
-                    peer_first_seen_s={
-                        peer: round(t - discovery_start, 3)
-                        for peer, t in discovery_peer_first_seen_monotonic.items()
-                    },
-                )
-            )
+        # required_peers_for_diag: reuses the SAME expression hoisted
+        # above the discovery loop for the periodic-snapshot helper --
+        # not recomputed differently here.
+        write_discovery_diagnostic_atomic(
+            args.discovery_diag_json,
+            build_discovery_diagnostic(
+                endpoint=args.endpoint,
+                required_peers=set(required_peers_for_diag),
+                peers_seen=set(discovery_peers_seen),
+                converged=converged,
+                beacon_active=beacon_pub is not None,
+                skip_discovery_wait=args.skip_discovery_wait,
+                expected_peer_count=args.expected_peer_count,
+                discovery_timeout_s=args.discovery_timeout_s,
+                discovery_convergence_s=discovery_convergence_s,
+                peer_first_seen_s={
+                    peer: round(t - discovery_start, 3)
+                    for peer, t in discovery_peer_first_seen_monotonic.items()
+                },
+                is_final=True,
+                snapshot_elapsed_s=discovery_convergence_s,
+                lifecycle=_current_lifecycle(),
+            ),
         )
 
     if args.ready_file:

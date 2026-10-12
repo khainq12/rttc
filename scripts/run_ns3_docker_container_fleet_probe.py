@@ -121,6 +121,57 @@ READY_DEADLINE_S = 60
 # window, which (per the Phase 4 code trace) only ever starts after real
 # convergence, however long that took.
 LAN_DISCOVERY_WATCHDOG_S = 45.0
+# Wi-Fi Table V readiness watchdog (see docs/AUDIT_ACCEPTANCE_TRACKING.md,
+# "TABLE V WI-FI SETUP WATCHDOG -- DEADLOCK-PROTECTION-ONLY DERIVATION").
+# DEADLOCK PROTECTION ONLY -- not a Table V performance threshold. A
+# method that converges at 59s is not worse, for Table V purposes, than
+# one that converges at 7s; readiness duration is reported only as
+# supplementary bootstrap data, never mixed into latency/delivery/
+# stale/jitter/repair/CPU/RSS.
+#
+# Superseded derivation history: first frozen at 45.0 (CycloneDDS's
+# documented 30s SPDPInterval x 1.5 margin, reusing LAN_DISCOVERY_
+# WATCHDOG_S's own derivation verbatim) -- proven, by live N=16 Avis
+# evidence, to still cut off Fast DDS/CycloneDDS while they were
+# genuinely still making progress (missing-required-peer counts SHRANK
+# from 15s->45s, not flat/stuck), so 45.0 was too tight to serve as a
+# pure deadlock backstop at this scale.
+#
+# Current derivation (60.0, NOT chosen by observing a pass/fail outcome
+# at 60.0 -- no run at this value had occurred when this was set):
+# CycloneDDS's official docs describe an accelerated burst-response on
+# new-peer-join LAYERED ON TOP OF the flat, documented 30s SPDPInterval
+# -- the plain 30s-per-cycle bound is specifically what applies when
+# that accelerated burst message itself is lost. Wi-Fi's simulated
+# channel is lossy (unlike LAN's zero-loss environment, where the 1.5x-
+# margin single-cycle reasoning was sufficient) -- a single 30s cycle
+# gives a required pair exactly ONE announce opportunity, with no
+# guaranteed recovery if it is dropped. Waiting a SECOND full
+# SPDPInterval guarantees a second, independent periodic announce for
+# that same pair, regardless of whether the first (burst or plain) was
+# lost -- 60.0 = 2 x 30s, not a 1.5x margin multiplier.
+#
+# Deliberately NOT N-multiplied: SPDP is a broadcast mechanism, so the
+# star hub's need to hear from every required peer is bounded by the
+# SAME per-pair worst case, not a linear function of how many peers it
+# has -- no protocol evidence supports scaling this constant by N, and
+# none is applied. Also deliberately NOT extended to a 3rd cycle (90s):
+# a 3rd cycle would only add protection against a SECOND consecutive
+# lost announce for the same pair, a compounding-loss scenario with no
+# documented loss-rate evidence here to justify singling out -- 2
+# cycles has a concrete, protocol-mechanical justification; a 3rd would
+# be padding without an equally concrete one.
+#
+# Identical for all four middlewares, identical for N=8/16/32, frozen
+# before any rerun at this value. Replaces run_probe()'s own
+# discovery_timeout_s default only; Table VI's run_coordination_probe()
+# and 5G's run_nr_probe() keep their original 15.0 default untouched
+# (same scoping as the LAN fix). The previously-tested shared-readiness-
+# epoch mechanism is deliberately NOT reintroduced here -- a prior
+# investigation already built and live-A/B-tested it for these same
+# three middlewares and found it ineffective/harmful; no new evidence
+# is presented here that changes that conclusion.
+READINESS_WATCHDOG_S = 60.0
 CONTAINER_PREFIX = "fleetqox_ref"
 # Must match fleetqox_trace_replay_tap.cc's PrintWifiStats() reschedule
 # period (Simulator::Schedule(Seconds(5.0), ...)) exactly -- used to size
@@ -832,6 +883,16 @@ class ReferenceTopologyProbe:
         self.ips = {
             endpoint: f"{BASE_IP_PREFIX}{i + 2}" for i, endpoint in enumerate(self.endpoints)
         }
+        # CYCLONE DDS STARTUP TIMELINE INSTRUMENTATION (see
+        # docs/AUDIT_ACCEPTANCE_TRACKING.md): always captured, cheap
+        # (a handful of time.time() calls, never a hot loop) -- gating
+        # only applies to whether run_probe() PERSISTS this to disk
+        # (--lifecycle-timeline param), not to whether it's recorded in
+        # memory, matching g_wallClockStart's own unconditional-capture
+        # pattern in fleetqox_trace_replay_tap.cc.
+        self._launch_timeline: list[dict[str, Any]] = []
+        self._invalid_readiness_detected_wall_time: float | None = None
+        self._teardown_started_wall_time: float | None = None
 
     def _mount_args(self) -> list[str]:
         return ["-v", f"{ROOT}:/work", "-w", "/work"]
@@ -1159,6 +1220,7 @@ class ReferenceTopologyProbe:
         log_path: str = "/tmp/ns3.log",
         scheduler: str = "map",
         realtime_hard_limit_s: float = 0.0,
+        beacon_recognize: bool = False,
     ) -> None:
         # scheduler/realtime_hard_limit_s: see fleetqox_trace_replay_tap.cc's
         # --scheduler/--realtimeHardLimitS doc comments -- defaults ("map",
@@ -1172,7 +1234,9 @@ class ReferenceTopologyProbe:
             f"--pathLossExponent={path_loss_exponent:.12g} --txPowerDbm={tx_power_dbm:.12g} "
             f"--rxSensitivityDbm={rx_sensitivity_dbm:.12g} --mobilitySpeed={mobility_speed:.12g} "
             f"--seed={ns3_seed} --run={ns3_run} --scheduler={shlex.quote(scheduler)} "
-            f"--realtimeHardLimitS={realtime_hard_limit_s:.12g} > {log_path} 2>&1"
+            f"--realtimeHardLimitS={realtime_hard_limit_s:.12g}"
+            f"{' --beaconRecognize=true' if beacon_recognize else ''}"
+            f" > {log_path} 2>&1"
         )
         docker("exec", "-d", self.ns3sim_name, "bash", "-lc", cmd)
         time.sleep(NS3_ATTACH_WAIT_S)
@@ -1440,7 +1504,47 @@ class ReferenceTopologyProbe:
         sustain_beacon_until_deadline: bool = False,
         deadline_aware_retransmission_lifespan: bool = False,
         verify_static_topology: bool = False,
+        beacon_trace: bool = False,
+        launch_order: list[int] | None = None,
+        periodic_discovery_snapshot: bool = False,
+        lifecycle_timeline: bool = False,
     ) -> None:
+        # lifecycle_timeline: opt-in (default False, preserving every
+        # existing caller's behavior byte-for-byte). CYCLONE DDS STARTUP
+        # TIMELINE INSTRUMENTATION (see docs/AUDIT_ACCEPTANCE_TRACKING.md):
+        # per-endpoint docker-exec wall-clock timestamps are ALWAYS
+        # recorded into self._launch_timeline below (cheap, one
+        # time.time() call before/after each of the 17 already-existing
+        # docker exec -d calls -- no new calls added) -- this flag only
+        # controls whether the ENDPOINT's own process is told
+        # --lifecycle-timeline (so IT records and persists its matching
+        # wall-clock timestamps too) and whether run_probe() ultimately
+        # writes self._launch_timeline to disk. False means: identical
+        # command lines to every prior caller, and self._launch_timeline
+        # is simply never read back.
+        # launch_order: opt-in (default None), same contract and purpose
+        # as launch_coordination_endpoints()'s identical parameter (see
+        # that method's own docstring) -- a permutation of
+        # range(len(self.endpoints)) controlling the wall-clock ORDER
+        # `docker exec -d` calls fire in, for testing whether
+        # control_station being launched first (index 0, this method's
+        # only prior behavior) affects discovery outcomes versus
+        # launching it later. None preserves the exact prior 0..N-1
+        # order byte-for-byte. Every index/file/container-name
+        # association stays keyed by the endpoint's ORIGINAL position in
+        # self.endpoints (self.endpoint_container_names[i], result_i.json,
+        # readiness_diag_i.json, etc.) regardless of this launch order --
+        # only the sequence of docker exec calls themselves changes, so
+        # no other per-endpoint config (peer XML, QoS, static
+        # subscriptions) is affected by this parameter.
+        # beacon_trace: opt-in (default False, preserving every existing
+        # caller's behavior byte-for-byte). DIAGNOSTIC ONLY (see
+        # docs/AUDIT_ACCEPTANCE_TRACKING.md, "TABLE V WI-FI N=16
+        # LOSS-FUNNEL DIAGNOSTIC") -- passes each endpoint its own
+        # --beacon-trace-json path so it narrates events it was already
+        # going to produce (see that flag's own help text in
+        # fleetqox_rmw_trace_endpoint.py). Adds zero new publishes,
+        # changes no timing/QoS/network/middleware config.
         # verify_static_topology: opt-in (default False, preserving every
         # existing caller's behavior byte-for-byte). Table IV fairness fix
         # (see docs/AUDIT_ACCEPTANCE_TRACKING.md, "TABLE IV DISCOVERY
@@ -1495,7 +1599,9 @@ class ReferenceTopologyProbe:
             f"{results_dir_container}/readiness_diag_{i}.json" for i in range(len(self.endpoints))
         ]
         self._start_file = f"{results_dir_container}/start"
-        for i, endpoint in enumerate(self.endpoints):
+        order = launch_order if launch_order is not None else list(range(len(self.endpoints)))
+        for i in order:
+            endpoint = self.endpoints[i]
             peers = ",".join(
                 f"{self.ips[other]}:{RMW_PORT}" for other in self.endpoints if other != endpoint
             )
@@ -1698,6 +1804,15 @@ class ReferenceTopologyProbe:
                 )
                 else ""
             )
+            beacon_trace_flag = (
+                f" --beacon-trace-json=/work/{results_dir_container}/beacon_trace_{i}.jsonl"
+                if beacon_trace
+                else ""
+            )
+            periodic_discovery_snapshot_flag = (
+                " --periodic-discovery-snapshot" if periodic_discovery_snapshot else ""
+            )
+            lifecycle_timeline_flag = " --lifecycle-timeline" if lifecycle_timeline else ""
             # Causal-experiment flag (see docs/AUDIT_ACCEPTANCE_TRACKING.md,
             # "PRE-EXISTING LEDGER-PRUNING MECHANISM CAUSAL CHARACTERIZATION"):
             # FleetRMW-only -- sets a QoS policy that only rmw_fleetqox_cpp's
@@ -1738,14 +1853,27 @@ class ReferenceTopologyProbe:
                 f"{required_peer_ids_flag}"
                 f"{skip_discovery_wait_flag}"
                 f"{sustain_beacon_flag}"
-                f"{deadline_aware_lifespan_flag} "
+                f"{deadline_aware_lifespan_flag}"
+                f"{beacon_trace_flag}"
+                f"{periodic_discovery_snapshot_flag}"
+                f"{lifecycle_timeline_flag} "
                 f"--summary-json=/work/{result_json} "
                 f"--discovery-diag-json=/work/{self._readiness_diag_files[i]} "
                 f"--ready-file=/work/{self._ready_files[i]} "
                 f"--start-file=/work/{self._start_file}"
             )
             cmd = f"{inner} > /work/{log_file} 2>&1"
+            launch_cmd_issued_wall_time = time.time()
             docker("exec", "-d", self.endpoint_container_names[i], "bash", "-lc", cmd)
+            launch_cmd_returned_wall_time = time.time()
+            self._launch_timeline.append(
+                {
+                    "index": i,
+                    "endpoint": endpoint,
+                    "launch_cmd_issued_wall_time": launch_cmd_issued_wall_time,
+                    "launch_cmd_returned_wall_time": launch_cmd_returned_wall_time,
+                }
+            )
 
     def launch_coordination_endpoints(
         self,
@@ -1990,6 +2118,10 @@ class ReferenceTopologyProbe:
         while time.monotonic() < deadline:
             result = rigger_run(self.rigger_name, poll_cmd, check=False)
             if "INVALID_READINESS" in result.stdout:
+                # Always recorded (cheap, one time.time() call) -- see
+                # self._launch_timeline's own comment. Read back by
+                # run_probe() only when lifecycle_timeline=True.
+                self._invalid_readiness_detected_wall_time = time.time()
                 raise ReadinessFailure(
                     "one or more endpoints reported invalid_readiness "
                     "(required convergence not reached within "
@@ -2196,10 +2328,51 @@ class ReferenceTopologyProbe:
             return None
 
     def teardown(self) -> None:
+        # Always recorded (cheap) -- see self._launch_timeline's own
+        # comment above __init__.
+        self._teardown_started_wall_time = time.time()
         docker(
             "rm", "-f", self.rigger_name, self.ns3sim_name, *self.endpoint_container_names,
             check=False,
         )
+
+
+def effective_wifi_sim_duration_s(
+    *, sim_duration_s: float | None, discovery_timeout_s: float,
+    start_offset_ms: float, seconds: int, drain_s: float,
+) -> float:
+    """Deterministic sim_duration_s budget for run_probe() (see
+    docs/AUDIT_ACCEPTANCE_TRACKING.md, "TABLE V WI-FI SETUP WATCHDOG --
+    DEADLOCK-PROTECTION-ONLY DERIVATION"). Mirrors
+    effective_ns3_sim_duration_s()'s own pattern (explicit caller value
+    always wins; otherwise derive so ns-3's own network always outlives
+    every phase that needs it) -- but, unlike that Table VI helper,
+    Wi-Fi's setup/readiness phase can itself now legitimately take up
+    to discovery_timeout_s (a deadlock-protection watchdog, not a
+    performance threshold -- different methods may genuinely need very
+    different amounts of it) BEFORE the measured workload even starts,
+    so that phase must be budgeted in explicitly or ns-3 can shut down
+    mid-setup for a still-legitimately-converging method, well before
+    any workload data ever flows (the exact bug found and fixed earlier
+    this task).
+
+    sim_duration_s = discovery_timeout_s (worst-case setup, not best-
+    case) + start_offset_ms/1000 (pre-send delay) + seconds (workload
+    duration) + drain_s (post-send drain) +
+    NS3_SIM_DURATION_DRAIN_MARGIN_S (the SAME fixed safety-margin
+    constant run_coordination_probe()'s own effective_ns3_sim_duration_s()
+    already uses for an analogous role -- reused, not reinvented, per
+    this task's own explicit instruction to derive the margin from an
+    existing precedent rather than a new number)."""
+    if sim_duration_s is not None:
+        return sim_duration_s
+    return (
+        discovery_timeout_s
+        + start_offset_ms / 1000.0
+        + seconds
+        + drain_s
+        + NS3_SIM_DURATION_DRAIN_MARGIN_S
+    )
 
 
 def run_probe(
@@ -2210,10 +2383,10 @@ def run_probe(
     policy: str,
     seconds: int,
     seed: int,
-    sim_duration_s: float,
+    sim_duration_s: float | None = None,
     start_offset_ms: float = 2000.0,
     drain_s: float = 10.0,
-    discovery_timeout_s: float = 15.0,
+    discovery_timeout_s: float = READINESS_WATCHDOG_S,
     static_mode: bool = True,
     extra_rmw_env: dict[str, str] | None = None,
     ns3_seed: int = 1,
@@ -2239,6 +2412,11 @@ def run_probe(
     ns3_use_monolib: bool = False,
     ns3_build_profile: str = "release",
     verify_static_topology: bool = False,
+    beacon_trace: bool = False,
+    beacon_recognize: bool = False,
+    launch_order: list[int] | None = None,
+    periodic_discovery_snapshot: bool = False,
+    lifecycle_timeline: bool = False,
 ) -> dict[str, Any]:
     # ns3_use_monolib: passed straight through to
     # ReferenceTopologyProbe.build_ns3_binary()'s same-named `use_monolib`
@@ -2324,6 +2502,13 @@ def run_probe(
     # DEFAULT_CAPACITY_PACKETS_PER_SECOND=1200, reused here as a
     # starting point, NOT independently recalibrated for this harness's
     # own workload/topology) to let admission control account for it.
+    sim_duration_s = effective_wifi_sim_duration_s(
+        sim_duration_s=sim_duration_s,
+        discovery_timeout_s=discovery_timeout_s,
+        start_offset_ms=start_offset_ms,
+        seconds=seconds,
+        drain_s=drain_s,
+    )
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     run_id = output_dir.name.lstrip(".")
@@ -2404,6 +2589,7 @@ def run_probe(
             ns3_seed=ns3_seed,
             ns3_run=ns3_run,
             scheduler=ns3_scheduler,
+            beacon_recognize=beacon_recognize,
         )
         if rmw_implementation == "rmw_zenoh_cpp":
             probe.start_zenoh_router()
@@ -2435,6 +2621,10 @@ def run_probe(
             zenoh_control_station_explicit_listen=zenoh_control_station_explicit_listen,
             deadline_aware_retransmission_lifespan=deadline_aware_retransmission_lifespan,
             verify_static_topology=verify_static_topology,
+            beacon_trace=beacon_trace,
+            launch_order=launch_order,
+            periodic_discovery_snapshot=periodic_discovery_snapshot,
+            lifecycle_timeline=lifecycle_timeline,
         )
         probe.wait_for_ready_then_start(ready_deadline_s=ready_deadline_s)
         # Read back on the SUCCESS path too (previously only read on
@@ -2537,6 +2727,30 @@ def run_probe(
             pass
     finally:
         probe.teardown()
+        # CYCLONE DDS STARTUP TIMELINE INSTRUMENTATION (see
+        # docs/AUDIT_ACCEPTANCE_TRACKING.md): assembled and persisted
+        # ONLY when lifecycle_timeline=True -- probe._launch_timeline/
+        # _invalid_readiness_detected_wall_time/_teardown_started_wall_time
+        # are always recorded in memory (cheap), but writing them to
+        # disk is opt-in, matching every other diagnostic-only flag in
+        # this file. Written directly to the host path (no docker exec
+        # needed -- this orchestrator process already has ROOT mounted
+        # at the same path every endpoint sees as /work).
+        if lifecycle_timeline:
+            orchestrator_timeline_path = ROOT / results_dir_container / "orchestrator_timeline.json"
+            orchestrator_timeline_path.parent.mkdir(parents=True, exist_ok=True)
+            orchestrator_timeline_path.write_text(
+                json.dumps(
+                    {
+                        "launch_timeline": probe._launch_timeline,
+                        "invalid_readiness_detected_wall_time": (
+                            probe._invalid_readiness_detected_wall_time
+                        ),
+                        "teardown_started_wall_time": probe._teardown_started_wall_time,
+                    },
+                    indent=2,
+                )
+            )
 
     if save_ns3_log_path is not None and ns3_log_text:
         save_ns3_log_path.parent.mkdir(parents=True, exist_ok=True)
